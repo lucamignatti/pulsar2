@@ -17,7 +17,9 @@
 #endif
 
 #ifdef OS_DL_LINUX
-#define DLLNAME "libRLBotInterface.so" 
+#define DLLNAME "libRLBotInterface.so"
+#elif defined(OS_UNIX)
+#define DLLNAME "libRLBotInterface.dylib"
 #endif
 
 namespace rlbot {

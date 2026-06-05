@@ -59,3 +59,9 @@ libtorch
 
 /checkpoints
 /wandb
+
+# more
+.serena/
+.venv/
+GigaLearnCPP/python_scripts/__pycache__/
+.cache/

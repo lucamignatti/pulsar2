@@ -44,18 +44,22 @@ target_link_libraries(GigaLearnCPP PUBLIC RLGymCPP)
 target_include_directories(GigaLearnCPP PUBLIC "${PROJECT_SOURCE_DIR}/libsrc/json")
 
 # Include python
-find_package(Python COMPONENTS Interpreter Development)
-find_package(PythonLibs REQUIRED)
-include_directories(${PYTHON_INCLUDE_DIRS})
-target_link_libraries(GigaLearnCPP PUBLIC ${PYTHON_LIBRARIES})
+# Use CMake's modern FindPython package exclusively so the interpreter, headers,
+# and library all come from the same Python installation/virtualenv. Mixing this
+# with the legacy FindPythonLibs module can link against a different Python than
+# Python_EXECUTABLE, which breaks embedded Python extension imports on macOS/Linux.
+find_package(Python REQUIRED COMPONENTS Interpreter Development)
+target_include_directories(GigaLearnCPP PUBLIC ${Python_INCLUDE_DIRS})
+target_link_libraries(GigaLearnCPP PUBLIC Python::Python)
 message("Found Python:")
-message("PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
-message("PYTHON_INCLUDE_DIRS: ${PYTHON_INCLUDE_DIRS}")
+message("Python_LIBRARIES: ${Python_LIBRARIES}")
+message("Python_INCLUDE_DIRS: ${Python_INCLUDE_DIRS}")
 message("Python_RUNTIME_LIBRARY_DIRS: ${Python_RUNTIME_LIBRARY_DIRS}")
 message("Python_EXECUTABLE: ${Python_EXECUTABLE}")
 add_definitions(-DPY_EXEC_PATH="${Python_EXECUTABLE}") # Give C++ access to the executable path
 
 # Include pybind11
+set(PYBIND11_FINDPYTHON ON)
 add_subdirectory(pybind11)
 target_link_libraries(GigaLearnCPP PUBLIC pybind11::embed)
 

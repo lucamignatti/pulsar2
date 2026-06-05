@@ -46,7 +46,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	at::Device device = at::Device(at::kCPU);
 	if (
-		config.deviceType == LearnerDeviceType::GPU_CUDA || 
+		config.deviceType == LearnerDeviceType::GPU_CUDA ||
 		(config.deviceType == LearnerDeviceType::AUTO && torch::cuda::is_available())
 		) {
 		RG_LOG("\tUsing CUDA GPU device...");
@@ -65,10 +65,34 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		if (!torch::cuda::is_available() || deviceTestFailed)
 			RG_ERR_CLOSE(
 				"Learner::Learner(): Can't use CUDA GPU because " <<
-				(torch::cuda::is_available() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
+				(at::hasMPS() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
 				"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
 			)
 		device = at::Device(at::kCUDA);
+	} else if (
+		config.deviceType == LearnerDeviceType::GPU_MPS ||
+		(config.deviceType == LearnerDeviceType::AUTO && at::hasMPS())
+		) {
+		RG_LOG("\tUsing MPS GPU device...");
+
+		// Test out moving a tensor to GPU and back to make sure the device is working
+		torch::Tensor t;
+		bool deviceTestFailed = false;
+		try {
+			t = torch::tensor(0);
+			t = t.to(at::Device(at::kMPS));
+			t = t.cpu();
+		} catch (...) {
+			deviceTestFailed = true;
+		}
+
+		if (!at::hasMPS() || deviceTestFailed)
+			RG_ERR_CLOSE(
+				"Learner::Learner(): Can't use MPS GPU because " <<
+				(at::hasMPS() ? "libtorch cannot access the GPU" : "MPS is not available to libtorch") << ".\n" <<
+				"Make sure your libtorch comes with MPS support, and that MPS is installed properly."
+			)
+		device = at::Device(at::kMPS);
 	} else {
 		RG_LOG("\tUsing CPU device...");
 		device = at::Device(at::kCPU);
@@ -349,7 +373,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 			{
 				RG_NO_GRAD;
 				for (stepsCollected = 0; stepsCollected < tlConfig.batchSize; stepsCollected += envSet->state.numPlayers) {
-					
+
 					auto terminals = envSet->state.terminals; // Backup
 					envSet->Reset();
 					for (int i = 0; i < envSet->arenas.size(); i++) // Manually reset old obs builders
@@ -383,7 +407,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 					}
 
 					ppo->InferActions(
-						tStates.to(ppo->device, true), tActionMasks.to(ppo->device, true), 
+						tStates.to(ppo->device, true), tActionMasks.to(ppo->device, true),
 						&tActions, &tLogProbs
 					);
 
@@ -534,8 +558,8 @@ void GGL::Learner::Start() {
 					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
 					oldVersion = &versionMgr->versions[oldVersionIdx];
 
-					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2)); 
-					
+					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2));
+
 					newPlayerIndices.clear();
 					oldVersionPlayerMask.resize(numPlayers);
 					int i = 0;
@@ -644,7 +668,7 @@ void GGL::Learner::Start() {
 						auto curActions = TENSOR_TO_VEC<int>(tActions);
 						FList newLogProbs;
 						if (tLogProbs.defined() && !render)
-							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);	
+							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
 
 						stepTimer.Reset();
 						envSet->Sync(); // Make sure the first half is done
@@ -746,7 +770,7 @@ void GGL::Learner::Start() {
 
 					report["Average Step Reward"] = tRewards.mean().item<float>();
 					report["Collected Timesteps"] = stepsCollected;
-					
+
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
 
@@ -888,7 +912,7 @@ void GGL::Learner::Start() {
 				);
 			}
 		}
-		
+
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Exception thrown during main learner loop: " << e.what());
 	}

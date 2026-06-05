@@ -4,8 +4,8 @@
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
 #include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
-#include <RLGymCPP/OBSBuilders/DefaultObs.h>
-#include <RLGymCPP/OBSBuilders/AdvancedObs.h>
+#include <RLGymCPP/ObsBuilders/DefaultObs.h>
+#include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
@@ -96,12 +96,12 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 int main(int argc, char* argv[]) {
 	// Initialize RocketSim with collision meshes
 	// Change this path to point to your meshes!
-	RocketSim::Init("C:\\Users\\admin\\source\\repos\\RLArenaCollisionDumper\\collision_meshes");
+	RocketSim::Init("collision_meshes");
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
 
-	cfg.deviceType = LearnerDeviceType::GPU_CUDA;
+	cfg.deviceType = LearnerDeviceType::GPU_MPS;
 
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks

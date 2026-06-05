@@ -1,5 +1,5 @@
 #pragma once
-#include "ExperienceBuffer.h";
+#include "ExperienceBuffer.h"
 #include <GigaLearnCPP/Util/Report.h>
 #include <GigaLearnCPP/Util/Timer.h>
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>

@@ -1,5 +1,5 @@
 #include "RLBotClient.h"
-
+#include <string>
 #include <rlbot/platform.h>
 #include <rlbot/botmanager.h>
 
@@ -14,7 +14,7 @@ rlbot::Bot* BotFactory(int index, int team, std::string name) {
 	return new RLBotBot(index, team, name, g_RLBotParams);
 }
 
-RLBotBot::RLBotBot(int _index, int _team, std::string _name, const RLBotParams& params) 
+RLBotBot::RLBotBot(int _index, int _team, std::string _name, const RLBotParams& params)
 	: rlbot::Bot(_index, _team, _name), params(params) {
 
 	RG_LOG("Created RLBot bot: index " << _index << ", name: " << name << "...");
@@ -43,7 +43,7 @@ PhysState ToPhysObj(const rlbot::flat::Physics* phys) {
 
 Player ToPlayer(const rlbot::flat::PlayerInfo* playerInfo) {
 	Player pd = {};
-	
+
 	static_cast<PhysState&>(pd) = ToPhysObj(playerInfo->physics());
 
 	pd.carId = playerInfo->spawnId();
@@ -115,7 +115,7 @@ rlbot::Controller RLBotBot::GetOutput(rlbot::GameTickPacket gameTickPacket) {
 	}
 
 	if (ticks >= params.tickSkip || ticks == -1) {
-		
+
 		// Trigger action update next tick
 		ticks = 0;
 		updateAction = true;
