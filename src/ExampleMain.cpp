@@ -63,6 +63,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new SaveBoostReward(), 0.05f },
 
 		// Game events
+		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
 		{ new GoalReward(), 150 }
 	};
 

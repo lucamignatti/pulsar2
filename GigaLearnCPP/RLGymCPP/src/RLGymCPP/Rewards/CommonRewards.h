@@ -310,6 +310,44 @@ namespace RLGC {
 		}
 	};
 
+	class KickoffTouchReward : public Reward {
+	public:
+		float maxTouchTime;
+		bool finished = false;
+		float elapsed = 0;
+
+		KickoffTouchReward(float maxTouchTime = 3.0f) : maxTouchTime(maxTouchTime) {}
+
+		virtual void Reset(const GameState& initialState) override {
+			finished = false;
+			elapsed = 0;
+		}
+
+		virtual void PreStep(const GameState& state) override {
+			if (!finished)
+				elapsed += state.deltaTime;
+		}
+
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			std::vector<float> rewards(state.players.size(), 0);
+			if (finished)
+				return rewards;
+
+			bool anyTouch = false;
+			for (int i = 0; i < state.players.size(); i++) {
+				if (state.players[i].ballTouchedStep) {
+					anyTouch = true;
+					rewards[i] = RS_CLAMP(1.0f - elapsed / maxTouchTime, 0, 1);
+				}
+			}
+
+			if (anyTouch)
+				finished = true;
+
+			return rewards;
+		}
+	};
+
 	// Mostly based on the classic Necto rewards
 	// Total reward output for speeding the ball up to MAX_REWARDED_BALL_SPEED is 1.0
 	// The bot can do this slowly (putting) or quickly (shooting)
