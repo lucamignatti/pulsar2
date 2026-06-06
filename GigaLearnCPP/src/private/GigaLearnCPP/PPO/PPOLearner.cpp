@@ -179,7 +179,7 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 	if (!config.useSORS || !models["sors_reward"])
 		return;
 
-	report["SORS Replay Windows"] = sorsReplay.size();
+	report["SORS/Replay Windows"] = sorsReplay.size();
 	if (sorsReplay.empty())
 		return;
 
@@ -189,8 +189,8 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 		positives += window.label > 0;
 		labelTotal += window.label;
 	}
-	report["SORS Positive Windows"] = positives;
-	report["SORS Avg Label"] = labelTotal / RS_MAX(1, (int)sorsReplay.size());
+	report["SORS/Positive Windows"] = positives;
+	report["SORS/Avg Label"] = labelTotal / RS_MAX(1, (int)sorsReplay.size());
 
 	if (sorsTrainCalls++ < config.sorsWarmupIters || sorsReplay.size() < 2)
 		return;
@@ -239,9 +239,9 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 	if (trainedPairs > 0) {
 		nn::utils::clip_grad_norm_(sors->parameters(), 0.5f);
 		sors->StepOptim();
-		report["SORS Loss"] = avgLoss.Get();
-		report["SORS Pair Accuracy"] = avgAcc.Get();
-		report["SORS Pred Window Return"] = avgPredReturn.Get();
+		report["SORS/Loss"] = avgLoss.Get();
+		report["SORS/Pair Accuracy"] = avgAcc.Get();
+		report["SORS/Pred Window Return"] = avgPredReturn.Get();
 	}
 }
 

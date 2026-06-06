@@ -58,17 +58,4 @@ def init(py_exec_path, project, group, name, id=None):
 
 def add_metrics(metrics):
     global wandb_run
-    normal_metrics = {}
-    sors_rows = []
-
-    for key, value in metrics.items():
-        if key.startswith("SORS "):
-            sors_rows.append([key[5:], value])
-        else:
-            normal_metrics[key] = value
-
-    if sors_rows:
-        import wandb
-        normal_metrics["SORS"] = wandb.Table(columns=["metric", "value"], data=sors_rows)
-
-    wandb_run.log(normal_metrics)
+    wandb_run.log(metrics)

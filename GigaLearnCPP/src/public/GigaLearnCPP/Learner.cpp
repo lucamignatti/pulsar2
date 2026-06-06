@@ -998,8 +998,8 @@ void GGL::Learner::Start() {
 
 						if (tSORSRewards.defined()) {
 							tSORSRewards = tSORSRewards.clamp(-config.ppo.sorsRewardClipRange, config.ppo.sorsRewardClipRange);
-							report["SORS Avg Reward"] = tSORSRewards.mean().item<float>();
-							report["SORS Avg Abs Reward"] = tSORSRewards.abs().mean().item<float>();
+							report["SORS/Avg Reward"] = tSORSRewards.mean().item<float>();
+							report["SORS/Avg Abs Reward"] = tSORSRewards.abs().mean().item<float>();
 							tRewards = tRewards + tSORSRewards * config.ppo.sorsRewardScale;
 						}
 					}
@@ -1152,14 +1152,14 @@ void GGL::Learner::Start() {
 						"-GAE Time",
 						"-PPO Learn Time",
 						"",
-						"SORS Loss",
-						"SORS Pair Accuracy",
-						"SORS Replay Windows",
-						"SORS Positive Windows",
-						"SORS Avg Label",
-						"SORS Avg Reward",
-						"SORS Avg Abs Reward",
-						"SORS Pred Window Return",
+						"SORS/Loss",
+						"SORS/Pair Accuracy",
+						"SORS/Replay Windows",
+						"SORS/Positive Windows",
+						"SORS/Avg Label",
+						"SORS/Avg Reward",
+						"SORS/Avg Abs Reward",
+						"SORS/Pred Window Return",
 						"",
 						"Collected Timesteps",
 						"Total Timesteps",
