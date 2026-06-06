@@ -168,9 +168,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gaeGamma = 0.99;
 
 	// Good learning rate to start
-	cfg.ppo.policyLR = 1.5e-4;
-	cfg.ppo.criticLR = 1.5e-4;
-	cfg.ppo.gcrlLR = 1.5e-4;
+	cfg.ppo.policyLR = 3e-4;
+	cfg.ppo.criticLR = 3e-4;
+	cfg.ppo.gcrlLR = 3e-4;
+	cfg.ppo.sorsLR = 3e-4f;
 
 	// faster
 	cfg.ppo.useHalfPrecision = false;
@@ -196,7 +197,6 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useSORS = true;
 	cfg.ppo.sorsRewardScale = 0.25f;
 	cfg.ppo.sorsRewardClipRange = 1.0f;
-	cfg.ppo.sorsLR = 1.5e-4f;
 	cfg.ppo.sorsWarmupIters = 8;
 	cfg.ppo.sorsTrainPairs = 4096;
 	cfg.ppo.sorsMaxReplayWindows = 20000;
@@ -222,10 +222,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.layerSizes = {};
 	cfg.ppo.policy.layerSizes = { 512, 512, 256 };
 	cfg.ppo.critic.layerSizes = { 768, 512, 256 };
-	// GCRL phi/psi hidden layers (output is always gcrlReprDim). These sit on top of the
-	// shared head, so they can be much smaller than policy/critic.
 	cfg.ppo.gcrlCritic.layerSizes = { 768, 512, 256 };
-	cfg.ppo.sorsReward.layerSizes = { 256, 256 };
+	cfg.ppo.sorsReward.layerSizes = { 256, 256, 128 };
 
 	cfg.skillTracker.enabled = true;
     cfg.skillTracker.numArenas = 24;        // eval arenas, keep near CPU thread count
@@ -244,12 +242,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
 	cfg.ppo.gcrlCritic.optimType = optim;
+	cfg.ppo.sorsReward.optimType = optim;
 
 	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
 	cfg.ppo.gcrlCritic.activationType = activation;
+	cfg.ppo.sorsReward.activationType = activation;
 
 	bool addLayerNorm = true;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
@@ -258,6 +258,7 @@ int main(int argc, char* argv[]) {
 	// Optional: the embedding is L2-normalized at scoring time, so trunk LayerNorm is less
 	// important here than for policy/critic. Off by default; flip to addLayerNorm to match.
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
+	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render

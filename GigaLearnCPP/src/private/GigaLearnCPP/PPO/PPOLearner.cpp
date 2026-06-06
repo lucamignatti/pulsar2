@@ -4,8 +4,18 @@
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
+#include <nlohmann/json.hpp>
 
 using namespace torch;
+
+namespace {
+	constexpr const char* PPO_STATE_FILE_NAME = "PPO_STATE.json";
+	constexpr const char* SORS_STATE_FILE_NAME = "SORS_STATE.json";
+	constexpr const char* SORS_REPLAY_STATES_FILE_NAME = "SORS_REPLAY_STATES.pt";
+	constexpr const char* SORS_REPLAY_ACTIONS_FILE_NAME = "SORS_REPLAY_ACTIONS.pt";
+	constexpr const char* SORS_REPLAY_LENGTHS_FILE_NAME = "SORS_REPLAY_LENGTHS.pt";
+	constexpr const char* SORS_REPLAY_LABELS_FILE_NAME = "SORS_REPLAY_LABELS.pt";
+}
 
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
 	curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
@@ -658,6 +668,7 @@ void GGL::PPOLearner::TransferLearn(
 
 void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 	models.Save(folderPath);
+	SavePPOState(folderPath);
 }
 
 void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
@@ -665,8 +676,175 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 		RG_ERR_CLOSE("PPOLearner:LoadFrom(): Path " << folderPath << " is not a valid directory");
 
 	models.Load(folderPath, true, true);
+	LoadPPOState(folderPath);
 
 	SetLearningRates(config.policyLR, config.criticLR);
+}
+
+void GGL::PPOLearner::SavePPOState(std::filesystem::path folderPath) {
+	using namespace nlohmann;
+
+	json j = {};
+	j["cur_entropy_scale"] = curEntropyScale;
+	j["sors_train_calls"] = sorsTrainCalls;
+
+	auto path = folderPath / PPO_STATE_FILE_NAME;
+	std::ofstream fOut(path);
+	if (!fOut.good())
+		RG_ERR_CLOSE("PPOLearner::SavePPOState(): Can't open file at " << path);
+
+	fOut << j.dump(4);
+	SaveSORSState(folderPath);
+}
+
+void GGL::PPOLearner::LoadPPOState(std::filesystem::path folderPath) {
+	using namespace nlohmann;
+
+	auto path = folderPath / PPO_STATE_FILE_NAME;
+	if (std::filesystem::exists(path)) {
+		std::ifstream fIn(path);
+		if (!fIn.good())
+			RG_ERR_CLOSE("PPOLearner::LoadPPOState(): Can't open file at " << path);
+
+		json j = json::parse(fIn);
+		if (j.contains("cur_entropy_scale"))
+			curEntropyScale = j["cur_entropy_scale"];
+		if (j.contains("sors_train_calls"))
+			sorsTrainCalls = j["sors_train_calls"];
+	} else {
+		curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
+		sorsTrainCalls = 0;
+	}
+
+	LoadSORSState(folderPath);
+}
+
+void GGL::PPOLearner::SaveSORSState(std::filesystem::path folderPath) {
+	using namespace nlohmann;
+
+	if (!config.useSORS)
+		return;
+
+	json j = {};
+	j["window_count"] = sorsReplay.size();
+	j["train_calls"] = sorsTrainCalls;
+
+	auto statePath = folderPath / SORS_STATE_FILE_NAME;
+	std::ofstream fOut(statePath);
+	if (!fOut.good())
+		RG_ERR_CLOSE("PPOLearner::SaveSORSState(): Can't open file at " << statePath);
+
+	if (sorsReplay.empty()) {
+		fOut << j.dump(4);
+		return;
+	}
+
+	size_t totalSteps = 0;
+	size_t totalStateVals = 0;
+	size_t totalActionVals = 0;
+	std::vector<int64_t> lengths = {};
+	FList labels = {};
+	for (const auto& window : sorsReplay) {
+		totalSteps += window.length;
+		totalStateVals += window.states.size();
+		totalActionVals += window.actionComps.size();
+		lengths.push_back(window.length);
+		labels.push_back(window.label);
+	}
+
+	FList states = {};
+	FList actionComps = {};
+	states.reserve(totalStateVals);
+	actionComps.reserve(totalActionVals);
+	for (const auto& window : sorsReplay) {
+		states.insert(states.end(), window.states.begin(), window.states.end());
+		actionComps.insert(actionComps.end(), window.actionComps.begin(), window.actionComps.end());
+	}
+
+	torch::save(torch::tensor(states), (folderPath / SORS_REPLAY_STATES_FILE_NAME).string());
+	torch::save(torch::tensor(actionComps), (folderPath / SORS_REPLAY_ACTIONS_FILE_NAME).string());
+	torch::save(torch::tensor(lengths, torch::TensorOptions().dtype(torch::kInt64)), (folderPath / SORS_REPLAY_LENGTHS_FILE_NAME).string());
+	torch::save(torch::tensor(labels), (folderPath / SORS_REPLAY_LABELS_FILE_NAME).string());
+
+	j["total_steps"] = totalSteps;
+	j["total_state_values"] = totalStateVals;
+	j["total_action_values"] = totalActionVals;
+	fOut << j.dump(4);
+}
+
+void GGL::PPOLearner::LoadSORSState(std::filesystem::path folderPath) {
+	sorsReplay.clear();
+	if (!config.useSORS)
+		return;
+
+	auto* sors = dynamic_cast<SORSRewardModel*>(models["sors_reward"]);
+	RG_ASSERT(sors);
+
+	auto statePath = folderPath / SORS_STATE_FILE_NAME;
+	if (!std::filesystem::exists(statePath))
+		return;
+
+	std::ifstream fIn(statePath);
+	if (!fIn.good())
+		RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Can't open file at " << statePath);
+
+	nlohmann::json j = nlohmann::json::parse(fIn);
+	if (j.contains("train_calls"))
+		sorsTrainCalls = j["train_calls"];
+
+	size_t windowCount = j.value("window_count", (size_t)0);
+	if (!windowCount)
+		return;
+
+	auto statesPath = folderPath / SORS_REPLAY_STATES_FILE_NAME;
+	auto actionsPath = folderPath / SORS_REPLAY_ACTIONS_FILE_NAME;
+	auto lengthsPath = folderPath / SORS_REPLAY_LENGTHS_FILE_NAME;
+	auto labelsPath = folderPath / SORS_REPLAY_LABELS_FILE_NAME;
+	if (!std::filesystem::exists(statesPath) || !std::filesystem::exists(actionsPath) ||
+		!std::filesystem::exists(lengthsPath) || !std::filesystem::exists(labelsPath)) {
+		RG_ERR_CLOSE("PPOLearner::LoadSORSState(): SORS replay metadata exists but replay tensor files are missing in " << folderPath);
+	}
+
+	torch::Tensor tStates, tActions, tLengths, tLabels;
+	torch::load(tStates, statesPath.string());
+	torch::load(tActions, actionsPath.string());
+	torch::load(tLengths, lengthsPath.string());
+	torch::load(tLabels, labelsPath.string());
+
+	tStates = tStates.flatten().contiguous().to(torch::kCPU, true, true);
+	tActions = tActions.flatten().contiguous().to(torch::kCPU, true, true);
+	tLengths = tLengths.flatten().contiguous().to(torch::kCPU, true, true);
+	tLabels = tLabels.flatten().contiguous().to(torch::kCPU, true, true);
+
+	if ((size_t)tLengths.numel() != windowCount || (size_t)tLabels.numel() != windowCount)
+		RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Corrupt SORS replay metadata in " << folderPath);
+
+	const float* statesData = tStates.data_ptr<float>();
+	const float* actionsData = tActions.data_ptr<float>();
+	const int64_t* lengthsData = tLengths.data_ptr<int64_t>();
+	const float* labelsData = tLabels.data_ptr<float>();
+
+	size_t stateOffset = 0;
+	size_t actionOffset = 0;
+	sorsReplay.clear();
+	sorsReplay.resize(windowCount);
+	for (size_t i = 0; i < windowCount; i++) {
+		auto& window = sorsReplay[i];
+		window.length = (int)lengthsData[i];
+		window.label = labelsData[i];
+		if (window.length < 0)
+			RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Negative SORS window length in " << folderPath);
+
+		size_t stateCount = (size_t)window.length * sors->obs_dim;
+		size_t actionCount = (size_t)window.length * sors->action_dim;
+		window.states.assign(statesData + stateOffset, statesData + stateOffset + stateCount);
+		window.actionComps.assign(actionsData + actionOffset, actionsData + actionOffset + actionCount);
+		stateOffset += stateCount;
+		actionOffset += actionCount;
+	}
+
+	if (stateOffset != (size_t)tStates.numel() || actionOffset != (size_t)tActions.numel())
+		RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Corrupt SORS replay tensor sizes in " << folderPath);
 }
 
 void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {

@@ -87,5 +87,11 @@ namespace GGL {
 		float GetEntropyScale() const;
 
 		ModelSet GetPolicyModels();
+
+	private:
+		void SavePPOState(std::filesystem::path folderPath);
+		void LoadPPOState(std::filesystem::path folderPath);
+		void SaveSORSState(std::filesystem::path folderPath);
+		void LoadSORSState(std::filesystem::path folderPath);
 	};
 }
