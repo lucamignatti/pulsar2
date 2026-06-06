@@ -108,8 +108,9 @@ int main(int argc, char* argv[]) {
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
+	// Let GigaLearnCPP select the best available device automatically.
+	cfg.deviceType = LearnerDeviceType::AUTO;
 
-	cfg.deviceType = LearnerDeviceType::GPU_MPS;
 
 	cfg.tickSkip = 4;
 	cfg.actionDelay = cfg.tickSkip - 2;
