@@ -168,10 +168,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gaeGamma = 0.99;
 
 	// Good learning rate to start
-	cfg.ppo.policyLR = 3e-4;
-	cfg.ppo.criticLR = 3e-4;
-	cfg.ppo.gcrlLR = 3e-4;
-	cfg.ppo.sorsLR = 3e-4f;
+	cfg.ppo.policyLR = 4e-4;
+	cfg.ppo.criticLR = 2e-4;
+	cfg.ppo.gcrlLR = 2e-4;
+	cfg.ppo.sorsLR = 2e-4f;
 
 	// faster
 	cfg.ppo.useHalfPrecision = false;
