@@ -145,6 +145,9 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.criticLR = 1.5e-4;
 	cfg.ppo.gcrlLR = 1.5e-4;
 
+	// faster
+	cfg.ppo.useHalfPrecision = true;
+
 	// Three quasimetric critics learn positioning/anticipation contrastively (InfoNCE)
 	// over hindsight-relabeled future ball goals, and blend their advantage into the
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
@@ -157,18 +160,30 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
 	cfg.ppo.gcrlUseVariableHER = true; // sample goal offset uniformly in [minH, H]; else fixed H
 	cfg.ppo.gcrlTau = 0.02f;         // embedding temperature (lower = sharper contrast)
-	cfg.ppo.gcrlReprDim = 2048;       // phi/psi embedding dimension (the metric-space capacity)
+	cfg.ppo.gcrlReprDim = 256;       // phi/psi embedding dimension (the metric-space capacity)
 	cfg.ppo.gcrlInfoNCECoef = 0.75f;  // weight of the InfoNCE loss in the combined objective
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
-	cfg.ppo.gcrlInfoSubSample = 768; // contrastive sub-batch size
+	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 
 	cfg.ppo.sharedHead.layerSizes = {};
-	cfg.ppo.policy.layerSizes = { 1024, 512, 512, 256 };
-	cfg.ppo.critic.layerSizes = { 1024, 768, 768, 512, 512, 256 };
+	cfg.ppo.policy.layerSizes = { 512, 512, 256 };
+	cfg.ppo.critic.layerSizes = { 768, 512, 256 };
 	// GCRL phi/psi hidden layers (output is always gcrlReprDim). These sit on top of the
 	// shared head, so they can be much smaller than policy/critic.
-	cfg.ppo.gcrlCritic.layerSizes = { 1024, 768, 768, 512, 512, 256 };
+	cfg.ppo.gcrlCritic.layerSizes = { 768, 512, 256 };
+
+	cfg.skillTracker.enabled = true;
+    cfg.skillTracker.numArenas = 24;        // eval arenas, keep near CPU thread count
+    cfg.skillTracker.simTime = 45;          // seconds simulated per eval run
+    cfg.skillTracker.maxSimTime = 240;      // continuation cap if too few goals happen
+    cfg.skillTracker.updateInterval = 16;   // run Elo every N training iterations
+    cfg.skillTracker.ratingInc = 5;         // Elo K-ish scale per goal
+    cfg.skillTracker.initialRating = 0;
+    cfg.skillTracker.deterministic = true;  // optional: rate greedy policy instead of sampled policy
+
+
+
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
