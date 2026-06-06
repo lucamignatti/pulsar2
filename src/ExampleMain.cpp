@@ -116,16 +116,17 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 2;
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 256;
+	cfg.numGames = 512;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 67;
 
-	int tsPerItr = 50'000;
+	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 50'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 150'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.overbatching = true;
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -162,12 +163,12 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 768; // contrastive sub-batch size
 
-	cfg.ppo.sharedHead.layerSizes = { 256, 512, 1024, 512 };
-	cfg.ppo.policy.layerSizes = { 1024, 1024, 512, 256 };
-	cfg.ppo.critic.layerSizes = { 1024, 2048, 2048, 512, 256 };
+	cfg.ppo.sharedHead.layerSizes = {};
+	cfg.ppo.policy.layerSizes = { 1024, 512, 512, 256 };
+	cfg.ppo.critic.layerSizes = { 1024, 768, 768, 512, 512, 256 };
 	// GCRL phi/psi hidden layers (output is always gcrlReprDim). These sit on top of the
 	// shared head, so they can be much smaller than policy/critic.
-	cfg.ppo.gcrlCritic.layerSizes = { 512, 1024, 1024 };
+	cfg.ppo.gcrlCritic.layerSizes = { 1024, 768, 768, 512, 512, 256 };
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
