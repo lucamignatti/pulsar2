@@ -9,6 +9,10 @@ add_executable(GigaLearnBot ${FILES_SRC})
 set_target_properties(GigaLearnBot PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnBot PROPERTIES CXX_STANDARD 20)
 
+if(NOT MSVC)
+    target_compile_options(GigaLearnBot PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+endif()
+
 # Make sure GigaLearnCPP is going to build in the same directory as us
 # Otherwise, we won't be able to import it at runtime
 set(LIBRARY_OUTPUT_PATH "${CMAKE_BINARY_DIR}")

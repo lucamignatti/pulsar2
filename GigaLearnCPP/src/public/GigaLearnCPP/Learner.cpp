@@ -513,7 +513,16 @@ void GGL::Learner::Start() {
 			std::vector<int32_t> actions;
 
 			void Clear() {
-				*this = Trajectory();
+				states.clear();
+				nextStates.clear();
+				rewards.clear();
+				logProbs.clear();
+				actionComps.clear();
+				futureGoals.clear();
+				carFutureGoals.clear();
+				actionMasks.clear();
+				terminals.clear();
+				actions.clear();
 			}
 
 			void Append(const Trajectory& other) {
@@ -536,6 +545,19 @@ void GGL::Learner::Start() {
 
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
+
+		// Pre-reserve to avoid repeated realloc during episodes.
+		for (auto& traj : trajectories) {
+			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
+			traj.rewards.reserve(maxEpisodeLength);
+			traj.logProbs.reserve(maxEpisodeLength);
+			traj.actions.reserve(maxEpisodeLength);
+			traj.terminals.reserve(maxEpisodeLength);
+			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
+			if (config.ppo.useGCRL) {
+				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
+			}
+		}
 
 		while (true) {
 			Report report = {};
@@ -594,6 +616,21 @@ void GGL::Learner::Start() {
 
 				// Only contains complete episodes
 				auto combinedTraj = Trajectory();
+				{
+					// Pre-reserve combined trajectory to avoid realloc as episodes accumulate.
+					size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
+					combinedTraj.states.reserve(expTs * obsSize);
+					combinedTraj.rewards.reserve(expTs);
+					combinedTraj.logProbs.reserve(expTs);
+					combinedTraj.actions.reserve(expTs);
+					combinedTraj.terminals.reserve(expTs);
+					combinedTraj.actionMasks.reserve(expTs * numActions);
+					if (config.ppo.useGCRL) {
+						combinedTraj.actionComps.reserve(expTs * 8);
+						combinedTraj.futureGoals.reserve(expTs * 6);
+						combinedTraj.carFutureGoals.reserve(expTs * 6);
+					}
+				}
 
 				Timer collectionTimer = {};
 				{ // Collect timesteps
@@ -602,14 +639,22 @@ void GGL::Learner::Start() {
 					float inferTime = 0;
 					float envStepTime = 0;
 
+					// Scratch buffers declared outside the loop to avoid per-step allocation.
+					std::vector<float> _normOffset(obsSize, 0.0f), _normInvStd(obsSize, 1.0f);
+					FList _curActionComps;
+					if (config.ppo.useGCRL)
+						_curActionComps.resize(numPlayers * 8);
+
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
+#ifndef NDEBUG
 						for (float f : envSet->state.obs.data)
 							if (isnan(f) || isinf(f))
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
+#endif
 
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too
@@ -619,17 +664,20 @@ void GGL::Learner::Start() {
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
 							}
 
-							std::vector<double> mean = obsStat->GetMean();
-							std::vector<double> std = obsStat->GetSTD();
-							for (double& f : mean)
-								f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
-							for (double& f : std)
-								f = RS_MAX(f, config.minObsSTD);
+							// Precompute per-dim float scale/offset once (not per player).
+							// Turns inner-loop division into multiplication and avoids double→float
+							// conversion inside the hot path.
+							const auto& meanVec = obsStat->GetMean();
+							auto stdVec = obsStat->GetSTD();
+							for (int j = 0; j < obsSize; j++) {
+								_normOffset[j] = RS_CLAMP((float)meanVec[j], -config.maxObsMeanRange, config.maxObsMeanRange);
+								_normInvStd[j] = 1.0f / RS_MAX((float)stdVec[j], config.minObsSTD);
+							}
+							float* obsPtr = envSet->state.obs.data.data();
 							for (int i = 0; i < envSet->state.numPlayers; i++) {
-								for (int j = 0; j < obsSize; j++) {
-									float& obsVal = envSet->state.obs.At(i, j);
-									obsVal = (obsVal - mean[j]) / std[j];
-								}
+								float* row = obsPtr + i * obsSize;
+								for (int j = 0; j < obsSize; j++)
+									row[j] = (row[j] - _normOffset[j]) * _normInvStd[j];
 							}
 						}
 
@@ -639,8 +687,8 @@ void GGL::Learner::Start() {
 
 						if (!render) {
 							for (int newPlayerIdx : newPlayerIndices) {
-								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
-								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
+								envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
+								envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
 							}
 						}
 
@@ -672,16 +720,14 @@ void GGL::Learner::Start() {
 						inferTime += inferTimer.Elapsed();
 
 						auto curActions = TENSOR_TO_VEC<int>(tActions);
-						
+
 						// GCRL: decode flat action indices -> 8-dim continuous components for the critics
-						FList curActionComps;
 						if (config.ppo.useGCRL) {
 							auto* actionParser = envSet->actionParsers[0];
-							curActionComps.resize(curActions.size() * 8);
-							for (int p = 0; p < curActions.size(); p++) {
+							for (int p = 0; p < (int)curActions.size(); p++) {
 								Action act = actionParser->ParseAction(curActions[p], envSet->state.gameStates[0].players[0], envSet->state.gameStates[0]);
 								for (int d = 0; d < 8; d++)
-									curActionComps[p * 8 + d] = act[d];
+									_curActionComps[p * 8 + d] = act[d];
 							}
 						}
 						FList newLogProbs;
@@ -725,9 +771,11 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
-							if (config.ppo.useGCRL)
-								for (int d = 0; d < 8; d++)
-									trajectories[newPlayerIdx].actionComps += curActionComps[newPlayerIdx * 8 + d];
+							if (config.ppo.useGCRL) {
+								const float* comp = _curActionComps.data() + newPlayerIdx * 8;
+								trajectories[newPlayerIdx].actionComps.insert(
+									trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
+							}
 							i++;
 						}
 
@@ -758,7 +806,7 @@ void GGL::Learner::Start() {
 
 								if (terminalType == RLGC::TerminalType::TRUNCATED) {
 									// Truncation requires an additional next state for the critic
-									traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
+									envSet->state.obs.AppendRow(newPlayerIdx, traj.nextStates);
 								}
 
 								// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──

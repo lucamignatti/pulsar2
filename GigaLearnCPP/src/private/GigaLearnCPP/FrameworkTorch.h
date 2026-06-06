@@ -25,7 +25,13 @@ at::autocast::set_enabled(false); \
 namespace GGL {
 	template <typename T>
 	inline torch::Tensor DIMLIST2_TO_TENSOR(const RLGC::DimList2<T>& list) {
-		return torch::tensor(list.data).reshape({ (int64_t)list.size[0], (int64_t)list.size[1] });
+		// from_blob creates a non-owning view into the DimList2 data — no copy.
+		// Callers must not modify list.data until this tensor is consumed (sent to device or cloned).
+		return torch::from_blob(
+			const_cast<T*>(list.data.data()),
+			{ (int64_t)list.size[0], (int64_t)list.size[1] },
+			torch::TensorOptions().dtype(torch::CppTypeToScalarType<T>())
+		);
 	}
 
 	template <typename T>

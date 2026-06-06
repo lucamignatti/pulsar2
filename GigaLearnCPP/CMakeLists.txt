@@ -36,6 +36,11 @@ endif()
 set_target_properties(GigaLearnCPP PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnCPP PROPERTIES CXX_STANDARD 20)
 
+if(NOT MSVC)
+    # -fno-finite-math-only restores correct NaN/Inf semantics for nlohmann/json (serialises float infinity).
+    target_compile_options(GigaLearnCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+endif()
+
 # Include RLGymCPP
 add_subdirectory(RLGymCPP)
 target_link_libraries(GigaLearnCPP PUBLIC RLGymCPP)

@@ -10,8 +10,6 @@ void GGL::GAE::Compute(
 
 	float prevLambda = 0;
 	int numReturns = rews.size(0);
-	outAdvantages = torch::zeros(numReturns);
-	outReturns = torch::zeros(numReturns);
 	float prevRet = 0;
 	int truncCount = 0;
 
@@ -39,8 +37,10 @@ void GGL::GAE::Compute(
 		numTruncs = 0;
 	}
 
-	auto _outReturns = std::vector<float>(numReturns, 0);
-	auto _outAdvantages = std::vector<float>(numReturns, 0);
+	outAdvantages = torch::zeros(numReturns);
+	outReturns = torch::zeros(numReturns);
+	auto _outReturns = outReturns.data_ptr<float>();
+	auto _outAdvantages = outAdvantages.data_ptr<float>();
 
 	for (int step = numReturns - 1; step >= 0; step--) {
 		uint8_t terminal = _terminals[step];
@@ -95,8 +95,6 @@ void GGL::GAE::Compute(
 		if (truncCount != truncValPreds.size(0))
 			RG_ERR_CLOSE("GAE didn't receive expected truncation count (only " << truncCount << "/" << truncValPreds.size(0) << ")");
 
-	outReturns = torch::tensor(_outReturns);
-	outAdvantages = torch::tensor(_outAdvantages);
 	outTargetValues = valPreds.slice(0, 0, numReturns) + outAdvantages;
 	outRewClipPortion = (totalRew - totalClippedRew) / RS_MAX(totalRew, 1e-7f);
 }

@@ -200,13 +200,9 @@ namespace GGL {
 	public:
 		std::map<std::string, Model*> map = {};
 
-		Model* operator[](const std::string& name) { 
+		Model* operator[](const std::string& name) {
 			auto itr = map.find(name);
-			if (itr == map.end()) {
-				return NULL;
-			} else {
-				return map[name];
-			}
+			return (itr != map.end()) ? itr->second : nullptr;
 		};
 
 		void Add(Model* model) {

@@ -33,12 +33,13 @@ std::vector<GGL::ExperienceTensors> GGL::ExperienceBuffer::GetAllBatchesShuffled
 	size_t expSize = data.states.size(0);
 
 	// Make list of shuffled sample indices
-	int64_t* indices = new int64_t[expSize];
-	std::iota(indices, indices + expSize, 0); // Fill ascending indices
-	std::shuffle(indices, indices + expSize, rng);
+	std::vector<int64_t> indices(expSize);
+	std::iota(indices.begin(), indices.end(), 0);
+	std::shuffle(indices.begin(), indices.end(), rng);
 
 	// Get a sample set from each of the batches
 	std::vector<ExperienceTensors> result;
+	result.reserve(expSize / batchSize + 1);
 	for (int64_t startIdx = 0; startIdx + batchSize <= expSize; startIdx += batchSize) {
 
 		int curBatchSize = batchSize;
@@ -50,9 +51,8 @@ std::vector<GGL::ExperienceTensors> GGL::ExperienceBuffer::GetAllBatchesShuffled
 			}
 		}
 
-		result.push_back(_GetSamples(indices + startIdx, curBatchSize));
+		result.push_back(_GetSamples(indices.data() + startIdx, curBatchSize));
 	}
 
-	delete[] indices;
 	return result;
 }

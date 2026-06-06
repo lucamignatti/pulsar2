@@ -183,7 +183,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	bool trainPolicy = config.policyLR != 0;
 	bool trainCritic = config.criticLR != 0;
-	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
+
+	// Cache raw pointers once — avoids repeated std::map lookups inside the hot epoch loop.
+	Model* m_sharedHead = models["shared_head"];
+	Model* m_policy     = models["policy"];
+	Model* m_critic     = models["critic"];
+
+	bool trainSharedHead = m_sharedHead && (trainPolicy || trainCritic);
 
 	bool trainGCRL = config.useGCRL && models["goal_critic"] && models["anti_critic"] && models["car_critic"];
 	QuasimetricCritic *gc_goal = nullptr, *gc_anti = nullptr, *gc_car = nullptr;
@@ -231,8 +237,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 				// Shared encoder forward once; policy, value critic and GCRL critics read it
 				torch::Tensor features = obs;
-				if (models["shared_head"])
-					features = models["shared_head"]->Forward(obs, false);
+				if (m_sharedHead)
+					features = m_sharedHead->Forward(obs, false);
 
 				// ── GCRL "game sense" advantage, blended onto the reward-driven advantage ──
 				// Both channels are unit-normalized so gcrlAdvScale is a meaningful weight.
@@ -261,9 +267,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					float curEntropy;
 					{
 						auto maskBool = actionMasks.to(torch::kBool);
-						auto logits = models["policy"]->Forward(features, false) / config.policyTemperature;
+						auto logits = m_policy->Forward(features, false) / config.policyTemperature;
 						probs = torch::softmax(logits + (-1e10f) * maskBool.logical_not(), -1)
-							.view({ -1, models["policy"]->config.numOutputs }).clamp(1e-11f, 1);
+							.view({ -1, m_policy->config.numOutputs }).clamp(1e-11f, 1);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						curEntropy = entropy.detach().cpu().item<float>();
@@ -306,7 +312,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 				torch::Tensor criticLoss;
 				if (trainCritic) {
-					auto vals = models["critic"]->Forward(features, false).flatten();
+					auto vals = m_critic->Forward(features, false).flatten();
 
 					// Compute value loss
 					vals = vals.view_as(targetValues);
