@@ -49,23 +49,20 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> rewards = {
 
 		// Movement
-		{ new AirReward(), 0.25f },
+		{ new AirReward(), 0.02f },
 
 		// Player-ball
-		{ new FaceBallReward(), 0.25f },
-		{ new VelocityPlayerToBallReward(), 4.f },
-		{ new StrongTouchReward(20, 100), 60 },
+		{ new FaceBallReward(), 0.05f },
+		{ new VelocityPlayerToBallReward(), 0.25f },
 
 		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.5f },
 
 		// Boost
-		{ new PickupBoostReward(), 10.f },
-		{ new SaveBoostReward(), 0.2f },
+		{ new PickupBoostReward(), 0.25f },
+		{ new SaveBoostReward(), 0.05f },
 
 		// Game events
-		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
 		{ new GoalReward(), 150 }
 	};
 
@@ -175,7 +172,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlLR = 1.5e-4;
 
 	// faster
-	cfg.ppo.useHalfPrecision = true;
+	cfg.ppo.useHalfPrecision = false;
 
 	// Three quasimetric critics learn positioning/anticipation contrastively (InfoNCE)
 	// over hindsight-relabeled future ball goals, and blend their advantage into the
@@ -195,12 +192,39 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 
+	cfg.ppo.useSORS = true;
+	cfg.ppo.sorsRewardScale = 0.25f;
+	cfg.ppo.sorsRewardClipRange = 1.0f;
+	cfg.ppo.sorsLR = 1.5e-4f;
+	cfg.ppo.sorsWarmupIters = 8;
+	cfg.ppo.sorsTrainPairs = 4096;
+	cfg.ppo.sorsMaxReplayWindows = 20000;
+	cfg.ppo.sorsMinLabelDelta = 0.25f;
+	cfg.ppo.sorsWindowBefore = 45;
+	cfg.ppo.sorsWindowAfter = 30;
+	cfg.ppo.sorsLabels = {
+		{ new AirTouchSORSLabel(500), 1.0f },
+		{ new FlipResetSORSLabel(500), 1.0f },
+		{ new PostResetTouchSORSLabel(500), 1.0f },
+		{ new WavedashSORSLabel(), 1.0f },
+
+		{ new UsefulBallDeltaSORSLabel(30, 300, 300), 0.5f },
+		{ new PossessionOrFirstToBallSORSLabel(45), 0.5f },
+		{ new GoodRecoverySORSLabel(30, 0.5f), 0.3f },
+		{ new ShotCreatedSORSLabel(60), 1.0f },
+		{ new GoalForSORSLabel(90), 2.0f },
+		{ new GoalAgainstSORSLabel(90), -2.0f },
+		{ new LostPossessionSORSLabel(45), -0.7f },
+		{ new BadRecoverySORSLabel(30, 0.0f), -0.7f }
+	};
+
 	cfg.ppo.sharedHead.layerSizes = {};
 	cfg.ppo.policy.layerSizes = { 512, 512, 256 };
 	cfg.ppo.critic.layerSizes = { 768, 512, 256 };
 	// GCRL phi/psi hidden layers (output is always gcrlReprDim). These sit on top of the
 	// shared head, so they can be much smaller than policy/critic.
 	cfg.ppo.gcrlCritic.layerSizes = { 768, 512, 256 };
+	cfg.ppo.sorsReward.layerSizes = { 256, 256 };
 
 	cfg.skillTracker.enabled = true;
     cfg.skillTracker.numArenas = 24;        // eval arenas, keep near CPU thread count

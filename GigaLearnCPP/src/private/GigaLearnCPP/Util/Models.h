@@ -202,6 +202,20 @@ namespace GGL {
 		virtual void Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim = true) override;
 	};
 
+	class SORSRewardModel : public Model {
+	public:
+		int obs_dim, action_dim;
+
+		SORSRewardModel(
+			const char* modelName,
+			int obs_dim, int action_dim,
+			PartialModelConfig config,
+			torch::Device device
+		);
+
+		torch::Tensor Forward(torch::Tensor obs, torch::Tensor actions, bool halfPrec = false);
+	};
+
 	class ModelSet {
 	public:
 		std::map<std::string, Model*> map = {};

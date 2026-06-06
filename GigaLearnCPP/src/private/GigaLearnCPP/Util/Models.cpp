@@ -330,3 +330,22 @@ void GGL::QuasimetricCritic::Load(std::filesystem::path folder, bool allowNotExi
 		}
 	}
 }
+
+GGL::SORSRewardModel::SORSRewardModel(
+	const char* modelName,
+	int _obs_dim, int _action_dim,
+	PartialModelConfig _config,
+	torch::Device device) :
+	Model(modelName, [&]() {
+		ModelConfig fullConfig = _config;
+		fullConfig.numInputs = _obs_dim + _action_dim;
+		fullConfig.numOutputs = 1;
+		return fullConfig;
+	}(), device),
+	obs_dim(_obs_dim), action_dim(_action_dim) {
+}
+
+torch::Tensor GGL::SORSRewardModel::Forward(torch::Tensor obs, torch::Tensor actions, bool halfPrec) {
+	auto input = torch::cat({ obs, actions.to(torch::kFloat32).to(obs.device()) }, -1);
+	return Model::Forward(input, halfPrec).flatten();
+}

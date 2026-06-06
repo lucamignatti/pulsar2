@@ -506,12 +506,24 @@ void GGL::Learner::Start() {
 		ExperienceBuffer experience = ExperienceBuffer(config.randomSeed, torch::kCPU);
 
 		int numPlayers = envSet->state.numPlayers;
+		bool useActionComps = config.ppo.useGCRL || config.ppo.useSORS;
+
+		std::vector<int> playerArenaIdx(numPlayers), playerLocalIdx(numPlayers);
+		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
+			int start = envSet->state.arenaPlayerStartIdx[arenaIdx];
+			int count = envSet->state.gameStates[arenaIdx].players.size();
+			for (int i = 0; i < count; i++) {
+				playerArenaIdx[start + i] = arenaIdx;
+				playerLocalIdx[start + i] = i;
+			}
+		}
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
 			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
 			// ball goals (global / car-local), filled at episode end.
 			FList actionComps, futureGoals, carFutureGoals;
+			std::vector<SORSStep> sorsSteps;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
@@ -524,6 +536,7 @@ void GGL::Learner::Start() {
 				actionComps.clear();
 				futureGoals.clear();
 				carFutureGoals.clear();
+				sorsSteps.clear();
 				actionMasks.clear();
 				terminals.clear();
 				actions.clear();
@@ -537,6 +550,7 @@ void GGL::Learner::Start() {
 				actionComps += other.actionComps;
 				futureGoals += other.futureGoals;
 				carFutureGoals += other.carFutureGoals;
+				sorsSteps += other.sorsSteps;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -558,10 +572,65 @@ void GGL::Learner::Start() {
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
 			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
-			if (config.ppo.useGCRL) {
+			if (useActionComps) {
 				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
 			}
+			if (config.ppo.useSORS)
+				traj.sorsSteps.reserve(maxEpisodeLength);
 		}
+
+		auto fnBuildSORSWindows = [&](const Trajectory& traj) {
+			std::vector<PPOLearner::SORSWindow> windows;
+			if (!config.ppo.useSORS)
+				return windows;
+
+			int N = (int)traj.Length();
+			if (N <= 0 || traj.sorsSteps.size() != N || traj.actionComps.size() != (size_t)N * 8)
+				return windows;
+
+			auto fnMakeWindow = [&](int center, float label) {
+				int start = RS_MAX(0, center - config.ppo.sorsWindowBefore);
+				int stop = RS_MIN(N, center + config.ppo.sorsWindowAfter + 1);
+				int len = stop - start;
+				if (len <= 0)
+					return;
+
+				PPOLearner::SORSWindow window;
+				window.length = len;
+				window.label = label;
+				window.states.insert(window.states.end(),
+					traj.states.begin() + (size_t)start * obsSize,
+					traj.states.begin() + (size_t)stop * obsSize);
+				window.actionComps.insert(window.actionComps.end(),
+					traj.actionComps.begin() + (size_t)start * 8,
+					traj.actionComps.begin() + (size_t)stop * 8);
+				windows.push_back(std::move(window));
+			};
+
+			for (int t = 0; t < N; t++) {
+				bool isTrigger = false;
+				float label = 0;
+				for (const WeightedSORSLabel& weighted : config.ppo.sorsLabels) {
+					if (!weighted.label)
+						continue;
+
+					float curLabel = weighted.label->GetLabel(traj.sorsSteps, t);
+					label += weighted.weight * curLabel;
+					isTrigger = isTrigger || (weighted.label->IsTrigger() && curLabel != 0);
+				}
+
+				if (!isTrigger)
+					continue;
+
+				fnMakeWindow(t, label);
+
+				int negCenter = t - config.ppo.sorsWindowBefore - config.ppo.sorsWindowAfter - 1;
+				if (negCenter >= 0)
+					fnMakeWindow(negCenter, 0);
+			}
+
+			return windows;
+		};
 
 		while (true) {
 			Report report = {};
@@ -629,11 +698,15 @@ void GGL::Learner::Start() {
 					combinedTraj.actions.reserve(expTs);
 					combinedTraj.terminals.reserve(expTs);
 					combinedTraj.actionMasks.reserve(expTs * numActions);
-					if (config.ppo.useGCRL) {
+					if (useActionComps) {
 						combinedTraj.actionComps.reserve(expTs * 8);
+					}
+					if (config.ppo.useGCRL) {
 						combinedTraj.futureGoals.reserve(expTs * 6);
 						combinedTraj.carFutureGoals.reserve(expTs * 6);
 					}
+					if (config.ppo.useSORS)
+						combinedTraj.sorsSteps.reserve(expTs);
 				}
 
 				Timer collectionTimer = {};
@@ -646,7 +719,7 @@ void GGL::Learner::Start() {
 					// Scratch buffers declared outside the loop to avoid per-step allocation.
 					std::vector<float> _normOffset(obsSize, 0.0f), _normInvStd(obsSize, 1.0f);
 					FList _curActionComps;
-					if (config.ppo.useGCRL)
+					if (useActionComps)
 						_curActionComps.resize(numPlayers * 8);
 
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
@@ -725,8 +798,8 @@ void GGL::Learner::Start() {
 
 						auto curActions = TENSOR_TO_VEC<int>(tActions);
 
-						// GCRL: decode flat action indices -> 8-dim continuous components for the critics
-						if (config.ppo.useGCRL) {
+						// Decode flat action indices -> 8-dim continuous components for auxiliary critics/reward models.
+						if (useActionComps) {
 							auto* actionParser = envSet->actionParsers[0];
 							for (int p = 0; p < (int)curActions.size(); p++) {
 								Action act = actionParser->ParseAction(curActions[p], envSet->state.gameStates[0].players[0], envSet->state.gameStates[0]);
@@ -775,10 +848,47 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
-							if (config.ppo.useGCRL) {
+							if (useActionComps) {
 								const float* comp = _curActionComps.data() + newPlayerIdx * 8;
 								trajectories[newPlayerIdx].actionComps.insert(
 									trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
+							}
+							if (config.ppo.useSORS) {
+								int arenaIdx = playerArenaIdx[newPlayerIdx];
+								int localIdx = playerLocalIdx[newPlayerIdx];
+								const GameState& gs = envSet->state.gameStates[arenaIdx];
+								const Player& player = gs.players[localIdx];
+								const Player* prevPlayer = player.prev;
+
+								SORSStep sorsStep = {};
+								sorsStep.ballPos = gs.ball.pos;
+								sorsStep.ballVel = gs.ball.vel;
+								sorsStep.playerPos = player.pos;
+								sorsStep.playerVel = player.vel;
+								sorsStep.team = player.team;
+								sorsStep.touch = player.ballTouchedStep;
+								sorsStep.shot = player.eventState.shot;
+								if (gs.goalScored) {
+									bool scored = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y));
+									sorsStep.goalFor = scored;
+									sorsStep.goalAgainst = !scored;
+								}
+								sorsStep.playerOnGround = player.isOnGround;
+								sorsStep.playerDemoed = player.isDemoed;
+								sorsStep.gotFlipReset = player.GotFlipReset();
+								sorsStep.prevValid = prevPlayer;
+								sorsStep.prevGotFlipReset = prevPlayer && prevPlayer->GotFlipReset();
+								sorsStep.prevFlipping = prevPlayer && prevPlayer->isFlipping;
+								sorsStep.prevOnGround = prevPlayer && prevPlayer->isOnGround;
+								sorsStep.playerUpZ = player.rotMat.up.z;
+
+								float ownDist = player.pos.Dist(gs.ball.pos);
+								float bestOppDist = 1e30f;
+								for (const Player& other : gs.players)
+									if (other.team != player.team)
+										bestOppDist = RS_MIN(bestOppDist, other.pos.Dist(gs.ball.pos));
+								sorsStep.firstToBall = ownDist <= bestOppDist;
+								trajectories[newPlayerIdx].sorsSteps.push_back(sorsStep);
 							}
 							i++;
 						}
@@ -839,6 +949,9 @@ void GGL::Learner::Start() {
 									}
 								}
 
+								if (config.ppo.useSORS)
+									ppo->AddSORSWindows(fnBuildSORSWindows(traj));
+
 								combinedTraj.Append(traj);
 								traj.Clear();
 							}
@@ -849,6 +962,9 @@ void GGL::Learner::Start() {
 					report["Env Step Time"] = envStepTime;
 				}
 				float collectionTime = collectionTimer.Elapsed();
+
+				if (config.ppo.useSORS)
+					ppo->TrainSORS(report);
 
 				Timer consumptionTimer = {};
 				{ // Process timesteps
@@ -861,6 +977,32 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
+
+					if (config.ppo.useSORS && !combinedTraj.actionComps.empty()) {
+						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+						torch::Tensor tSORSRewards;
+						if (ppo->device.is_cpu()) {
+							tSORSRewards = ppo->InferSORSRewards(tStates.to(ppo->device, true, true), tActionComps.to(ppo->device, true, true)).cpu();
+						} else {
+							tSORSRewards = torch::zeros({ (int64_t)combinedTraj.Length() });
+							for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
+								int start = i;
+								int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
+								auto rewardPart = ppo->InferSORSRewards(
+									tStates.slice(0, start, end).to(ppo->device, true, true),
+									tActionComps.slice(0, start, end).to(ppo->device, true, true)
+								).cpu();
+								tSORSRewards.slice(0, start, end).copy_(rewardPart, true);
+							}
+						}
+
+						if (tSORSRewards.defined()) {
+							tSORSRewards = tSORSRewards.clamp(-config.ppo.sorsRewardClipRange, config.ppo.sorsRewardClipRange);
+							report["SORS Avg Reward"] = tSORSRewards.mean().item<float>();
+							report["SORS Avg Abs Reward"] = tSORSRewards.abs().mean().item<float>();
+							tRewards = tRewards + tSORSRewards * config.ppo.sorsRewardScale;
+						}
+					}
 
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
@@ -1008,7 +1150,16 @@ void GGL::Learner::Start() {
 						"-Env Step Time",
 						"Consumption Time",
 						"-GAE Time",
-						"-PPO Learn Time"
+						"-PPO Learn Time",
+						"",
+						"SORS Loss",
+						"SORS Pair Accuracy",
+						"SORS Replay Windows",
+						"SORS Positive Windows",
+						"SORS Avg Label",
+						"SORS Avg Reward",
+						"SORS Avg Abs Reward",
+						"SORS Pred Window Return",
 						"",
 						"Collected Timesteps",
 						"Total Timesteps",

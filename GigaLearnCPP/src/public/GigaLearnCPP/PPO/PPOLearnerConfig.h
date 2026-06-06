@@ -1,9 +1,199 @@
 #pragma once
 #include <RLGymCPP/BasicTypes/Lists.h>
+#include <RLGymCPP/CommonValues.h>
 
 #include "../Util/ModelConfig.h"
 
 namespace GGL {
+
+	struct SORSStep {
+		Vec ballPos, ballVel, playerPos, playerVel;
+		Team team = Team::BLUE;
+		bool touch = false;
+		bool shot = false;
+		bool goalFor = false;
+		bool goalAgainst = false;
+		bool firstToBall = false;
+		bool playerOnGround = false;
+		bool playerDemoed = false;
+		bool gotFlipReset = false;
+		bool prevValid = false;
+		bool prevGotFlipReset = false;
+		bool prevFlipping = false;
+		bool prevOnGround = false;
+		float playerUpZ = 1;
+	};
+
+	class SORSLabel {
+	public:
+		virtual bool IsTrigger() const { return false; }
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const = 0;
+		virtual ~SORSLabel() {}
+	};
+
+	struct WeightedSORSLabel {
+		SORSLabel* label;
+		float weight;
+
+		WeightedSORSLabel(SORSLabel* label, float weight) : label(label), weight(weight) {}
+		WeightedSORSLabel(SORSLabel* label, int weight) : label(label), weight(weight) {}
+	};
+
+	class AirTouchSORSLabel : public SORSLabel {
+	public:
+		float minBallHeight;
+		AirTouchSORSLabel(float minBallHeight = 500) : minBallHeight(minBallHeight) {}
+		virtual bool IsTrigger() const override { return true; }
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			const auto& step = steps[stepIdx];
+			return step.touch && !step.playerOnGround && step.ballPos.z >= minBallHeight;
+		}
+	};
+
+	class FlipResetSORSLabel : public SORSLabel {
+	public:
+		float minBallHeight;
+		FlipResetSORSLabel(float minBallHeight = 500) : minBallHeight(minBallHeight) {}
+		virtual bool IsTrigger() const override { return true; }
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			const auto& step = steps[stepIdx];
+			return step.prevValid && step.gotFlipReset && !step.prevGotFlipReset && !step.playerOnGround && step.ballPos.z >= minBallHeight;
+		}
+	};
+
+	class PostResetTouchSORSLabel : public SORSLabel {
+	public:
+		float minBallHeight;
+		PostResetTouchSORSLabel(float minBallHeight = 500) : minBallHeight(minBallHeight) {}
+		virtual bool IsTrigger() const override { return true; }
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			const auto& step = steps[stepIdx];
+			return step.touch && step.gotFlipReset && !step.playerOnGround && step.ballPos.z >= minBallHeight;
+		}
+	};
+
+	class WavedashSORSLabel : public SORSLabel {
+	public:
+		virtual bool IsTrigger() const override { return true; }
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			const auto& step = steps[stepIdx];
+			return step.prevValid && step.playerOnGround && step.prevFlipping && !step.prevOnGround;
+		}
+	};
+
+	class UsefulBallDeltaSORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		float velThreshold, progressThreshold;
+		UsefulBallDeltaSORSLabel(int lookahead = 30, float velThreshold = 300, float progressThreshold = 300)
+			: lookahead(lookahead), velThreshold(velThreshold), progressThreshold(progressThreshold) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			const auto& eventStep = steps[stepIdx];
+			Vec targetGoal = eventStep.team == Team::BLUE ? RLGC::CommonValues::ORANGE_GOAL_BACK : RLGC::CommonValues::BLUE_GOAL_BACK;
+			Vec dirToGoal = (targetGoal - eventStep.ballPos).Normalized();
+			float bestProgress = 0;
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++) {
+				const auto& step = steps[i];
+				bestProgress = RS_MAX(bestProgress, (step.ballPos - eventStep.ballPos).Dot(dirToGoal));
+				if (step.ballVel.Dot(dirToGoal) > velThreshold || bestProgress > progressThreshold)
+					return 1;
+			}
+			return 0;
+		}
+	};
+
+	class PossessionOrFirstToBallSORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		PossessionOrFirstToBallSORSLabel(int lookahead = 45) : lookahead(lookahead) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++)
+				if (steps[i].firstToBall)
+					return 1;
+			return 0;
+		}
+	};
+
+	class LostPossessionSORSLabel : public PossessionOrFirstToBallSORSLabel {
+	public:
+		LostPossessionSORSLabel(int lookahead = 45) : PossessionOrFirstToBallSORSLabel(lookahead) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			return 1.0f - PossessionOrFirstToBallSORSLabel::GetLabel(steps, stepIdx);
+		}
+	};
+
+	class GoodRecoverySORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		float minUpZ;
+		GoodRecoverySORSLabel(int lookahead = 30, float minUpZ = 0.5f) : lookahead(lookahead), minUpZ(minUpZ) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++) {
+				const auto& step = steps[i];
+				if (step.playerOnGround && step.playerUpZ > minUpZ && !step.playerDemoed)
+					return 1;
+			}
+			return 0;
+		}
+	};
+
+	class BadRecoverySORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		float maxUpZ;
+		BadRecoverySORSLabel(int lookahead = 30, float maxUpZ = 0.0f) : lookahead(lookahead), maxUpZ(maxUpZ) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++) {
+				const auto& step = steps[i];
+				if (step.playerDemoed || (step.playerOnGround && step.playerUpZ < maxUpZ))
+					return 1;
+			}
+			return 0;
+		}
+	};
+
+	class ShotCreatedSORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		ShotCreatedSORSLabel(int lookahead = 60) : lookahead(lookahead) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++)
+				if (steps[i].shot)
+					return 1;
+			return 0;
+		}
+	};
+
+	class GoalForSORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		GoalForSORSLabel(int lookahead = 90) : lookahead(lookahead) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++)
+				if (steps[i].goalFor)
+					return 1;
+			return 0;
+		}
+	};
+
+	class GoalAgainstSORSLabel : public SORSLabel {
+	public:
+		int lookahead;
+		GoalAgainstSORSLabel(int lookahead = 90) : lookahead(lookahead) {}
+		virtual float GetLabel(const std::vector<SORSStep>& steps, int stepIdx) const override {
+			int end = RS_MIN((int)steps.size(), stepIdx + lookahead + 1);
+			for (int i = stepIdx; i < end; i++)
+				if (steps[i].goalAgainst)
+					return 1;
+			return 0;
+		}
+	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
@@ -87,6 +277,23 @@ namespace GGL {
 		// like policy/critic: layerSizes / activationType / addLayerNorm / optimType.
 		PartialModelConfig gcrlCritic;
 
+		// ── SORS mechanic densification reward model ──
+		// Learns a dense reward from short, utility-weighted sparse mechanic windows.
+		// The model consumes obs + continuous action components and its clipped output is
+		// added to collected rewards before GAE.
+		bool useSORS = false;
+		float sorsRewardScale = 0.25f;
+		float sorsRewardClipRange = 1.0f;
+		float sorsLR = 0; // SORS reward learning rate; 0 -> use policyLR
+		int sorsWarmupIters = 8;
+		int sorsTrainPairs = 4096;
+		int sorsMaxReplayWindows = 20000;
+		float sorsMinLabelDelta = 0.25f;
+		int sorsWindowBefore = 45;
+		int sorsWindowAfter = 30;
+		std::vector<WeightedSORSLabel> sorsLabels;
+		PartialModelConfig sorsReward;
+
 		PPOLearnerConfig() {
 			policy = {};
 			policy.layerSizes = { 256, 256, 256 };
@@ -98,6 +305,8 @@ namespace GGL {
 			gcrlCritic = {};
 			gcrlCritic.layerSizes = { 256, 256 }; // hidden layers of phi/psi (output is gcrlReprDim)
 			gcrlCritic.addLayerNorm = false;
+			sorsReward = {};
+			sorsReward.layerSizes = { 256, 256 };
 		}
 	};
 }

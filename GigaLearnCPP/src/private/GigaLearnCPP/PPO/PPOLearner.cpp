@@ -39,6 +39,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		models.Add(makeGCRLCritic("car_critic"));
 	}
 
+	if (config.useSORS) {
+		const int actionDim = 8;
+		models.Add(new SORSRewardModel("sors_reward", obsSize, actionDim, config.sorsReward, device));
+	}
+
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	// Print param counts
@@ -145,6 +150,99 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
 
 	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
+}
+
+torch::Tensor GGL::PPOLearner::InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps) {
+	if (!config.useSORS || !models["sors_reward"])
+		return {};
+
+	auto* sors = dynamic_cast<SORSRewardModel*>(models["sors_reward"]);
+	RG_ASSERT(sors);
+	return sors->Forward(obs, actionComps, config.useHalfPrecision);
+}
+
+void GGL::PPOLearner::AddSORSWindows(std::vector<SORSWindow>&& windows) {
+	if (!config.useSORS)
+		return;
+
+	for (auto& window : windows) {
+		if (window.length <= 0)
+			continue;
+
+		sorsReplay.push_back(std::move(window));
+		while ((int)sorsReplay.size() > config.sorsMaxReplayWindows)
+			sorsReplay.pop_front();
+	}
+}
+
+void GGL::PPOLearner::TrainSORS(Report& report) {
+	if (!config.useSORS || !models["sors_reward"])
+		return;
+
+	report["SORS Replay Windows"] = sorsReplay.size();
+	if (sorsReplay.empty())
+		return;
+
+	int positives = 0;
+	float labelTotal = 0;
+	for (auto& window : sorsReplay) {
+		positives += window.label > 0;
+		labelTotal += window.label;
+	}
+	report["SORS Positive Windows"] = positives;
+	report["SORS Avg Label"] = labelTotal / RS_MAX(1, (int)sorsReplay.size());
+
+	if (sorsTrainCalls++ < config.sorsWarmupIters || sorsReplay.size() < 2)
+		return;
+
+	auto* sors = dynamic_cast<SORSRewardModel*>(models["sors_reward"]);
+	RG_ASSERT(sors);
+
+	MutAvgTracker avgLoss, avgPredReturn, avgAcc;
+	int trainedPairs = 0;
+	int attempts = 0;
+	int maxAttempts = config.sorsTrainPairs * 8;
+
+	while (trainedPairs < config.sorsTrainPairs && attempts++ < maxAttempts) {
+		int idxA = Math::RandInt(0, (int)sorsReplay.size());
+		int idxB = Math::RandInt(0, (int)sorsReplay.size());
+		if (idxA == idxB)
+			continue;
+
+		auto& a = sorsReplay[idxA];
+		auto& b = sorsReplay[idxB];
+		float delta = a.label - b.label;
+		if (fabsf(delta) < config.sorsMinLabelDelta)
+			continue;
+
+		auto& hi = delta > 0 ? a : b;
+		auto& lo = delta > 0 ? b : a;
+
+		auto hiObs = torch::tensor(hi.states).reshape({ hi.length, sors->obs_dim }).to(device, true, true);
+		auto hiActs = torch::tensor(hi.actionComps).reshape({ hi.length, sors->action_dim }).to(device, true, true);
+		auto loObs = torch::tensor(lo.states).reshape({ lo.length, sors->obs_dim }).to(device, true, true);
+		auto loActs = torch::tensor(lo.actionComps).reshape({ lo.length, sors->action_dim }).to(device, true, true);
+
+		auto hiReturn = sors->Forward(hiObs, hiActs).sum();
+		auto loReturn = sors->Forward(loObs, loActs).sum();
+		auto loss = -torch::log(torch::sigmoid(hiReturn - loReturn) + 1e-8f);
+		loss.backward();
+
+		float hiVal = hiReturn.detach().cpu().item<float>();
+		float loVal = loReturn.detach().cpu().item<float>();
+		avgLoss += loss.detach().cpu().item<float>();
+		avgPredReturn += hiVal;
+		avgAcc += hiVal > loVal ? 1.0f : 0.0f;
+		trainedPairs++;
+	}
+
+	if (trainedPairs > 0) {
+		nn::utils::clip_grad_norm_(sors->parameters(), 0.5f);
+		sors->StepOptim();
+		report["SORS Loss"] = avgLoss.Get();
+		report["SORS Pair Accuracy"] = avgAcc.Get();
+		report["SORS Pred Window Return"] = avgPredReturn.Get();
+	}
 }
 
 torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
@@ -530,6 +628,9 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	if (models["anti_critic"]) models["anti_critic"]->SetOptimLR(gcrlLR);
 	if (models["car_critic"])  models["car_critic"]->SetOptimLR(gcrlLR);
 
+	float sorsLR = config.sorsLR > 0 ? config.sorsLR : policyLR;
+	if (models["sors_reward"]) models["sors_reward"]->SetOptimLR(sorsLR);
+
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }
 
@@ -538,7 +639,7 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 	for (Model* model : models) {
 		std::string name = model->modelName;
 		// Exclude value and GCRL critics: only policy + shared head define a playable version
-		if (name == "critic" || name == "goal_critic" || name == "anti_critic" || name == "car_critic")
+		if (name == "critic" || name == "goal_critic" || name == "anti_critic" || name == "car_critic" || name == "sors_reward")
 			continue;
 
 		result.Add(model);

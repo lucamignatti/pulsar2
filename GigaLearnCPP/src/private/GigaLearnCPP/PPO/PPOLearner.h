@@ -12,6 +12,7 @@
 #include <torch/nn/modules/container/sequential.h>
 
 #include "ExperienceBuffer.h"
+#include <deque>
 
 namespace GGL {
 
@@ -22,6 +23,15 @@ namespace GGL {
 
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
+
+		struct SORSWindow {
+			FList states;
+			FList actionComps;
+			float label = 0;
+			int length = 0;
+		};
+		std::deque<SORSWindow> sorsReplay;
+		int64_t sorsTrainCalls = 0;
 
 		PPOLearnerConfig config;
 		torch::Device device;
@@ -42,6 +52,9 @@ namespace GGL {
 		// If models is null, this->models will be used
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
+		torch::Tensor InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps);
+		void AddSORSWindows(std::vector<SORSWindow>&& windows);
+		void TrainSORS(Report& report);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		static torch::Tensor InferPolicyProbsFromModels(
