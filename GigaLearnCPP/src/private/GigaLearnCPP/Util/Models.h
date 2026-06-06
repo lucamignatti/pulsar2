@@ -11,6 +11,7 @@
 #include <torch/optim/rmsprop.h>
 #include <torch/optim/sgd.h>
 
+#include "Muon.h"
 #include "MagSGD.h"
 
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
@@ -47,6 +48,8 @@ namespace GGL {
 			return new torch::optim::Adagrad(parameters, lr);
 		case ModelOptimType::RMSPROP:
 			return new torch::optim::RMSprop(parameters, lr);
+		case ModelOptimType::MUON:
+			return new Muon(parameters, MuonOptions(lr));
 		case ModelOptimType::MAGSGD:
 			return new MagSGD(parameters, lr);
 		}
@@ -69,6 +72,9 @@ namespace GGL {
 				break;
 			case ModelOptimType::RMSPROP:
 				static_cast<torch::optim::RMSpropOptions&>(group.options()).lr(lr);
+				break;
+			case ModelOptimType::MUON:
+				static_cast<MuonOptions&>(group.options()).lr(lr);
 				break;
 			case ModelOptimType::MAGSGD:
 				static_cast<MagSGDOptions&>(group.options()).lr(lr);

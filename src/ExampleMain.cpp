@@ -169,7 +169,7 @@ int main(int argc, char* argv[]) {
 	// shared head, so they can be much smaller than policy/critic.
 	cfg.ppo.gcrlCritic.layerSizes = { 512, 1024, 1024 };
 
-	auto optim = ModelOptimType::ADAMW;
+	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;

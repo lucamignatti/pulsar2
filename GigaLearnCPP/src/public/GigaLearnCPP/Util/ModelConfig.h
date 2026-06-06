@@ -8,7 +8,8 @@ namespace GGL {
 		ADAMW,
 		ADAGRAD,
 		RMSPROP,
-		MAGSGD
+		MAGSGD,
+		MUON
 	};
 
 	enum class ModelActivationType {
