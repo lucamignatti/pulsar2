@@ -1,6 +1,7 @@
 #pragma once
 #include "Reward.h"
 #include "../Math.h"
+#include <unordered_map>
 
 namespace RLGC {
 
@@ -115,6 +116,164 @@ namespace RLGC {
 			} else {
 				return 0;
 			}
+		}
+	};
+
+	class TimePenalty : public Reward {
+	public:
+		float penalty;
+
+		TimePenalty(float penalty = -0.5f) : penalty(penalty) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return state.goalScored ? 0 : penalty;
+		}
+	};
+
+	class EnergyReward : public Reward {
+	public:
+		float speedScale, boostScale, flipScale, forwardVelScale;
+
+		EnergyReward(float speedScale = 0.45f, float boostScale = 0.25f, float flipScale = 0.2f, float forwardVelScale = 0.1f)
+			: speedScale(speedScale), boostScale(boostScale), flipScale(flipScale), forwardVelScale(forwardVelScale) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			float speed = RS_CLAMP(player.vel.Length() / CommonValues::CAR_MAX_SPEED, 0, 1);
+			float boost = RS_CLAMP(sqrtf(player.boost / 100.f), 0, 1);
+			float flipAvailable = player.HasFlipOrJump() ? 1 : 0;
+			float forwardVel = RS_CLAMP(player.rotMat.forward.Dot(player.vel) / CommonValues::CAR_MAX_SPEED, 0, 1);
+
+			return speedScale * speed + boostScale * boost + flipScale * flipAvailable + forwardVelScale * forwardVel;
+		}
+	};
+
+	class AirTouchReward : public Reward {
+	public:
+		float minBallHeight, maxBallHeight;
+		bool requireGoalwardTouch;
+
+		AirTouchReward(float minBallHeight = 500, float maxBallHeight = CommonValues::CEILING_Z, bool requireGoalwardTouch = true)
+			: minBallHeight(minBallHeight), maxBallHeight(maxBallHeight), requireGoalwardTouch(requireGoalwardTouch) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.ballTouchedStep || player.isOnGround || state.ball.pos.z < minBallHeight)
+				return 0;
+
+			if (requireGoalwardTouch) {
+				Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+				Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+				Vec touchDeltaVel = state.ball.vel - state.prev->ball.vel;
+
+				if (touchDeltaVel.Dot(ballDirToGoal) <= 0)
+					return 0;
+			}
+
+			float heightRange = RS_MAX(1, maxBallHeight - minBallHeight);
+			return RS_CLAMP((state.ball.pos.z - minBallHeight) / heightRange, 0, 1);
+		}
+	};
+
+	class PossessionReward : public Reward {
+	public:
+		float maxDistance, maxRelativeSpeed;
+
+		PossessionReward(float maxDistance = 350, float maxRelativeSpeed = 1400)
+			: maxDistance(maxDistance), maxRelativeSpeed(maxRelativeSpeed) {}
+
+		float GetPossessionScore(const Player& candidate, const GameState& state) const {
+			float distance = candidate.pos.Dist(state.ball.pos);
+			if (distance > maxDistance)
+				return 0;
+
+			float relativeSpeed = (state.ball.vel - candidate.vel).Length();
+			float proximityScore = 1 - (distance / maxDistance);
+			float controlScore = 1 - RS_CLAMP(relativeSpeed / maxRelativeSpeed, 0, 1);
+
+			return proximityScore * controlScore;
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			float playerScore = GetPossessionScore(player, state);
+			if (playerScore <= 0)
+				return 0;
+
+			for (const Player& other : state.players) {
+				if (other.index != player.index && GetPossessionScore(other, state) > playerScore)
+					return 0;
+			}
+
+			return playerScore;
+		}
+	};
+
+	class OpponentPossessionPenalty : public PossessionReward {
+	public:
+		OpponentPossessionPenalty(float maxDistance = 350, float maxRelativeSpeed = 1400)
+			: PossessionReward(maxDistance, maxRelativeSpeed) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			float bestOpponentScore = 0;
+
+			for (const Player& other : state.players) {
+				if (other.team != player.team)
+					bestOpponentScore = RS_MAX(bestOpponentScore, GetPossessionScore(other, state));
+			}
+
+			return -bestOpponentScore;
+		}
+	};
+
+	class FlipResetReward : public Reward {
+	public:
+		float minBallHeight;
+
+		FlipResetReward(float minBallHeight = 500) : minBallHeight(minBallHeight) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!player.prev || !player.ballTouchedStep || player.isOnGround || state.ball.pos.z < minBallHeight)
+				return 0;
+
+			return player.GotFlipReset() && !player.prev->GotFlipReset();
+		}
+	};
+
+	class FlipResetFollowupReward : public Reward {
+	public:
+		float minBallHeight, followupWindow, maxRewardedGoalwardAccel;
+		std::unordered_map<int, float> resetTimers;
+
+		FlipResetFollowupReward(float minBallHeight = 500, float followupWindow = 2.0f, float maxRewardedGoalwardAccel = Math::KPHToVel(80))
+			: minBallHeight(minBallHeight), followupWindow(followupWindow), maxRewardedGoalwardAccel(maxRewardedGoalwardAccel) {}
+
+		virtual void Reset(const GameState& initialState) override {
+			resetTimers.clear();
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!player.prev || !state.prev)
+				return 0;
+
+			float& resetTimer = resetTimers[player.index];
+			bool gotResetNow = player.GotFlipReset() && !player.prev->GotFlipReset() && !player.isOnGround && state.ball.pos.z >= minBallHeight;
+			float reward = 0;
+
+			if (resetTimer > 0 && !gotResetNow && player.ballTouchedStep && !player.isOnGround && state.ball.pos.z >= minBallHeight) {
+				Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+				Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+				Vec touchDeltaVel = state.ball.vel - state.prev->ball.vel;
+				float goalwardAccel = touchDeltaVel.Dot(ballDirToGoal);
+
+				if (goalwardAccel > 0) {
+					reward = RS_CLAMP(goalwardAccel / maxRewardedGoalwardAccel, 0, 1);
+					resetTimer = 0;
+				}
+			}
+
+			resetTimer = RS_MAX(0, resetTimer - state.deltaTime);
+			if (gotResetNow)
+				resetTimer = followupWindow;
+
+			return reward;
 		}
 	};
 

@@ -18,16 +18,32 @@ EnvCreateResult EnvCreateFunc(int index) {
 
     std::vector<WeightedReward> rewards = {
         // Objective anchor
-        { new GoalReward(), 150 },
+        { new GoalReward(-0.85f), 150 },
+        { new TimePenalty(-0.1f), 1.0f },
 
-        // Broad pressure / directionality
-        { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 1.0f },
+        // Broad pressure / directionality, kept low for GCRL compatibility
+        { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.1f },
+
+        // General physical readiness, kept tiny to avoid energy farming
+        { new EnergyReward(), 0.02f },
 
         // Light mechanics / resource priors
-        { new StrongTouchReward(20, 100), 5 },
+        { new StrongTouchReward(20, 100), 0.5f },
         { new PickupBoostReward(), 1.0f },
-        { new SaveBoostReward(), 0.1f }
-	};
+        { new SaveBoostReward(), 0.1f },
+
+        // Physical play, light
+        { new BumpReward(), 0.25f },
+        { new BumpedPenalty(), 0.25f },
+        { new DemoReward(), 1.0f },
+        { new DemoedPenalty(), 1.0f },
+
+        // Hard-to-discover mechanics/control, kept very light to avoid farming
+        { new AirTouchReward(500), 1.0f },
+        { new PossessionReward(), 0.05f },
+        { new FlipResetFollowupReward(500), 1.0f }
+    };
+
 
 
 
