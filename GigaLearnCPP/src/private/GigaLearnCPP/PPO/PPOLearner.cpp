@@ -278,11 +278,29 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgRatio,
 		avgClip,
 		avgInfoNCELoss,
-		avgGcrlAdv;
+		avgInfoNCEGoalLoss,
+		avgInfoNCEAntiLoss,
+		avgInfoNCECarLoss,
+		avgGcrlAdv,
+		avgGcrlGoalAdv,
+		avgGcrlAntiAdv,
+		avgGcrlCarAdv,
+		avgGcrlRewardAdv,
+		avgGcrlFinalAdv,
+		avgGcrlGoalQ,
+		avgGcrlAntiQ,
+		avgGcrlCarQ,
+		avgGcrlGoalQStd,
+		avgGcrlAntiQStd,
+		avgGcrlCarQStd;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
 	auto criticBefore = models["critic"]->CopyParams();
+	torch::Tensor gcrlGoalBefore, gcrlAntiBefore, gcrlCarBefore;
+	if (models["goal_critic"]) gcrlGoalBefore = models["goal_critic"]->CopyParams();
+	if (models["anti_critic"]) gcrlAntiBefore = models["anti_critic"]->CopyParams();
+	if (models["car_critic"])  gcrlCarBefore  = models["car_critic"]->CopyParams();
 
 	bool trainPolicy = config.policyLR != 0;
 	bool trainCritic = config.criticLR != 0;
@@ -350,17 +368,28 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					auto q_goal = gc_goal->score_q(features, actionComps, futureGoals);
 					auto q_anti = gc_anti->score_q(features, actionComps, futureGoals);
 					auto q_car  = gc_car->score_q(features, actionComps, carFutureGoals);
+					avgGcrlGoalQ += q_goal.mean().item<float>();
+					avgGcrlAntiQ += q_anti.mean().item<float>();
+					avgGcrlCarQ += q_car.mean().item<float>();
+					avgGcrlGoalQStd += q_goal.std().item<float>();
+					avgGcrlAntiQStd += q_anti.std().item<float>();
+					avgGcrlCarQStd += q_car.std().item<float>();
 
 					auto adv_goal = (q_goal - q_goal.mean()) / (q_goal.std() + 1e-8f);
 					auto adv_anti = (q_anti - q_anti.mean()) / (q_anti.std() + 1e-8f);
 					auto adv_car  = (q_car  - q_car.mean())  / (q_car.std()  + 1e-8f);
+					avgGcrlGoalAdv += adv_goal.abs().mean().item<float>();
+					avgGcrlAntiAdv += adv_anti.abs().mean().item<float>();
+					avgGcrlCarAdv += adv_car.abs().mean().item<float>();
 
 					// goal pursuit, "anti" pessimism (double-critic), car positioning
 					auto adv_gcrl = adv_goal - config.gcrlAntiScale * adv_anti + config.gcrlCarScale * adv_car;
 					avgGcrlAdv += adv_gcrl.abs().mean().item<float>();
 
 					auto adv_rew = (advantages - advantages.mean()) / (advantages.std() + 1e-8f);
+					avgGcrlRewardAdv += adv_rew.abs().mean().item<float>();
 					advantages = adv_rew + config.gcrlAdvScale * adv_gcrl;
+					avgGcrlFinalAdv += advantages.abs().mean().item<float>();
 				}
 
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
@@ -462,6 +491,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						auto il_car  = gc_car->infonce_loss(sub_obs, sub_actions, sub_car_goals);
 						infoNCELoss = (il_goal + il_anti + il_car) * batchSizeRatio;
 						avgInfoNCELoss += infoNCELoss.detach().cpu().item<float>();
+						avgInfoNCEGoalLoss += il_goal.detach().cpu().item<float>();
+						avgInfoNCEAntiLoss += il_anti.detach().cpu().item<float>();
+						avgInfoNCECarLoss += il_car.detach().cpu().item<float>();
 					}
 				}
 
@@ -515,6 +547,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
+	float gcrlGoalUpdateMagnitude = 0;
+	float gcrlAntiUpdateMagnitude = 0;
+	float gcrlCarUpdateMagnitude = 0;
+	if (trainGCRL) {
+		gcrlGoalUpdateMagnitude = (gcrlGoalBefore - models["goal_critic"]->CopyParams()).norm().item<float>();
+		gcrlAntiUpdateMagnitude = (gcrlAntiBefore - models["anti_critic"]->CopyParams()).norm().item<float>();
+		gcrlCarUpdateMagnitude = (gcrlCarBefore - models["car_critic"]->CopyParams()).norm().item<float>();
+	}
 
 	// Assemble and return report
 	report["Policy Entropy"] = avgEntropy.Get();
@@ -531,7 +571,24 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 		if (trainGCRL) {
 			report["InfoNCE Loss"] = avgInfoNCELoss.Get();
+			report["GCRL/InfoNCE Goal Loss"] = avgInfoNCEGoalLoss.Get();
+			report["GCRL/InfoNCE Anti Loss"] = avgInfoNCEAntiLoss.Get();
+			report["GCRL/InfoNCE Car Loss"] = avgInfoNCECarLoss.Get();
 			report["GCRL/Avg Advantage"] = avgGcrlAdv.Get();
+			report["GCRL/Goal Advantage"] = avgGcrlGoalAdv.Get();
+			report["GCRL/Anti Advantage"] = avgGcrlAntiAdv.Get();
+			report["GCRL/Car Advantage"] = avgGcrlCarAdv.Get();
+			report["GCRL/Reward Advantage"] = avgGcrlRewardAdv.Get();
+			report["GCRL/Final Advantage"] = avgGcrlFinalAdv.Get();
+			report["GCRL/Goal Q Mean"] = avgGcrlGoalQ.Get();
+			report["GCRL/Anti Q Mean"] = avgGcrlAntiQ.Get();
+			report["GCRL/Car Q Mean"] = avgGcrlCarQ.Get();
+			report["GCRL/Goal Q STD"] = avgGcrlGoalQStd.Get();
+			report["GCRL/Anti Q STD"] = avgGcrlAntiQStd.Get();
+			report["GCRL/Car Q STD"] = avgGcrlCarQStd.Get();
+			report["GCRL/Goal Update Magnitude"] = gcrlGoalUpdateMagnitude;
+			report["GCRL/Anti Update Magnitude"] = gcrlAntiUpdateMagnitude;
+			report["GCRL/Car Update Magnitude"] = gcrlCarUpdateMagnitude;
 		}
 
 		if (config.useGuidingPolicy)
