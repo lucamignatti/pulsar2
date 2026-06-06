@@ -56,6 +56,32 @@ namespace GGL {
 		std::filesystem::path guidingPolicyPath = "guiding_policy/"; // Path of the guiding policy model(s)
 		float guidingStrength = 0.03f;
 
+		// ── Quasimetric GCRL ("game sense" channel) ──
+		// Three quasimetric critics learn, contrastively (InfoNCE) over hindsight-relabeled
+		// future ball goals, a directional distance from (state, action) to a goal. Their
+		// combined advantage is unit-normalized and blended into the policy gradient on top
+		// of the reward-driven GAE advantage. GCRL teaches positioning/anticipation; the
+		// dense rewards (via GAE) teach mechanics.
+		bool useGCRL = true;
+		float gcrlAdvScale = 1.0f;   // Blend weight: adv = norm(GAE_adv) + gcrlAdvScale * GCRL_adv
+		float gcrlAntiScale = 0.85f; // Weight of the pessimistic "anti" critic in the GCRL advantage
+		float gcrlCarScale = 0.5f;   // Weight of the car-positioning critic in the GCRL advantage
+		float gcrlTau = 0.02f;       // Embedding temperature (sharp contrast)
+		// HER relabeling horizons are in STEPS. At tickSkip 4 there are ~30 steps/sec, so
+		// these defaults span roughly 0.25s..1.05s of "future" — long enough to be strategic.
+		int gcrlHorizon = 32;        // Max future offset (upper bound of the HER goal window)
+		int gcrlMinHorizon = 8;      // Min future offset (lower bound of the HER goal window)
+		bool gcrlUseVariableHER = true; // Sample goal offset uniformly in [minH, H]; else fixed H
+		float gcrlInfoNCECoef = 0.5f;     // Weight of the InfoNCE loss in the combined objective
+		float gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside the InfoNCE loss
+		float gcrlVarReg = 0.3f;          // Embedding variance regularization (anti-collapse)
+		int gcrlInfoSubSample = 512;      // Sub-batch size for the InfoNCE contrastive matrix
+		int gcrlReprDim = 128;            // Embedding (output) dim; phi and psi MUST share it
+		float gcrlLR = 0;                 // GCRL critic learning rate; 0 -> use policyLR
+		// Hidden architecture of the phi/psi towers (output is always gcrlReprDim). Configured
+		// like policy/critic: layerSizes / activationType / addLayerNorm / optimType.
+		PartialModelConfig gcrlCritic;
+
 		PPOLearnerConfig() {
 			policy = {};
 			policy.layerSizes = { 256, 256, 256 };
@@ -64,6 +90,9 @@ namespace GGL {
 			sharedHead = {};
 			sharedHead.layerSizes = { 256 };
 			sharedHead.addOutputLayer = false;
+			gcrlCritic = {};
+			gcrlCritic.layerSizes = { 256, 256 }; // hidden layers of phi/psi (output is gcrlReprDim)
+			gcrlCritic.addLayerNorm = false;
 		}
 	};
 }

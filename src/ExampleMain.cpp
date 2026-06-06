@@ -125,25 +125,52 @@ int main(int argc, char* argv[]) {
 	// Good learning rate to start
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
+	cfg.ppo.gcrlLR = 1.5e-4;
+
+	// Three quasimetric critics learn positioning/anticipation contrastively (InfoNCE)
+	// over hindsight-relabeled future ball goals, and blend their advantage into the
+	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
+	// teach mechanics; GCRL teaches where to be.
+	cfg.ppo.useGCRL = true;
+	cfg.ppo.gcrlAdvScale = 1.0f;    // GCRL advantage weight (1.0 == equal to the reward advantage)
+	cfg.ppo.gcrlAntiScale = 0.85f;   // pessimistic "anti" critic weight in the GCRL advantage
+	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
+	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
+	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
+	cfg.ppo.gcrlUseVariableHER = true; // sample goal offset uniformly in [minH, H]; else fixed H
+	cfg.ppo.gcrlTau = 0.02f;         // embedding temperature (lower = sharper contrast)
+	cfg.ppo.gcrlReprDim = 2048;       // phi/psi embedding dimension (the metric-space capacity)
+	cfg.ppo.gcrlInfoNCECoef = 0.75f;  // weight of the InfoNCE loss in the combined objective
+	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
+	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
+	cfg.ppo.gcrlInfoSubSample = 768; // contrastive sub-batch size
 
 	cfg.ppo.sharedHead.layerSizes = { 256, 512, 1024, 512 };
 	cfg.ppo.policy.layerSizes = { 1024, 1024, 512, 256 };
 	cfg.ppo.critic.layerSizes = { 1024, 2048, 2048, 512, 256 };
+	// GCRL phi/psi hidden layers (output is always gcrlReprDim). These sit on top of the
+	// shared head, so they can be much smaller than policy/critic.
+	cfg.ppo.gcrlCritic.layerSizes = { 512, 1024, 1024 };
 
 	auto optim = ModelOptimType::ADAMW;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
+	cfg.ppo.gcrlCritic.optimType = optim;
 
 	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
+	cfg.ppo.gcrlCritic.activationType = activation;
 
 	bool addLayerNorm = true;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
+	// Optional: the embedding is L2-normalized at scoring time, so trunk LayerNorm is less
+	// important here than for policy/critic. Off by default; flip to addLayerNorm to match.
+	cfg.ppo.gcrlCritic.addLayerNorm = false;
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render

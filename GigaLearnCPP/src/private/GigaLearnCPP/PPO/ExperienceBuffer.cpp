@@ -20,7 +20,8 @@ GGL::ExperienceTensors GGL::ExperienceBuffer::_GetSamples(const int64_t* indices
 	auto* toItr = result.begin();
 	auto* fromItr = data.begin();
 	for (; toItr != result.end(); toItr++, fromItr++)
-		*toItr = torch::index_select(*fromItr, 0, tIndices);
+		if (fromItr->defined()) // GCRL fields are undefined when useGCRL is off
+			*toItr = torch::index_select(*fromItr, 0, tIndices);
 
 	return result;
 }

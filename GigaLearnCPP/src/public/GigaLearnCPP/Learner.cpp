@@ -505,6 +505,9 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
+			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
+			// ball goals (global / car-local), filled at episode end.
+			FList actionComps, futureGoals, carFutureGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
@@ -518,6 +521,9 @@ void GGL::Learner::Start() {
 				nextStates += other.nextStates;
 				rewards += other.rewards;
 				logProbs += other.logProbs;
+				actionComps += other.actionComps;
+				futureGoals += other.futureGoals;
+				carFutureGoals += other.carFutureGoals;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -666,6 +672,18 @@ void GGL::Learner::Start() {
 						inferTime += inferTimer.Elapsed();
 
 						auto curActions = TENSOR_TO_VEC<int>(tActions);
+						
+						// GCRL: decode flat action indices -> 8-dim continuous components for the critics
+						FList curActionComps;
+						if (config.ppo.useGCRL) {
+							auto* actionParser = envSet->actionParsers[0];
+							curActionComps.resize(curActions.size() * 8);
+							for (int p = 0; p < curActions.size(); p++) {
+								Action act = actionParser->ParseAction(curActions[p], envSet->state.gameStates[0].players[0], envSet->state.gameStates[0]);
+								for (int d = 0; d < 8; d++)
+									curActionComps[p * 8 + d] = act[d];
+							}
+						}
 						FList newLogProbs;
 						if (tLogProbs.defined() && !render)
 							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
@@ -707,6 +725,9 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
+							if (config.ppo.useGCRL)
+								for (int d = 0; d < 8; d++)
+									trajectories[newPlayerIdx].actionComps += curActionComps[newPlayerIdx * 8 + d];
 							i++;
 						}
 
@@ -738,6 +759,32 @@ void GGL::Learner::Start() {
 								if (terminalType == RLGC::TerminalType::TRUNCATED) {
 									// Truncation requires an additional next state for the critic
 									traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
+								}
+
+								// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
+								// the goal. goal/anti critics use the global ball (obs[0:6]); the car
+								// critic uses the car-local ball (obs[69:75]).
+								if (config.ppo.useGCRL) {
+									int N = traj.Length();
+									int H = config.ppo.gcrlHorizon;
+									int minH = config.ppo.gcrlMinHorizon;
+									traj.futureGoals.resize(N * 6);
+									traj.carFutureGoals.resize(N * 6);
+									for (int t = 0; t < N; t++) {
+										// Goal is a future ball state sampled within [minH, H] steps ahead,
+										// capped at the episode end -- so gcrlHorizon bounds the goal window.
+										int lo = t + minH;
+										int hi = RS_MIN(t + H, N - 1);
+										int t_target;
+										if (config.ppo.gcrlUseVariableHER && hi > lo)
+											t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
+										else
+											t_target = hi;
+										for (int d = 0; d < 6; d++)
+											traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
+										for (int d = 0; d < 6; d++)
+											traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + 69 + d];
+									}
 								}
 
 								combinedTraj.Append(traj);
@@ -835,6 +882,12 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+
+					if (config.ppo.useGCRL) {
+						experience.data.actionComps    = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+						experience.data.futureGoals    = torch::tensor(combinedTraj.futureGoals).reshape({ -1, 6 });
+						experience.data.carFutureGoals = torch::tensor(combinedTraj.carFutureGoals).reshape({ -1, 6 });
+					}
 				}
 
 				// Free CUDA cache

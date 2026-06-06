@@ -156,6 +156,46 @@ namespace GGL {
 		virtual ~Model() = default;
 	};
 
+	// ── Quasimetric GCRL critic ──────────────────────────────────────────────
+	// L2-normalized phi(state-features, action) and psi(goal) embeddings, scored by
+	// cosine similarity / tau. Trained with a symmetric InfoNCE contrastive loss over
+	// hindsight-relabeled future goals. Three of these (goal/anti/car) produce the
+	// "game sense" advantage that is blended into the policy gradient alongside the
+	// reward-driven GAE advantage. This is a port of the Python QCritic architecture.
+	class QuasimetricCritic : public Model {
+	public:
+		torch::nn::Sequential phi_net, psi_net;
+		float tau;
+		float var_reg;
+		float infonce_penalty;
+		int action_dim;
+
+		// hiddenSizes defines the phi/psi tower hidden layers; the output is always repr_dim
+		// (phi and psi MUST share it for the cosine metric to be valid). obs_dim/action_dim/
+		// goal_dim are structural (shared-head width / Action::ELEM_AMOUNT / ball pos+vel).
+		QuasimetricCritic(
+			const char* modelName,
+			int obs_dim, int action_dim, int goal_dim,
+			const std::vector<int>& hiddenSizes, int repr_dim,
+			ModelActivationType activation, bool addLayerNorm,
+			float tau, float var_reg, float infonce_penalty,
+			ModelOptimType optimType,
+			torch::Device device
+		);
+
+		std::pair<torch::Tensor, torch::Tensor> embed(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
+		torch::Tensor forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
+		torch::Tensor score_q(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
+		torch::Tensor infonce_loss(
+			torch::Tensor obs, torch::Tensor actions, torch::Tensor goals,
+			float tau_override = -1,
+			torch::Tensor sampleWeights = {}
+		);
+
+		virtual void Save(std::filesystem::path folder, bool saveOptim = true) override;
+		virtual void Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim = true) override;
+	};
+
 	class ModelSet {
 	public:
 		std::map<std::string, Model*> map = {};

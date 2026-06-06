@@ -17,6 +17,27 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
+	// ── Quasimetric GCRL critics (game-sense channel) ──
+	// They score (shared-features, action) -> goal, so their input dim is the shared-head
+	// output (or raw obs if there is no shared head). Goals are 6-dim ball pos+vel.
+	if (config.useGCRL) {
+		int featureDim = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
+		const int goalDim = 6;    // ball pos(3)+vel(3): global for goal/anti, car-local for car
+		const int actionDim = 8;  // continuous action components
+
+		auto makeGCRLCritic = [&](const char* name) {
+			return new QuasimetricCritic(name,
+				featureDim, actionDim, goalDim,
+				config.gcrlCritic.layerSizes, config.gcrlReprDim,
+				config.gcrlCritic.activationType, config.gcrlCritic.addLayerNorm,
+				config.gcrlTau, config.gcrlVarReg, config.gcrlInfoNCEPenalty,
+				config.gcrlCritic.optimType, device);
+		};
+		models.Add(makeGCRLCritic("goal_critic"));
+		models.Add(makeGCRLCritic("anti_critic"));
+		models.Add(makeGCRLCritic("car_critic"));
+	}
+
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	// Print param counts
@@ -152,7 +173,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgCriticLoss,
 		avgGuidingLoss,
 		avgRatio,
-		avgClip;
+		avgClip,
+		avgInfoNCELoss,
+		avgGcrlAdv;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
@@ -161,6 +184,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	bool trainPolicy = config.policyLR != 0;
 	bool trainCritic = config.criticLR != 0;
 	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
+
+	bool trainGCRL = config.useGCRL && models["goal_critic"] && models["anti_critic"] && models["car_critic"];
+	QuasimetricCritic *gc_goal = nullptr, *gc_anti = nullptr, *gc_car = nullptr;
+	if (trainGCRL) {
+		gc_goal = dynamic_cast<QuasimetricCritic*>(models["goal_critic"]);
+		gc_anti = dynamic_cast<QuasimetricCritic*>(models["anti_critic"]);
+		gc_car  = dynamic_cast<QuasimetricCritic*>(models["car_critic"]);
+	}
 
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
@@ -174,6 +205,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
 			auto batchAdvantages = batch.advantages;
+			auto batchActionComps = batch.actionComps;
+			auto batchFutureGoals = batch.futureGoals;
+			auto batchCarFutureGoals = batch.carFutureGoals;
 
 			auto fnRunMinibatch = [&](int start, int stop) {
 
@@ -188,13 +222,48 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
 
+				torch::Tensor actionComps, futureGoals, carFutureGoals;
+				if (trainGCRL) {
+					actionComps    = batchActionComps.slice(0, start, stop).to(device, true, true);
+					futureGoals    = batchFutureGoals.slice(0, start, stop).to(device, true, true);
+					carFutureGoals = batchCarFutureGoals.slice(0, start, stop).to(device, true, true);
+				}
+
+				// Shared encoder forward once; policy, value critic and GCRL critics read it
+				torch::Tensor features = obs;
+				if (models["shared_head"])
+					features = models["shared_head"]->Forward(obs, false);
+
+				// ── GCRL "game sense" advantage, blended onto the reward-driven advantage ──
+				// Both channels are unit-normalized so gcrlAdvScale is a meaningful weight.
+				if (trainGCRL) {
+					RG_NO_GRAD;
+					auto q_goal = gc_goal->score_q(features, actionComps, futureGoals);
+					auto q_anti = gc_anti->score_q(features, actionComps, futureGoals);
+					auto q_car  = gc_car->score_q(features, actionComps, carFutureGoals);
+
+					auto adv_goal = (q_goal - q_goal.mean()) / (q_goal.std() + 1e-8f);
+					auto adv_anti = (q_anti - q_anti.mean()) / (q_anti.std() + 1e-8f);
+					auto adv_car  = (q_car  - q_car.mean())  / (q_car.std()  + 1e-8f);
+
+					// goal pursuit, "anti" pessimism (double-critic), car positioning
+					auto adv_gcrl = adv_goal - config.gcrlAntiScale * adv_anti + config.gcrlCarScale * adv_car;
+					avgGcrlAdv += adv_gcrl.abs().mean().item<float>();
+
+					auto adv_rew = (advantages - advantages.mean()) / (advantages.std() + 1e-8f);
+					advantages = adv_rew + config.gcrlAdvScale * adv_gcrl;
+				}
+
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
-					// Get policy log probs and entropy
+					// Get policy log probs and entropy (from the shared features)
 					float curEntropy;
 					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
+						auto maskBool = actionMasks.to(torch::kBool);
+						auto logits = models["policy"]->Forward(features, false) / config.policyTemperature;
+						probs = torch::softmax(logits + (-1e10f) * maskBool.logical_not(), -1)
+							.view({ -1, models["policy"]->config.numOutputs }).clamp(1e-11f, 1);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						curEntropy = entropy.detach().cpu().item<float>();
@@ -237,7 +306,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 				torch::Tensor criticLoss;
 				if (trainCritic) {
-					auto vals = InferCritic(obs);
+					auto vals = models["critic"]->Forward(features, false).flatten();
 
 					// Compute value loss
 					vals = vals.view_as(targetValues);
@@ -259,15 +328,40 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 				}
 
-				if (trainPolicy && trainCritic) {
-					auto combinedLoss = ppoLoss + criticLoss;
-					combinedLoss.backward();
-				} else {
-					if (trainPolicy)
-						ppoLoss.backward();
-					if (trainCritic)
-						criticLoss.backward();
+				// ── InfoNCE contrastive training of the quasimetric critics ──
+				torch::Tensor infoNCELoss;
+				if (trainGCRL) {
+					int64_t B = features.size(0);
+					if (B > 0) {
+						int64_t info_n = RS_MIN(B, (int64_t)config.gcrlInfoSubSample);
+						auto perm = torch::randperm(B, torch::TensorOptions().device(device).dtype(torch::kLong));
+						auto idxs = perm.slice(0, 0, info_n);
+
+						auto sub_obs = features.index_select(0, idxs);
+						auto sub_actions = actionComps.index_select(0, idxs);
+						auto sub_goals = futureGoals.index_select(0, idxs);
+						auto sub_car_goals = carFutureGoals.index_select(0, idxs);
+
+						auto il_goal = gc_goal->infonce_loss(sub_obs, sub_actions, sub_goals);
+						auto il_anti = gc_anti->infonce_loss(sub_obs, sub_actions, sub_goals);
+						auto il_car  = gc_car->infonce_loss(sub_obs, sub_actions, sub_car_goals);
+						infoNCELoss = (il_goal + il_anti + il_car) * batchSizeRatio;
+						avgInfoNCELoss += infoNCELoss.detach().cpu().item<float>();
+					}
 				}
+
+				// ── Combine & backprop (single graph through the shared encoder) ──
+				torch::Tensor combinedLoss;
+				if (trainPolicy)
+					combinedLoss = ppoLoss;
+				if (trainCritic)
+					combinedLoss = combinedLoss.defined() ? (combinedLoss + criticLoss) : criticLoss;
+				if (infoNCELoss.defined()) {
+					auto scaled = config.gcrlInfoNCECoef * infoNCELoss;
+					combinedLoss = combinedLoss.defined() ? (combinedLoss + scaled) : scaled;
+				}
+				if (combinedLoss.defined())
+					combinedLoss.backward();
 			};
 
 			
@@ -290,6 +384,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			if (trainSharedHead)
 				nn::utils::clip_grad_norm_(models["shared_head"]->parameters(), 0.5f);
 
+			if (trainGCRL) {
+				nn::utils::clip_grad_norm_(gc_goal->parameters(), 0.5f);
+				nn::utils::clip_grad_norm_(gc_anti->parameters(), 0.5f);
+				nn::utils::clip_grad_norm_(gc_car->parameters(), 0.5f);
+			}
+
 			models.StepOptims();
 		}
 	}
@@ -310,6 +410,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Policy Loss"] = avgPolicyLoss.Get();
 		report["Policy Relative Entropy Loss"] = avgRelEntropyLoss.Get();
 		report["Critic Loss"] = avgCriticLoss.Get();
+
+		if (trainGCRL) {
+			report["InfoNCE Loss"] = avgInfoNCELoss.Get();
+			report["GCRL/Avg Advantage"] = avgGcrlAdv.Get();
+		}
 
 		if (config.useGuidingPolicy)
 			report["Guiding Loss"] = avgGuidingLoss.Get();
@@ -399,15 +504,23 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	if (models["shared_head"])
 		models["shared_head"]->SetOptimLR(RS_MIN(policyLR, criticLR));
 
+	// GCRL critics are representation learners; default to the policy LR unless gcrlLR is set
+	float gcrlLR = config.gcrlLR > 0 ? config.gcrlLR : policyLR;
+	if (models["goal_critic"]) models["goal_critic"]->SetOptimLR(gcrlLR);
+	if (models["anti_critic"]) models["anti_critic"]->SetOptimLR(gcrlLR);
+	if (models["car_critic"])  models["car_critic"]->SetOptimLR(gcrlLR);
+
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }
 
 GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 	ModelSet result = {};
 	for (Model* model : models) {
-		if (model->modelName == "critic")
+		std::string name = model->modelName;
+		// Exclude value and GCRL critics: only policy + shared head define a playable version
+		if (name == "critic" || name == "goal_critic" || name == "anti_critic" || name == "car_critic")
 			continue;
-		
+
 		result.Add(model);
 	}
 	return result;

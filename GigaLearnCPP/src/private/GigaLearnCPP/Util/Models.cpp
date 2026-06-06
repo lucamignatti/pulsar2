@@ -170,3 +170,163 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 torch::Tensor GGL::Model::CopyParams() const {
 	return torch::nn::utils::parameters_to_vector(parameters()).cpu();
 }
+
+// ── QuasimetricCritic (Python QCritic port) ─────────────────────────────────
+
+GGL::QuasimetricCritic::QuasimetricCritic(
+	const char* _modelName,
+	int obs_dim, int _action_dim, int goal_dim,
+	const std::vector<int>& hiddenSizes, int repr_dim,
+	ModelActivationType activation, bool addLayerNorm,
+	float _tau, float _var_reg, float _infonce_penalty,
+	ModelOptimType optimType,
+	torch::Device device) :
+	Model(), tau(_tau), var_reg(_var_reg), infonce_penalty(_infonce_penalty), action_dim(_action_dim) {
+
+	this->modelName = _modelName;
+	this->device = device;
+	// The base Model uses config.optimType in SetOptimLR()/StepOptim(); keep it in sync
+	// with the optimizer we actually build below (default-constructed config is ADAM).
+	this->config.optimType = optimType;
+
+	// phi and psi share the architecture; only the input dim differs. Output is repr_dim
+	// (no activation) and is L2-normalized at scoring time, which is what makes the cosine
+	// quasimetric valid -- so both towers must end at the same repr_dim.
+	auto buildTower = [&](int inDim) {
+		torch::nn::Sequential seq;
+		int last = inDim;
+		for (int h : hiddenSizes) {
+			seq->push_back(torch::nn::Linear(last, h));
+			if (addLayerNorm)
+				seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ (int64_t)h })));
+			AddActivationFunc(seq, activation);
+			last = h;
+		}
+		seq->push_back(torch::nn::Linear(last, repr_dim));
+		return seq;
+	};
+
+	phi_net = buildTower(obs_dim + _action_dim);
+	psi_net = buildTower(goal_dim);
+
+	register_module("phi_net", phi_net);
+	register_module("psi_net", psi_net);
+
+	this->to(device);
+	optim = MakeOptimizer(optimType, this->parameters(), 0);
+}
+
+std::pair<torch::Tensor, torch::Tensor> GGL::QuasimetricCritic::embed(
+	torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {
+
+	auto sa_input = torch::cat({obs, actions.to(torch::kFloat32).to(obs.device())}, -1);
+	auto sa_raw = phi_net->forward(sa_input);
+	auto g_raw = psi_net->forward(goals.to(torch::kFloat32));
+
+	auto sa_emb = torch::nn::functional::normalize(sa_raw,
+		torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+	auto g_emb = torch::nn::functional::normalize(g_raw,
+		torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+
+	return {sa_emb, g_emb};
+}
+
+torch::Tensor GGL::QuasimetricCritic::forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {
+	auto [sa_emb, g_emb] = embed(obs, actions, goals);
+	return (sa_emb * g_emb).sum(-1) / tau;
+}
+
+torch::Tensor GGL::QuasimetricCritic::score_q(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {
+	return forward(obs, actions, goals);
+}
+
+torch::Tensor GGL::QuasimetricCritic::infonce_loss(
+	torch::Tensor obs, torch::Tensor actions, torch::Tensor goals,
+	float tau_override,
+	torch::Tensor sampleWeights) {
+
+	float t = tau_override > 0 ? tau_override : tau;
+
+	auto [sa, g] = embed(obs, actions, goals);
+
+	int64_t B = sa.size(0);
+	auto dev = obs.device();
+
+	auto logits = torch::matmul(sa, g.transpose(0, 1)) / t;
+
+	auto arange = torch::arange(B, torch::TensorOptions().dtype(torch::kLong).device(dev));
+
+	if (sampleWeights.defined() && sampleWeights.size(0) == B) {
+		auto w = sampleWeights.to(dev);
+		auto wSum = w.sum();
+		if (wSum.item<float>() > 1e-8f) {
+			auto rowVals = -torch::log_softmax(logits, 1).index({arange, arange});
+			auto colVals = -torch::log_softmax(logits, 0).index({arange, arange});
+			auto loss_row = (rowVals * w).sum() / wSum;
+			auto loss_col = (colVals * w).sum() / wSum;
+			auto loss = loss_row + loss_col;
+
+			auto reg1 = infonce_penalty * (
+				torch::logsumexp(logits, 1, false).square().mean() +
+				torch::logsumexp(logits, 0, false).square().mean()
+			);
+			auto reg2 = var_reg * (1.0f / (sa.std(0).mean() + 1e-4f) +
+			                       1.0f / (g.std(0).mean() + 1e-4f));
+			return loss + reg1 + reg2;
+		}
+	}
+
+	auto loss_row = -torch::log_softmax(logits, 1).index({arange, arange}).mean();
+	auto loss_col = -torch::log_softmax(logits, 0).index({arange, arange}).mean();
+	auto loss = loss_row + loss_col;
+
+	auto reg1 = infonce_penalty * (
+		torch::logsumexp(logits, 1, false).square().mean() +
+		torch::logsumexp(logits, 0, false).square().mean()
+	);
+
+	auto reg2 = var_reg * (1.0f / (sa.std(0).mean() + 1e-4f) +
+	                       1.0f / (g.std(0).mean() + 1e-4f));
+
+	return loss + reg1 + reg2;
+}
+
+void GGL::QuasimetricCritic::Save(std::filesystem::path folder, bool saveOptim) {
+	auto path = GetSavePath(folder);
+	torch::serialize::OutputArchive archive;
+	this->save(archive);
+	archive.save_to(path.string());
+
+	if (saveOptim) {
+		torch::serialize::OutputArchive optimArchive;
+		optim->save(optimArchive);
+		optimArchive.save_to(GetOptimSavePath(folder).string());
+	}
+}
+
+void GGL::QuasimetricCritic::Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim) {
+	auto path = GetSavePath(folder);
+	if (!std::filesystem::exists(path)) {
+		if (allowNotExist) {
+			RG_LOG("Warning: QuasimetricCritic \"" << modelName << "\" not found in " << folder);
+			return;
+		}
+		RG_ERR_CLOSE("QuasimetricCritic \"" << modelName << "\" not found in " << folder);
+	}
+
+	torch::serialize::InputArchive archive;
+	archive.load_from(path.string(), device);
+	this->load(archive);
+
+	if (loadOptim) {
+		auto optimPath = GetOptimSavePath(folder);
+		if (std::filesystem::exists(optimPath)) {
+			std::ifstream test(optimPath, std::istream::ate | std::ios::binary);
+			if (test.tellg() > 0) {
+				torch::serialize::InputArchive optArch;
+				optArch.load_from(optimPath.string(), device);
+				optim->load(optArch);
+			}
+		}
+	}
+}
