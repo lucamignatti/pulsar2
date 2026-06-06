@@ -37,6 +37,11 @@ namespace GGL {
 		float criticLR = 3e-4f; // Critic learning rate
 
 		float entropyScale = 0.018f; // The scale of the normalized entropy loss
+		bool adaptiveEntropy = false; // Tune entropyScale online to hold policy entropy near targetEntropy
+		float targetEntropy = 0.75f; // Target normalized policy entropy in [0, 1]
+		float adaptiveEntropyLR = 1e-3f; // Step size for the entropyScale controller
+		float minEntropyScale = 0.0f; // Lower clamp for the adaptive entropy coefficient
+		float maxEntropyScale = 1.0f; // Upper clamp for the adaptive entropy coefficient
 		// Whether to ignore invalid actions in the entropy calculation.
 		// True means that entropy will be determined only from available actions.
 		// False means that entropy for unavailable actions will be zero, 

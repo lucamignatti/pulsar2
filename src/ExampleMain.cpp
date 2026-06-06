@@ -16,34 +16,58 @@ using namespace RLGC; // RLGymCPP
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
 
-    std::vector<WeightedReward> rewards = {
-        // Objective anchor
-        { new GoalReward(-0.85f), 150 },
-        { new TimePenalty(-0.1f), 1.0f },
+    // my custom rewards that kinda (ok more than kinda) suck
+    // std::vector<WeightedReward> rewards = {
+    //     // Objective anchor
+    //     { new GoalReward(-0.85f), 150 },
+    //     { new TimePenalty(-0.1f), 1.0f },
 
-        // Broad pressure / directionality, kept low for GCRL compatibility
-        { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.1f },
+    //     // Broad pressure / directionality, kept low for GCRL compatibility
+    //     { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.1f },
 
-        // General physical readiness, kept tiny to avoid energy farming
-        { new EnergyReward(), 0.02f },
+    //     // General physical readiness, kept tiny to avoid energy farming
+    //     { new EnergyReward(), 0.02f },
 
-        // Light mechanics / resource priors
-        { new StrongTouchReward(20, 100), 0.5f },
-        { new PickupBoostReward(), 1.0f },
-        { new SaveBoostReward(), 0.1f },
+    //     // Light mechanics / resource priors
+    //     { new StrongTouchReward(20, 100), 0.5f },
+    //     { new PickupBoostReward(), 1.0f },
+    //     { new SaveBoostReward(), 0.1f },
 
-        // Physical play, light
-        { new BumpReward(), 0.25f },
-        { new BumpedPenalty(), 0.25f },
-        { new DemoReward(), 1.0f },
-        { new DemoedPenalty(), 1.0f },
+    //     // Physical play, light
+    //     { new BumpReward(), 0.25f },
+    //     { new BumpedPenalty(), 0.25f },
+    //     { new DemoReward(), 1.0f },
+    //     { new DemoedPenalty(), 1.0f },
 
-        // Hard-to-discover mechanics/control, kept very light to avoid farming
-        { new AirTouchReward(500), 1.0f },
-        { new PossessionReward(), 0.05f },
-        { new FlipResetFollowupReward(500), 1.0f }
-    };
+    //     // Hard-to-discover mechanics/control, kept very light to avoid farming
+    //     { new AirTouchReward(500), 1.0f },
+    //     { new PossessionReward(), 0.05f },
+    //     { new FlipResetFollowupReward(500), 1.0f }
+    // };
 
+   	// These are ok rewards that will produce a scoring bot in ~100m steps
+	std::vector<WeightedReward> rewards = {
+
+		// Movement
+		{ new AirReward(), 0.25f },
+
+		// Player-ball
+		{ new FaceBallReward(), 0.25f },
+		{ new VelocityPlayerToBallReward(), 4.f },
+		{ new StrongTouchReward(20, 100), 60 },
+
+		// Ball-goal
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+
+		// Boost
+		{ new PickupBoostReward(), 10.f },
+		{ new SaveBoostReward(), 0.2f },
+
+		// Game events
+		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
+		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
+		{ new GoalReward(), 150 }
+	};
 
 
 
@@ -135,6 +159,11 @@ int main(int argc, char* argv[]) {
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
+	cfg.ppo.adaptiveEntropy = true;
+	cfg.ppo.targetEntropy = 0.70f;
+	cfg.ppo.adaptiveEntropyLR = 5e-3f;
+	cfg.ppo.minEntropyScale = 0.0f;
+	cfg.ppo.maxEntropyScale = 0.10f;
 
 	// Rate of reward decay
 	// Starting low tends to work out

@@ -18,6 +18,8 @@ namespace GGL {
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	class PPOLearner {
 	public:
+		float curEntropyScale;
+
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
 
@@ -69,6 +71,7 @@ namespace GGL {
 		void SaveTo(std::filesystem::path folderPath);
 		void LoadFrom(std::filesystem::path folderPath);
 		void SetLearningRates(float policyLR, float criticLR);
+		float GetEntropyScale() const;
 
 		ModelSet GetPolicyModels();
 	};

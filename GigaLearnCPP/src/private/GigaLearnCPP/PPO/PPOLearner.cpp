@@ -8,6 +8,7 @@
 using namespace torch;
 
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
+	curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
 
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
@@ -162,6 +163,10 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 	return entropy.mean();
 }
 
+float GGL::PPOLearner::GetEntropyScale() const {
+	return config.adaptiveEntropy ? curEntropyScale : config.entropyScale;
+}
+
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration) {
 	auto mseLoss = torch::nn::MSELoss();
 
@@ -277,6 +282,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 
 					logProbs = logProbs.view_as(oldProbs);
+					const float entropyScale = GetEntropyScale();
 
 					// Compute PPO loss
 					ratio = exp(logProbs - oldProbs);
@@ -292,9 +298,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
 					avgPolicyLoss += curPolicyLoss;
 
-					avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+					avgRelEntropyLoss += (curEntropy * entropyScale) / curPolicyLoss;
 
-					ppoLoss = (policyLoss - entropy * config.entropyScale) * batchSizeRatio;
+					ppoLoss = (policyLoss - entropy * entropyScale) * batchSizeRatio;
+
+					if (config.adaptiveEntropy) {
+						curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - curEntropy);
+						curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
+					}
 
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
@@ -409,6 +420,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	// Assemble and return report
 	report["Policy Entropy"] = avgEntropy.Get();
+	report["Entropy Scale"] = GetEntropyScale();
+	if (config.adaptiveEntropy)
+		report["Target Entropy"] = config.targetEntropy;
 	report["Mean KL Divergence"] = avgDivergence.Get();
 	if (!isFirstIteration) {
 		// These metrics give bad data on the first iteration, which will mess up graph scaling
