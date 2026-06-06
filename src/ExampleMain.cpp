@@ -15,29 +15,21 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	// These are ok rewards that will produce a scoring bot in ~100m steps
-	std::vector<WeightedReward> rewards = {
 
-		// Movement
-		{ new AirReward(), 0.25f },
+    std::vector<WeightedReward> rewards = {
+        // Objective anchor
+        { new GoalReward(), 150 },
 
-		// Player-ball
-		{ new FaceBallReward(), 0.25f },
-		{ new VelocityPlayerToBallReward(), 4.f },
-		{ new StrongTouchReward(20, 100), 60 },
+        // Broad pressure / directionality
+        { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 1.0f },
 
-		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
-
-		// Boost
-		{ new PickupBoostReward(), 10.f },
-		{ new SaveBoostReward(), 0.2f },
-
-		// Game events
-		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
-		{ new GoalReward(), 150 }
+        // Light mechanics / resource priors
+        { new StrongTouchReward(20, 100), 5 },
+        { new PickupBoostReward(), 1.0f },
+        { new SaveBoostReward(), 0.1f }
 	};
+
+
 
 	std::vector<TerminalCondition*> terminalConditions = {
 		new NoTouchCondition(10),
@@ -103,15 +95,15 @@ int main(int argc, char* argv[]) {
 
 	cfg.deviceType = LearnerDeviceType::GPU_MPS;
 
-	cfg.tickSkip = 8;
-	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
+	cfg.tickSkip = 4;
+	cfg.actionDelay = cfg.tickSkip - 2;
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
 	cfg.numGames = 256;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
-	cfg.randomSeed = 123;
+	cfg.randomSeed = 67;
 
 	int tsPerItr = 50'000;
 	cfg.ppo.tsPerItr = tsPerItr;
@@ -120,7 +112,7 @@ int main(int argc, char* argv[]) {
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
-	cfg.ppo.epochs = 1;
+	cfg.ppo.epochs = 2;
 
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
@@ -134,16 +126,16 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
 
-	cfg.ppo.sharedHead.layerSizes = { 256, 256 };
-	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
-	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
+	cfg.ppo.sharedHead.layerSizes = { 256, 512, 1024, 512 };
+	cfg.ppo.policy.layerSizes = { 1024, 1024, 512, 256 };
+	cfg.ppo.critic.layerSizes = { 1024, 2048, 2048, 512, 256 };
 
-	auto optim = ModelOptimType::ADAM;
+	auto optim = ModelOptimType::ADAMW;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
 
-	auto activation = ModelActivationType::RELU;
+	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
