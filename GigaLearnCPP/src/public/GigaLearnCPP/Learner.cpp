@@ -8,7 +8,11 @@
 #include <pybind11/embed.h>
 
 #ifdef RG_CUDA_SUPPORT
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+#include <c10/hip/HIPCachingAllocator.h>
+#else
 #include <c10/cuda/CUDACachingAllocator.h>
+#endif
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>

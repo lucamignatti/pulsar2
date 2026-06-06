@@ -27,7 +27,7 @@ target_include_directories(GigaLearnCPP PRIVATE "src/private")
 # Include libtorch
 target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
-if (TORCH_CUDA_LIBRARIES)
+if (NOT APPLE)
 	message("Enabling CUDA support...")
 	target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
 endif()

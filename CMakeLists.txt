@@ -2,6 +2,9 @@ cmake_minimum_required (VERSION 3.8)
 
 project("GigaLearnBot")
 
+# Enable -fPIC for all targets (required because we mix static and shared libraries)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp")
 add_executable(GigaLearnBot ${FILES_SRC})
 
