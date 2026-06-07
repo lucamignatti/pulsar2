@@ -1124,6 +1124,7 @@ void GGL::Learner::Start() {
 
 		while (true) {
 			bool isFirstIteration = (totalTimesteps == 0);
+			Timer iterationTimer = {};
 
 			// ── Get a batch ───────────────────────────────────────────────────────
 			CollectedBatch batch;
@@ -1386,7 +1387,7 @@ void GGL::Learner::Start() {
 				report["Consumption Time"] = consumptionTime;
 				report["Collection Steps/Second"] = stepsCollected / batch.collectionTime;
 				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
-				report["Overall Steps/Second"] = stepsCollected / (batch.collectionTime + consumptionTime);
+				report["Overall Steps/Second"] = stepsCollected / iterationTimer.Elapsed();
 
 				uint64_t prevTimesteps = totalTimesteps;
 				totalTimesteps += stepsCollected;
