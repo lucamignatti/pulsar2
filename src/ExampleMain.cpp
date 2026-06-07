@@ -238,7 +238,7 @@ int main(int argc, char* argv[]) {
 	cfg.evolutionStrategy.weightDecay = 0.005f;
 	cfg.evolutionStrategy.gameSimTime = 60.0f;     // sim-seconds per full game (longer = better scoring signal, slower)
 	cfg.evolutionStrategy.maxSimTime = 90.0f;      // hard cap per game
-	cfg.evolutionStrategy.updateInterval = 300;    // run ES every N training iters; main dial for ES wall-time cost (watch ES/StepTime)
+	cfg.evolutionStrategy.updateInterval = 25;    // run ES every N training iters; main dial for ES wall-time cost (watch ES/StepTime)
 	cfg.evolutionStrategy.antithetic = true;       // evaluate +/- pairs (variance reduction)
 	cfg.evolutionStrategy.rankNormalize = true;    // centered-rank fitness shaping
 	// cfg.evolutionStrategy.scope = EvolutionStrategyConfig::Scope::POLICY_ONLY; // default; only perturb the policy head
