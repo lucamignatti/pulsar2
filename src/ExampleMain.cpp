@@ -94,7 +94,6 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new SecondTouchReward(), 12.0f },
 		{ new FlipResetFollowupReward(), 8.0f },
 		{ new UsefulFlickReward(), 8.0f },
-		{ new BallPredInterceptReward(), 2.0f },
 		{ new VelocityPlayerToBallReward(), 6.f },
 		{ new StrongTouchReward(20, 100), 90.f }
 	};
@@ -332,8 +331,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
