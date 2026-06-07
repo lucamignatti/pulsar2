@@ -1,7 +1,11 @@
 #pragma once
 #include "Reward.h"
 #include "../Math.h"
+#include "../../../RocketSim/src/Sim/BallPredTracker/BallPredTracker.h"
 #include <unordered_map>
+#include <memory>
+#include <cfloat>
+#include <cmath>
 
 namespace RLGC {
 
@@ -310,6 +314,79 @@ namespace RLGC {
 		}
 	};
 
+	class AerialApproachReward : public Reward {
+	public:
+		float minBallHeight;
+
+		AerialApproachReward(float minBallHeight = 500) : minBallHeight(minBallHeight) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (state.ball.pos.z < minBallHeight || player.isOnGround)
+				return 0;
+
+			Vec dirToBall = (state.ball.pos - player.pos).Normalized();
+			return RS_CLAMP(player.vel.Dot(dirToBall) / CommonValues::CAR_MAX_SPEED, 0, 1);
+		}
+	};
+
+	class BallPredInterceptReward : public Reward {
+	public:
+		float minBallHeight, maxPredTime, predTimeStep, reachSpeed, reachSlack;
+		std::unique_ptr<RocketSim::BallPredTracker> ballPredTracker;
+		Arena* ballPredArena = nullptr;
+
+		BallPredInterceptReward(
+			float minBallHeight = 500,
+			float maxPredTime = 2.0f,
+			float predTimeStep = 0.25f,
+			float reachSpeed = 1500.0f,
+			float reachSlack = 250.0f
+		) : minBallHeight(minBallHeight), maxPredTime(maxPredTime), predTimeStep(predTimeStep), reachSpeed(reachSpeed), reachSlack(reachSlack) {}
+
+		virtual void Reset(const GameState& initialState) override {
+			ballPredTracker.reset();
+			ballPredArena = nullptr;
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.lastArena || state.ball.pos.z < minBallHeight)
+				return 0;
+
+			if (!ballPredTracker || ballPredArena != state.lastArena) {
+				ballPredArena = state.lastArena;
+				ballPredTracker = std::make_unique<RocketSim::BallPredTracker>(state.lastArena, 256);
+			} else {
+				ballPredTracker->UpdatePredFromArena(state.lastArena);
+			}
+
+			Vec target = state.ball.pos;
+			bool foundReachable = false;
+			float bestScore = -FLT_MAX;
+
+			for (float t = predTimeStep; t <= maxPredTime + 0.001f; t += predTimeStep) {
+				BallState predBall = ballPredTracker->GetBallStateForTime(t);
+				float dist = player.pos.Dist(predBall.pos);
+				float reachableDist = reachSpeed * t + reachSlack;
+				float score = reachableDist - dist;
+
+				if (score >= 0) {
+					target = predBall.pos;
+					foundReachable = true;
+					break;
+				}
+
+				if (score > bestScore) {
+					bestScore = score;
+					target = predBall.pos;
+				}
+			}
+
+			Vec dirToTarget = (target - player.pos).Normalized();
+			float approach = RS_CLAMP(player.vel.Dot(dirToTarget) / CommonValues::CAR_MAX_SPEED, 0, 1);
+			return foundReachable ? approach : approach * 0.5f;
+		}
+	};
+
 	class KickoffTouchReward : public Reward {
 	public:
 		float maxTouchTime;
@@ -372,6 +449,39 @@ namespace RLGC {
 			} else {
 				return 0;
 			}
+		}
+	};
+
+	class ShotOnFrameReward : public Reward {
+	public:
+		float maxPredTime, maxRewardedBallSpeed;
+
+		ShotOnFrameReward(float maxPredTime = 2.0f, float maxRewardedBallSpeed = RLGC::Math::KPHToVel(120))
+			: maxPredTime(maxPredTime), maxRewardedBallSpeed(maxRewardedBallSpeed) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.ballTouchedStep)
+				return 0;
+
+			float targetY = player.team == Team::BLUE ? CommonValues::BACK_WALL_Y : -CommonValues::BACK_WALL_Y;
+			float velY = state.ball.vel.y;
+			float yDelta = targetY - state.ball.pos.y;
+			if (velY * yDelta <= 0)
+				return 0;
+
+			float t = yDelta / velY;
+			if (t <= 0 || t > maxPredTime)
+				return 0;
+
+			Vec targetPos = state.ball.pos + state.ball.vel * t;
+			if (fabsf(targetPos.x) > CommonValues::GOAL_WIDTH_FROM_CENTER || targetPos.z > CommonValues::GOAL_HEIGHT || targetPos.z < 0)
+				return 0;
+
+			Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+			Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+			float alignment = RS_CLAMP(state.ball.vel.Normalized().Dot(ballDirToGoal), 0, 1);
+			float speedFrac = RS_CLAMP(state.ball.vel.Length() / maxRewardedBallSpeed, 0, 1);
+			return alignment * speedFrac;
 		}
 	};
 

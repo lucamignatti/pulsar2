@@ -34,3 +34,19 @@ PhysState RLGC::MirrorPhysX(const PhysState& physState, bool shouldMirror) {
 
 	return result;
 }
+
+RLGC::Action RLGC::MirrorActionX(const Action& action, bool shouldMirror) {
+	Action result = action;
+	if (shouldMirror) {
+		result.steer *= -1;
+		result.yaw *= -1;
+		result.roll *= -1;
+	}
+	return result;
+}
+
+bool RLGC::ShouldMirrorXForPlayer(const Player& player) {
+	bool inv = player.team == Team::ORANGE;
+	PhysState playerPhys = InvertPhys(player, inv);
+	return playerPhys.pos.x > 0;
+}

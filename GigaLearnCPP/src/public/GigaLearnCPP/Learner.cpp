@@ -927,11 +927,16 @@ void GGL::Learner::Start() {
 
 						// Decode flat action indices -> 8-dim continuous components for auxiliary critics/reward models.
 						if (useActionComps) {
-							auto* actionParser = envSet->actionParsers[0];
-							for (int p = 0; p < (int)curActions.size(); p++) {
-								Action act = actionParser->ParseAction(curActions[p], envSet->state.gameStates[0].players[0], envSet->state.gameStates[0]);
-								for (int d = 0; d < 8; d++)
-									_curActionComps[p * 8 + d] = act[d];
+							for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
+								auto* actionParser = envSet->actionParsers[arenaIdx];
+								auto& gs = envSet->state.gameStates[arenaIdx];
+								int playerStartIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
+								for (int playerIdx = 0; playerIdx < (int)gs.players.size(); playerIdx++) {
+									int flatIdx = playerStartIdx + playerIdx;
+									Action act = actionParser->ParseAction(curActions[flatIdx], gs.players[playerIdx], gs);
+									for (int d = 0; d < 8; d++)
+										_curActionComps[flatIdx * 8 + d] = act[d];
+								}
 							}
 						}
 						FList newLogProbs;

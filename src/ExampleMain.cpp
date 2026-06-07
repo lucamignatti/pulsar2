@@ -27,6 +27,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Game events
 		{ new ShotReward(), 15.f },
+		{ new ShotOnFrameReward(), 35.f },
 		{ new SaveReward(), 20.f },
 		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
 		{ new GoalReward(), 275 },
@@ -38,7 +39,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
 		// Movement / player-ball rewards are filtered by GCRL terminal progress.
-		{ new AirReward(), 0.35f },
+		{ new AirReward(), 0.08f },
+		{ new AerialApproachReward(), 3.0f },
+		{ new AirTouchReward(500, CommonValues::CEILING_Z, true), 20.0f },
+		{ new BallPredInterceptReward(), 2.0f },
 		{ new VelocityPlayerToBallReward(), 6.f },
 		{ new StrongTouchReward(20, 100), 90.f }
 	};
@@ -60,7 +64,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
-	result.obsBuilder = new AdvancedObs();
+	result.obsBuilder = new AdvancedObs(3, true, true);
 	result.stateSetter = new KickoffState();
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
@@ -120,6 +124,11 @@ int main(int argc, char* argv[]) {
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 67;
+	cfg.savePolicyVersions = true;
+	cfg.trainAgainstOldVersions = true;
+	cfg.trainAgainstOldChance = 0.25f;
+	cfg.tsPerVersion = 25'000'000;
+	cfg.maxOldVersions = 32;
 
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
@@ -230,7 +239,7 @@ int main(int argc, char* argv[]) {
 	// current policy, and nudges the live weights toward what actually wins (goal differential,
 	// reward breaks ties). A gradient-free booster that helps PPO escape local minima.
 	// Like the skill tracker, it only runs when renderMode = false.
-	cfg.evolutionStrategy.enabled = true;
+	cfg.evolutionStrategy.enabled = false;
 	cfg.evolutionStrategy.populationSize = 8192;   // members per ES step (split into populationSize/numGames full-game rollouts)
 	cfg.evolutionStrategy.lowRankRank = 4;         // EGGROLL low-rank perturbation rank
 	cfg.evolutionStrategy.sigma = 0.02f;           // perturbation scale (exploration radius in weight space)

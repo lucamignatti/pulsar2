@@ -1,5 +1,6 @@
 #pragma once
 #include "ActionParser.h"
+#include "../Gamestates/StateUtil.h"
 
 namespace RLGC {
 
@@ -13,7 +14,7 @@ namespace RLGC {
 		DefaultAction();
 
 		virtual Action ParseAction(int index, const Player& player, const GameState& state) override {
-			return actions[index];
+			return MirrorActionX(actions[index], ShouldMirrorXForPlayer(player));
 		}
 
 		virtual int GetActionAmount() override {
