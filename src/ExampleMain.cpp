@@ -119,7 +119,7 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 2;
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 512;
+	cfg.numGames = 2048;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
