@@ -55,7 +55,7 @@ namespace GGL {
 		// If models is null, this->models will be used
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
-		torch::Tensor InferGCRLRewardGate(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets);
+		torch::Tensor InferGCRLTerminalScores(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets);
 		torch::Tensor InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps);
 		void AddSORSWindows(std::vector<SORSWindow>&& windows);
 		void TrainSORS(Report& report);

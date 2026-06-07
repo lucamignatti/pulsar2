@@ -168,7 +168,7 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
 }
 
-torch::Tensor GGL::PPOLearner::InferGCRLRewardGate(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets) {
+torch::Tensor GGL::PPOLearner::InferGCRLTerminalScores(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets) {
 	if (!config.useGCRLRewardGate || !config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
 		return {};
 
@@ -181,16 +181,9 @@ torch::Tensor GGL::PPOLearner::InferGCRLRewardGate(torch::Tensor obs, torch::Ten
 	auto* gcAnti = dynamic_cast<QuasimetricCritic*>(models["anti_critic"]);
 	RG_ASSERT(gcGoal && gcAnti);
 
-	auto qGoal = gcGoal->score_q(obs, actionComps, goalTargets);
-	auto qAnti = gcAnti->score_q(obs, actionComps, antiTargets);
-
-	auto normGoal = (qGoal - qGoal.mean()) / (qGoal.std(false) + 1e-8f);
-	auto normAnti = (qAnti - qAnti.mean()) / (qAnti.std(false) + 1e-8f);
-	auto terminalAdv = normGoal - config.gcrlRewardGateAntiScale * normAnti;
-
-	float minGate = std::clamp(config.gcrlRewardGateMin, 0.0f, 1.0f);
-	auto rawGate = torch::sigmoid(config.gcrlRewardGateSharpness * terminalAdv);
-	return minGate + (1.0f - minGate) * rawGate;
+	auto qGoal = gcGoal->score_q(obs, actionComps, goalTargets).flatten();
+	auto qAnti = gcAnti->score_q(obs, actionComps, antiTargets).flatten();
+	return torch::stack({ qGoal, qAnti }, 1);
 }
 
 torch::Tensor GGL::PPOLearner::InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps) {

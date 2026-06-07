@@ -19,18 +19,20 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> rewards = {
 
 		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 5.0f },
 
 		// Boost
 		{ new PickupBoostReward(), 10.f },
 		{ new SaveBoostReward(), 0.2f },
 
 		// Game events
+		{ new ShotReward(), 15.f },
+		{ new SaveReward(), 20.f },
 		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
 		{ new GoalReward(), 275 },
 
 		// time penalty
-		{ new TimePenalty(0.075f), 1.0f }
+		{ new TimePenalty(-0.075f), 1.0f }
 	};
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
@@ -178,6 +180,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
+	cfg.ppo.gcrlRewardGateLookahead = 15;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;
@@ -247,8 +250,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

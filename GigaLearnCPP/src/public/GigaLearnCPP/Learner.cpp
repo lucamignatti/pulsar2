@@ -63,7 +63,7 @@ namespace {
 		return targets;
 	}
 
-	torch::Tensor InferGCRLRewardGateBatched(
+	torch::Tensor InferGCRLTerminalScoresBatched(
 		GGL::PPOLearner* ppo,
 		torch::Tensor states,
 		torch::Tensor actionComps,
@@ -72,7 +72,7 @@ namespace {
 		int length
 	) {
 		if (ppo->device.is_cpu()) {
-			return ppo->InferGCRLRewardGate(
+			return ppo->InferGCRLTerminalScores(
 				states.to(ppo->device, true, true),
 				actionComps.to(ppo->device, true, true),
 				goalTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, true, true),
@@ -82,20 +82,20 @@ namespace {
 
 		torch::Tensor goalTargetDev = goalTargetRow.to(ppo->device, true, true);
 		torch::Tensor antiTargetDev = antiTargetRow.to(ppo->device, true, true);
-		torch::Tensor fullGate = torch::zeros({ (int64_t)length });
+		torch::Tensor terminalScores = torch::zeros({ (int64_t)length, 2 });
 		for (int i = 0; i < length; i += ppo->config.miniBatchSize) {
 			int start = i;
 			int end = RS_MIN(i + ppo->config.miniBatchSize, length);
 			int batchSize = end - start;
-			auto gatePart = ppo->InferGCRLRewardGate(
+			auto scorePart = ppo->InferGCRLTerminalScores(
 				states.slice(0, start, end).to(ppo->device, true, true),
 				actionComps.slice(0, start, end).to(ppo->device, true, true),
 				goalTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM }),
 				antiTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM })
 			).cpu();
-			fullGate.slice(0, start, end).copy_(gatePart, true);
+			terminalScores.slice(0, start, end).copy_(scorePart, true);
 		}
-		return fullGate;
+		return terminalScores;
 	}
 }
 
@@ -1122,7 +1122,7 @@ void GGL::Learner::Start() {
 						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
 						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat);
 						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
-						torch::Tensor tFullGate = InferGCRLRewardGateBatched(
+						torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
 							ppo,
 							tStates,
 							tActionComps,
@@ -1131,8 +1131,30 @@ void GGL::Learner::Start() {
 							combinedTraj.Length()
 						);
 
-						if (tFullGate.defined()) {
+						if (tTerminalScores.defined()) {
+							torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
+							torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
+							torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
+							torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
+							torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
+
+							int trajLength = combinedTraj.Length();
+							int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+							std::vector<int64_t> futureIdxs(trajLength);
+							for (int epStart = 0; epStart < trajLength;) {
+								int epEnd = epStart;
+								while (epEnd < trajLength - 1 && combinedTraj.terminals[epEnd] == 0)
+									epEnd++;
+								for (int i = epStart; i <= epEnd; i++)
+									futureIdxs[i] = RS_MIN(i + lookahead, epEnd);
+								epStart = epEnd + 1;
+							}
+
+							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
+							torch::Tensor tNormGateDelta = (tGateDelta - tGateDelta.mean()) / (tGateDelta.std(false) + 1e-8f);
 							float minGate = RS_CLAMP(config.ppo.gcrlRewardGateMin, 0.0f, 1.0f);
+							torch::Tensor tFullGate = minGate + (1.0f - minGate) * torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
 							tFullGate = tFullGate.clamp(minGate, 1.0f);
 							torch::Tensor tEffectiveGate = 1.0f + (tFullGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
 							// Preserve negative shaping penalties; only discount positive farmable rewards.
@@ -1141,6 +1163,8 @@ void GGL::Learner::Start() {
 
 							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
 							report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
+							report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
+							report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
 							report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
 							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
 							report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
@@ -1325,6 +1349,7 @@ void GGL::Learner::Start() {
 						"GCRL/Adv Scale",
 						"GCRL Gate/Influence",
 						"GCRL Gate/Mean",
+						"GCRL Gate/Delta Mean",
 						"GCRL Gate/Gated Reward Raw",
 						"GCRL Gate/Gated Reward Applied",
 						"SORS/Reward Scale",

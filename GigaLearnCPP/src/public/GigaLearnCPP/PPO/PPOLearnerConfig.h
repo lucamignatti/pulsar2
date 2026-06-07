@@ -283,6 +283,7 @@ namespace GGL {
 		float gcrlRewardGateSharpness = 1.0f; // Sigmoid sharpness for terminal progress
 		float gcrlRewardGateAntiScale = 0.85f; // Own-goal danger penalty inside gate progress
 		float gcrlRewardGateTargetVel = 1200.0f; // Terminal goal target ball velocity in uu/s
+		int gcrlRewardGateLookahead = 15; // Steps to measure terminal-progress delta (~0.5s at tickSkip 4)
 		// Hidden architecture of the phi/psi towers (output is always gcrlReprDim). Configured
 		// like policy/critic: layerSizes / activationType / addLayerNorm / optimType.
 		PartialModelConfig gcrlCritic;
