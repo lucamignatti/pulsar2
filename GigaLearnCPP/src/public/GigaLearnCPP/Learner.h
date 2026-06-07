@@ -19,6 +19,7 @@ namespace GGL {
 
 		class PPOLearner* ppo;
 		class PolicyVersionManager* versionMgr;
+		class EvolutionStrategy* esManager;
 
 		RLGC::EnvCreateFn envCreateFn;
 		MetricSender* metricSender;

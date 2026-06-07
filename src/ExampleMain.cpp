@@ -225,6 +225,23 @@ int main(int argc, char* argv[]) {
     cfg.skillTracker.deterministic = true;  // optional: rate greedy policy instead of sampled policy
 
 
+	// ── Evolution Strategies (EGGROLL) ──
+	// Periodically perturbs a large population of policy variants, plays full games against the
+	// current policy, and nudges the live weights toward what actually wins (goal differential,
+	// reward breaks ties). A gradient-free booster that helps PPO escape local minima.
+	// Like the skill tracker, it only runs when renderMode = false.
+	cfg.evolutionStrategy.enabled = true;
+	cfg.evolutionStrategy.populationSize = 8192;   // members per ES step (split into populationSize/numGames full-game rollouts)
+	cfg.evolutionStrategy.lowRankRank = 4;         // EGGROLL low-rank perturbation rank
+	cfg.evolutionStrategy.sigma = 0.02f;           // perturbation scale (exploration radius in weight space)
+	cfg.evolutionStrategy.learningRate = 0.01f;    // ES step size; watch ES/UpdateNorm, raise if too gentle
+	cfg.evolutionStrategy.weightDecay = 0.005f;
+	cfg.evolutionStrategy.gameSimTime = 60.0f;     // sim-seconds per full game (longer = better scoring signal, slower)
+	cfg.evolutionStrategy.maxSimTime = 90.0f;      // hard cap per game
+	cfg.evolutionStrategy.updateInterval = 300;    // run ES every N training iters; main dial for ES wall-time cost (watch ES/StepTime)
+	cfg.evolutionStrategy.antithetic = true;       // evaluate +/- pairs (variance reduction)
+	cfg.evolutionStrategy.rankNormalize = true;    // centered-rank fitness shaping
+	// cfg.evolutionStrategy.scope = EvolutionStrategyConfig::Scope::POLICY_ONLY; // default; only perturb the policy head
 
 
 	auto optim = ModelOptimType::MUON;

@@ -19,6 +19,7 @@
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
+#include <private/GigaLearnCPP/EvolutionStrategy.h>
 
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
@@ -234,6 +235,14 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		);
 	} else {
 		versionMgr = NULL;
+	}
+
+	if (config.evolutionStrategy.enabled && !config.renderMode) {
+		esManager = new EvolutionStrategy(
+			config.evolutionStrategy, envSet->config,
+			obsStat, config.minObsSTD, config.maxObsMeanRange);
+	} else {
+		esManager = NULL;
 	}
 
 	if (!config.checkpointFolder.empty())
@@ -870,21 +879,10 @@ void GGL::Learner::Start() {
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
 							}
 
-							// Precompute per-dim float scale/offset once (not per player).
-							// Turns inner-loop division into multiplication and avoids double→float
-							// conversion inside the hot path.
-							const auto& meanVec = obsStat->GetMean();
-							auto stdVec = obsStat->GetSTD();
-							for (int j = 0; j < obsSize; j++) {
-								_normOffset[j] = RS_CLAMP((float)meanVec[j], -config.maxObsMeanRange, config.maxObsMeanRange);
-								_normInvStd[j] = 1.0f / RS_MAX((float)stdVec[j], config.minObsSTD);
-							}
-							float* obsPtr = envSet->state.obs.data.data();
-							for (int i = 0; i < envSet->state.numPlayers; i++) {
-								float* row = obsPtr + i * obsSize;
-								for (int j = 0; j < obsSize; j++)
-									row[j] = (row[j] - _normOffset[j]) * _normInvStd[j];
-							}
+							// Precompute per-dim float scale/offset once (not per player), then apply.
+							// Shared with the ES rollouts via ComputeObsNorm/ApplyObsNorm.
+							ComputeObsNorm(obsStat, config.minObsSTD, config.maxObsMeanRange, _normOffset, _normInvStd);
+							ApplyObsNorm(envSet->state.obs.data.data(), envSet->state.numPlayers, obsSize, _normOffset, _normInvStd);
 						}
 
 						torch::Tensor tActions, tLogProbs;
@@ -1306,6 +1304,9 @@ void GGL::Learner::Start() {
 				if (versionMgr)
 					versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 
+				if (esManager)
+					esManager->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
+
 				if (saveQueued) {
 					if (!config.checkpointFolder.empty())
 						Save();
@@ -1378,6 +1379,7 @@ void GGL::Learner::Start() {
 GGL::Learner::~Learner() {
 	delete ppo;
 	delete versionMgr;
+	delete esManager;
 	delete metricSender;
 	delete renderSender;
 	pybind11::finalize_interpreter();

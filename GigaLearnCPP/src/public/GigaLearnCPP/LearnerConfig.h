@@ -2,6 +2,7 @@
 #include <RLGymCPP/BasicTypes/Lists.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
+#include "EvolutionStrategyConfig.h"
 
 namespace GGL {
 	enum class LearnerDeviceType {
@@ -69,5 +70,7 @@ namespace GGL {
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
 		SkillTrackerConfig skillTracker = {};
+
+		EvolutionStrategyConfig evolutionStrategy = {};
 	};
 }
