@@ -19,21 +19,19 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> rewards = {
 
 		// Movement
-		{ new AirReward(), 0.02f },
+		{ new AirReward(), 0.25f },
 
 		// Player-ball
-		{ new FaceBallReward(), 0.05f },
-		{ new VelocityPlayerToBallReward(), 0.5f },
+		{ new FaceBallReward(), 0.25f },
+		{ new VelocityPlayerToBallReward(), 4.f },
+		{ new StrongTouchReward(20, 100), 60 },
 
 		// Ball-goal
 		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
 
-		// Scoring bootstrap
-		{ new TouchBallReward(), 1.0f },
-		{ new StrongTouchReward(20, 100), 5.0f },
-
 		// Boost
-		{ new SaveBoostReward(), 0.05f },
+		{ new PickupBoostReward(), 10.f },
+		{ new SaveBoostReward(), 0.2f },
 
 		// Game events
 		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
@@ -154,7 +152,9 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	cfg.ppo.gcrlAdvScale = 1.0f;    // GCRL advantage weight (1.0 == equal to the reward advantage)
+	cfg.ppo.gcrlAdvScale = 0.65f;   // Target GCRL advantage weight after annealing
+	cfg.ppo.gcrlAdvScaleAnnealStart = -1; // Start ramping from the current checkpoint/load point
+	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlAntiScale = 0.85f;   // pessimistic "anti" critic weight in the GCRL advantage
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
 	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
@@ -167,8 +167,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 
-	cfg.ppo.useSORS = true;
-	cfg.ppo.sorsRewardScale = 0.25f;
+	cfg.ppo.useSORS = false; // DISABLED
+	cfg.ppo.sorsRewardScale = 0.10f;
+	cfg.ppo.sorsRewardScaleAnnealStart = -1; // Train SORS immediately, but delay reward influence
+	cfg.ppo.sorsRewardScaleAnnealSteps = 100'000'000;
 	cfg.ppo.sorsRewardClipRange = 1.0f;
 	cfg.ppo.sorsWarmupIters = 8;
 	cfg.ppo.sorsTrainPairs = 4096;

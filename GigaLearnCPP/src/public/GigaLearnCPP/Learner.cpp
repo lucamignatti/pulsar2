@@ -194,6 +194,10 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	json j = {};
 	j["total_timesteps"] = totalTimesteps;
 	j["total_iterations"] = totalIterations;
+	if (gcrlAdvScaleAnnealStartTS != UINT64_MAX)
+		j["gcrl_adv_scale_anneal_start_ts"] = gcrlAdvScaleAnnealStartTS;
+	if (sorsRewardScaleAnnealStartTS != UINT64_MAX)
+		j["sors_reward_scale_anneal_start_ts"] = sorsRewardScaleAnnealStartTS;
 
 	if (config.sendMetrics)
 		j["run_id"] = metricSender->curRunID;
@@ -223,6 +227,10 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	json j = json::parse(fIn);
 	totalTimesteps = j["total_timesteps"];
 	totalIterations = j["total_iterations"];
+	if (j.contains("gcrl_adv_scale_anneal_start_ts"))
+		gcrlAdvScaleAnnealStartTS = j["gcrl_adv_scale_anneal_start_ts"];
+	if (j.contains("sors_reward_scale_anneal_start_ts"))
+		sorsRewardScaleAnnealStartTS = j["sors_reward_scale_anneal_start_ts"];
 
 	if (j.contains("run_id"))
 		runID = j["run_id"];
@@ -637,6 +645,35 @@ void GGL::Learner::Start() {
 
 			bool isFirstIteration = (totalTimesteps == 0);
 
+			auto fnGetAnnealedScale = [&](float targetScale, int64_t configStart, int64_t annealSteps, uint64_t& startTS) {
+				if (annealSteps <= 0)
+					return targetScale;
+
+				if (startTS == UINT64_MAX)
+					startTS = configStart >= 0 ? (uint64_t)configStart : totalTimesteps;
+
+				if (totalTimesteps <= startTS)
+					return 0.0f;
+
+				float progress = (float)((double)(totalTimesteps - startTS) / (double)annealSteps);
+				return targetScale * RS_CLAMP(progress, 0.0f, 1.0f);
+			};
+
+			ppo->curGCRLAdvScale = fnGetAnnealedScale(
+				config.ppo.gcrlAdvScale,
+				config.ppo.gcrlAdvScaleAnnealStart,
+				config.ppo.gcrlAdvScaleAnnealSteps,
+				gcrlAdvScaleAnnealStartTS
+			);
+			ppo->curSORSRewardScale = fnGetAnnealedScale(
+				config.ppo.sorsRewardScale,
+				config.ppo.sorsRewardScaleAnnealStart,
+				config.ppo.sorsRewardScaleAnnealSteps,
+				sorsRewardScaleAnnealStartTS
+			);
+			report["GCRL/Adv Scale"] = ppo->curGCRLAdvScale;
+			report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
+
 			// TODO: Old version switching messes up the gameplay potentially
 			GGL::PolicyVersion* oldVersion = NULL;
 			std::vector<bool> oldVersionPlayerMask;
@@ -1000,7 +1037,7 @@ void GGL::Learner::Start() {
 							tSORSRewards = tSORSRewards.clamp(-config.ppo.sorsRewardClipRange, config.ppo.sorsRewardClipRange);
 							report["SORS/Avg Reward"] = tSORSRewards.mean().item<float>();
 							report["SORS/Avg Abs Reward"] = tSORSRewards.abs().mean().item<float>();
-							tRewards = tRewards + tSORSRewards * config.ppo.sorsRewardScale;
+							tRewards = tRewards + tSORSRewards * ppo->curSORSRewardScale;
 						}
 					}
 
@@ -1152,6 +1189,8 @@ void GGL::Learner::Start() {
 						"-GAE Time",
 						"-PPO Learn Time",
 						"",
+						"GCRL/Adv Scale",
+						"SORS/Reward Scale",
 						"SORS/Loss",
 						"SORS/Pair Accuracy",
 						"SORS/Replay Windows",

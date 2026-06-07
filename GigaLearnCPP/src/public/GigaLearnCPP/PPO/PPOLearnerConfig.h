@@ -259,6 +259,8 @@ namespace GGL {
 		// dense rewards (via GAE) teach mechanics.
 		bool useGCRL = true;
 		float gcrlAdvScale = 1.0f;   // Blend weight: adv = norm(GAE_adv) + gcrlAdvScale * GCRL_adv
+		int64_t gcrlAdvScaleAnnealStart = 0; // Timesteps to start policy influence ramp; -1 -> current checkpoint
+		int64_t gcrlAdvScaleAnnealSteps = 0; // Timesteps to ramp from 0 to gcrlAdvScale; 0 disables
 		float gcrlAntiScale = 0.85f; // Weight of the pessimistic "anti" critic in the GCRL advantage
 		float gcrlCarScale = 0.5f;   // Weight of the car-positioning critic in the GCRL advantage
 		float gcrlTau = 0.02f;       // Embedding temperature (sharp contrast)
@@ -283,6 +285,8 @@ namespace GGL {
 		// added to collected rewards before GAE.
 		bool useSORS = false;
 		float sorsRewardScale = 0.25f;
+		int64_t sorsRewardScaleAnnealStart = 0; // Timesteps to start reward influence ramp; -1 -> current checkpoint
+		int64_t sorsRewardScaleAnnealSteps = 0; // Timesteps to ramp from 0 to sorsRewardScale; 0 disables
 		float sorsRewardClipRange = 1.0f;
 		float sorsLR = 0; // SORS reward learning rate; 0 -> use policyLR
 		int sorsWarmupIters = 8;

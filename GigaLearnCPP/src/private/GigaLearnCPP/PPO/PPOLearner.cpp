@@ -19,6 +19,8 @@ namespace {
 
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
 	curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
+	curGCRLAdvScale = config.gcrlAdvScale;
+	curSORSRewardScale = config.sorsRewardScale;
 
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
@@ -398,7 +400,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					auto adv_rew = (advantages - advantages.mean()) / (advantages.std() + 1e-8f);
 					avgGcrlRewardAdv += adv_rew.abs().mean().item<float>();
-					advantages = adv_rew + config.gcrlAdvScale * adv_gcrl;
+					advantages = adv_rew + curGCRLAdvScale * adv_gcrl;
 					avgGcrlFinalAdv += advantages.abs().mean().item<float>();
 				}
 

@@ -36,6 +36,10 @@ namespace GGL {
 			totalTimesteps = 0,
 			totalIterations = 0;
 
+		uint64_t
+			gcrlAdvScaleAnnealStartTS = UINT64_MAX,
+			sorsRewardScaleAnnealStartTS = UINT64_MAX;
+
 		StepCallbackFn stepCallback = NULL;
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);

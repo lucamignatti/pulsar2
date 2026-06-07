@@ -20,6 +20,8 @@ namespace GGL {
 	class PPOLearner {
 	public:
 		float curEntropyScale;
+		float curGCRLAdvScale;
+		float curSORSRewardScale;
 
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
