@@ -27,7 +27,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Game events
 		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
-		{ new GoalReward(), 150 }
+		{ new GoalReward(), 275 },
+
+		// time penalty
+		{ new TimePenalty(0.075f), 1.0f }
 	};
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
@@ -244,8 +247,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

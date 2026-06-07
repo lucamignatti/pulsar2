@@ -762,7 +762,8 @@ void GGL::Learner::Start() {
 			report["GCRL/Adv Scale"] = ppo->curGCRLAdvScale;
 			if (config.ppo.useGCRLRewardGate)
 				report["GCRL Gate/Influence"] = ppo->curGCRLRewardGateInfluence;
-			report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
+			if (config.ppo.useSORS)
+				report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
 
 			// TODO: Old version switching messes up the gameplay potentially
 			GGL::PolicyVersion* oldVersion = NULL;
