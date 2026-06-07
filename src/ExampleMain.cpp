@@ -331,8 +331,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = false; // Send metrics
-	cfg.renderMode = true; // Don't render
+	cfg.sendMetrics = true; // Send metrics
+	cfg.renderMode = false; // Don't render
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
