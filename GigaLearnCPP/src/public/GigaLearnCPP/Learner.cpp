@@ -659,6 +659,8 @@ void GGL::Learner::Start() {
 			}
 		};
 
+		// Persistent per-player trajectory state — spans episode boundaries across batches.
+		// Owned exclusively by the collector (main thread in sync mode, collector thread in async).
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
 
@@ -671,12 +673,17 @@ void GGL::Learner::Start() {
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
 			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
-			if (useActionComps) {
+			if (useActionComps)
 				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
-			}
 			if (config.ppo.useSORS)
 				traj.sorsSteps.reserve(maxEpisodeLength);
 		}
+
+		// Scratch buffers reused across batches to avoid per-call realloc (owned by collector).
+		std::vector<float> _normOffset(obsSize, 0.0f), _normInvStd(obsSize, 1.0f);
+		FList _curActionComps;
+		if (useActionComps)
+			_curActionComps.resize(numPlayers * 8);
 
 		auto fnBuildSORSWindows = [&](const Trajectory& traj) {
 			std::vector<PPOLearner::SORSWindow> windows;
@@ -731,10 +738,421 @@ void GGL::Learner::Start() {
 			return windows;
 		};
 
-		while (true) {
-			Report report = {};
+		// ── Batch output ─────────────────────────────────────────────────────────
+		struct CollectedBatch {
+			Trajectory combinedTraj;
+			Report report;
+			int stepsCollected = 0;
+			float collectionTime = 0, inferTime = 0, envStepTime = 0;
+		};
 
+		// ── Collection lambda ─────────────────────────────────────────────────────
+		// Fills one iteration's worth of experience into `out`.
+		// Uses `inferModels` for new-policy InferActions; old-version uses its own models.
+		// Takes shared_lock on versionsMutex for the duration so AddVersion/erase can't dangle the pointer.
+		auto fnCollectBatch = [&](ModelSet& inferModels, CollectedBatch& out) {
+
+			// TODO: Old version switching messes up the gameplay potentially
+			GGL::PolicyVersion* oldVersion = NULL;
+			std::vector<bool> oldVersionPlayerMask;
+			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
+			torch::Tensor tNewPlayerIndices, tOldPlayerIndices;
+
+			for (int i = 0; i < numPlayers; i++)
+				newPlayerIndices.push_back(i);
+
+			// Hold shared_lock for the lifetime of oldVersion pointer (AddVersion's unique_lock will wait).
+			std::shared_lock<std::shared_mutex> versionLock;
+			if (config.trainAgainstOldVersions && versionMgr) {
+				versionLock = std::shared_lock<std::shared_mutex>(versionMgr->versionsMutex);
+				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
+				bool shouldTrainAgainstOld =
+					(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
+					&& !versionMgr->versions.empty()
+					&& !render;
+
+				if (shouldTrainAgainstOld) {
+					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
+					oldVersion = &versionMgr->versions[oldVersionIdx];
+
+					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2));
+
+					newPlayerIndices.clear();
+					oldVersionPlayerMask.resize(numPlayers);
+					int i = 0;
+					for (auto& state : envSet->state.gameStates) {
+						for (auto& player : state.players) {
+							if (player.team == oldVersionTeam) {
+								oldVersionPlayerMask[i] = true;
+								oldPlayerIndices.push_back(i);
+							} else {
+								oldVersionPlayerMask[i] = false;
+								newPlayerIndices.push_back(i);
+							}
+							i++;
+						}
+					}
+
+					tNewPlayerIndices = torch::tensor(newPlayerIndices);
+					tOldPlayerIndices = torch::tensor(oldPlayerIndices);
+				}
+			}
+
+			int numRealPlayers = oldVersion ? (int)newPlayerIndices.size() : envSet->state.numPlayers;
+			out.stepsCollected = 0;
+			out.inferTime = 0;
+			out.envStepTime = 0;
+
+			// Reset and pre-reserve the combined trajectory.
+			auto& combinedTraj = out.combinedTraj;
+			combinedTraj = Trajectory{};
+			{
+				size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
+				combinedTraj.states.reserve(expTs * obsSize);
+				combinedTraj.rewards.reserve(expTs);
+				combinedTraj.gcrlGatedRewards.reserve(expTs);
+				combinedTraj.logProbs.reserve(expTs);
+				combinedTraj.actions.reserve(expTs);
+				combinedTraj.terminals.reserve(expTs);
+				combinedTraj.actionMasks.reserve(expTs * numActions);
+				if (useActionComps)
+					combinedTraj.actionComps.reserve(expTs * 8);
+				if (config.ppo.useGCRL) {
+					combinedTraj.futureGoals.reserve(expTs * 6);
+					combinedTraj.carFutureGoals.reserve(expTs * 6);
+				}
+				if (config.ppo.useSORS)
+					combinedTraj.sorsSteps.reserve(expTs);
+			}
+
+			auto& report = out.report;
+			report = Report{};
+
+			Timer collectionTimer = {};
+			{
+				RG_NO_GRAD;
+
+				for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, out.stepsCollected += numRealPlayers) {
+					Timer stepTimer = {};
+					envSet->Reset();
+					out.envStepTime += stepTimer.Elapsed();
+
+#ifndef NDEBUG
+					for (float f : envSet->state.obs.data)
+						if (isnan(f) || isinf(f))
+							RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
+#endif
+
+					if (!render && obsStat) {
+						// TODO: This samples from old versions too
+						// NOTE: obsStat is also read by main thread (MakeGCRLTerminalTargetRow) — benign torn-read for approximate normalization stats.
+						int numSamples = RS_MAX(envSet->state.numPlayers, config.maxObsSamples);
+						for (int i = 0; i < numSamples; i++) {
+							int idx = Math::RandInt(0, envSet->state.numPlayers);
+							obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
+						}
+
+						// Precompute per-dim float scale/offset once (not per player), then apply.
+						// Shared with the ES rollouts via ComputeObsNorm/ApplyObsNorm.
+						ComputeObsNorm(obsStat, config.minObsSTD, config.maxObsMeanRange, _normOffset, _normInvStd);
+						ApplyObsNorm(envSet->state.obs.data.data(), envSet->state.numPlayers, obsSize, _normOffset, _normInvStd);
+					}
+
+					torch::Tensor tActions, tLogProbs;
+					torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
+					torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
+
+					if (!render) {
+						for (int newPlayerIdx : newPlayerIndices) {
+							envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
+							envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
+						}
+					}
+
+					envSet->StepFirstHalf(true);
+
+					Timer inferTimer = {};
+
+					if (oldVersion) {
+						torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
+						torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+						torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
+						torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+
+						torch::Tensor tNewActions;
+						torch::Tensor tOldActions;
+
+						ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, &inferModels);
+						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
+
+						tActions = torch::zeros(numPlayers, tNewActions.dtype());
+						tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
+						tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
+					} else {
+						torch::Tensor tdStates = tStates.to(ppo->device, true);
+						torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
+						ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, &inferModels);
+						tActions = tActions.cpu();
+					}
+					out.inferTime += inferTimer.Elapsed();
+
+					auto curActions = TENSOR_TO_VEC<int>(tActions);
+
+					// Decode flat action indices -> 8-dim continuous components for auxiliary critics/reward models.
+					if (useActionComps) {
+						for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
+							auto* actionParser = envSet->actionParsers[arenaIdx];
+							auto& gs = envSet->state.gameStates[arenaIdx];
+							int playerStartIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
+							for (int playerIdx = 0; playerIdx < (int)gs.players.size(); playerIdx++) {
+								int flatIdx = playerStartIdx + playerIdx;
+								Action act = actionParser->ParseAction(curActions[flatIdx], gs.players[playerIdx], gs);
+								for (int d = 0; d < 8; d++)
+									_curActionComps[flatIdx * 8 + d] = act[d];
+							}
+						}
+					}
+					FList newLogProbs;
+					if (tLogProbs.defined() && !render)
+						newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
+
+					stepTimer.Reset();
+					envSet->Sync(); // Make sure the first half is done
+					envSet->StepSecondHalf(curActions, false);
+					out.envStepTime += stepTimer.Elapsed();
+
+					if (stepCallback)
+						stepCallback(this, envSet->state.gameStates, report);
+
+					if (render) {
+						renderSender->Send(envSet->state.gameStates[0]);
+						continue;
+					}
+
+					// Calc average rewards
+					if (config.addRewardsToMetrics && (Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
+						int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
+						std::unordered_map<std::string, AvgTracker> avgRewards = {};
+						std::unordered_map<std::string, AvgTracker> avgGatedRewards = {};
+						for (int i = 0; i < numSamples; i++) {
+							int arenaIdx = Math::RandInt(0, envSet->arenas.size());
+							auto& prevRewards = envSet->state.lastRewards[arenaIdx];
+							auto& prevGatedRewards = envSet->state.lastGCRLGatedRewards[arenaIdx];
+
+							for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
+								std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();
+								avgRewards[rewardName] += prevRewards[j];
+							}
+							for (int j = 0; j < envSet->gcrlGatedRewards[arenaIdx].size(); j++) {
+								std::string rewardName = envSet->gcrlGatedRewards[arenaIdx][j].reward->GetName();
+								avgGatedRewards[rewardName] += prevGatedRewards[j];
+							}
+						}
+
+						for (auto& pair : avgRewards)
+							report.AddAvg("Rewards/" + pair.first, pair.second.Get());
+						for (auto& pair : avgGatedRewards)
+							report.AddAvg("Rewards/Gated/" + pair.first, pair.second.Get());
+					}
+
+					// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
+					int i = 0;
+					for (int newPlayerIdx : newPlayerIndices) {
+						trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
+						trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
+						trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].logProbs += newLogProbs[i];
+						if (useActionComps) {
+							const float* comp = _curActionComps.data() + newPlayerIdx * 8;
+							trajectories[newPlayerIdx].actionComps.insert(
+								trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
+						}
+						if (config.ppo.useSORS) {
+							int arenaIdx = playerArenaIdx[newPlayerIdx];
+							int localIdx = playerLocalIdx[newPlayerIdx];
+							const GameState& gs = envSet->state.gameStates[arenaIdx];
+							const Player& player = gs.players[localIdx];
+							const Player* prevPlayer = player.prev;
+
+							SORSStep sorsStep = {};
+							sorsStep.ballPos = gs.ball.pos;
+							sorsStep.ballVel = gs.ball.vel;
+							sorsStep.playerPos = player.pos;
+							sorsStep.playerVel = player.vel;
+							sorsStep.team = player.team;
+							sorsStep.touch = player.ballTouchedStep;
+							sorsStep.shot = player.eventState.shot;
+							if (gs.goalScored) {
+								bool scored = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y));
+								sorsStep.goalFor = scored;
+								sorsStep.goalAgainst = !scored;
+							}
+							sorsStep.playerOnGround = player.isOnGround;
+							sorsStep.playerDemoed = player.isDemoed;
+							sorsStep.gotFlipReset = player.GotFlipReset();
+							sorsStep.prevValid = prevPlayer;
+							sorsStep.prevGotFlipReset = prevPlayer && prevPlayer->GotFlipReset();
+							sorsStep.prevFlipping = prevPlayer && prevPlayer->isFlipping;
+							sorsStep.prevOnGround = prevPlayer && prevPlayer->isOnGround;
+							sorsStep.playerUpZ = player.rotMat.up.z;
+
+							float ownDist = player.pos.Dist(gs.ball.pos);
+							float bestOppDist = 1e30f;
+							for (const Player& other : gs.players)
+								if (other.team != player.team)
+									bestOppDist = RS_MIN(bestOppDist, other.pos.Dist(gs.ball.pos));
+							sorsStep.firstToBall = ownDist <= bestOppDist;
+							trajectories[newPlayerIdx].sorsSteps.push_back(sorsStep);
+						}
+						i++;
+					}
+
+					auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
+					for (int idx = 0; idx < envSet->arenas.size(); idx++) {
+						uint8_t terminalType = envSet->state.terminals[idx];
+						if (!terminalType)
+							continue;
+
+						auto playerStartIdx = envSet->state.arenaPlayerStartIdx[idx];
+						int playersInArena = envSet->state.gameStates[idx].players.size();
+						for (int i = 0; i < playersInArena; i++)
+							curTerminals[playerStartIdx + i] = terminalType;
+					}
+
+					for (int newPlayerIdx : newPlayerIndices) {
+						int8_t terminalType = curTerminals[newPlayerIdx];
+						auto& traj = trajectories[newPlayerIdx];
+
+						if (!terminalType && traj.Length() >= maxEpisodeLength) {
+							// Episode is too long, truncate it here
+							// This won't actually reset the env, but rather will just add it to experience buffer as truncated
+							terminalType = RLGC::TerminalType::TRUNCATED;
+						}
+
+						traj.terminals.push_back(terminalType);
+						if (terminalType) {
+
+							if (terminalType == RLGC::TerminalType::TRUNCATED) {
+								// Truncation requires an additional next state for the critic
+								envSet->state.obs.AppendRow(newPlayerIdx, traj.nextStates);
+							}
+
+							// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
+							// the goal. goal/anti critics use the global ball (obs[0:6]); the car
+							// critic uses the car-local ball (obs[69:75]).
+							if (config.ppo.useGCRL) {
+								int N = traj.Length();
+								int H = config.ppo.gcrlHorizon;
+								int minH = config.ppo.gcrlMinHorizon;
+								traj.futureGoals.resize(N * 6);
+								traj.carFutureGoals.resize(N * 6);
+								for (int t = 0; t < N; t++) {
+									// Goal is a future ball state sampled within [minH, H] steps ahead,
+									// capped at the episode end -- so gcrlHorizon bounds the goal window.
+									int lo = t + minH;
+									int hi = RS_MIN(t + H, N - 1);
+									int t_target;
+									if (config.ppo.gcrlUseVariableHER && hi > lo)
+										t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
+									else
+										t_target = hi;
+									for (int d = 0; d < 6; d++)
+										traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
+									for (int d = 0; d < 6; d++)
+										traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + 69 + d];
+								}
+							}
+
+							if (config.ppo.useSORS)
+								ppo->AddSORSWindows(fnBuildSORSWindows(traj));
+
+							combinedTraj.Append(traj);
+							traj.Clear();
+						}
+					}
+				}
+
+				report["Inference Time"] = out.inferTime;
+				report["Env Step Time"] = out.envStepTime;
+			}
+			out.collectionTime = collectionTimer.Elapsed();
+		}; // fnCollectBatch
+
+		// ── Async collection setup ────────────────────────────────────────────────
+		// When asyncCollection is on, a background thread fills pendingBatch while
+		// the main thread processes and learns from the previous batch (1 update off-policy).
+		// When off, fnCollectBatch is called inline on the main thread.
+		bool doAsync = config.ppo.asyncCollection && !render;
+		ModelSet inferenceModels;
+		if (doAsync)
+			inferenceModels = ppo->GetPolicyModels().CloneAll();
+
+		struct {
+			std::mutex m;
+			std::condition_variable cvReady, cvGo;
+			bool batchReady = false, collectGo = false, stop = false;
+		} handoff;
+
+		CollectedBatch pendingBatch;
+		std::thread collectorThread;
+
+		if (doAsync) {
+			collectorThread = std::thread([&] {
+				while (true) {
+					{
+						std::unique_lock<std::mutex> lk(handoff.m);
+						handoff.cvGo.wait(lk, [&] { return handoff.collectGo || handoff.stop; });
+						if (handoff.stop) return;
+						handoff.collectGo = false;
+					}
+					fnCollectBatch(inferenceModels, pendingBatch);
+					{
+						std::lock_guard<std::mutex> lk(handoff.m);
+						handoff.batchReady = true;
+					}
+					handoff.cvReady.notify_one();
+				}
+			});
+
+			// Prime: kick first batch immediately
+			{
+				std::lock_guard<std::mutex> lk(handoff.m);
+				handoff.collectGo = true;
+			}
+			handoff.cvGo.notify_one();
+		}
+
+		while (true) {
 			bool isFirstIteration = (totalTimesteps == 0);
+
+			// ── Get a batch ───────────────────────────────────────────────────────
+			CollectedBatch batch;
+			if (doAsync) {
+				// Wait for collector to finish the batch it was kicked with last turn
+				{
+					std::unique_lock<std::mutex> lk(handoff.m);
+					handoff.cvReady.wait(lk, [&] { return handoff.batchReady; });
+					handoff.batchReady = false;
+				}
+				batch = std::move(pendingBatch);
+
+				// Sync policy snapshot to the latest weights (ES + Learn from previous turn).
+				// Collector is idle between handoff and kick, so no lock is needed here.
+				inferenceModels.CopyParamsFrom(ppo->GetPolicyModels());
+
+				// Kick next batch collection — runs concurrently with process+learn below
+				{
+					std::lock_guard<std::mutex> lk(handoff.m);
+					handoff.collectGo = true;
+				}
+				handoff.cvGo.notify_one();
+			} else {
+				fnCollectBatch(ppo->models, batch);
+			}
+
+			Report report = std::move(batch.report);
+			int stepsCollected = batch.stepsCollected;
+			auto& combinedTraj = batch.combinedTraj;
 
 			auto fnGetAnnealedScale = [&](float targetScale, int64_t configStart, int64_t annealSteps, uint64_t& startTS) {
 				if (annealSteps <= 0)
@@ -774,341 +1192,11 @@ void GGL::Learner::Start() {
 			if (config.ppo.useSORS)
 				report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
 
-			// TODO: Old version switching messes up the gameplay potentially
-			GGL::PolicyVersion* oldVersion = NULL;
-			std::vector<bool> oldVersionPlayerMask;
-			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
-			torch::Tensor tNewPlayerIndices, tOldPlayerIndices;
+			if (config.ppo.useSORS)
+				ppo->TrainSORS(report);
 
-			for (int i = 0; i < numPlayers; i++)
-				newPlayerIndices.push_back(i);
-
-			if (config.trainAgainstOldVersions) {
-				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				bool shouldTrainAgainstOld =
-					(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
-					&& !versionMgr->versions.empty()
-					&& !render;
-
-				if (shouldTrainAgainstOld) {
-					// Set up training against old versions
-
-					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-					oldVersion = &versionMgr->versions[oldVersionIdx];
-
-					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2));
-
-					newPlayerIndices.clear();
-					oldVersionPlayerMask.resize(numPlayers);
-					int i = 0;
-					for (auto& state : envSet->state.gameStates) {
-						for (auto& player : state.players) {
-							if (player.team == oldVersionTeam) {
-								oldVersionPlayerMask[i] = true;
-								oldPlayerIndices.push_back(i);
-							} else {
-								oldVersionPlayerMask[i] = false;
-								newPlayerIndices.push_back(i);
-							}
-							i++;
-						}
-					}
-
-					tNewPlayerIndices = torch::tensor(newPlayerIndices);
-					tOldPlayerIndices = torch::tensor(oldPlayerIndices);
-				}
-			}
-
-			int numRealPlayers = oldVersion ? newPlayerIndices.size() : envSet->state.numPlayers;
-
-			int stepsCollected = 0;
-			{ // Generate experience
-
-				// Only contains complete episodes
-				auto combinedTraj = Trajectory();
-				{
-					// Pre-reserve combined trajectory to avoid realloc as episodes accumulate.
-					size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
-					combinedTraj.states.reserve(expTs * obsSize);
-					combinedTraj.rewards.reserve(expTs);
-					combinedTraj.gcrlGatedRewards.reserve(expTs);
-					combinedTraj.logProbs.reserve(expTs);
-					combinedTraj.actions.reserve(expTs);
-					combinedTraj.terminals.reserve(expTs);
-					combinedTraj.actionMasks.reserve(expTs * numActions);
-					if (useActionComps) {
-						combinedTraj.actionComps.reserve(expTs * 8);
-					}
-					if (config.ppo.useGCRL) {
-						combinedTraj.futureGoals.reserve(expTs * 6);
-						combinedTraj.carFutureGoals.reserve(expTs * 6);
-					}
-					if (config.ppo.useSORS)
-						combinedTraj.sorsSteps.reserve(expTs);
-				}
-
-				Timer collectionTimer = {};
-				{ // Collect timesteps
-					RG_NO_GRAD;
-
-					float inferTime = 0;
-					float envStepTime = 0;
-
-					// Scratch buffers declared outside the loop to avoid per-step allocation.
-					std::vector<float> _normOffset(obsSize, 0.0f), _normInvStd(obsSize, 1.0f);
-					FList _curActionComps;
-					if (useActionComps)
-						_curActionComps.resize(numPlayers * 8);
-
-					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
-						Timer stepTimer = {};
-						envSet->Reset();
-						envStepTime += stepTimer.Elapsed();
-
-#ifndef NDEBUG
-						for (float f : envSet->state.obs.data)
-							if (isnan(f) || isinf(f))
-								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
-#endif
-
-						if (!render && obsStat) {
-							// TODO: This samples from old versions too
-							int numSamples = RS_MAX(envSet->state.numPlayers, config.maxObsSamples);
-							for (int i = 0; i < numSamples; i++) {
-								int idx = Math::RandInt(0, envSet->state.numPlayers);
-								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
-							}
-
-							// Precompute per-dim float scale/offset once (not per player), then apply.
-							// Shared with the ES rollouts via ComputeObsNorm/ApplyObsNorm.
-							ComputeObsNorm(obsStat, config.minObsSTD, config.maxObsMeanRange, _normOffset, _normInvStd);
-							ApplyObsNorm(envSet->state.obs.data.data(), envSet->state.numPlayers, obsSize, _normOffset, _normInvStd);
-						}
-
-						torch::Tensor tActions, tLogProbs;
-						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
-						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
-
-						if (!render) {
-							for (int newPlayerIdx : newPlayerIndices) {
-								envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
-								envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
-							}
-						}
-
-						envSet->StepFirstHalf(true);
-
-						Timer inferTimer = {};
-
-						if (oldVersion) {
-							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-
-							torch::Tensor tNewActions;
-							torch::Tensor tOldActions;
-
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
-							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
-
-							tActions = torch::zeros(numPlayers, tNewActions.dtype());
-							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
-							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
-						} else {
-							torch::Tensor tdStates = tStates.to(ppo->device, true);
-							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs);
-							tActions = tActions.cpu();
-						}
-						inferTime += inferTimer.Elapsed();
-
-						auto curActions = TENSOR_TO_VEC<int>(tActions);
-
-						// Decode flat action indices -> 8-dim continuous components for auxiliary critics/reward models.
-						if (useActionComps) {
-							for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
-								auto* actionParser = envSet->actionParsers[arenaIdx];
-								auto& gs = envSet->state.gameStates[arenaIdx];
-								int playerStartIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
-								for (int playerIdx = 0; playerIdx < (int)gs.players.size(); playerIdx++) {
-									int flatIdx = playerStartIdx + playerIdx;
-									Action act = actionParser->ParseAction(curActions[flatIdx], gs.players[playerIdx], gs);
-									for (int d = 0; d < 8; d++)
-										_curActionComps[flatIdx * 8 + d] = act[d];
-								}
-							}
-						}
-						FList newLogProbs;
-						if (tLogProbs.defined() && !render)
-							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
-
-						stepTimer.Reset();
-						envSet->Sync(); // Make sure the first half is done
-						envSet->StepSecondHalf(curActions, false);
-						envStepTime += stepTimer.Elapsed();
-
-						if (stepCallback)
-							stepCallback(this, envSet->state.gameStates, report);
-
-						if (render) {
-							renderSender->Send(envSet->state.gameStates[0]);
-							continue;
-						}
-
-						// Calc average rewards
-						if (config.addRewardsToMetrics && (Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
-							int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
-							std::unordered_map<std::string, AvgTracker> avgRewards = {};
-							std::unordered_map<std::string, AvgTracker> avgGatedRewards = {};
-							for (int i = 0; i < numSamples; i++) {
-								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
-								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
-								auto& prevGatedRewards = envSet->state.lastGCRLGatedRewards[arenaIdx];
-
-								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
-									std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();
-									avgRewards[rewardName] += prevRewards[j];
-								}
-								for (int j = 0; j < envSet->gcrlGatedRewards[arenaIdx].size(); j++) {
-									std::string rewardName = envSet->gcrlGatedRewards[arenaIdx][j].reward->GetName();
-									avgGatedRewards[rewardName] += prevGatedRewards[j];
-								}
-							}
-
-							for (auto& pair : avgRewards)
-								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
-							for (auto& pair : avgGatedRewards)
-								report.AddAvg("Rewards/Gated/" + pair.first, pair.second.Get());
-						}
-
-						// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
-						int i = 0;
-						for (int newPlayerIdx : newPlayerIndices) {
-							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
-							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-							trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
-							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
-							if (useActionComps) {
-								const float* comp = _curActionComps.data() + newPlayerIdx * 8;
-								trajectories[newPlayerIdx].actionComps.insert(
-									trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
-							}
-							if (config.ppo.useSORS) {
-								int arenaIdx = playerArenaIdx[newPlayerIdx];
-								int localIdx = playerLocalIdx[newPlayerIdx];
-								const GameState& gs = envSet->state.gameStates[arenaIdx];
-								const Player& player = gs.players[localIdx];
-								const Player* prevPlayer = player.prev;
-
-								SORSStep sorsStep = {};
-								sorsStep.ballPos = gs.ball.pos;
-								sorsStep.ballVel = gs.ball.vel;
-								sorsStep.playerPos = player.pos;
-								sorsStep.playerVel = player.vel;
-								sorsStep.team = player.team;
-								sorsStep.touch = player.ballTouchedStep;
-								sorsStep.shot = player.eventState.shot;
-								if (gs.goalScored) {
-									bool scored = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y));
-									sorsStep.goalFor = scored;
-									sorsStep.goalAgainst = !scored;
-								}
-								sorsStep.playerOnGround = player.isOnGround;
-								sorsStep.playerDemoed = player.isDemoed;
-								sorsStep.gotFlipReset = player.GotFlipReset();
-								sorsStep.prevValid = prevPlayer;
-								sorsStep.prevGotFlipReset = prevPlayer && prevPlayer->GotFlipReset();
-								sorsStep.prevFlipping = prevPlayer && prevPlayer->isFlipping;
-								sorsStep.prevOnGround = prevPlayer && prevPlayer->isOnGround;
-								sorsStep.playerUpZ = player.rotMat.up.z;
-
-								float ownDist = player.pos.Dist(gs.ball.pos);
-								float bestOppDist = 1e30f;
-								for (const Player& other : gs.players)
-									if (other.team != player.team)
-										bestOppDist = RS_MIN(bestOppDist, other.pos.Dist(gs.ball.pos));
-								sorsStep.firstToBall = ownDist <= bestOppDist;
-								trajectories[newPlayerIdx].sorsSteps.push_back(sorsStep);
-							}
-							i++;
-						}
-
-						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
-						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
-							uint8_t terminalType = envSet->state.terminals[idx];
-							if (!terminalType)
-								continue;
-
-							auto playerStartIdx = envSet->state.arenaPlayerStartIdx[idx];
-							int playersInArena = envSet->state.gameStates[idx].players.size();
-							for (int i = 0; i < playersInArena; i++)
-								curTerminals[playerStartIdx + i] = terminalType;
-						}
-
-						for (int newPlayerIdx : newPlayerIndices) {
-							int8_t terminalType = curTerminals[newPlayerIdx];
-							auto& traj = trajectories[newPlayerIdx];
-
-							if (!terminalType && traj.Length() >= maxEpisodeLength) {
-								// Episode is too long, truncate it here
-								// This won't actually reset the env, but rather will just add it to experience buffer as truncated
-								terminalType = RLGC::TerminalType::TRUNCATED;
-							}
-
-							traj.terminals.push_back(terminalType);
-							if (terminalType) {
-
-								if (terminalType == RLGC::TerminalType::TRUNCATED) {
-									// Truncation requires an additional next state for the critic
-									envSet->state.obs.AppendRow(newPlayerIdx, traj.nextStates);
-								}
-
-								// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
-								// the goal. goal/anti critics use the global ball (obs[0:6]); the car
-								// critic uses the car-local ball (obs[69:75]).
-								if (config.ppo.useGCRL) {
-									int N = traj.Length();
-									int H = config.ppo.gcrlHorizon;
-									int minH = config.ppo.gcrlMinHorizon;
-									traj.futureGoals.resize(N * 6);
-									traj.carFutureGoals.resize(N * 6);
-									for (int t = 0; t < N; t++) {
-										// Goal is a future ball state sampled within [minH, H] steps ahead,
-										// capped at the episode end -- so gcrlHorizon bounds the goal window.
-										int lo = t + minH;
-										int hi = RS_MIN(t + H, N - 1);
-										int t_target;
-										if (config.ppo.gcrlUseVariableHER && hi > lo)
-											t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
-										else
-											t_target = hi;
-										for (int d = 0; d < 6; d++)
-											traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
-										for (int d = 0; d < 6; d++)
-											traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + 69 + d];
-									}
-								}
-
-								if (config.ppo.useSORS)
-									ppo->AddSORSWindows(fnBuildSORSWindows(traj));
-
-								combinedTraj.Append(traj);
-								traj.Clear();
-							}
-						}
-					}
-
-					report["Inference Time"] = inferTime;
-					report["Env Step Time"] = envStepTime;
-				}
-				float collectionTime = collectionTimer.Elapsed();
-
-				if (config.ppo.useSORS)
-					ppo->TrainSORS(report);
-
-				Timer consumptionTimer = {};
-				{ // Process timesteps
+			Timer consumptionTimer = {};
+			{ // Process timesteps
 					RG_NO_GRAD;
 
 					// Make and transpose tensors
@@ -1294,11 +1382,11 @@ void GGL::Learner::Start() {
 
 				// Set metrics
 				float consumptionTime = consumptionTimer.Elapsed();
-				report["Collection Time"] = collectionTime;
+				report["Collection Time"] = batch.collectionTime;
 				report["Consumption Time"] = consumptionTime;
-				report["Collection Steps/Second"] = stepsCollected / collectionTime;
+				report["Collection Steps/Second"] = stepsCollected / batch.collectionTime;
 				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
-				report["Overall Steps/Second"] = stepsCollected / (collectionTime + consumptionTime);
+				report["Overall Steps/Second"] = stepsCollected / (batch.collectionTime + consumptionTime);
 
 				uint64_t prevTimesteps = totalTimesteps;
 				totalTimesteps += stepsCollected;
@@ -1313,6 +1401,15 @@ void GGL::Learner::Start() {
 					esManager->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 
 				if (saveQueued) {
+					if (doAsync) {
+						// Join the collector before saving so no torch op is mid-flight during teardown.
+						{
+							std::lock_guard<std::mutex> lk(handoff.m);
+							handoff.stop = true;
+						}
+						handoff.cvGo.notify_one();
+						collectorThread.join();
+					}
 					if (!config.checkpointFolder.empty())
 						Save();
 					exit(0);
@@ -1373,7 +1470,6 @@ void GGL::Learner::Start() {
 						"Total Iterations"
 					}
 				);
-			}
 		}
 
 	} catch (std::exception& e) {

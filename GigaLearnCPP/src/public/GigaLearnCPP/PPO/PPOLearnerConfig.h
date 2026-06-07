@@ -209,6 +209,9 @@ namespace GGL {
 		// This will only happen if the amount of remaining experience is < batchSize*2.
 		bool overbatching = true;
 
+		// Collect the next batch while the current one trains (1 update off-policy). Big speedup when env-step-bound.
+		bool asyncCollection = true;
+
 		double maxEpisodeDuration = 120; // In seconds
 
 		// Actions with the highest probability are always chosen, instead of being more likely

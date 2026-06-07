@@ -276,6 +276,23 @@ namespace GGL {
 			return clone;
 		}
 
+		// Copy weights from src into this set's matching models (by name). Both sets must have the same models.
+		void CopyParamsFrom(const ModelSet& src) {
+			RG_NO_GRAD;
+			for (Model* dst : *this) {
+				auto it = src.map.find(dst->modelName);
+				RG_ASSERT(it != src.map.end());
+				Model* srcModel = it->second;
+				RG_ASSERT(srcModel);
+				auto srcParams = srcModel->parameters();
+				auto dstParams = dst->parameters();
+				RG_ASSERT(srcParams.size() == dstParams.size());
+				for (int i = 0; i < (int)srcParams.size(); i++)
+					dstParams[i].copy_(srcParams[i], true);
+				dst->_seqHalfOutdated = true;
+			}
+		}
+
 		void Free() {
 			for (Model* model : *this)
 				delete model;

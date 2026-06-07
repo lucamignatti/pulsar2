@@ -6,6 +6,7 @@
 #include <GigaLearnCPP/Util/RenderSender.h>
 
 #include <nlohmann/json.hpp>
+#include <shared_mutex>
 
 namespace GGL {
 
@@ -59,6 +60,7 @@ namespace GGL {
 
 	struct PolicyVersionManager {
 		std::vector<PolicyVersion> versions;
+		mutable std::shared_mutex versionsMutex; // shared: collectors reading; unique: OnIteration mutating
 		std::filesystem::path saveFolder;
 		int maxVersions;
 		uint64_t tsPerVersion;

@@ -47,15 +47,18 @@ GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone
 
 	newVersion.ratings = skill.curRatings;
 
-	versions.push_back(newVersion);
+	{
+		std::unique_lock lock(versionsMutex);
+		versions.push_back(newVersion);
 
-	SortVersions();
+		SortVersions();
 
-	// Remove old versions
-	while (versions.size() > maxVersions) {
-		auto& toRemove = versions[0];
-		toRemove.models.Free();
-		versions.erase(versions.begin());
+		// Remove old versions
+		while (versions.size() > maxVersions) {
+			auto& toRemove = versions[0];
+			toRemove.models.Free();
+			versions.erase(versions.begin());
+		}
 	}
 
 	return versions.back();
