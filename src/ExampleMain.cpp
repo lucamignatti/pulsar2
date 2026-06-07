@@ -7,14 +7,63 @@
 #include <RLGymCPP/ObsBuilders/DefaultObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
+#include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
 
+struct EnvResetInfo {
+	bool isKickoffReset = true;
+};
+
+class ResetModeStateSetter : public StateSetter {
+public:
+	StateSetter* child;
+	EnvResetInfo* resetInfo;
+	bool isKickoffReset;
+
+	ResetModeStateSetter(StateSetter* child, EnvResetInfo* resetInfo, bool isKickoffReset) :
+		child(child), resetInfo(resetInfo), isKickoffReset(isKickoffReset) {
+	}
+
+	virtual void ResetArena(Arena* arena) override {
+		resetInfo->isKickoffReset = isKickoffReset;
+		child->ResetArena(arena);
+	}
+};
+
+class KickoffOnlyReward : public Reward {
+public:
+	Reward* child;
+
+	KickoffOnlyReward(Reward* child) : child(child) {}
+
+	virtual void Reset(const GameState& initialState) override {
+		child->Reset(initialState);
+	}
+
+	virtual void PreStep(const GameState& state) override {
+		EnvResetInfo* resetInfo = (EnvResetInfo*)state.userInfo;
+		if (resetInfo && !resetInfo->isKickoffReset)
+			return;
+
+		child->PreStep(state);
+	}
+
+	virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+		EnvResetInfo* resetInfo = (EnvResetInfo*)state.userInfo;
+		if (resetInfo && !resetInfo->isKickoffReset)
+			return std::vector<float>(state.players.size(), 0);
+
+		return child->GetAllRewards(state, isFinal);
+	}
+};
+
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
+	EnvResetInfo* resetInfo = new EnvResetInfo();
 
 	std::vector<WeightedReward> rewards = {
 
@@ -29,7 +78,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ShotReward(), 15.f },
 		{ new ShotOnFrameReward(), 35.f },
 		{ new SaveReward(), 20.f },
-		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
+		{ new ZeroSumReward(new KickoffOnlyReward(new KickoffTouchReward(3.0f)), 0.0f), 5.0f },
 		{ new GoalReward(), 275 },
 
 		// time penalty
@@ -39,9 +88,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
 		// Movement / player-ball rewards are filtered by GCRL terminal progress.
-		{ new AirReward(), 0.08f },
-		{ new AerialApproachReward(), 3.0f },
-		{ new AirTouchReward(500, CommonValues::CEILING_Z, true), 20.0f },
+		{ new AirReward(), 0.02f },
+		{ new HeightWeightedAerialApproachReward(), 1.5f },
+		{ new UsefulAirTouchReward(), 25.0f },
+		{ new SecondTouchReward(), 12.0f },
+		{ new FlipResetFollowupReward(), 8.0f },
+		{ new UsefulFlickReward(), 8.0f },
 		{ new BallPredInterceptReward(), 2.0f },
 		{ new VelocityPlayerToBallReward(), 6.f },
 		{ new StrongTouchReward(20, 100), 90.f }
@@ -65,10 +117,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs(3, true, true);
-	result.stateSetter = new KickoffState();
+	result.stateSetter = new CombinedState({
+		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
+		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
+	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
+	result.userInfo = resetInfo;
 
 	result.arena = arena;
 

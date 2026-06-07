@@ -32,6 +32,29 @@ namespace RLGC {
 	typedef PlayerDataEventReward<&PlayerEventState::demo, false> DemoReward;
 	typedef PlayerDataEventReward<&PlayerEventState::demoed, true> DemoedPenalty;
 
+	inline float GoalwardTouchQuality(
+		const Player& player,
+		const GameState& state,
+		float maxRewardedGoalwardAccel = Math::KPHToVel(100),
+		float maxRewardedBallSpeed = Math::KPHToVel(120)
+	) {
+		if (!state.prev || !player.ballTouchedStep)
+			return 0;
+
+		Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+		Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+		Vec touchDeltaVel = state.ball.vel - state.prev->ball.vel;
+		float goalwardAccel = touchDeltaVel.Dot(ballDirToGoal);
+		if (goalwardAccel <= 0)
+			return 0;
+
+		float accelScore = RS_CLAMP(goalwardAccel / maxRewardedGoalwardAccel, 0, 1);
+		float directionScore = RS_CLAMP(state.ball.vel.Normalized().Dot(ballDirToGoal), 0, 1);
+		float speedScore = RS_CLAMP(state.ball.vel.Length() / maxRewardedBallSpeed, 0, 1);
+
+		return 0.6f * accelScore + 0.25f * directionScore + 0.15f * speedScore;
+	}
+
 	// Rewards a goal by anyone on the team
 	// NOTE: Already zero-sum
 	class GoalReward : public Reward {
@@ -177,6 +200,60 @@ namespace RLGC {
 		}
 	};
 
+	class UsefulAirTouchReward : public Reward {
+	public:
+		float minBallHeight, maxBallHeight, heightExponent;
+
+		UsefulAirTouchReward(float minBallHeight = 500, float maxBallHeight = CommonValues::CEILING_Z, float heightExponent = 1.35f)
+			: minBallHeight(minBallHeight), maxBallHeight(maxBallHeight), heightExponent(heightExponent) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (player.isOnGround || state.ball.pos.z < minBallHeight)
+				return 0;
+
+			float quality = GoalwardTouchQuality(player, state);
+			if (quality <= 0)
+				return 0;
+
+			float heightRange = RS_MAX(1, maxBallHeight - minBallHeight);
+			float heightScore = RS_CLAMP((state.ball.pos.z - minBallHeight) / heightRange, 0, 1);
+			return quality * powf(heightScore, heightExponent);
+		}
+	};
+
+	class SecondTouchReward : public Reward {
+	public:
+		float minTouchDelay, followupWindow;
+		std::unordered_map<int, float> touchTimers;
+
+		SecondTouchReward(float minTouchDelay = 0.15f, float followupWindow = 3.0f)
+			: minTouchDelay(minTouchDelay), followupWindow(followupWindow) {}
+
+		virtual void Reset(const GameState& initialState) override {
+			touchTimers.clear();
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			auto insertResult = touchTimers.insert({ player.index, followupWindow + 1 });
+			float& touchTimer = insertResult.first->second;
+			float reward = 0;
+
+			if (player.ballTouchedStep) {
+				if (touchTimer >= minTouchDelay && touchTimer <= followupWindow) {
+					float quality = GoalwardTouchQuality(player, state);
+					float timeScore = 1 - RS_CLAMP((touchTimer - minTouchDelay) / RS_MAX(0.001f, followupWindow - minTouchDelay), 0, 1);
+					reward = quality * (0.5f + 0.5f * timeScore);
+				}
+
+				touchTimer = 0;
+			} else if (touchTimer <= followupWindow) {
+				touchTimer += state.deltaTime;
+			}
+
+			return reward;
+		}
+	};
+
 	class PossessionReward : public Reward {
 	public:
 		float maxDistance, maxRelativeSpeed;
@@ -243,11 +320,11 @@ namespace RLGC {
 
 	class FlipResetFollowupReward : public Reward {
 	public:
-		float minBallHeight, followupWindow, maxRewardedGoalwardAccel;
+		float minBallHeight, followupWindow;
 		std::unordered_map<int, float> resetTimers;
 
-		FlipResetFollowupReward(float minBallHeight = 500, float followupWindow = 2.0f, float maxRewardedGoalwardAccel = Math::KPHToVel(80))
-			: minBallHeight(minBallHeight), followupWindow(followupWindow), maxRewardedGoalwardAccel(maxRewardedGoalwardAccel) {}
+		FlipResetFollowupReward(float minBallHeight = 500, float followupWindow = 2.0f)
+			: minBallHeight(minBallHeight), followupWindow(followupWindow) {}
 
 		virtual void Reset(const GameState& initialState) override {
 			resetTimers.clear();
@@ -262,13 +339,9 @@ namespace RLGC {
 			float reward = 0;
 
 			if (resetTimer > 0 && !gotResetNow && player.ballTouchedStep && !player.isOnGround && state.ball.pos.z >= minBallHeight) {
-				Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
-				Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
-				Vec touchDeltaVel = state.ball.vel - state.prev->ball.vel;
-				float goalwardAccel = touchDeltaVel.Dot(ballDirToGoal);
-
-				if (goalwardAccel > 0) {
-					reward = RS_CLAMP(goalwardAccel / maxRewardedGoalwardAccel, 0, 1);
+				float quality = GoalwardTouchQuality(player, state);
+				if (quality > 0) {
+					reward = quality;
 					resetTimer = 0;
 				}
 			}
@@ -326,6 +399,28 @@ namespace RLGC {
 
 			Vec dirToBall = (state.ball.pos - player.pos).Normalized();
 			return RS_CLAMP(player.vel.Dot(dirToBall) / CommonValues::CAR_MAX_SPEED, 0, 1);
+		}
+	};
+
+	class HeightWeightedAerialApproachReward : public Reward {
+	public:
+		float minBallHeight, maxBallHeight, heightExponent;
+
+		HeightWeightedAerialApproachReward(float minBallHeight = 500, float maxBallHeight = 1600, float heightExponent = 1.5f)
+			: minBallHeight(minBallHeight), maxBallHeight(maxBallHeight), heightExponent(heightExponent) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (state.ball.pos.z < minBallHeight || player.isOnGround)
+				return 0;
+
+			Vec dirToBall = (state.ball.pos - player.pos).Normalized();
+			float approach = RS_CLAMP(player.vel.Dot(dirToBall) / CommonValues::CAR_MAX_SPEED, 0, 1);
+			if (approach <= 0)
+				return 0;
+
+			float heightRange = RS_MAX(1, maxBallHeight - minBallHeight);
+			float heightScore = RS_CLAMP((state.ball.pos.z - minBallHeight) / heightRange, 0, 1);
+			return approach * powf(heightScore, heightExponent);
 		}
 	};
 
@@ -449,6 +544,30 @@ namespace RLGC {
 			} else {
 				return 0;
 			}
+		}
+	};
+
+	class UsefulFlickReward : public Reward {
+	public:
+		float maxSetupBallHeight, minUpwardVel, maxRewardedUpwardVel;
+
+		UsefulFlickReward(float maxSetupBallHeight = 450, float minUpwardVel = 300, float maxRewardedUpwardVel = 1400)
+			: maxSetupBallHeight(maxSetupBallHeight), minUpwardVel(minUpwardVel), maxRewardedUpwardVel(maxRewardedUpwardVel) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.ballTouchedStep || state.prev->ball.pos.z > maxSetupBallHeight)
+				return 0;
+
+			float addedUpwardVel = state.ball.vel.z - state.prev->ball.vel.z;
+			if (addedUpwardVel < minUpwardVel)
+				return 0;
+
+			float quality = GoalwardTouchQuality(player, state);
+			if (quality <= 0)
+				return 0;
+
+			float upwardScore = RS_CLAMP((addedUpwardVel - minUpwardVel) / RS_MAX(1, maxRewardedUpwardVel - minUpwardVel), 0, 1);
+			return quality * upwardScore;
 		}
 	};
 
