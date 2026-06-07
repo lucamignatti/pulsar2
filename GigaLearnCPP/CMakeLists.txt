@@ -17,7 +17,9 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # Add all headers and code files
-file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
+# CONFIGURE_DEPENDS makes CMake re-glob on every build, so newly added source files are picked
+# up automatically without a manual reconfigure (otherwise new .cpp files silently fail to link).
+file(GLOB_RECURSE FILES_SRC CONFIGURE_DEPENDS "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
 
 add_library(GigaLearnCPP SHARED ${FILES_SRC})
 target_compile_definitions(GigaLearnCPP PRIVATE -DWITHIN_GGL)
