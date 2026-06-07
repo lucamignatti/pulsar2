@@ -16,36 +16,6 @@ using namespace RLGC; // RLGymCPP
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
 
-    // my custom rewards that kinda (ok more than kinda) suck
-    // std::vector<WeightedReward> rewards = {
-    //     // Objective anchor
-    //     { new GoalReward(-0.85f), 150 },
-    //     { new TimePenalty(-0.1f), 1.0f },
-
-    //     // Broad pressure / directionality, kept low for GCRL compatibility
-    //     { new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.1f },
-
-    //     // General physical readiness, kept tiny to avoid energy farming
-    //     { new EnergyReward(), 0.02f },
-
-    //     // Light mechanics / resource priors
-    //     { new StrongTouchReward(20, 100), 0.5f },
-    //     { new PickupBoostReward(), 1.0f },
-    //     { new SaveBoostReward(), 0.1f },
-
-    //     // Physical play, light
-    //     { new BumpReward(), 0.25f },
-    //     { new BumpedPenalty(), 0.25f },
-    //     { new DemoReward(), 1.0f },
-    //     { new DemoedPenalty(), 1.0f },
-
-    //     // Hard-to-discover mechanics/control, kept very light to avoid farming
-    //     { new AirTouchReward(500), 1.0f },
-    //     { new PossessionReward(), 0.05f },
-    //     { new FlipResetFollowupReward(500), 1.0f }
-    // };
-
-   	// These are ok rewards that will produce a scoring bot in ~100m steps
 	std::vector<WeightedReward> rewards = {
 
 		// Movement
@@ -53,13 +23,16 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Player-ball
 		{ new FaceBallReward(), 0.05f },
-		{ new VelocityPlayerToBallReward(), 0.25f },
+		{ new VelocityPlayerToBallReward(), 0.5f },
 
 		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 0.5f },
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+
+		// Scoring bootstrap
+		{ new TouchBallReward(), 1.0f },
+		{ new StrongTouchReward(20, 100), 5.0f },
 
 		// Boost
-		{ new PickupBoostReward(), 0.25f },
 		{ new SaveBoostReward(), 0.05f },
 
 		// Game events
@@ -173,7 +146,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlLR = 2e-4;
 	cfg.ppo.sorsLR = 2e-4f;
 
-	// faster
+	// faster but broken on rocm
 	cfg.ppo.useHalfPrecision = false;
 
 	// Three quasimetric critics learn positioning/anticipation contrastively (InfoNCE)
