@@ -20,7 +20,11 @@ namespace {
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
 	curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
 	curGCRLAdvScale = config.gcrlAdvScale;
+	curGCRLRewardGateInfluence = config.gcrlRewardGateInfluence;
 	curSORSRewardScale = config.sorsRewardScale;
+
+	if (config.useGCRLRewardGate && !config.useGCRL)
+		RG_ERR_CLOSE("PPOLearner: useGCRLRewardGate requires useGCRL");
 
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
@@ -162,6 +166,31 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
 
 	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
+}
+
+torch::Tensor GGL::PPOLearner::InferGCRLRewardGate(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets) {
+	if (!config.useGCRLRewardGate || !config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
+		return {};
+
+	torch::NoGradGuard noGrad;
+
+	if (models["shared_head"])
+		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+
+	auto* gcGoal = dynamic_cast<QuasimetricCritic*>(models["goal_critic"]);
+	auto* gcAnti = dynamic_cast<QuasimetricCritic*>(models["anti_critic"]);
+	RG_ASSERT(gcGoal && gcAnti);
+
+	auto qGoal = gcGoal->score_q(obs, actionComps, goalTargets);
+	auto qAnti = gcAnti->score_q(obs, actionComps, antiTargets);
+
+	auto normGoal = (qGoal - qGoal.mean()) / (qGoal.std(false) + 1e-8f);
+	auto normAnti = (qAnti - qAnti.mean()) / (qAnti.std(false) + 1e-8f);
+	auto terminalAdv = normGoal - config.gcrlRewardGateAntiScale * normAnti;
+
+	float minGate = std::clamp(config.gcrlRewardGateMin, 0.0f, 1.0f);
+	auto rawGate = torch::sigmoid(config.gcrlRewardGateSharpness * terminalAdv);
+	return minGate + (1.0f - minGate) * rawGate;
 }
 
 torch::Tensor GGL::PPOLearner::InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps) {

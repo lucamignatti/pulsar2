@@ -18,14 +18,6 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// Movement
-		{ new AirReward(), 0.25f },
-
-		// Player-ball
-		{ new FaceBallReward(), 0.25f },
-		{ new VelocityPlayerToBallReward(), 4.f },
-		{ new StrongTouchReward(20, 100), 60 },
-
 		// Ball-goal
 		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
 
@@ -36,6 +28,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Game events
 		{ new ZeroSumReward(new KickoffTouchReward(3.0f), 0.0f), 5.0f },
 		{ new GoalReward(), 150 }
+	};
+
+	std::vector<WeightedReward> gcrlGatedRewards = {
+
+		// Movement / player-ball rewards are filtered by GCRL terminal progress.
+		{ new AirReward(), 0.35f },
+		{ new VelocityPlayerToBallReward(), 6.f },
+		{ new StrongTouchReward(20, 100), 90.f }
 	};
 
 
@@ -59,6 +59,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.stateSetter = new KickoffState();
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
+	result.gcrlGatedRewards = gcrlGatedRewards;
 
 	result.arena = arena;
 
@@ -166,6 +167,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
+	cfg.ppo.useGCRLRewardGate = true;
+	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
+	cfg.ppo.gcrlRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
+	cfg.ppo.gcrlRewardGateMin = 0.2f;
+	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
+	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
+	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;
@@ -235,8 +244,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

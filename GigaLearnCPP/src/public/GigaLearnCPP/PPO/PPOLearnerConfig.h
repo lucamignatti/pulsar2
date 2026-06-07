@@ -275,6 +275,14 @@ namespace GGL {
 		int gcrlInfoSubSample = 512;      // Sub-batch size for the InfoNCE contrastive matrix
 		int gcrlReprDim = 128;            // Embedding (output) dim; phi and psi MUST share it
 		float gcrlLR = 0;                 // GCRL critic learning rate; 0 -> use policyLR
+		bool useGCRLRewardGate = false;   // Gate selected dense rewards with terminal-oriented GCRL progress
+		float gcrlRewardGateInfluence = 1.0f; // 0 -> ungated, 1 -> full gate
+		int64_t gcrlRewardGateAnnealStart = -1; // Timesteps to start gate influence ramp; -1 -> current checkpoint
+		int64_t gcrlRewardGateAnnealSteps = 100'000'000; // Timesteps to ramp from 0 to gcrlRewardGateInfluence
+		float gcrlRewardGateMin = 0.2f;   // Minimum multiplier for positive gated rewards
+		float gcrlRewardGateSharpness = 1.0f; // Sigmoid sharpness for terminal progress
+		float gcrlRewardGateAntiScale = 0.85f; // Own-goal danger penalty inside gate progress
+		float gcrlRewardGateTargetVel = 1200.0f; // Terminal goal target ball velocity in uu/s
 		// Hidden architecture of the phi/psi towers (output is always gcrlReprDim). Configured
 		// like policy/critic: layerSizes / activationType / addLayerNorm / optimType.
 		PartialModelConfig gcrlCritic;

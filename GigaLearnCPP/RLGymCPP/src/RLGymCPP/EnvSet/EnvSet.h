@@ -14,6 +14,7 @@ namespace RLGC {
 	struct EnvCreateResult {
 		Arena* arena;
 		std::vector<WeightedReward> rewards;
+		std::vector<WeightedReward> gcrlGatedRewards;
 		std::vector<TerminalCondition*> terminalConditions;
 		ObsBuilder* obsBuilder;
 		ActionParser* actionParser;
@@ -39,7 +40,9 @@ namespace RLGC {
 		DimList2<float> obs;
 		DimList2<uint8_t> actionMasks;
 		std::vector<float> rewards;
+		std::vector<float> gcrlGatedRewards;
 		std::vector<std::vector<float>> lastRewards; // Only from the first arena
+		std::vector<std::vector<float>> lastGCRLGatedRewards;
 		std::vector<uint8_t> terminals;
 
 		std::vector<int> arenaPlayerStartIdx = {};
@@ -54,7 +57,9 @@ namespace RLGC {
 			gameStates.resize(arenas.size());
 			prevGameStates.resize(arenas.size());
 			rewards.resize(numPlayers);
+			gcrlGatedRewards.resize(numPlayers);
 			lastRewards.resize(arenas.size());
+			lastGCRLGatedRewards.resize(arenas.size());
 			terminals.resize(arenas.size());
 		}
 	};
@@ -79,6 +84,7 @@ namespace RLGC {
 		int numActions;
 
 		std::vector<std::vector<WeightedReward>> rewards;
+		std::vector<std::vector<WeightedReward>> gcrlGatedRewards;
 		std::vector<std::vector<TerminalCondition*>> terminalConditions;
 		std::vector<ObsBuilder*> obsBuilders;
 		std::vector<ActionParser*> actionParsers;

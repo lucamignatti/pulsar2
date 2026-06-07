@@ -2,6 +2,8 @@
 
 #include <GigaLearnCPP/PPO/PPOLearner.h>
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
+#include <RLGymCPP/CommonValues.h>
+#include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 
 #include <torch/cuda.h>
 #include <nlohmann/json.hpp>
@@ -23,6 +25,79 @@
 #include "Util/AvgTracker.h"
 
 using namespace RLGC;
+
+namespace {
+	constexpr int GCRL_GATE_GOAL_DIM = 6;
+
+	torch::Tensor MakeGCRLTerminalTargetRow(
+		bool ownGoal,
+		const GGL::LearnerConfig& config,
+		GGL::BatchedWelfordStat* obsStat
+	) {
+		// AdvancedObs inverts orange-player states into blue perspective, so these
+		// opponent/own targets are already correct for every player's obs row.
+		Vec pos = ownGoal ? CommonValues::BLUE_GOAL_BACK : CommonValues::ORANGE_GOAL_BACK;
+		float yVel = ownGoal ? -config.ppo.gcrlRewardGateTargetVel : config.ppo.gcrlRewardGateTargetVel;
+		float vals[GCRL_GATE_GOAL_DIM] = {
+			pos.x * AdvancedObs::POS_COEF,
+			pos.y * AdvancedObs::POS_COEF,
+			pos.z * AdvancedObs::POS_COEF,
+			0.0f,
+			yVel * AdvancedObs::VEL_COEF,
+			0.0f
+		};
+
+		if (config.standardizeObs && obsStat) {
+			const auto& meanVec = obsStat->GetMean();
+			auto stdVec = obsStat->GetSTD();
+			for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++) {
+				float offset = RS_CLAMP((float)meanVec[d], -config.maxObsMeanRange, config.maxObsMeanRange);
+				float invStd = 1.0f / RS_MAX((float)stdVec[d], config.minObsSTD);
+				vals[d] = (vals[d] - offset) * invStd;
+			}
+		}
+
+		auto targets = torch::empty({ 1, GCRL_GATE_GOAL_DIM }, torch::TensorOptions().dtype(torch::kFloat32));
+		for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++)
+			targets.slice(1, d, d + 1).fill_(vals[d]);
+		return targets;
+	}
+
+	torch::Tensor InferGCRLRewardGateBatched(
+		GGL::PPOLearner* ppo,
+		torch::Tensor states,
+		torch::Tensor actionComps,
+		torch::Tensor goalTargetRow,
+		torch::Tensor antiTargetRow,
+		int length
+	) {
+		if (ppo->device.is_cpu()) {
+			return ppo->InferGCRLRewardGate(
+				states.to(ppo->device, true, true),
+				actionComps.to(ppo->device, true, true),
+				goalTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, true, true),
+				antiTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, true, true)
+			).cpu();
+		}
+
+		torch::Tensor goalTargetDev = goalTargetRow.to(ppo->device, true, true);
+		torch::Tensor antiTargetDev = antiTargetRow.to(ppo->device, true, true);
+		torch::Tensor fullGate = torch::zeros({ (int64_t)length });
+		for (int i = 0; i < length; i += ppo->config.miniBatchSize) {
+			int start = i;
+			int end = RS_MIN(i + ppo->config.miniBatchSize, length);
+			int batchSize = end - start;
+			auto gatePart = ppo->InferGCRLRewardGate(
+				states.slice(0, start, end).to(ppo->device, true, true),
+				actionComps.slice(0, start, end).to(ppo->device, true, true),
+				goalTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM }),
+				antiTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM })
+			).cpu();
+			fullGate.slice(0, start, end).copy_(gatePart, true);
+		}
+		return fullGate;
+	}
+}
 
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
@@ -196,6 +271,8 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	j["total_iterations"] = totalIterations;
 	if (gcrlAdvScaleAnnealStartTS != UINT64_MAX)
 		j["gcrl_adv_scale_anneal_start_ts"] = gcrlAdvScaleAnnealStartTS;
+	if (gcrlRewardGateAnnealStartTS != UINT64_MAX)
+		j["gcrl_reward_gate_anneal_start_ts"] = gcrlRewardGateAnnealStartTS;
 	if (sorsRewardScaleAnnealStartTS != UINT64_MAX)
 		j["sors_reward_scale_anneal_start_ts"] = sorsRewardScaleAnnealStartTS;
 
@@ -229,6 +306,8 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	totalIterations = j["total_iterations"];
 	if (j.contains("gcrl_adv_scale_anneal_start_ts"))
 		gcrlAdvScaleAnnealStartTS = j["gcrl_adv_scale_anneal_start_ts"];
+	if (j.contains("gcrl_reward_gate_anneal_start_ts"))
+		gcrlRewardGateAnnealStartTS = j["gcrl_reward_gate_anneal_start_ts"];
 	if (j.contains("sors_reward_scale_anneal_start_ts"))
 		sorsRewardScaleAnnealStartTS = j["sors_reward_scale_anneal_start_ts"];
 
@@ -514,7 +593,7 @@ void GGL::Learner::Start() {
 		ExperienceBuffer experience = ExperienceBuffer(config.randomSeed, torch::kCPU);
 
 		int numPlayers = envSet->state.numPlayers;
-		bool useActionComps = config.ppo.useGCRL || config.ppo.useSORS;
+		bool useActionComps = config.ppo.useGCRL || config.ppo.useSORS || config.ppo.useGCRLRewardGate;
 
 		std::vector<int> playerArenaIdx(numPlayers), playerLocalIdx(numPlayers);
 		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
@@ -527,7 +606,7 @@ void GGL::Learner::Start() {
 		}
 
 		struct Trajectory {
-			FList states, nextStates, rewards, logProbs;
+			FList states, nextStates, rewards, gcrlGatedRewards, logProbs;
 			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
 			// ball goals (global / car-local), filled at episode end.
 			FList actionComps, futureGoals, carFutureGoals;
@@ -540,6 +619,7 @@ void GGL::Learner::Start() {
 				states.clear();
 				nextStates.clear();
 				rewards.clear();
+				gcrlGatedRewards.clear();
 				logProbs.clear();
 				actionComps.clear();
 				futureGoals.clear();
@@ -554,6 +634,7 @@ void GGL::Learner::Start() {
 				states += other.states;
 				nextStates += other.nextStates;
 				rewards += other.rewards;
+				gcrlGatedRewards += other.gcrlGatedRewards;
 				logProbs += other.logProbs;
 				actionComps += other.actionComps;
 				futureGoals += other.futureGoals;
@@ -576,6 +657,7 @@ void GGL::Learner::Start() {
 		for (auto& traj : trajectories) {
 			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
 			traj.rewards.reserve(maxEpisodeLength);
+			traj.gcrlGatedRewards.reserve(maxEpisodeLength);
 			traj.logProbs.reserve(maxEpisodeLength);
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
@@ -665,13 +747,21 @@ void GGL::Learner::Start() {
 				config.ppo.gcrlAdvScaleAnnealSteps,
 				gcrlAdvScaleAnnealStartTS
 			);
-			ppo->curSORSRewardScale = fnGetAnnealedScale(
+			ppo->curGCRLRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetAnnealedScale(
+				config.ppo.gcrlRewardGateInfluence,
+				config.ppo.gcrlRewardGateAnnealStart,
+				config.ppo.gcrlRewardGateAnnealSteps,
+				gcrlRewardGateAnnealStartTS
+			) : 0.0f;
+			ppo->curSORSRewardScale = config.ppo.useSORS ? fnGetAnnealedScale(
 				config.ppo.sorsRewardScale,
 				config.ppo.sorsRewardScaleAnnealStart,
 				config.ppo.sorsRewardScaleAnnealSteps,
 				sorsRewardScaleAnnealStartTS
-			);
+			) : 0.0f;
 			report["GCRL/Adv Scale"] = ppo->curGCRLAdvScale;
+			if (config.ppo.useGCRLRewardGate)
+				report["GCRL Gate/Influence"] = ppo->curGCRLRewardGateInfluence;
 			report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
 
 			// TODO: Old version switching messes up the gameplay potentially
@@ -731,6 +821,7 @@ void GGL::Learner::Start() {
 					size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
 					combinedTraj.states.reserve(expTs * obsSize);
 					combinedTraj.rewards.reserve(expTs);
+					combinedTraj.gcrlGatedRewards.reserve(expTs);
 					combinedTraj.logProbs.reserve(expTs);
 					combinedTraj.actions.reserve(expTs);
 					combinedTraj.terminals.reserve(expTs);
@@ -865,18 +956,26 @@ void GGL::Learner::Start() {
 						if (config.addRewardsToMetrics && (Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
 							int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
 							std::unordered_map<std::string, AvgTracker> avgRewards = {};
+							std::unordered_map<std::string, AvgTracker> avgGatedRewards = {};
 							for (int i = 0; i < numSamples; i++) {
 								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
-								auto& prevRewards = envSet->state.lastRewards[i];
+								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
+								auto& prevGatedRewards = envSet->state.lastGCRLGatedRewards[arenaIdx];
 
 								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
 									std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();
 									avgRewards[rewardName] += prevRewards[j];
 								}
+								for (int j = 0; j < envSet->gcrlGatedRewards[arenaIdx].size(); j++) {
+									std::string rewardName = envSet->gcrlGatedRewards[arenaIdx][j].reward->GetName();
+									avgGatedRewards[rewardName] += prevGatedRewards[j];
+								}
 							}
 
 							for (auto& pair : avgRewards)
 								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
+							for (auto& pair : avgGatedRewards)
+								report.AddAvg("Rewards/Gated/" + pair.first, pair.second.Get());
 						}
 
 						// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
@@ -884,6 +983,7 @@ void GGL::Learner::Start() {
 						for (int newPlayerIdx : newPlayerIndices) {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
+							trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
 							if (useActionComps) {
 								const float* comp = _curActionComps.data() + newPlayerIdx * 8;
@@ -1014,6 +1114,38 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
+
+					if (config.ppo.useGCRLRewardGate && ppo->curGCRLRewardGateInfluence > 0 && !combinedTraj.gcrlGatedRewards.empty() && !combinedTraj.actionComps.empty()) {
+						torch::Tensor tGatedRewards = torch::tensor(combinedTraj.gcrlGatedRewards);
+						torch::Tensor tBaseRewards = tRewards - tGatedRewards;
+						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat);
+						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
+						torch::Tensor tFullGate = InferGCRLRewardGateBatched(
+							ppo,
+							tStates,
+							tActionComps,
+							tGoalTargetRow,
+							tAntiTargetRow,
+							combinedTraj.Length()
+						);
+
+						if (tFullGate.defined()) {
+							float minGate = RS_CLAMP(config.ppo.gcrlRewardGateMin, 0.0f, 1.0f);
+							tFullGate = tFullGate.clamp(minGate, 1.0f);
+							torch::Tensor tEffectiveGate = 1.0f + (tFullGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
+							// Preserve negative shaping penalties; only discount positive farmable rewards.
+							torch::Tensor tAppliedGatedRewards = tGatedRewards.clamp_max(0.0f) + tGatedRewards.clamp_min(0.0f) * tEffectiveGate;
+							tRewards = tBaseRewards + tAppliedGatedRewards;
+
+							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
+							report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
+							report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
+							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
+							report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
+							report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
+						}
+					}
 
 					if (config.ppo.useSORS && !combinedTraj.actionComps.empty()) {
 						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
@@ -1190,6 +1322,10 @@ void GGL::Learner::Start() {
 						"-PPO Learn Time",
 						"",
 						"GCRL/Adv Scale",
+						"GCRL Gate/Influence",
+						"GCRL Gate/Mean",
+						"GCRL Gate/Gated Reward Raw",
+						"GCRL Gate/Gated Reward Applied",
 						"SORS/Reward Scale",
 						"SORS/Loss",
 						"SORS/Pair Accuracy",

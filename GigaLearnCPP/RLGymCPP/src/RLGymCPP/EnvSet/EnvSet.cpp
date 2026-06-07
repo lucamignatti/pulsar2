@@ -79,6 +79,7 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 			userInfos.push_back(createResult.userInfo);
 
 			rewards.push_back(createResult.rewards);
+			gcrlGatedRewards.push_back(createResult.gcrlGatedRewards);
 			terminalConditions.push_back(createResult.terminalConditions);
 			obsBuilders.push_back(createResult.obsBuilder);
 			actionParsers.push_back(createResult.actionParser);
@@ -191,51 +192,60 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 		{
 			for (auto& weighted : rewards[arenaIdx])
 				weighted.reward->PreStep(gs);
+			for (auto& weighted : gcrlGatedRewards[arenaIdx])
+				weighted.reward->PreStep(gs);
 		}
 
 		// Update rewards
 		{
-			FList allRewards = FList(gs.players.size(), 0);
-			for (int rewardIdx = 0; rewardIdx < rewards[arenaIdx].size(); rewardIdx++) {
-				auto& weightedReward = rewards[arenaIdx][rewardIdx];
-				FList output = weightedReward.reward->GetAllRewards(gs, terminalType);
-				for (int i = 0; i < gs.players.size(); i++)
-					allRewards[i] += output[i] * weightedReward.weight;
+			FList baseRewards = FList(gs.players.size(), 0);
+			FList gatedRewards = FList(gs.players.size(), 0);
 
-				// Save the reward
-				if (config.saveRewards) {
-					int playerSampleIndex;
-					if (config.shuffleRewardSampling) {
-						playerSampleIndex = Math::RandInt(0, output.size());
-					} else {
-						// Find player with the lowest id
-						playerSampleIndex = 0;
-						int lowestID = gs.players[0].carId;
-						for (int i = 1; i < gs.players.size(); i++) {
-							auto id = gs.players[i].carId;
-							if (id < lowestID) {
-								lowestID = id;
-								playerSampleIndex = i;
-							}
-						}
+			auto fnGetPlayerSampleIndex = [&](const FList& output) {
+				if (config.shuffleRewardSampling)
+					return Math::RandInt(0, output.size());
+
+				int playerSampleIndex = 0;
+				int lowestID = gs.players[0].carId;
+				for (int i = 1; i < gs.players.size(); i++) {
+					auto id = gs.players[i].carId;
+					if (id < lowestID) {
+						lowestID = id;
+						playerSampleIndex = i;
 					}
-					// We will only take the reward from a random player
-					float rewardToSave = output[playerSampleIndex];
-						
-					// If zero-sum, use the inner reward
-					if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
-						rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
-
-					// If needed, initialize last rewards
-					if (state.lastRewards[arenaIdx].empty())
-						state.lastRewards[arenaIdx].resize(rewards[arenaIdx].size());
-
-					state.lastRewards[arenaIdx][rewardIdx] = rewardToSave;
 				}
-			}
+				return playerSampleIndex;
+			};
+
+			auto fnUpdateRewardGroup = [&](std::vector<WeightedReward>& rewardGroup, FList& outRewards, std::vector<float>& lastRewards) {
+				for (int rewardIdx = 0; rewardIdx < rewardGroup.size(); rewardIdx++) {
+					auto& weightedReward = rewardGroup[rewardIdx];
+					FList output = weightedReward.reward->GetAllRewards(gs, terminalType);
+					for (int i = 0; i < gs.players.size(); i++)
+						outRewards[i] += output[i] * weightedReward.weight;
+
+					if (config.saveRewards) {
+						int playerSampleIndex = fnGetPlayerSampleIndex(output);
+						float rewardToSave = output[playerSampleIndex];
+
+						if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
+							rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
+
+						if (lastRewards.empty())
+							lastRewards.resize(rewardGroup.size());
+
+						lastRewards[rewardIdx] = rewardToSave;
+					}
+				}
+			};
+
+			fnUpdateRewardGroup(rewards[arenaIdx], baseRewards, state.lastRewards[arenaIdx]);
+			fnUpdateRewardGroup(gcrlGatedRewards[arenaIdx], gatedRewards, state.lastGCRLGatedRewards[arenaIdx]);
 
 			for (int i = 0; i < gs.players.size(); i++)
-				state.rewards[playerStartIdx + i] = allRewards[i];
+				state.rewards[playerStartIdx + i] = baseRewards[i] + gatedRewards[i];
+			for (int i = 0; i < gs.players.size(); i++)
+				state.gcrlGatedRewards[playerStartIdx + i] = gatedRewards[i];
 		}
 
 		// Update observations
@@ -270,6 +280,8 @@ void RLGC::EnvSet::ResetArena(int index) {
 	for (auto& cond : terminalConditions[index])
 		cond->Reset(newState);
 	for (auto& weightedReward : rewards[index])
+		weightedReward.reward->Reset(newState);
+	for (auto& weightedReward : gcrlGatedRewards[index])
 		weightedReward.reward->Reset(newState);
 
 	int playerStartIdx = state.arenaPlayerStartIdx[index];
