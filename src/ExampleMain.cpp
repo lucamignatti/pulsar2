@@ -70,6 +70,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Ball-goal
 		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 5.0f },
 
+		// Ungated aerial bootstrap; completed aerial touches/followups remain GCRL-gated.
+		{ new AerialCommitReward(), 1.0f },
+
 		// Boost
 		{ new PickupBoostReward(), 10.f },
 		{ new SaveBoostReward(), 0.2f },
@@ -148,6 +151,13 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 				report.AddAvg("Player/Speed Towards Ball", RS_MAX(0, player.vel.Dot(dirToBall)));
 
 				report.AddAvg("Player/Boost", player.boost);
+
+				bool highBall = state.ball.pos.z >= 650;
+				report.AddAvg("Aerial/High Ball Ratio", highBall);
+				report.AddAvg("Aerial/Airborne On High Ball", highBall && !player.isOnGround);
+				report.AddAvg("Aerial/Jump Action Ratio", player.prevAction.jump);
+				report.AddAvg("Aerial/Air Boost Ratio", !player.isOnGround && player.prevAction.boost);
+				report.AddAvg("Aerial/High Air Touch Ratio", player.ballTouchedStep && !player.isOnGround && state.ball.pos.z >= 500);
 
 				if (player.ballTouchedStep)
 					report.AddAvg("Player/Touch Height", state.ball.pos.z);
@@ -331,8 +341,9 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.addLayerNorm = false;
 	cfg.ppo.sorsReward.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
+	cfg.ppo.deterministic = true;
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

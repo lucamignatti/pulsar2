@@ -200,6 +200,121 @@ namespace RLGC {
 		}
 	};
 
+	class AerialCommitReward : public Reward {
+	public:
+		struct PlayerState {
+			float lastPotential = 0;
+			float paidThisAir = 0;
+			float groundedTime = 0;
+			bool hasLast = false;
+			bool touchedThisAir = false;
+		};
+
+		float minBallHeight, maxBallHeight;
+		float minInterceptTime, maxInterceptTime, interceptTimeStep;
+		float aerialReachSpeed, reachSlack;
+		float minGoalwardVelFrac, perAirCap, maxStepReward, minPotentialDelta, minGroundResetTime;
+		std::unordered_map<int, PlayerState> playerStates;
+
+		AerialCommitReward(
+			float minBallHeight = 650,
+			float maxBallHeight = CommonValues::CEILING_Z,
+			float minInterceptTime = 0.35f,
+			float maxInterceptTime = 1.8f,
+			float interceptTimeStep = 0.15f,
+			float aerialReachSpeed = 1650,
+			float reachSlack = 650,
+			float minGoalwardVelFrac = -0.20f,
+			float perAirCap = 0.20f,
+			float maxStepReward = 0.04f,
+			float minPotentialDelta = 0.01f,
+			float minGroundResetTime = 0.20f
+		) :
+			minBallHeight(minBallHeight), maxBallHeight(maxBallHeight),
+			minInterceptTime(minInterceptTime), maxInterceptTime(maxInterceptTime), interceptTimeStep(interceptTimeStep),
+			aerialReachSpeed(aerialReachSpeed), reachSlack(reachSlack),
+			minGoalwardVelFrac(minGoalwardVelFrac), perAirCap(perAirCap),
+			maxStepReward(maxStepReward), minPotentialDelta(minPotentialDelta), minGroundResetTime(minGroundResetTime) {
+		}
+
+		virtual void Reset(const GameState& initialState) override {
+			playerStates.clear();
+		}
+
+		float GetPotential(const Player& player, const GameState& state) const {
+			Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+			Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+			float goalwardVelFrac = state.ball.vel.Dot(ballDirToGoal) / CommonValues::BALL_MAX_SPEED;
+			if (goalwardVelFrac < minGoalwardVelFrac)
+				return 0;
+
+			float goalScore = 0.35f + 0.65f * RS_CLAMP((goalwardVelFrac - minGoalwardVelFrac) / RS_MAX(0.001f, 0.25f - minGoalwardVelFrac), 0, 1);
+			Vec gravity = Vec(0, 0, CommonValues::GRAVITY_Z);
+			float best = 0;
+
+			for (float t = minInterceptTime; t <= maxInterceptTime + 0.001f; t += interceptTimeStep) {
+				Vec predPos = state.ball.pos + state.ball.vel * t + gravity * (0.5f * t * t);
+				if (predPos.z < minBallHeight || predPos.z > maxBallHeight)
+					continue;
+
+				Vec toPred = predPos - player.pos;
+				float dist = toPred.Length();
+				if (dist <= 1)
+					continue;
+
+				float requiredSpeed = dist / RS_MAX(t, 0.001f);
+				float reachScore = 1 - RS_CLAMP((requiredSpeed - aerialReachSpeed) / RS_MAX(reachSlack, 1.0f), 0, 1);
+				if (reachScore <= 0)
+					continue;
+
+				Vec dirToPred = toPred / dist;
+				float approachScore = RS_CLAMP(player.vel.Dot(dirToPred) / CommonValues::CAR_MAX_SPEED, 0, 1);
+				float heightScore = RS_CLAMP((predPos.z - minBallHeight) / RS_MAX(1, maxBallHeight - minBallHeight), 0, 1);
+				float potential = reachScore * (0.30f + 0.70f * approachScore) * (0.50f + 0.50f * heightScore) * goalScore;
+				best = RS_MAX(best, potential);
+			}
+
+			return best;
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			PlayerState& st = playerStates[player.index];
+			float potential = GetPotential(player, state);
+
+			if (player.isOnGround) {
+				st.groundedTime += state.deltaTime;
+				st.lastPotential = potential;
+				st.hasLast = true;
+				if (st.groundedTime >= minGroundResetTime) {
+					st.paidThisAir = 0;
+					st.touchedThisAir = false;
+				}
+				return 0;
+			}
+			st.groundedTime = 0;
+
+			if (player.ballTouchedStep)
+				st.touchedThisAir = true;
+
+			if (!st.hasLast) {
+				st.lastPotential = potential;
+				st.hasLast = true;
+				return 0;
+			}
+
+			float delta = potential - st.lastPotential;
+			st.lastPotential = potential;
+
+			if (st.touchedThisAir || delta <= minPotentialDelta || st.paidThisAir >= perAirCap)
+				return 0;
+
+			float reward = RS_MIN(delta, maxStepReward);
+			reward = RS_MIN(reward, perAirCap - st.paidThisAir);
+			st.paidThisAir += reward;
+			return reward;
+		}
+	};
+
 	class UsefulAirTouchReward : public Reward {
 	public:
 		float minBallHeight, maxBallHeight, heightExponent;
