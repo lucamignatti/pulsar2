@@ -71,7 +71,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 5.0f },
 
 		// Ungated aerial bootstrap; completed aerial touches/followups remain GCRL-gated.
-		{ new AerialCommitReward(), 1.0f },
+		{ new AerialCommitReward(), 6.0f },
 
 		// Boost
 		{ new PickupBoostReward(), 10.f },
@@ -254,7 +254,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
-	cfg.ppo.gcrlRewardGateLookahead = 15;
+	cfg.ppo.gcrlRewardGateLookahead = 32;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;
