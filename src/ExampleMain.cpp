@@ -232,7 +232,7 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	cfg.ppo.gcrlAdvScale = 0.65f;   // Target GCRL advantage weight after annealing
+	cfg.ppo.gcrlAdvScale = 1.00f;   // Target GCRL advantage weight after annealing
 	cfg.ppo.gcrlAdvScaleAnnealStart = -1; // Start ramping from the current checkpoint/load point
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlAntiScale = 0.85f;   // pessimistic "anti" critic weight in the GCRL advantage
