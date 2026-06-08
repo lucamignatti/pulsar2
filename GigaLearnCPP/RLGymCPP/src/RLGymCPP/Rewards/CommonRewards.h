@@ -214,7 +214,7 @@ namespace RLGC {
 		float minInterceptTime, maxInterceptTime, interceptTimeStep;
 		float aerialReachSpeed, reachSlack;
 		float minGoalwardVelFrac, perAirCap, maxStepReward, minPotentialDelta, minGroundResetTime;
-		std::unordered_map<int, PlayerState> playerStates;
+		std::vector<PlayerState> playerStates;
 
 		AerialCommitReward(
 			float minBallHeight = 650,
@@ -277,8 +277,7 @@ namespace RLGC {
 			return best;
 		}
 
-		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
-			PlayerState& st = playerStates[player.index];
+		float GetRewardForPlayer(const Player& player, const GameState& state, PlayerState& st) {
 			float potential = GetPotential(player, state);
 
 			if (player.isOnGround) {
@@ -312,6 +311,17 @@ namespace RLGC {
 			reward = RS_MIN(reward, perAirCap - st.paidThisAir);
 			st.paidThisAir += reward;
 			return reward;
+		}
+
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			if (playerStates.size() != state.players.size())
+				playerStates.assign(state.players.size(), {});
+
+			std::vector<float> rewards(state.players.size(), 0);
+			for (int i = 0; i < state.players.size(); i++)
+				rewards[i] = GetRewardForPlayer(state.players[i], state, playerStates[i]);
+
+			return rewards;
 		}
 	};
 
