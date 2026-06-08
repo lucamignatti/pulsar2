@@ -593,6 +593,8 @@ void GGL::Learner::Start() {
 
 	if (render)
 		RG_LOG("\t(Render mode enabled)");
+	if (!render && config.ppo.deterministic)
+		RG_ERR_CLOSE("Learner::Start(): PPO deterministic mode cannot be used for training because sampled action log-probs are required.");
 
 	try {
 		bool saveQueued;

@@ -343,7 +343,7 @@ int main(int argc, char* argv[]) {
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
-	cfg.ppo.deterministic = true;
+	cfg.ppo.deterministic = cfg.renderMode;
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
