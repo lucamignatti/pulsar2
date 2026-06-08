@@ -10,6 +10,7 @@
 #include <torch/optim/adagrad.h>
 #include <torch/optim/rmsprop.h>
 #include <torch/optim/sgd.h>
+#include <torch/cuda.h>
 
 #include "Muon.h"
 #include "MagSGD.h"
@@ -144,7 +145,9 @@ namespace GGL {
 			auto fromParams = this->parameters();
 			auto toParams = clone->parameters();
 			for (int i = 0; i < fromParams.size(); i++)
-				toParams[i].copy_(fromParams[i], true);
+				toParams[i].copy_(fromParams[i], false);
+			if (device.is_cuda())
+				torch::cuda::synchronize(device.index());
 			return clone;
 		}
 
@@ -288,8 +291,10 @@ namespace GGL {
 				auto dstParams = dst->parameters();
 				RG_ASSERT(srcParams.size() == dstParams.size());
 				for (int i = 0; i < (int)srcParams.size(); i++)
-					dstParams[i].copy_(srcParams[i], true);
+					dstParams[i].copy_(srcParams[i], false);
 				dst->_seqHalfOutdated = true;
+				if (dst->device.is_cuda())
+					torch::cuda::synchronize(dst->device.index());
 			}
 		}
 
