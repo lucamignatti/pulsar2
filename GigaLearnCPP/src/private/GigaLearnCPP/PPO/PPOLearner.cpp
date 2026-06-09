@@ -21,6 +21,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	curEntropyScale = std::clamp(config.entropyScale, config.minEntropyScale, config.maxEntropyScale);
 	curGCRLAdvScale = config.gcrlAdvScale;
 	curGCRLRewardGateInfluence = config.gcrlRewardGateInfluence;
+	curGCRLAerialRewardGateInfluence = config.gcrlAerialRewardGateInfluence;
+	curAerialCurriculumRewardScale = config.aerialCurriculumRewardScale;
 	curSORSRewardScale = config.sorsRewardScale;
 
 	if (config.useGCRLRewardGate && !config.useGCRL)

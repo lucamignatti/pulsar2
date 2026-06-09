@@ -549,6 +549,41 @@ namespace RLGC {
 		}
 	};
 
+	class ExponentialAerialBallProgressReward : public Reward {
+	public:
+		float minBallHeight, minCarHeight, progressNorm, exponent, cap;
+
+		ExponentialAerialBallProgressReward(
+			float minBallHeight = 500,
+			float minCarHeight = 120,
+			float progressNorm = 120,
+			float exponent = 2.5f,
+			float cap = 0.08f
+		) :
+			minBallHeight(minBallHeight), minCarHeight(minCarHeight),
+			progressNorm(progressNorm), exponent(exponent), cap(cap) {
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.prev)
+				return 0;
+			if (player.isOnGround || player.pos.z < minCarHeight || state.ball.pos.z < minBallHeight)
+				return 0;
+			if (state.prev->ball.pos.z < minBallHeight)
+				return 0;
+
+			float prevDist = (state.prev->ball.pos - player.prev->pos).Length();
+			float curDist = (state.ball.pos - player.pos).Length();
+			float progress = prevDist - curDist;
+			if (progress <= 0)
+				return 0;
+
+			float x = RS_CLAMP(progress / RS_MAX(progressNorm, 1.0f), 0, 1);
+			float denom = RS_MAX(expf(exponent) - 1.0f, 1e-6f);
+			return cap * ((expf(exponent * x) - 1.0f) / denom);
+		}
+	};
+
 	class BallPredInterceptReward : public Reward {
 	public:
 		float minBallHeight, maxPredTime, predTimeStep, reachSpeed, reachSlack;

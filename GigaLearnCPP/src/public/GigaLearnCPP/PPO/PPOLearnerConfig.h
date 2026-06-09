@@ -287,6 +287,13 @@ namespace GGL {
 		float gcrlRewardGateAntiScale = 0.85f; // Own-goal danger penalty inside gate progress
 		float gcrlRewardGateTargetVel = 1200.0f; // Terminal goal target ball velocity in uu/s
 		int gcrlRewardGateLookahead = 15; // Steps to measure terminal-progress delta (~0.5s at tickSkip 4)
+		float gcrlAerialRewardGateInfluence = 1.0f; // Separate gate influence for aerial rewards
+		float gcrlAerialRewardGateStartInfluence = 0.0f; // Initial aerial gate influence before annealing
+		int64_t gcrlAerialRewardGateAnnealStart = -1; // Timesteps to start aerial gate influence ramp; -1 -> current checkpoint
+		int64_t gcrlAerialRewardGateAnnealSteps = 1'000'000'000; // Timesteps to ramp start influence to target influence
+		float aerialCurriculumRewardScale = 1.0f; // Temporary aerial approach reward scale
+		int64_t aerialCurriculumRewardAnnealStart = -1; // Timesteps to start decaying the curriculum reward; -1 -> current checkpoint
+		int64_t aerialCurriculumRewardAnnealSteps = 800'000'000; // Timesteps to decay curriculum reward scale to 0
 		// Hidden architecture of the phi/psi towers (output is always gcrlReprDim). Configured
 		// like policy/critic: layerSizes / activationType / addLayerNorm / optimType.
 		PartialModelConfig gcrlCritic;

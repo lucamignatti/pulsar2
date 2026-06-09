@@ -80,6 +80,8 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 
 			rewards.push_back(createResult.rewards);
 			gcrlGatedRewards.push_back(createResult.gcrlGatedRewards);
+			aerialGCRLGatedRewards.push_back(createResult.aerialGCRLGatedRewards);
+			aerialCurriculumRewards.push_back(createResult.aerialCurriculumRewards);
 			terminalConditions.push_back(createResult.terminalConditions);
 			obsBuilders.push_back(createResult.obsBuilder);
 			actionParsers.push_back(createResult.actionParser);
@@ -194,12 +196,18 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 				weighted.reward->PreStep(gs);
 			for (auto& weighted : gcrlGatedRewards[arenaIdx])
 				weighted.reward->PreStep(gs);
+			for (auto& weighted : aerialGCRLGatedRewards[arenaIdx])
+				weighted.reward->PreStep(gs);
+			for (auto& weighted : aerialCurriculumRewards[arenaIdx])
+				weighted.reward->PreStep(gs);
 		}
 
 		// Update rewards
 		{
 			FList baseRewards = FList(gs.players.size(), 0);
 			FList gatedRewards = FList(gs.players.size(), 0);
+			FList aerialGatedRewards = FList(gs.players.size(), 0);
+			FList aerialCurriculumRewardsOut = FList(gs.players.size(), 0);
 
 			auto fnGetPlayerSampleIndex = [&](const FList& output) {
 				if (config.shuffleRewardSampling)
@@ -241,11 +249,17 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 
 			fnUpdateRewardGroup(rewards[arenaIdx], baseRewards, state.lastRewards[arenaIdx]);
 			fnUpdateRewardGroup(gcrlGatedRewards[arenaIdx], gatedRewards, state.lastGCRLGatedRewards[arenaIdx]);
+			fnUpdateRewardGroup(aerialGCRLGatedRewards[arenaIdx], aerialGatedRewards, state.lastAerialGCRLGatedRewards[arenaIdx]);
+			fnUpdateRewardGroup(aerialCurriculumRewards[arenaIdx], aerialCurriculumRewardsOut, state.lastAerialCurriculumRewards[arenaIdx]);
 
 			for (int i = 0; i < gs.players.size(); i++)
-				state.rewards[playerStartIdx + i] = baseRewards[i] + gatedRewards[i];
+				state.rewards[playerStartIdx + i] = baseRewards[i] + gatedRewards[i] + aerialGatedRewards[i] + aerialCurriculumRewardsOut[i];
 			for (int i = 0; i < gs.players.size(); i++)
 				state.gcrlGatedRewards[playerStartIdx + i] = gatedRewards[i];
+			for (int i = 0; i < gs.players.size(); i++)
+				state.aerialGCRLGatedRewards[playerStartIdx + i] = aerialGatedRewards[i];
+			for (int i = 0; i < gs.players.size(); i++)
+				state.aerialCurriculumRewards[playerStartIdx + i] = aerialCurriculumRewardsOut[i];
 		}
 
 		// Update observations
@@ -281,6 +295,10 @@ void RLGC::EnvSet::ResetArena(int index) {
 	for (auto& weightedReward : rewards[index])
 		weightedReward.reward->Reset(newState);
 	for (auto& weightedReward : gcrlGatedRewards[index])
+		weightedReward.reward->Reset(newState);
+	for (auto& weightedReward : aerialGCRLGatedRewards[index])
+		weightedReward.reward->Reset(newState);
+	for (auto& weightedReward : aerialCurriculumRewards[index])
 		weightedReward.reward->Reset(newState);
 
 	int playerStartIdx = state.arenaPlayerStartIdx[index];

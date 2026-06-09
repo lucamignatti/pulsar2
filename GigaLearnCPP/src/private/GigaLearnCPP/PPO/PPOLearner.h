@@ -22,6 +22,8 @@ namespace GGL {
 		float curEntropyScale;
 		float curGCRLAdvScale;
 		float curGCRLRewardGateInfluence;
+		float curGCRLAerialRewardGateInfluence;
+		float curAerialCurriculumRewardScale;
 		float curSORSRewardScale;
 
 		ModelSet models = {};

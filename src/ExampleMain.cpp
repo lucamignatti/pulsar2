@@ -90,15 +90,26 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
-		// Movement / player-ball rewards are filtered by GCRL terminal progress.
+		// Ground/contact rewards are filtered by GCRL terminal progress.
+		{ new VelocityPlayerToBallReward(), 6.f },
+		{ new StrongTouchReward(20, 100), 90.f }
+	};
+
+	std::vector<WeightedReward> aerialGCRLGatedRewards = {
+
+		// Aerial rewards use a slower gate anneal so bootstrap signals are not filtered out early.
 		{ new AirReward(), 0.02f },
 		{ new HeightWeightedAerialApproachReward(), 1.5f },
 		{ new UsefulAirTouchReward(), 25.0f },
 		{ new SecondTouchReward(), 12.0f },
 		{ new FlipResetFollowupReward(), 8.0f },
-		{ new UsefulFlickReward(), 8.0f },
-		{ new VelocityPlayerToBallReward(), 6.f },
-		{ new StrongTouchReward(20, 100), 90.f }
+		{ new UsefulFlickReward(), 8.0f }
+	};
+
+	std::vector<WeightedReward> aerialCurriculumRewards = {
+
+		// Temporary capped bootstrap: go make progress toward high balls while airborne.
+		{ new ExponentialAerialBallProgressReward(), 1.0f }
 	};
 
 
@@ -126,6 +137,8 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
+	result.aerialGCRLGatedRewards = aerialGCRLGatedRewards;
+	result.aerialCurriculumRewards = aerialCurriculumRewards;
 	result.userInfo = resetInfo;
 
 	result.arena = arena;
@@ -232,7 +245,7 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	cfg.ppo.gcrlAdvScale = 1.00f;   // Target GCRL advantage weight after annealing
+	cfg.ppo.gcrlAdvScale = 0.75f;   // Target GCRL advantage weight after annealing
 	cfg.ppo.gcrlAdvScaleAnnealStart = -1; // Start ramping from the current checkpoint/load point
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlAntiScale = 0.85f;   // pessimistic "anti" critic weight in the GCRL advantage
@@ -255,6 +268,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 	cfg.ppo.gcrlRewardGateLookahead = 32;
+	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
+	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
+	cfg.ppo.aerialCurriculumRewardScale = 1.0f;
+	cfg.ppo.aerialCurriculumRewardAnnealStart = -1;
+	cfg.ppo.aerialCurriculumRewardAnnealSteps = 800'000'000;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;

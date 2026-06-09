@@ -40,6 +40,8 @@ namespace GGL {
 		uint64_t
 			gcrlAdvScaleAnnealStartTS = UINT64_MAX,
 			gcrlRewardGateAnnealStartTS = UINT64_MAX,
+			gcrlAerialRewardGateAnnealStartTS = UINT64_MAX,
+			aerialCurriculumRewardAnnealStartTS = UINT64_MAX,
 			sorsRewardScaleAnnealStartTS = UINT64_MAX;
 
 		StepCallbackFn stepCallback = NULL;
