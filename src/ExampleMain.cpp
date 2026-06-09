@@ -62,8 +62,25 @@ public:
 };
 
 // Create the RLGymCPP environment for each of our games
+// Cycles through four modes every 4 arenas so the fleet is evenly split:
+//   index % 4 == 0 → 1v1 SOCCAR
+//   index % 4 == 1 → 2v2 SOCCAR
+//   index % 4 == 2 → 3v3 SOCCAR
+//   index % 4 == 3 → Heatseeker 2v2
+// AdvancedObs(maxPlayers=3) pads every obs to the same fixed size regardless of
+// how many cars are actually present, so all modes share one policy network.
 EnvCreateResult EnvCreateFunc(int index) {
 	EnvResetInfo* resetInfo = new EnvResetInfo();
+
+	int modeIdx = index % 4;
+	int playersPerTeam;
+	GameMode gameMode;
+	switch (modeIdx) {
+		case 0:  playersPerTeam = 1; gameMode = GameMode::SOCCAR;     break; // 1v1
+		case 1:  playersPerTeam = 2; gameMode = GameMode::SOCCAR;     break; // 2v2
+		case 2:  playersPerTeam = 3; gameMode = GameMode::SOCCAR;     break; // 3v3
+		default: playersPerTeam = 2; gameMode = GameMode::HEATSEEKER; break; // Heatseeker 2v2
+	}
 
 	std::vector<WeightedReward> rewards = {
 
@@ -77,7 +94,8 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new PickupBoostReward(), 10.f },
 		{ new SaveBoostReward(), 0.2f },
 
-		// Game events
+		// Game events — shot/save callbacks are NULL in Heatseeker (no event tracker),
+		// so ShotReward and SaveReward naturally return 0 there.
 		{ new ShotReward(), 15.f },
 		{ new ShotOnFrameReward(), 35.f },
 		{ new SaveReward(), 20.f },
@@ -117,16 +135,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ExponentialAerialBallProgressReward(), 1.0f }
 	};
 
-
-
 	std::vector<TerminalCondition*> terminalConditions = {
 		new NoTouchCondition(10),
 		new GoalScoreCondition()
 	};
 
-	// Make the arena
-	int playersPerTeam = 1;
-	auto arena = Arena::Create(GameMode::SOCCAR);
+	auto arena = Arena::Create(gameMode);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
 		arena->AddCar(Team::ORANGE);
@@ -134,7 +148,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
-	result.obsBuilder = new AdvancedObs(3, true, true);
+	result.obsBuilder = new AdvancedObs(3, true, true); // maxPlayers=3 → fixed obs size for all modes
 	result.stateSetter = new CombinedState({
 		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
 		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
