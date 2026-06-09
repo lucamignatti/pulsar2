@@ -9,11 +9,22 @@
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
 
+#include <optional>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPStream.h>
+#include <c10/hip/HIPGuard.h>
+namespace c10_gpu = c10::hip;
+using GpuStream = c10::hip::HIPStream;
+using GpuStreamGuard = c10::hip::HIPStreamGuard;
 #else
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+namespace c10_gpu = c10::cuda;
+using GpuStream = c10::cuda::CUDAStream;
+using GpuStreamGuard = c10::cuda::CUDAStreamGuard;
 #endif
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
@@ -1123,6 +1134,20 @@ void GGL::Learner::Start() {
 		if (doAsync)
 			inferenceModels = ppo->GetPolicyModels().CloneAll();
 
+		// Dedicated GPU stream for the async collector. The collector thread and the main
+		// (process+learn) thread both issue libtorch GPU ops; driving the *same* default
+		// HIP/CUDA stream from two threads is what produced the HSA queue faults
+		// (HSA_STATUS_ERROR_EXCEPTION 0x1016): one thread's caching-allocator free recycled
+		// a block the other thread's in-flight copy/kernel was still reading. Pinning the
+		// collector to its own non-default stream makes the caching allocator insert the
+		// proper cross-stream events whenever a block is reused between the two threads, so
+		// the overlap stays correct without serializing kernels.
+#ifdef RG_CUDA_SUPPORT
+		std::optional<GpuStream> collectorStream;
+		if (doAsync && ppo->device.is_cuda())
+			collectorStream = c10_gpu::getStreamFromPool(/*isHighPriority=*/false, ppo->device.index());
+#endif
+
 		struct {
 			std::mutex m;
 			std::condition_variable cvReady, cvGo;
@@ -1134,6 +1159,13 @@ void GGL::Learner::Start() {
 
 		if (doAsync) {
 			collectorThread = std::thread([&] {
+#ifdef RG_CUDA_SUPPORT
+				// Make `collectorStream` the current stream for this thread's entire
+				// lifetime, so every device tensor the collector allocates is homed on it.
+				std::optional<GpuStreamGuard> streamGuard;
+				if (collectorStream.has_value())
+					streamGuard.emplace(*collectorStream);
+#endif
 				while (true) {
 					{
 						std::unique_lock<std::mutex> lk(handoff.m);
@@ -1142,6 +1174,13 @@ void GGL::Learner::Start() {
 						handoff.collectGo = false;
 					}
 					fnCollectBatch(inferenceModels, pendingBatch);
+#ifdef RG_CUDA_SUPPORT
+					// Flush all collector GPU work before publishing the batch, so every
+					// device block this batch touched is fully retired before the main
+					// thread takes over and the next CopyParamsFrom/kick happens.
+					if (collectorStream.has_value())
+						collectorStream->synchronize();
+#endif
 					{
 						std::lock_guard<std::mutex> lk(handoff.m);
 						handoff.batchReady = true;
@@ -1464,9 +1503,15 @@ void GGL::Learner::Start() {
 					}
 				}
 
-				// Free CUDA cache
+				// Free CUDA cache.
+				// emptyCache() does a device-wide hipFree sync that stalls the concurrent
+				// collector overlap and largely defeats the caching allocator, so don't run
+				// it every iteration -- only periodically to keep fragmentation in check.
+				// Bump kEmptyCacheInterval up if you still see throughput dips, down (or to 1)
+				// if you hit OOM from cached-block fragmentation.
 #ifdef RG_CUDA_SUPPORT
-				if (ppo->device.is_cuda())
+				constexpr uint64_t kEmptyCacheInterval = 32;
+				if (ppo->device.is_cuda() && (totalIterations % kEmptyCacheInterval == 0))
 					c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
