@@ -282,6 +282,8 @@ namespace GGL {
 		// Copy weights from src into this set's matching models (by name). Both sets must have the same models.
 		void CopyParamsFrom(const ModelSet& src) {
 			RG_NO_GRAD;
+			bool anyCuda = false;
+			c10::DeviceIndex deviceIndex = 0;
 			for (Model* dst : *this) {
 				auto it = src.map.find(dst->modelName);
 				RG_ASSERT(it != src.map.end());
@@ -293,9 +295,17 @@ namespace GGL {
 				for (int i = 0; i < (int)srcParams.size(); i++)
 					dstParams[i].copy_(srcParams[i], false);
 				dst->_seqHalfOutdated = true;
-				if (dst->device.is_cuda())
-					torch::cuda::synchronize(dst->device.index());
+				if (dst->device.is_cuda()) {
+					anyCuda = true;
+					deviceIndex = dst->device.index();
+				}
 			}
+			// Single device sync after all copies (was once per model -> several redundant
+			// full-device syncs per iteration). The copies are enqueued on the calling
+			// (main) thread's stream; one sync guarantees they all complete before the
+			// collector reads the updated weights on its own stream.
+			if (anyCuda)
+				torch::cuda::synchronize(deviceIndex);
 		}
 
 		void Free() {
