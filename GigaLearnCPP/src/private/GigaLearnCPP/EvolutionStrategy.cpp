@@ -454,14 +454,16 @@ void GGL::EvolutionStrategy::EvaluateChunk(
 		envSet->StepSecondHalf(curActions, false);
 
 		// Goal attribution.
+		// RS_TEAM_FROM_Y returns the team whose goal the ball is IN (i.e. the team that conceded),
+		// matching the convention used in GoalReward: scored = (player.team != RS_TEAM_FROM_Y(...))
 		for (int a = 0; a < M; a++) {
 			auto& gs = envSet->state.gameStates[a];
 			if (gs.goalScored) {
-				Team scoringTeam = RS_TEAM_FROM_Y(gs.ball.pos.y);
-				if (scoringTeam == memberTeam[a])
-					goalsFor[a]++;
-				else
+				Team concededTeam = RS_TEAM_FROM_Y(gs.ball.pos.y);
+				if (concededTeam == memberTeam[a])
 					goalsAgainst[a]++;
+				else
+					goalsFor[a]++;
 			}
 		}
 

@@ -446,7 +446,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 
 	// Reset all obs builders initially
 	for (int i = 0; i < envSet->arenas.size(); i++)
-		oldObsBuilders[i]->Reset(envSet->state.gameStates[0]);
+		oldObsBuilders[i]->Reset(envSet->state.gameStates[i]);
 
 	std::vector<ActionParser*> oldActionParsers = {};
 	for (int i = 0; i < envSet->arenas.size(); i++)
@@ -628,6 +628,9 @@ void GGL::Learner::Start() {
 
 		int numPlayers = envSet->state.numPlayers;
 		bool useActionComps = config.ppo.useGCRL || config.ppo.useSORS || config.ppo.useGCRLRewardGate;
+
+		// Car-local ball offset for GCRL carFutureGoals — depends on obs builder layout.
+		int carLocalBallOffset = envSet->obsBuilders[0]->GetCarLocalBallOffset();
 
 		std::vector<int> playerArenaIdx(numPlayers), playerLocalIdx(numPlayers);
 		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
@@ -883,7 +886,7 @@ void GGL::Learner::Start() {
 					if (!render && obsStat) {
 						// TODO: This samples from old versions too
 						// NOTE: obsStat is also read by main thread (MakeGCRLTerminalTargetRow) — benign torn-read for approximate normalization stats.
-						int numSamples = RS_MAX(envSet->state.numPlayers, config.maxObsSamples);
+						int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 						for (int i = 0; i < numSamples; i++) {
 							int idx = Math::RandInt(0, envSet->state.numPlayers);
 							obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
@@ -935,7 +938,16 @@ void GGL::Learner::Start() {
 
 					auto curActions = TENSOR_TO_VEC<int>(tActions);
 
+					FList newLogProbs;
+					if (tLogProbs.defined() && !render)
+						newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
+
+					stepTimer.Reset();
+					envSet->Sync(); // Make sure the first half is done
+
 					// Decode flat action indices -> 8-dim continuous components for auxiliary critics/reward models.
+					// Placed after Sync() to avoid a data race: StepFirstHalf calls ResetBeforeStep()
+					// on worker threads which writes player.eventState concurrently with this read.
 					if (useActionComps) {
 						for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 							auto* actionParser = envSet->actionParsers[arenaIdx];
@@ -949,12 +961,7 @@ void GGL::Learner::Start() {
 							}
 						}
 					}
-					FList newLogProbs;
-					if (tLogProbs.defined() && !render)
-						newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);
 
-					stepTimer.Reset();
-					envSet->Sync(); // Make sure the first half is done
 					envSet->StepSecondHalf(curActions, false);
 					out.envStepTime += stepTimer.Elapsed();
 
@@ -1099,11 +1106,17 @@ void GGL::Learner::Start() {
 							if (terminalType == RLGC::TerminalType::TRUNCATED) {
 								// Truncation requires an additional next state for the critic
 								envSet->state.obs.AppendRow(newPlayerIdx, traj.nextStates);
+								// Normalize the just-appended next-state using the current iteration's stats
+								// (regular trajectory states are already normalized; nextStates come raw from the env).
+								if (obsStat && !_normOffset.empty()) {
+									float* ptr = traj.nextStates.data() + traj.nextStates.size() - obsSize;
+									ApplyObsNorm(ptr, 1, obsSize, _normOffset, _normInvStd);
+								}
 							}
 
 							// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
 							// the goal. goal/anti critics use the global ball (obs[0:6]); the car
-							// critic uses the car-local ball (obs[69:75]).
+							// critic uses the car-local ball at carLocalBallOffset (layout-dependent).
 							if (config.ppo.useGCRL) {
 								int N = traj.Length();
 								int H = config.ppo.gcrlHorizon;
@@ -1122,8 +1135,10 @@ void GGL::Learner::Start() {
 										t_target = hi;
 									for (int d = 0; d < 6; d++)
 										traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
-									for (int d = 0; d < 6; d++)
-										traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + 69 + d];
+									if (carLocalBallOffset >= 0) {
+										for (int d = 0; d < 6; d++)
+											traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + carLocalBallOffset + d];
+									}
 								}
 							}
 
@@ -1139,6 +1154,12 @@ void GGL::Learner::Start() {
 				report["Inference Time"] = out.inferTime;
 				report["Env Step Time"] = out.envStepTime;
 			}
+
+			// Clear old-version players' in-progress trajectories so stale data from a previous
+			// batch (under a different old-version assignment) is never stitched to new-policy steps.
+			for (int oldPlayerIdx : oldPlayerIndices)
+				trajectories[oldPlayerIdx].Clear();
+
 			out.collectionTime = collectionTimer.Elapsed();
 		}; // fnCollectBatch
 

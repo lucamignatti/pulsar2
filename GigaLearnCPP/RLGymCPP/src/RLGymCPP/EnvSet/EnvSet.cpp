@@ -53,13 +53,14 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 		auto createResult = config.envCreateFn(idx);
 		auto arena = createResult.arena;
 
-		appendMutex.lock();
 		{
+			std::lock_guard<std::mutex> lk(appendMutex);
+
 			arenas.push_back(arena);
 
 			auto userInfo = new CallbackUserInfo();
 			userInfo->arena = arena;
-			userInfo->arenaIdx = idx;
+			userInfo->arenaIdx = (int)arenas.size() - 1; // index in push_back order, not job-creation order
 			userInfo->envSet = this;
 			eventCallbackInfos.push_back(userInfo);
 			arena->SetCarBumpCallback(_BumpCallback, userInfo);
@@ -73,7 +74,7 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 				tracker->SetSaveCallback(_SaveEventCallback, userInfo);
 			} else {
 				eventTrackers.push_back(NULL);
-				eventCallbackInfos.push_back(NULL);
+				// NOTE: no second eventCallbackInfos push here — one entry per arena is correct
 			}
 
 			userInfos.push_back(createResult.userInfo);
@@ -88,7 +89,6 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 			actionParsers.push_back(createResult.actionParser);
 			stateSetters.push_back(createResult.stateSetter);
 		}
-		appendMutex.unlock();
 	};
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 

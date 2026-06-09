@@ -290,7 +290,8 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 		// Account for action masking in entropy
 		// We will effectively narrow the entropy to the scope of the valid actions
 		// This way states with more masked actions don't just have inherently lower entropy
-		entropy /= actionMasks.to(torch::kFloat32).sum(-1).log();
+		// Clamp denominator to at least log(2) to avoid division by zero when only one action is valid.
+		entropy /= actionMasks.to(torch::kFloat32).sum(-1).clamp_min(2.0f).log();
 	} else {
 		entropy /= logf(actionMasks.size(-1));
 	}
@@ -549,13 +550,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			};
 
 			
+			// Use actual tensor size so overbatched tail samples aren't silently discarded.
+			int actualBatchSize = (int)batchObs.size(0);
 			if (device.is_cpu()) {
-				// Just run one minibatch
-				fnRunMinibatch(0, config.batchSize);
+				fnRunMinibatch(0, actualBatchSize);
 			} else {
-				for (int mbs = 0; mbs < config.batchSize; mbs += config.miniBatchSize) {
+				for (int mbs = 0; mbs < actualBatchSize; mbs += config.miniBatchSize) {
 					int start = mbs;
-					int stop = start + config.miniBatchSize;
+					int stop = RS_MIN(start + config.miniBatchSize, actualBatchSize);
 					fnRunMinibatch(start, stop);
 				}
 			}
@@ -864,6 +866,8 @@ void GGL::PPOLearner::LoadSORSState(std::filesystem::path folderPath) {
 
 		size_t stateCount = (size_t)window.length * sors->obs_dim;
 		size_t actionCount = (size_t)window.length * sors->action_dim;
+		if (stateOffset + stateCount > (size_t)tStates.numel() || actionOffset + actionCount > (size_t)tActions.numel())
+			RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Corrupt SORS replay tensor sizes in " << folderPath);
 		window.states.assign(statesData + stateOffset, statesData + stateOffset + stateCount);
 		window.actionComps.assign(actionsData + actionOffset, actionsData + actionOffset + actionCount);
 		stateOffset += stateCount;

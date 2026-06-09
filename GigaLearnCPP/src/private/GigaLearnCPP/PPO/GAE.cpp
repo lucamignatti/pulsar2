@@ -11,7 +11,8 @@ void GGL::GAE::Compute(
 	float prevLambda = 0;
 	int numReturns = rews.size(0);
 	float prevRet = 0;
-	int truncCount = 0;
+	// Walk truncation preds in reverse (they were appended forward) to match the backward GAE pass.
+	int truncCount = numTruncs - 1;
 
 	float totalRew = 0, totalClippedRew = 0;
 
@@ -71,13 +72,15 @@ void GGL::GAE::Compute(
 			if (!hasTruncValPreds)
 				RG_ERR_CLOSE("GAE encountered a truncated terminal, but has no truncated val pred");
 
-			if (truncCount >= numTruncs)
+			if (truncCount < 0)
 				RG_ERR_CLOSE("GAE encountered too many truncated terminals, not enough val preds (max: " << numTruncs << ")")
 
 			nextValPred = _truncValPreds[truncCount];
-			truncCount++;
+			truncCount--;
 		} else {
-			nextValPred = _valPreds[step + 1];
+			// Guard against OOB at the last step: (1-done) is 0 for NORMAL terminals so the
+			// value is multiplied away, but the read itself would be UB without the check.
+			nextValPred = (step + 1 < numReturns) ? _valPreds[step + 1] : 0.0f;
 		}
 
 		float predReturn = curReward + gamma * nextValPred * (1 - done);
@@ -92,8 +95,8 @@ void GGL::GAE::Compute(
 	}
 	
 	if (hasTruncValPreds)
-		if (truncCount != truncValPreds.size(0))
-			RG_ERR_CLOSE("GAE didn't receive expected truncation count (only " << truncCount << "/" << truncValPreds.size(0) << ")");
+		if (truncCount != -1)
+			RG_ERR_CLOSE("GAE didn't receive expected truncation count (consumed " << (numTruncs - 1 - truncCount) << "/" << numTruncs << ")");
 
 	outTargetValues = valPreds.slice(0, 0, numReturns) + outAdvantages;
 	outRewClipPortion = (totalRew - totalClippedRew) / RS_MAX(totalRew, 1e-7f);
