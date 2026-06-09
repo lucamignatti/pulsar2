@@ -23,6 +23,7 @@ namespace GGL {
 		float curGCRLAdvScale;
 		float curGCRLRewardGateInfluence;
 		float curGCRLAerialRewardGateInfluence;
+		float curCurriculumRewardScale;
 		float curAerialCurriculumRewardScale;
 		float curSORSRewardScale;
 

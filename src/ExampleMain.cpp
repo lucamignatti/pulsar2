@@ -91,8 +91,13 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
 		// Ground/contact rewards are filtered by GCRL terminal progress.
-		{ new VelocityPlayerToBallReward(), 6.f },
 		{ new StrongTouchReward(20, 100), 90.f }
+	};
+
+	std::vector<WeightedReward> curriculumRewards = {
+
+		// Temporary chase incentive; signed GCRL gating turns bad-progress chasing into punishment.
+		{ new VelocityPlayerToBallReward(), 6.f }
 	};
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
@@ -137,6 +142,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
+	result.curriculumRewards = curriculumRewards;
 	result.aerialGCRLGatedRewards = aerialGCRLGatedRewards;
 	result.aerialCurriculumRewards = aerialCurriculumRewards;
 	result.userInfo = resetInfo;
@@ -263,7 +269,6 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
 	cfg.ppo.gcrlRewardGateAnnealStart = -1;
 	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
-	cfg.ppo.gcrlRewardGateMin = 0.2f;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
@@ -272,6 +277,9 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
 	cfg.ppo.gcrlAerialRewardGateAnnealStart = -1;
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
+	cfg.ppo.curriculumRewardScale = 1.0f;
+	cfg.ppo.curriculumRewardAnnealStart = -1;
+	cfg.ppo.curriculumRewardAnnealSteps = 800'000'000;
 	cfg.ppo.aerialCurriculumRewardScale = 1.0f;
 	cfg.ppo.aerialCurriculumRewardAnnealStart = -1;
 	cfg.ppo.aerialCurriculumRewardAnnealSteps = 800'000'000;

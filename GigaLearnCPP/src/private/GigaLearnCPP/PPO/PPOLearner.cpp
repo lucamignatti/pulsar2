@@ -22,6 +22,7 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	curGCRLAdvScale = config.gcrlAdvScale;
 	curGCRLRewardGateInfluence = config.gcrlRewardGateInfluence;
 	curGCRLAerialRewardGateInfluence = config.gcrlAerialRewardGateInfluence;
+	curCurriculumRewardScale = config.curriculumRewardScale;
 	curAerialCurriculumRewardScale = config.aerialCurriculumRewardScale;
 	curSORSRewardScale = config.sorsRewardScale;
 

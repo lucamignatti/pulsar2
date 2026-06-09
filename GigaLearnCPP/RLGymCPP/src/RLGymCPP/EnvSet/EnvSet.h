@@ -15,6 +15,7 @@ namespace RLGC {
 		Arena* arena;
 		std::vector<WeightedReward> rewards;
 		std::vector<WeightedReward> gcrlGatedRewards;
+		std::vector<WeightedReward> curriculumRewards;
 		std::vector<WeightedReward> aerialGCRLGatedRewards;
 		std::vector<WeightedReward> aerialCurriculumRewards;
 		std::vector<TerminalCondition*> terminalConditions;
@@ -43,10 +44,12 @@ namespace RLGC {
 		DimList2<uint8_t> actionMasks;
 		std::vector<float> rewards;
 		std::vector<float> gcrlGatedRewards;
+		std::vector<float> curriculumRewards;
 		std::vector<float> aerialGCRLGatedRewards;
 		std::vector<float> aerialCurriculumRewards;
 		std::vector<std::vector<float>> lastRewards; // Only from the first arena
 		std::vector<std::vector<float>> lastGCRLGatedRewards;
+		std::vector<std::vector<float>> lastCurriculumRewards;
 		std::vector<std::vector<float>> lastAerialGCRLGatedRewards;
 		std::vector<std::vector<float>> lastAerialCurriculumRewards;
 		std::vector<uint8_t> terminals;
@@ -64,10 +67,12 @@ namespace RLGC {
 			prevGameStates.resize(arenas.size());
 			rewards.resize(numPlayers);
 			gcrlGatedRewards.resize(numPlayers);
+			curriculumRewards.resize(numPlayers);
 			aerialGCRLGatedRewards.resize(numPlayers);
 			aerialCurriculumRewards.resize(numPlayers);
 			lastRewards.resize(arenas.size());
 			lastGCRLGatedRewards.resize(arenas.size());
+			lastCurriculumRewards.resize(arenas.size());
 			lastAerialGCRLGatedRewards.resize(arenas.size());
 			lastAerialCurriculumRewards.resize(arenas.size());
 			terminals.resize(arenas.size());
@@ -95,6 +100,7 @@ namespace RLGC {
 
 		std::vector<std::vector<WeightedReward>> rewards;
 		std::vector<std::vector<WeightedReward>> gcrlGatedRewards;
+		std::vector<std::vector<WeightedReward>> curriculumRewards;
 		std::vector<std::vector<WeightedReward>> aerialGCRLGatedRewards;
 		std::vector<std::vector<WeightedReward>> aerialCurriculumRewards;
 		std::vector<std::vector<TerminalCondition*>> terminalConditions;

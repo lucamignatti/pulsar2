@@ -295,6 +295,8 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["gcrl_reward_gate_anneal_start_ts"] = gcrlRewardGateAnnealStartTS;
 	if (gcrlAerialRewardGateAnnealStartTS != UINT64_MAX)
 		j["gcrl_aerial_reward_gate_anneal_start_ts"] = gcrlAerialRewardGateAnnealStartTS;
+	if (curriculumRewardAnnealStartTS != UINT64_MAX)
+		j["curriculum_reward_anneal_start_ts"] = curriculumRewardAnnealStartTS;
 	if (aerialCurriculumRewardAnnealStartTS != UINT64_MAX)
 		j["aerial_curriculum_reward_anneal_start_ts"] = aerialCurriculumRewardAnnealStartTS;
 	if (sorsRewardScaleAnnealStartTS != UINT64_MAX)
@@ -334,6 +336,8 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		gcrlRewardGateAnnealStartTS = j["gcrl_reward_gate_anneal_start_ts"];
 	if (j.contains("gcrl_aerial_reward_gate_anneal_start_ts"))
 		gcrlAerialRewardGateAnnealStartTS = j["gcrl_aerial_reward_gate_anneal_start_ts"];
+	if (j.contains("curriculum_reward_anneal_start_ts"))
+		curriculumRewardAnnealStartTS = j["curriculum_reward_anneal_start_ts"];
 	if (j.contains("aerial_curriculum_reward_anneal_start_ts"))
 		aerialCurriculumRewardAnnealStartTS = j["aerial_curriculum_reward_anneal_start_ts"];
 	if (j.contains("sors_reward_scale_anneal_start_ts"))
@@ -636,7 +640,7 @@ void GGL::Learner::Start() {
 		}
 
 		struct Trajectory {
-			FList states, nextStates, rewards, gcrlGatedRewards, aerialGCRLGatedRewards, aerialCurriculumRewards, logProbs;
+			FList states, nextStates, rewards, gcrlGatedRewards, curriculumRewards, aerialGCRLGatedRewards, aerialCurriculumRewards, logProbs;
 			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
 			// ball goals (global / car-local), filled at episode end.
 			FList actionComps, futureGoals, carFutureGoals;
@@ -650,6 +654,7 @@ void GGL::Learner::Start() {
 				nextStates.clear();
 				rewards.clear();
 				gcrlGatedRewards.clear();
+				curriculumRewards.clear();
 				aerialGCRLGatedRewards.clear();
 				aerialCurriculumRewards.clear();
 				logProbs.clear();
@@ -667,6 +672,7 @@ void GGL::Learner::Start() {
 				nextStates += other.nextStates;
 				rewards += other.rewards;
 				gcrlGatedRewards += other.gcrlGatedRewards;
+				curriculumRewards += other.curriculumRewards;
 				aerialGCRLGatedRewards += other.aerialGCRLGatedRewards;
 				aerialCurriculumRewards += other.aerialCurriculumRewards;
 				logProbs += other.logProbs;
@@ -694,6 +700,7 @@ void GGL::Learner::Start() {
 			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
 			traj.rewards.reserve(maxEpisodeLength);
 			traj.gcrlGatedRewards.reserve(maxEpisodeLength);
+			traj.curriculumRewards.reserve(maxEpisodeLength);
 			traj.aerialGCRLGatedRewards.reserve(maxEpisodeLength);
 			traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
 			traj.logProbs.reserve(maxEpisodeLength);
@@ -838,6 +845,7 @@ void GGL::Learner::Start() {
 				combinedTraj.states.reserve(expTs * obsSize);
 				combinedTraj.rewards.reserve(expTs);
 				combinedTraj.gcrlGatedRewards.reserve(expTs);
+				combinedTraj.curriculumRewards.reserve(expTs);
 				combinedTraj.aerialGCRLGatedRewards.reserve(expTs);
 				combinedTraj.aerialCurriculumRewards.reserve(expTs);
 				combinedTraj.logProbs.reserve(expTs);
@@ -963,12 +971,14 @@ void GGL::Learner::Start() {
 						int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
 						std::unordered_map<std::string, AvgTracker> avgRewards = {};
 						std::unordered_map<std::string, AvgTracker> avgGatedRewards = {};
+						std::unordered_map<std::string, AvgTracker> avgCurriculumRewards = {};
 						std::unordered_map<std::string, AvgTracker> avgAerialGatedRewards = {};
 						std::unordered_map<std::string, AvgTracker> avgAerialCurriculumRewards = {};
 						for (int i = 0; i < numSamples; i++) {
 							int arenaIdx = Math::RandInt(0, envSet->arenas.size());
 							auto& prevRewards = envSet->state.lastRewards[arenaIdx];
 							auto& prevGatedRewards = envSet->state.lastGCRLGatedRewards[arenaIdx];
+							auto& prevCurriculumRewards = envSet->state.lastCurriculumRewards[arenaIdx];
 							auto& prevAerialGatedRewards = envSet->state.lastAerialGCRLGatedRewards[arenaIdx];
 							auto& prevAerialCurriculumRewards = envSet->state.lastAerialCurriculumRewards[arenaIdx];
 
@@ -979,6 +989,10 @@ void GGL::Learner::Start() {
 							for (int j = 0; j < envSet->gcrlGatedRewards[arenaIdx].size(); j++) {
 								std::string rewardName = envSet->gcrlGatedRewards[arenaIdx][j].reward->GetName();
 								avgGatedRewards[rewardName] += prevGatedRewards[j];
+							}
+							for (int j = 0; j < envSet->curriculumRewards[arenaIdx].size(); j++) {
+								std::string rewardName = envSet->curriculumRewards[arenaIdx][j].reward->GetName();
+								avgCurriculumRewards[rewardName] += prevCurriculumRewards[j];
 							}
 							for (int j = 0; j < envSet->aerialGCRLGatedRewards[arenaIdx].size(); j++) {
 								std::string rewardName = envSet->aerialGCRLGatedRewards[arenaIdx][j].reward->GetName();
@@ -994,6 +1008,8 @@ void GGL::Learner::Start() {
 							report.AddAvg("Rewards/" + pair.first, pair.second.Get());
 						for (auto& pair : avgGatedRewards)
 							report.AddAvg("Rewards/Gated/" + pair.first, pair.second.Get());
+						for (auto& pair : avgCurriculumRewards)
+							report.AddAvg("Rewards/Curriculum/" + pair.first, pair.second.Get());
 						for (auto& pair : avgAerialGatedRewards)
 							report.AddAvg("Rewards/AerialGated/" + pair.first, pair.second.Get());
 						for (auto& pair : avgAerialCurriculumRewards)
@@ -1006,6 +1022,7 @@ void GGL::Learner::Start() {
 						trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 						trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 						trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].curriculumRewards += envSet->state.curriculumRewards[newPlayerIdx];
 						trajectories[newPlayerIdx].aerialGCRLGatedRewards += envSet->state.aerialGCRLGatedRewards[newPlayerIdx];
 						trajectories[newPlayerIdx].aerialCurriculumRewards += envSet->state.aerialCurriculumRewards[newPlayerIdx];
 						trajectories[newPlayerIdx].logProbs += newLogProbs[i];
@@ -1277,6 +1294,13 @@ void GGL::Learner::Start() {
 				config.ppo.gcrlAerialRewardGateAnnealSteps,
 				gcrlAerialRewardGateAnnealStartTS
 			) : 0.0f;
+			ppo->curCurriculumRewardScale = fnGetAnnealedRange(
+				config.ppo.curriculumRewardScale,
+				0.0f,
+				config.ppo.curriculumRewardAnnealStart,
+				config.ppo.curriculumRewardAnnealSteps,
+				curriculumRewardAnnealStartTS
+			);
 			ppo->curAerialCurriculumRewardScale = fnGetAnnealedRange(
 				config.ppo.aerialCurriculumRewardScale,
 				0.0f,
@@ -1295,6 +1319,7 @@ void GGL::Learner::Start() {
 				report["GCRL Gate/Influence"] = ppo->curGCRLRewardGateInfluence;
 				report["GCRL Aerial Gate/Influence"] = ppo->curGCRLAerialRewardGateInfluence;
 			}
+			report["Curriculum/Scale"] = ppo->curCurriculumRewardScale;
 			report["Aerial Curriculum/Scale"] = ppo->curAerialCurriculumRewardScale;
 			if (config.ppo.useSORS)
 				report["SORS/Reward Scale"] = ppo->curSORSRewardScale;
@@ -1315,17 +1340,21 @@ void GGL::Learner::Start() {
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
 
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
+					bool hasCurriculumRewards = !combinedTraj.curriculumRewards.empty();
 					bool hasAerialGatedRewards = !combinedTraj.aerialGCRLGatedRewards.empty();
 					bool hasAerialCurriculumRewards = !combinedTraj.aerialCurriculumRewards.empty();
 					bool needsGCRLRewardGate =
 						config.ppo.useGCRLRewardGate &&
 						(ppo->curGCRLRewardGateInfluence > 0 || ppo->curGCRLAerialRewardGateInfluence > 0) &&
-						(hasGatedRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) &&
+						(hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) &&
 						!combinedTraj.actionComps.empty();
 
 					if (needsGCRLRewardGate) {
 						torch::Tensor tGatedRewards = hasGatedRewards ?
 							torch::tensor(combinedTraj.gcrlGatedRewards) :
+							torch::zeros_like(tRewards);
+						torch::Tensor tCurriculumRewards = hasCurriculumRewards ?
+							torch::tensor(combinedTraj.curriculumRewards) :
 							torch::zeros_like(tRewards);
 						torch::Tensor tAerialGatedRewards = hasAerialGatedRewards ?
 							torch::tensor(combinedTraj.aerialGCRLGatedRewards) :
@@ -1333,9 +1362,11 @@ void GGL::Learner::Start() {
 						torch::Tensor tAerialCurriculumRewards = hasAerialCurriculumRewards ?
 							torch::tensor(combinedTraj.aerialCurriculumRewards) :
 							torch::zeros_like(tRewards);
+						torch::Tensor tScaledCurriculumRewards = tCurriculumRewards * ppo->curCurriculumRewardScale;
 						torch::Tensor tScaledAerialCurriculumRewards = tAerialCurriculumRewards * ppo->curAerialCurriculumRewardScale;
+						torch::Tensor tNormalRewards = tGatedRewards + tScaledCurriculumRewards;
 						torch::Tensor tAerialRewards = tAerialGatedRewards + tScaledAerialCurriculumRewards;
-						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tAerialGatedRewards - tAerialCurriculumRewards;
+						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
 						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
 						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat);
 						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
@@ -1370,13 +1401,11 @@ void GGL::Learner::Start() {
 							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
 							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
 							torch::Tensor tNormGateDelta = (tGateDelta - tGateDelta.mean()) / (tGateDelta.std(false) + 1e-8f);
-							float minGate = RS_CLAMP(config.ppo.gcrlRewardGateMin, 0.0f, 1.0f);
-							torch::Tensor tFullGate = minGate + (1.0f - minGate) * torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
-							tFullGate = tFullGate.clamp(minGate, 1.0f);
-							torch::Tensor tEffectiveGate = 1.0f + (tFullGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
-							torch::Tensor tEffectiveAerialGate = 1.0f + (tFullGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
-							// Preserve negative shaping penalties; only discount positive farmable rewards.
-							torch::Tensor tAppliedGatedRewards = tGatedRewards.clamp_max(0.0f) + tGatedRewards.clamp_min(0.0f) * tEffectiveGate;
+							torch::Tensor tSignedGate = torch::tanh(config.ppo.gcrlRewardGateSharpness * tNormGateDelta).clamp(-1.0f, 1.0f);
+							torch::Tensor tEffectiveGate = 1.0f + (tSignedGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
+							torch::Tensor tEffectiveAerialGate = 1.0f + (tSignedGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
+							// Preserve existing negative penalties; signed gate can turn positive shaping into punishment.
+							torch::Tensor tAppliedGatedRewards = tNormalRewards.clamp_max(0.0f) + tNormalRewards.clamp_min(0.0f) * tEffectiveGate;
 							torch::Tensor tAppliedAerialRewards = tAerialRewards.clamp_max(0.0f) + tAerialRewards.clamp_min(0.0f) * tEffectiveAerialGate;
 							tRewards = tBaseRewards + tAppliedGatedRewards + tAppliedAerialRewards;
 
@@ -1388,6 +1417,8 @@ void GGL::Learner::Start() {
 							report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
 							report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
 							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
+							report["GCRL Gate/Curriculum Reward Raw"] = tCurriculumRewards.mean().item<float>();
+							report["GCRL Gate/Curriculum Reward Scaled"] = tScaledCurriculumRewards.mean().item<float>();
 							report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
 							report["GCRL Aerial Gate/Aerial Reward Raw"] = tAerialGatedRewards.mean().item<float>();
 							report["GCRL Aerial Gate/Curriculum Reward Raw"] = tAerialCurriculumRewards.mean().item<float>();

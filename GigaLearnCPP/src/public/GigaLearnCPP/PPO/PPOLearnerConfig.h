@@ -282,8 +282,8 @@ namespace GGL {
 		float gcrlRewardGateInfluence = 1.0f; // 0 -> ungated, 1 -> full gate
 		int64_t gcrlRewardGateAnnealStart = -1; // Timesteps to start gate influence ramp; -1 -> current checkpoint
 		int64_t gcrlRewardGateAnnealSteps = 100'000'000; // Timesteps to ramp from 0 to gcrlRewardGateInfluence
-		float gcrlRewardGateMin = 0.2f;   // Minimum multiplier for positive gated rewards
-		float gcrlRewardGateSharpness = 1.0f; // Sigmoid sharpness for terminal progress
+		float gcrlRewardGateMin = 0.2f;   // Deprecated: signed gates now use tanh(delta) in [-1, 1]
+		float gcrlRewardGateSharpness = 1.0f; // Signed gate sharpness for terminal progress
 		float gcrlRewardGateAntiScale = 0.85f; // Own-goal danger penalty inside gate progress
 		float gcrlRewardGateTargetVel = 1200.0f; // Terminal goal target ball velocity in uu/s
 		int gcrlRewardGateLookahead = 15; // Steps to measure terminal-progress delta (~0.5s at tickSkip 4)
@@ -291,6 +291,9 @@ namespace GGL {
 		float gcrlAerialRewardGateStartInfluence = 0.0f; // Initial aerial gate influence before annealing
 		int64_t gcrlAerialRewardGateAnnealStart = -1; // Timesteps to start aerial gate influence ramp; -1 -> current checkpoint
 		int64_t gcrlAerialRewardGateAnnealSteps = 1'000'000'000; // Timesteps to ramp start influence to target influence
+		float curriculumRewardScale = 1.0f; // Temporary non-aerial curriculum reward scale
+		int64_t curriculumRewardAnnealStart = -1; // Timesteps to start decaying the curriculum reward; -1 -> current checkpoint
+		int64_t curriculumRewardAnnealSteps = 800'000'000; // Timesteps to decay curriculum reward scale to 0
 		float aerialCurriculumRewardScale = 1.0f; // Temporary aerial approach reward scale
 		int64_t aerialCurriculumRewardAnnealStart = -1; // Timesteps to start decaying the curriculum reward; -1 -> current checkpoint
 		int64_t aerialCurriculumRewardAnnealSteps = 800'000'000; // Timesteps to decay curriculum reward scale to 0
