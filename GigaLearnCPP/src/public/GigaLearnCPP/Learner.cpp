@@ -15,17 +15,17 @@
 #include <c10/hip/HIPCachingAllocator.h>
 #include <c10/hip/HIPStream.h>
 #include <c10/hip/HIPGuard.h>
-namespace c10_gpu = c10::hip;
-using GpuStream = c10::hip::HIPStream;
-using GpuStreamGuard = c10::hip::HIPStreamGuard;
 #else
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#endif
+// libtorch's ROCm build masquerades as CUDA: even the c10/hip/* headers declare
+// these under c10::cuda (matching the c10::cuda::CUDACachingAllocator call below),
+// so the same spelling works on both backends.
 namespace c10_gpu = c10::cuda;
 using GpuStream = c10::cuda::CUDAStream;
 using GpuStreamGuard = c10::cuda::CUDAStreamGuard;
-#endif
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
