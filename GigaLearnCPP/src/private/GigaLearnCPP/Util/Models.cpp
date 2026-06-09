@@ -81,7 +81,35 @@ void GGL::Model::SetOptimLR(float newLR) {
 }
 
 void GGL::Model::StepOptim() {
-	optim->step();
+	// --- Non-finite gradient guard ---
+	// clip_grad_norm_ does NOT protect the weights from NaN/Inf gradients: when the total
+	// grad norm is non-finite the clip scale becomes 0/Inf or NaN, which launders the bad
+	// gradient straight into optim->step(), turning every weight NaN. That corruption only
+	// surfaces later, on the next rollout, as torch::multinomial's device-side assert
+	// (_assert_async_cuda_kernel) aborting the GPU queue. Standard PPO/AMP practice is to
+	// skip any optimizer step whose gradients aren't all finite, so one poisoned minibatch
+	// can't kill the whole run. The check is one reduction + one host sync per step.
+	torch::Tensor finiteFlag;
+	for (auto& p : this->parameters()) {
+		if (!p.grad().defined())
+			continue;
+		torch::Tensor f = torch::isfinite(p.grad()).all();
+		finiteFlag = finiteFlag.defined() ? finiteFlag.logical_and(f) : f;
+	}
+	bool gradsFinite = !finiteFlag.defined() || finiteFlag.item<bool>();
+
+	if (gradsFinite) {
+		optim->step();
+	} else {
+		// Drop the bad gradient (handled by zero_grad below) and leave weights untouched.
+		static uint64_t nanGradSkips = 0;
+		nanGradSkips++;
+		if (nanGradSkips == 1 || nanGradSkips % 100 == 0)
+			RG_LOG("WARNING: Model::StepOptim() skipped a non-finite gradient (model '" << modelName
+				<< "', total skips: " << nanGradSkips << "). The policy/critic is producing NaN/Inf"
+				<< " -- inspect reward/advantage magnitudes; weights were left intact.");
+	}
+
 	optim->zero_grad();
 	_seqHalfOutdated = true;
 }
