@@ -250,9 +250,7 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 2;
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 16; // SMOKE
-	cfg.checkpointFolder = "checkpoints_smoke"; // SMOKE
-	cfg.tsPerSave = 6'000; // SMOKE
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -263,10 +261,10 @@ int main(int argc, char* argv[]) {
 	cfg.tsPerVersion = 25'000'000;
 	cfg.maxOldVersions = 32;
 
-	int tsPerItr = 6'000; // SMOKE
+	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 1'500; // SMOKE
+	cfg.ppo.miniBatchSize = 37'500; // Lower this if too much VRAM is being allocated
 	cfg.ppo.overbatching = true;
 	// 4 optimizer steps per batch (one per minibatch) instead of one accumulated step.
 	cfg.ppo.stepPerMiniBatch = true;
@@ -386,7 +384,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlCritic.layerSizes = { 768, 512, 256 };
 	cfg.ppo.sorsReward.layerSizes = { 256, 256, 128 };
 
-	cfg.skillTracker.enabled = false; // SMOKE
+	cfg.skillTracker.enabled = true;
     cfg.skillTracker.numArenas = 24;        // eval arenas, keep near CPU thread count
     cfg.skillTracker.simTime = 45;          // seconds simulated per eval run
     cfg.skillTracker.maxSimTime = 240;      // continuation cap if too few goals happen
