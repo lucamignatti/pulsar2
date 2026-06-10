@@ -1422,12 +1422,11 @@ void GGL::Learner::Start() {
 							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
 							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
 							torch::Tensor tNormGateDelta = (tGateDelta - tGateDelta.mean()) / (tGateDelta.std(false) + 1e-8f);
-							torch::Tensor tSignedGate = torch::tanh(config.ppo.gcrlRewardGateSharpness * tNormGateDelta).clamp(-1.0f, 1.0f);
-							torch::Tensor tEffectiveGate = 1.0f + (tSignedGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
-							torch::Tensor tEffectiveAerialGate = 1.0f + (tSignedGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
-							// Preserve existing negative penalties; signed gate can turn positive shaping into punishment.
-							torch::Tensor tAppliedGatedRewards = tNormalRewards.clamp_max(0.0f) + tNormalRewards.clamp_min(0.0f) * tEffectiveGate;
-							torch::Tensor tAppliedAerialRewards = tAerialRewards.clamp_max(0.0f) + tAerialRewards.clamp_min(0.0f) * tEffectiveAerialGate;
+							torch::Tensor tGate = torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
+							torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
+							torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
+							torch::Tensor tAppliedGatedRewards = tNormalRewards * tEffectiveGate;
+							torch::Tensor tAppliedAerialRewards = tAerialRewards * tEffectiveAerialGate;
 							tRewards = tBaseRewards + tAppliedGatedRewards + tAppliedAerialRewards;
 
 							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();

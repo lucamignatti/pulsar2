@@ -11,8 +11,6 @@ void GGL::GAE::Compute(
 	float prevLambda = 0;
 	int numReturns = rews.size(0);
 	float prevRet = 0;
-	// Walk truncation preds in reverse (they were appended forward) to match the backward GAE pass.
-	int truncCount = numTruncs - 1;
 
 	float totalRew = 0, totalClippedRew = 0;
 
@@ -37,6 +35,8 @@ void GGL::GAE::Compute(
 		_truncValPreds = NULL;
 		numTruncs = 0;
 	}
+	// Walk truncation preds in reverse (they were appended forward) to match the backward GAE pass.
+	int truncCount = numTruncs - 1;
 
 	outAdvantages = torch::zeros(numReturns);
 	outReturns = torch::zeros(numReturns);

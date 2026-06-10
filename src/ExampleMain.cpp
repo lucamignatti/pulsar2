@@ -114,7 +114,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> curriculumRewards = {
 
-		// Temporary chase incentive; signed GCRL gating turns bad-progress chasing into punishment.
+		// Temporary chase incentive; GCRL gate suppresses steps with below-average progress toward goal.
 		{ new VelocityPlayerToBallReward(), 6.f }
 	};
 
