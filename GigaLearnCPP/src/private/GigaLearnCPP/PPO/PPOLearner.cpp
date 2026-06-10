@@ -422,7 +422,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		gc_car  = dynamic_cast<QuasimetricCritic*>(models["car_critic"]);
 	}
 
-	for (int epoch = 0; epoch < config.epochs; epoch++) {
+	bool klEarlyStopped = false;
+
+	for (int epoch = 0; epoch < config.epochs && !klEarlyStopped; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
 		auto batches = experience.GetAllBatchesShuffled(config.batchSize, config.overbatching);
@@ -530,7 +532,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					auto adv_rew = NormalizePerMode(advantages, modeIds, numModes);
 					mbSlots[M_GCRL_REW_ADV] = adv_rew.abs().mean();
-					advantages = adv_rew + curGCRLAdvScale * adv_gcrl;
+					// Clamp the blended advantage: GAE advantages are heavy-tailed (rare
+					// goal-sized spikes), and unclamped outliers both dominate the gradient
+					// and can overflow the backward pass into non-finite gradients.
+					advantages = (adv_rew + curGCRLAdvScale * adv_gcrl).clamp(-8.0f, 8.0f);
 					mbSlots[M_GCRL_FINAL_ADV] = advantages.abs().mean();
 				}
 
@@ -738,6 +743,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - m[M_ENTROPY]);
 					curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
 				}
+
+				// KL early stop: the policy has drifted as far from the collection policy as
+				// we allow this iteration; further epochs would only push it past the trust
+				// region (run bgksd0wi sat at KL 0.01-0.03 all night and collapsed).
+				if (config.maxMeanKL > 0 && trainPolicy && !std::isnan(m[M_DIVERGENCE]) && m[M_DIVERGENCE] > config.maxMeanKL) {
+					klEarlyStopped = true;
+					break;
+				}
 			}
 		}
 	}
@@ -759,6 +772,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		gcrlAntiUpdateMagnitude = (gcrlAntiBefore - models["anti_critic"]->CopyParams()).norm().item<float>();
 		gcrlCarUpdateMagnitude = (gcrlCarBefore - models["car_critic"]->CopyParams()).norm().item<float>();
 	}
+
+	// KL early-stop visibility (1 = this iteration's later epochs were skipped)
+	if (config.maxMeanKL > 0)
+		report["Learn/KL Early Stop"] = klEarlyStopped ? 1 : 0;
 
 	// Non-finite minibatch visibility (always reported so the wandb graph exists; should sit at 0)
 	report["Learn/Non-Finite Minibatches"] = nfMinibatches;

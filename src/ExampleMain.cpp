@@ -93,8 +93,8 @@ EnvCreateResult EnvCreateFunc(int index) {
 	float chaseWeight;
 	switch (playersPerTeam) {
 		case 1:  chaseWeight = 6.0f; break;
-		case 2:  chaseWeight = 3.0f; break;
-		default: chaseWeight = 2.0f; break;
+		case 2:  chaseWeight = 4.0f; break;
+		default: chaseWeight = 3.0f; break;
 	}
 
 	std::vector<WeightedReward> rewards = {
@@ -107,7 +107,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Boost
 		{ new PickupBoostReward(), 10.f },
-		{ new SaveBoostReward(), 0.2f },
+		// 0.05: at 0.2 the max passive income (0.2/step at full boost) beat the time penalty
+		// (0.075/step) and run bgksd0wi converged to boost-camping as its best strategy.
+		{ new SaveBoostReward(), 0.05f },
 
 		// Game events — shot/save callbacks are NULL in Heatseeker (no event tracker),
 		// so ShotReward and SaveReward naturally return 0 there.
@@ -135,7 +137,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> curriculumRewards = {
 
 		// Temporary chase incentive; GCRL gate suppresses steps with below-average progress toward goal.
-		{ new VelocityPlayerToBallReward(), chaseWeight }
+		{ new VelocityPlayerToBallReward(), chaseWeight },
+
+		// Bottom rung of the touch ladder: StrongTouchReward pays zero below 20kph hit
+		// force, so the first weeks of grazing touches earn nothing from it. This pays for
+		// ANY contact and anneals away with the rest of the curriculum.
+		{ new TouchBallReward(), 2.0f }
 	};
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
@@ -260,8 +267,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.miniBatchSize = 37'500; // Lower this if too much VRAM is being allocated
 	cfg.ppo.overbatching = true;
 	// 4 optimizer steps per batch (one per minibatch) instead of one accumulated step.
-	// If Mean KL Divergence sits above ~0.01, lower policyLR or flip this off.
 	cfg.ppo.stepPerMiniBatch = true;
+	// Hard speed limit: abort the iteration's remaining epochs when the batch-mean KL
+	// exceeds this (SB3-style early stop). Makes minibatch stepping self-limiting.
+	cfg.ppo.maxMeanKL = 0.015f;
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -271,12 +280,13 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	// 0.70 was unreachable: the controller pinned at maxEntropyScale for entire runs and the
-	// entropy term dwarfed the PPO surrogate. 0.60 is still exploratory for ~40 actions.
-	cfg.ppo.targetEntropy = 0.60f;
+	cfg.ppo.targetEntropy = 0.70f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
-	cfg.ppo.maxEntropyScale = 0.10f;
+	// 0.10 was too weak a ceiling: in run bgksd0wi the controller pinned there for 9k
+	// iterations while entropy sat at 0.14-0.42. The controller needs authority to actually
+	// arrest a collapse; it only spends what it needs.
+	cfg.ppo.maxEntropyScale = 0.25f;
 
 	// Rate of reward decay
 	// At tickSkip 4 (30 steps/sec) 0.995 gives a ~6.6s credit half-life -- the same time
@@ -284,8 +294,10 @@ int main(int argc, char* argv[]) {
 	// goal credit back through buildup play.)
 	cfg.ppo.gaeGamma = 0.995;
 
-	// Good learning rate to start
-	cfg.ppo.policyLR = 4e-4;
+	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
+	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets
+	// the healthy ~0.03/iter update magnitude; maxMeanKL below is the hard backstop.
+	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 2e-4;
 	cfg.ppo.gcrlLR = 2e-4;
 	cfg.ppo.sorsLR = 2e-4f;
@@ -298,8 +310,12 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	cfg.ppo.gcrlAdvScale = 0.75f;   // Target GCRL advantage weight after annealing
-	cfg.ppo.gcrlAdvScaleAnnealStart = -1; // Start ramping from the current checkpoint/load point
+	// 0.75 nominal delivered a 2:1 GCRL:reward gradient after the anti-critic fix (the old
+	// runs' 0.65-0.75 was mostly twin-noise that cancelled; the channel is coherent now).
+	// 0.3 restores the old EFFECTIVE influence. Delayed start: GCRL critics should refine a
+	// ball-playing policy, not shape a random one with self-referential goals.
+	cfg.ppo.gcrlAdvScale = 0.3f;
+	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
 	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
@@ -318,7 +334,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 	cfg.ppo.useGCRLRewardGate = true;
 	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000; // keep early shaping ungated until the critics have ball-touching data
 	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
@@ -326,14 +342,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateLookahead = 32;
 	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
 	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
-	cfg.ppo.gcrlAerialRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
 	cfg.ppo.curriculumRewardScale = 1.0f;
 	cfg.ppo.curriculumRewardAnnealStart = -1;
-	cfg.ppo.curriculumRewardAnnealSteps = 800'000'000;
+	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000; // must outlive incompetence: 800M expired while touch ratio was still ~0.001
 	cfg.ppo.aerialCurriculumRewardScale = 1.0f;
 	cfg.ppo.aerialCurriculumRewardAnnealStart = -1;
-	cfg.ppo.aerialCurriculumRewardAnnealSteps = 800'000'000;
+	cfg.ppo.aerialCurriculumRewardAnnealSteps = 2'500'000'000;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;

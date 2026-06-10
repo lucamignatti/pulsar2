@@ -248,6 +248,11 @@ namespace GGL {
 		bool maskEntropy = false; 
 
 		float clipRange = 0.2f;
+
+		// SB3-style KL early stop: if the batch-mean KL divergence exceeds this after any
+		// batch, the remaining epochs/batches of the iteration are skipped. A hard speed
+		// limit on policy drift (especially important with stepPerMiniBatch). 0 disables.
+		float maxMeanKL = 0;
 		
 		// Temperature of the policy's softmax distribution
 		float policyTemperature = 1;
