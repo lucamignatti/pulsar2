@@ -17,7 +17,7 @@ GGL::Model::Model(
 	for (int i = 0; i < config.layerSizes.size(); i++) {
 		seq->push_back(torch::nn::Linear(lastSize, config.layerSizes[i]));
 		if (config.addLayerNorm)
-			seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({(int64_t)config.layerSizes[i]})));
+			seq->push_back(ManualLayerNorm((int64_t)config.layerSizes[i]));
 		lastSize = config.layerSizes[i];
 		AddActivationFunc(seq, config.activationType);
 	}
@@ -107,6 +107,25 @@ void GGL::Model::StepOptim() {
 			RG_LOG("WARNING: Model::StepOptim() skipped a non-finite gradient (model '" << modelName
 				<< "', this model's total skips: " << nanGradSkips << "). The policy/critic is producing NaN/Inf"
 				<< " -- inspect reward/advantage magnitudes; weights were left intact.");
+
+		// Attribution dump for the first few skips: which parameters carry non-finite grads?
+		// If ALL of them do, one non-finite total norm in clip_grad_norm_ laundered every
+		// grad (the overflow could be anywhere in backward); if only SOME do, the producing
+		// op is local to those layers (e.g. a backend's fused LayerNorm backward kernel).
+		if (nanGradSkips <= 3) {
+			std::stringstream dump;
+			int badCount = 0, totalCount = 0;
+			for (auto& pair : this->named_parameters()) {
+				if (!pair.value().grad().defined())
+					continue;
+				totalCount++;
+				if (!torch::isfinite(pair.value().grad()).all().item<bool>()) {
+					badCount++;
+					dump << " " << pair.key();
+				}
+			}
+			RG_LOG("  > '" << modelName << "' non-finite grads in " << badCount << "/" << totalCount << " params:" << dump.str());
+		}
 	}
 
 	optim->zero_grad();
@@ -225,7 +244,7 @@ GGL::QuasimetricCritic::QuasimetricCritic(
 		for (int h : hiddenSizes) {
 			seq->push_back(torch::nn::Linear(last, h));
 			if (addLayerNorm)
-				seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ (int64_t)h })));
+				seq->push_back(ManualLayerNorm((int64_t)h));
 			AddActivationFunc(seq, activation);
 			last = h;
 		}

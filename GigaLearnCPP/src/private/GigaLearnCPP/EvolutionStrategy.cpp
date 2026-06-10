@@ -148,6 +148,15 @@ namespace {
 				op.lnShape = ln->options.normalized_shape();
 				op.lnEps = ln->options.eps();
 				pm.ops.push_back(std::move(op));
+			} else if (auto mln = std::dynamic_pointer_cast<ManualLayerNormImpl>(child)) {
+				// Forward-only path: the functional layer_norm is equivalent to ManualLayerNorm
+				PreparedOp op;
+				op.type = OpType::LAYERNORM;
+				op.lnW = mln->weight.to(wopt);
+				op.lnB = mln->bias.to(wopt);
+				op.lnShape = { mln->size };
+				op.lnEps = mln->eps;
+				pm.ops.push_back(std::move(op));
 			} else {
 				PreparedOp op;
 				op.type = OpType::ACTIVATION;

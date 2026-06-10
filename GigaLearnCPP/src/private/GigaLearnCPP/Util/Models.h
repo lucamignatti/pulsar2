@@ -88,6 +88,35 @@ namespace GGL {
 
 	//////////////////////////
 
+	// Drop-in LayerNorm composed from primitive ops, so autograd derives the backward from
+	// simple, well-tested kernels. The fused native_layer_norm_backward was the prime
+	// suspect for ROCm's recurring non-finite policy/critic gradients: losses were finite,
+	// every input was clamped, and the LayerNorm-free GCRL towers never produced a single
+	// bad gradient while the LN-bearing policy/critic did constantly.
+	// Parameter names/order/shapes match torch::nn::LayerNorm, so checkpoints interchange.
+	struct ManualLayerNormImpl : torch::nn::Cloneable<ManualLayerNormImpl> {
+		int64_t size;
+		double eps;
+		torch::Tensor weight, bias;
+
+		ManualLayerNormImpl(int64_t size = 1, double eps = 1e-5) : size(size), eps(eps) {
+			reset();
+		}
+
+		void reset() override {
+			weight = register_parameter("weight", torch::ones({ size }));
+			bias = register_parameter("bias", torch::zeros({ size }));
+		}
+
+		torch::Tensor forward(torch::Tensor x) {
+			auto mean = x.mean(-1, true);
+			auto centered = x - mean;
+			auto var = centered.square().mean(-1, true);
+			return centered / (var + eps).sqrt() * weight + bias;
+		}
+	};
+	TORCH_MODULE(ManualLayerNorm);
+
 	class Model : public torch::nn::Module {
 	public:
 		const char* modelName;
