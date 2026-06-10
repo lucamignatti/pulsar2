@@ -98,6 +98,9 @@ namespace GGL {
 
 		torch::optim::Optimizer* optim;
 
+		// Optimizer steps skipped due to non-finite gradients (per model, see StepOptim)
+		uint64_t nanGradSkips = 0;
+
 		Model() : config(PartialModelConfig{}), device({}), modelName(NULL) {} // Uninitialized init
 
 		Model(

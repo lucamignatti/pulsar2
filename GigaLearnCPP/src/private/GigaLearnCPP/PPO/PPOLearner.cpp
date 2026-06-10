@@ -344,20 +344,20 @@ float GGL::PPOLearner::GetEntropyScale() const {
 
 // Z-score x within each mode group (heatseeker/soccar team sizes have very different
 // dynamics, so pooled normalization lets one mode dominate the tails of another).
-// Uses biased std so single-sample groups normalize to 0 instead of NaN.
-// No host syncs: empty groups produce empty masked_selects and scatter nothing.
+// Implemented with index_add_/index_select segment reductions: core, well-tested ops on
+// every backend (the earlier masked_select/masked_scatter loop was suspected of producing
+// garbage on ROCm). Biased variance so single-sample groups normalize to 0, not NaN.
+// No host syncs.
 static torch::Tensor NormalizePerMode(const torch::Tensor& x, const torch::Tensor& modeIds, int numModes) {
 	if (!modeIds.defined() || numModes <= 1)
 		return (x - x.mean()) / (x.std(false) + 1e-8f);
 
-	torch::Tensor result = x.clone();
-	for (int m = 0; m < numModes; m++) {
-		auto mask = (modeIds == m);
-		auto vals = x.masked_select(mask);
-		auto norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
-		result = result.masked_scatter(mask, norm);
-	}
-	return result;
+	auto opts = x.options();
+	auto counts = torch::zeros({ numModes }, opts).index_add_(0, modeIds, torch::ones_like(x)).clamp_min(1);
+	auto means = torch::zeros({ numModes }, opts).index_add_(0, modeIds, x) / counts;
+	auto centered = x - means.index_select(0, modeIds);
+	auto stds = (torch::zeros({ numModes }, opts).index_add_(0, modeIds, centered.square()) / counts).sqrt();
+	return centered / (stds.index_select(0, modeIds) + 1e-8f);
 }
 
 namespace {
@@ -377,9 +377,16 @@ namespace {
 }
 
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration) {
-	auto mseLoss = torch::nn::MSELoss();
+	// Huber instead of MSE: gradients are linear beyond |delta|, so oversized value
+	// targets (e.g. before the per-mode return STDs warm up on a fresh run) cannot
+	// overflow the backward pass into inf/NaN gradients.
+	auto criticLossFn = torch::nn::HuberLoss(torch::nn::HuberLossOptions().delta(10.0));
 
 	AvgTracker avg[METRIC_SLOT_COUNT] = {};
+
+	// Per-component non-finite minibatch counts (reported so bad minibatches are visible;
+	// the nanmean'd loss metrics silently exclude them otherwise)
+	int64_t nfMinibatches = 0, nfObs = 0, nfAdvantages = 0, nfPpoLoss = 0, nfCriticLoss = 0, nfInfoNCELoss = 0;
 
 	// Device-side metric staging (see MetricSlot)
 	auto nanScalar = torch::full({}, std::numeric_limits<float>::quiet_NaN(),
@@ -545,7 +552,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					const float entropyScale = GetEntropyScale();
 
 					// Compute PPO loss
-					ratio = exp(logProbs - oldProbs);
+					// (log-ratio clamped at +-15: e^15 is already ~1e6x past the clip range, and
+					// unbounded ratios can overflow the backward pass into inf gradients)
+					ratio = exp((logProbs - oldProbs).clamp(-15.0f, 15.0f));
 					mbSlots[M_RATIO] = ratio.mean().detach();
 					clipped = clamp(
 						ratio, 1 - config.clipRange, 1 + config.clipRange
@@ -583,7 +592,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					// Compute value loss
 					vals = vals.view_as(targetValues);
-					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
+					criticLoss = criticLossFn(vals, targetValues) * batchSizeRatio;
 					mbSlots[M_CRITIC_LOSS] = criticLoss.detach();
 				}
 
@@ -629,13 +638,44 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 				}
 
+				// ── Non-finite gating ──
+				// Validate the inputs and each loss component on-device, sync the booleans
+				// once, and drop any non-finite component from the backward. Without this one
+				// bad minibatch poisons the gradients -- StepOptim's guard catches that, but
+				// invisibly: the nanmean'd loss metrics exclude NaN minibatches, so the run
+				// looks healthy while a chunk of its optimizer steps are being skipped.
+				// The obs/advantage checks don't gate anything extra (a bad input makes the
+				// loss checks fail anyway); they attribute WHERE the corruption entered.
+				auto fineTrue = torch::ones({}, torch::TensorOptions().dtype(torch::kBool).device(device));
+				torch::Tensor checks[5] = { fineTrue, fineTrue, fineTrue, fineTrue, fineTrue };
+				checks[0] = torch::isfinite(obs).all();
+				if (advantages.defined())
+					checks[1] = torch::isfinite(advantages).all();
+				if (ppoLoss.defined())
+					checks[2] = torch::isfinite(ppoLoss).all();
+				if (criticLoss.defined())
+					checks[3] = torch::isfinite(criticLoss).all();
+				if (infoNCELoss.defined())
+					checks[4] = torch::isfinite(infoNCELoss).all();
+
+				auto checksCpu = torch::stack({ checks[0], checks[1], checks[2], checks[3], checks[4] }).cpu();
+				const bool* fin = checksCpu.data_ptr<bool>();
+				if (!(fin[0] && fin[1] && fin[2] && fin[3] && fin[4])) {
+					nfMinibatches++;
+					nfObs += !fin[0];
+					nfAdvantages += !fin[1];
+					nfPpoLoss += !fin[2];
+					nfCriticLoss += !fin[3];
+					nfInfoNCELoss += !fin[4];
+				}
+
 				// ── Combine & backprop (single graph through the shared encoder) ──
 				torch::Tensor combinedLoss;
-				if (trainPolicy)
+				if (ppoLoss.defined() && fin[2])
 					combinedLoss = ppoLoss;
-				if (trainCritic)
+				if (criticLoss.defined() && fin[3])
 					combinedLoss = combinedLoss.defined() ? (combinedLoss + criticLoss) : criticLoss;
-				if (infoNCELoss.defined()) {
+				if (infoNCELoss.defined() && fin[4]) {
 					auto scaled = config.gcrlInfoNCECoef * infoNCELoss;
 					combinedLoss = combinedLoss.defined() ? (combinedLoss + scaled) : scaled;
 				}
@@ -719,6 +759,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		gcrlAntiUpdateMagnitude = (gcrlAntiBefore - models["anti_critic"]->CopyParams()).norm().item<float>();
 		gcrlCarUpdateMagnitude = (gcrlCarBefore - models["car_critic"]->CopyParams()).norm().item<float>();
 	}
+
+	// Non-finite minibatch visibility (always reported so the wandb graph exists; should sit at 0)
+	report["Learn/Non-Finite Minibatches"] = nfMinibatches;
+	if (nfMinibatches > 0) {
+		report["Learn/Non-Finite Obs"] = nfObs;
+		report["Learn/Non-Finite Advantages"] = nfAdvantages;
+		report["Learn/Non-Finite PPO Loss"] = nfPpoLoss;
+		report["Learn/Non-Finite Critic Loss"] = nfCriticLoss;
+		report["Learn/Non-Finite InfoNCE Loss"] = nfInfoNCELoss;
+		RG_LOG("WARNING: PPOLearner::Learn(): " << nfMinibatches << " minibatch(es) had non-finite components this iteration "
+			<< "(obs: " << nfObs << ", advantages: " << nfAdvantages << ", ppoLoss: " << nfPpoLoss
+			<< ", criticLoss: " << nfCriticLoss << ", infoNCE: " << nfInfoNCELoss << "); they were excluded from the backward pass.");
+	}
+	for (Model* model : models)
+		if (model->nanGradSkips > 0)
+			report[std::string("Learn/Grad Skips/") + model->modelName] = model->nanGradSkips;
 
 	// Assemble and return report
 	report["Policy Entropy"] = avg[M_ENTROPY].Get();

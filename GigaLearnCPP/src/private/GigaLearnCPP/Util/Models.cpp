@@ -102,11 +102,10 @@ void GGL::Model::StepOptim() {
 		optim->step();
 	} else {
 		// Drop the bad gradient (handled by zero_grad below) and leave weights untouched.
-		static uint64_t nanGradSkips = 0;
 		nanGradSkips++;
 		if (nanGradSkips == 1 || nanGradSkips % 100 == 0)
 			RG_LOG("WARNING: Model::StepOptim() skipped a non-finite gradient (model '" << modelName
-				<< "', total skips: " << nanGradSkips << "). The policy/critic is producing NaN/Inf"
+				<< "', this model's total skips: " << nanGradSkips << "). The policy/critic is producing NaN/Inf"
 				<< " -- inspect reward/advantage magnitudes; weights were left intact.");
 	}
 
