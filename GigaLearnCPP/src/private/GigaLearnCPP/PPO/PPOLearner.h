@@ -31,8 +31,10 @@ namespace GGL {
 		ModelSet guidingPolicyModels = {};
 
 		struct SORSWindow {
-			FList states;
-			FList actionComps;
+			// CPU tensors [length, obs_dim] / [length, action_dim], built once when the
+			// window is created so training doesn't re-tensorize replay data every iteration
+			torch::Tensor states;
+			torch::Tensor actionComps;
 			float label = 0;
 			int length = 0;
 		};

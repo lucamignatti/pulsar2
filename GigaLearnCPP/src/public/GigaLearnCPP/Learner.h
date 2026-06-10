@@ -6,6 +6,8 @@
 #include "LearnerConfig.h"
 #include "PPO/TransferLearnConfig.h"
 
+#include <atomic>
+
 namespace GGL {
 
 	typedef std::function<void(class Learner*, const std::vector<RLGC::GameState>& states, Report& report)> StepCallbackFn;
@@ -52,7 +54,7 @@ namespace GGL {
 
 		void StartTransferLearn(const TransferLearnConfig& transferLearnConfig);
 
-		void StartQuitKeyThread(bool& quitPressed, std::thread& outThread);
+		void StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread);
 
 		void Save();
 		void Load();

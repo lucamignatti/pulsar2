@@ -59,9 +59,16 @@ GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone
 			toRemove.models.Free();
 			versions.erase(versions.begin());
 		}
+
+		// Sorting means the new version isn't necessarily at the back, so find it by timesteps
+		for (auto& version : versions)
+			if (version.timesteps == timesteps)
+				return version;
 	}
 
-	return versions.back();
+	RG_ERR_CLOSE(
+		"PolicyVersionManager::AddVersion(): Newly added version (at " << timesteps << " timesteps) was immediately pruned, " <<
+		"it must be older than all " << maxVersions << " existing versions");
 }
 
 void GGL::PolicyVersionManager::SaveVersions() {
@@ -75,13 +82,9 @@ void GGL::PolicyVersionManager::SaveVersions() {
 		for (auto& version : versions)
 			matchesVersion |= (savedTimesteps == version.timesteps);
 
-		if (matchesVersion) {
-			// We want to keep this
-			allSavedTimesteps.insert(savedTimesteps);
-		} else {
-			// Get rid of it
+		// Get rid of saved versions we no longer track
+		if (!matchesVersion)
 			std::filesystem::remove_all(saveFolder / std::to_string(savedTimesteps));
-		}
 	}
 
 	for (auto& version : versions) {
@@ -280,7 +283,7 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		float delta = pair.second - prevRating;
 
 		std::stringstream ratingLine;
-		ratingLine << " > " << pair.first << " = " << prevRating;
+		ratingLine << pair.first << " = " << pair.second;
 		if (delta != 0)
 			ratingLine << " (" << (delta >= 0 ? '+' : '-') << abs(delta) << ")";
 

@@ -73,8 +73,19 @@ void GGL::MetricSender::Send(const Report& report) {
 
 	try {
 		pyMod.attr("add_metrics")(reportDict);
+		consecutiveSendFailures = 0;
 	} catch (std::exception& e) {
-		RG_ERR_CLOSE("MetricSender: Failed to add metrics, exception: " << e.what());
+		// A transient wandb/network error shouldn't kill a long training run.
+		// Drop this report and only give up after repeated consecutive failures.
+		consecutiveSendFailures++;
+		if (consecutiveSendFailures >= MAX_CONSECUTIVE_SEND_FAILURES)
+			RG_ERR_CLOSE(
+				"MetricSender: Failed to add metrics " << consecutiveSendFailures << " times in a row, giving up.\n" <<
+				"Last exception: " << e.what());
+
+		RG_LOG(
+			"WARNING: MetricSender failed to add metrics (" << consecutiveSendFailures << "/" << MAX_CONSECUTIVE_SEND_FAILURES <<
+			" consecutive failures), this report will be dropped. Exception: " << e.what());
 	}
 }
 

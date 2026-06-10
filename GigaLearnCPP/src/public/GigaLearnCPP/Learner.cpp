@@ -415,7 +415,7 @@ void GGL::Learner::Load() {
 	}
 }
 
-void GGL::Learner::StartQuitKeyThread(bool& quitPressed, std::thread& outThread) {
+void GGL::Learner::StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread) {
 	quitPressed = false;
 
 	RG_LOG("Press 'Q' to save and quit!");
@@ -479,7 +479,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 	}
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued;
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
@@ -507,8 +507,9 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 					torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 					torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
-					envSet->StepFirstHalf(true);
-
+					// Collect new and old obs BEFORE StepFirstHalf: it mutates the game states
+					// on worker threads (ResetBeforeStep + arena step), so reading them after
+					// would be a data race.
 					allNewObs += envSet->state.obs.data;
 					allNewActionMasks += envSet->state.actionMasks.data;
 
@@ -528,6 +529,8 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 							}
 						}
 					}
+
+					envSet->StepFirstHalf(true);
 
 					ppo->InferActions(
 						tStates.to(ppo->device, true), tActionMasks.to(ppo->device, true),
@@ -620,7 +623,7 @@ void GGL::Learner::Start() {
 		RG_ERR_CLOSE("Learner::Start(): PPO deterministic mode cannot be used for training because sampled action log-probs are required.");
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued;
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
@@ -741,12 +744,13 @@ void GGL::Learner::Start() {
 				PPOLearner::SORSWindow window;
 				window.length = len;
 				window.label = label;
-				window.states.insert(window.states.end(),
-					traj.states.begin() + (size_t)start * obsSize,
-					traj.states.begin() + (size_t)stop * obsSize);
-				window.actionComps.insert(window.actionComps.end(),
-					traj.actionComps.begin() + (size_t)start * 8,
-					traj.actionComps.begin() + (size_t)stop * 8);
+				// Clone the from_blob views since the trajectory buffers are cleared at episode end
+				window.states = torch::from_blob(
+					(void*)(traj.states.data() + (size_t)start * obsSize),
+					{ (int64_t)len, (int64_t)obsSize }, torch::TensorOptions().dtype(torch::kFloat32)).clone();
+				window.actionComps = torch::from_blob(
+					(void*)(traj.actionComps.data() + (size_t)start * 8),
+					{ (int64_t)len, 8 }, torch::TensorOptions().dtype(torch::kFloat32)).clone();
 				windows.push_back(std::move(window));
 			};
 
@@ -1360,6 +1364,11 @@ void GGL::Learner::Start() {
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
 
+					// Built once, shared by the GCRL gate, SORS inference and the experience buffer
+					torch::Tensor tActionComps;
+					if (!combinedTraj.actionComps.empty())
+						tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
 					bool hasCurriculumRewards = !combinedTraj.curriculumRewards.empty();
 					bool hasAerialGatedRewards = !combinedTraj.aerialGCRLGatedRewards.empty();
@@ -1388,7 +1397,6 @@ void GGL::Learner::Start() {
 						torch::Tensor tNormalRewards = tGatedRewards + tScaledCurriculumRewards;
 						torch::Tensor tAerialRewards = tAerialGatedRewards + tScaledAerialCurriculumRewards;
 						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
-						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
 						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat);
 						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
 						torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
@@ -1448,8 +1456,7 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					if (config.ppo.useSORS && !combinedTraj.actionComps.empty()) {
-						torch::Tensor tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+					if (config.ppo.useSORS && tActionComps.defined()) {
 						torch::Tensor tSORSRewards;
 						if (ppo->device.is_cpu()) {
 							tSORSRewards = ppo->InferSORSRewards(tStates.to(ppo->device, true, true), tActionComps.to(ppo->device, true, true)).cpu();
@@ -1512,7 +1519,10 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					report["Episode Length"] = 1.f / (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
+					// Skip when no episode fully ended this batch (would divide by zero -> inf on the graph)
+					float terminalPortion = (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
+					if (terminalPortion > 0)
+						report["Episode Length"] = 1.f / terminalPortion;
 
 					Timer gaeTimer = {};
 					// Run GAE
@@ -1548,7 +1558,7 @@ void GGL::Learner::Start() {
 					experience.data.targetValues = tTargetVals;
 
 					if (config.ppo.useGCRL) {
-						experience.data.actionComps    = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+						experience.data.actionComps    = tActionComps;
 						experience.data.futureGoals    = torch::tensor(combinedTraj.futureGoals).reshape({ -1, 6 });
 						experience.data.carFutureGoals = torch::tensor(combinedTraj.carFutureGoals).reshape({ -1, 6 });
 					}
@@ -1622,8 +1632,7 @@ void GGL::Learner::Start() {
 					{
 						"Average Step Reward",
 						"Policy Entropy",
-						"KL Div Loss",
-						"First Accuracy",
+						"Mean KL Divergence",
 						"",
 						"Policy Update Magnitude",
 						"Critic Update Magnitude",
@@ -1674,5 +1683,8 @@ GGL::Learner::~Learner() {
 	delete esManager;
 	delete metricSender;
 	delete renderSender;
+	delete envSet;
+	delete returnStat;
+	delete obsStat;
 	pybind11::finalize_interpreter();
 }

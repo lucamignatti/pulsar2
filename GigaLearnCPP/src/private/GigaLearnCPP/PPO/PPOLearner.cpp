@@ -235,12 +235,15 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 	auto* sors = dynamic_cast<SORSRewardModel*>(models["sors_reward"]);
 	RG_ASSERT(sors);
 
-	MutAvgTracker avgLoss, avgPredReturn, avgAcc;
-	int trainedPairs = 0;
+	// Sample (higher-labeled, lower-labeled) window pairs first, then train them in
+	// batched chunks: one forward/backward per chunk with per-window segment sums,
+	// instead of one forward/backward (and 4 host->device copies) per pair.
+	std::vector<std::pair<const SORSWindow*, const SORSWindow*>> pairs;
+	pairs.reserve(config.sorsTrainPairs);
 	int attempts = 0;
 	int maxAttempts = config.sorsTrainPairs * 8;
 
-	while (trainedPairs < config.sorsTrainPairs && attempts++ < maxAttempts) {
+	while ((int)pairs.size() < config.sorsTrainPairs && attempts++ < maxAttempts) {
 		int idxA = Math::RandInt(0, (int)sorsReplay.size());
 		int idxB = Math::RandInt(0, (int)sorsReplay.size());
 		if (idxA == idxB)
@@ -252,34 +255,67 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 		if (fabsf(delta) < config.sorsMinLabelDelta)
 			continue;
 
-		auto& hi = delta > 0 ? a : b;
-		auto& lo = delta > 0 ? b : a;
-
-		auto hiObs = torch::tensor(hi.states).reshape({ hi.length, sors->obs_dim }).to(device, true, true);
-		auto hiActs = torch::tensor(hi.actionComps).reshape({ hi.length, sors->action_dim }).to(device, true, true);
-		auto loObs = torch::tensor(lo.states).reshape({ lo.length, sors->obs_dim }).to(device, true, true);
-		auto loActs = torch::tensor(lo.actionComps).reshape({ lo.length, sors->action_dim }).to(device, true, true);
-
-		auto hiReturn = sors->Forward(hiObs, hiActs).sum();
-		auto loReturn = sors->Forward(loObs, loActs).sum();
-		auto loss = -torch::log(torch::sigmoid(hiReturn - loReturn) + 1e-8f);
-		loss.backward();
-
-		float hiVal = hiReturn.detach().cpu().item<float>();
-		float loVal = loReturn.detach().cpu().item<float>();
-		avgLoss += loss.detach().cpu().item<float>();
-		avgPredReturn += hiVal;
-		avgAcc += hiVal > loVal ? 1.0f : 0.0f;
-		trainedPairs++;
+		pairs.push_back(delta > 0 ? std::make_pair(&a, &b) : std::make_pair(&b, &a));
 	}
 
-	if (trainedPairs > 0) {
-		nn::utils::clip_grad_norm_(sors->parameters(), 0.5f);
-		sors->StepOptim();
-		report["SORS/Loss"] = avgLoss.Get();
-		report["SORS/Pair Accuracy"] = avgAcc.Get();
-		report["SORS/Pred Window Return"] = avgPredReturn.Get();
+	if (pairs.empty())
+		return;
+
+	MutAvgTracker avgLoss, avgPredReturn, avgAcc;
+
+	constexpr int PAIRS_PER_BATCH = 128;
+	for (size_t chunkStart = 0; chunkStart < pairs.size(); chunkStart += PAIRS_PER_BATCH) {
+		size_t chunkEnd = RS_MIN(chunkStart + PAIRS_PER_BATCH, pairs.size());
+		int numPairs = (int)(chunkEnd - chunkStart);
+
+		// Concatenate windows interleaved [hi0, lo0, hi1, lo1, ...] with per-row window ids
+		std::vector<torch::Tensor> statesList, actionsList;
+		statesList.reserve((size_t)numPairs * 2);
+		actionsList.reserve((size_t)numPairs * 2);
+		std::vector<int64_t> windowIds;
+		int64_t numWindows = 0;
+		for (size_t p = chunkStart; p < chunkEnd; p++) {
+			for (const SORSWindow* window : { pairs[p].first, pairs[p].second }) {
+				statesList.push_back(window->states);
+				actionsList.push_back(window->actionComps);
+				windowIds.insert(windowIds.end(), window->length, numWindows);
+				numWindows++;
+			}
+		}
+
+		auto obs = torch::cat(statesList).to(device, true, true);
+		auto acts = torch::cat(actionsList).to(device, true, true);
+		auto tWindowIds = torch::tensor(windowIds, torch::TensorOptions().dtype(torch::kLong)).to(device, true, true);
+
+		// Per-step rewards -> per-window return sums -> per-pair preference loss
+		auto stepRewards = sors->Forward(obs, acts);
+		auto windowReturns = torch::zeros({ numWindows }, stepRewards.options())
+			.index_add_(0, tWindowIds, stepRewards);
+		auto pairReturns = windowReturns.view({ numPairs, 2 });
+		auto hiReturns = pairReturns.select(1, 0);
+		auto loReturns = pairReturns.select(1, 1);
+
+		auto losses = -torch::log(torch::sigmoid(hiReturns - loReturns) + 1e-8f);
+		losses.sum().backward(); // Sum, not mean: matches the old accumulated per-pair backward
+
+		auto lossesCpu = losses.detach().cpu();
+		auto hiCpu = hiReturns.detach().cpu();
+		auto loCpu = loReturns.detach().cpu();
+		const float* lossData = lossesCpu.data_ptr<float>();
+		const float* hiData = hiCpu.data_ptr<float>();
+		const float* loData = loCpu.data_ptr<float>();
+		for (int i = 0; i < numPairs; i++) {
+			avgLoss += lossData[i];
+			avgPredReturn += hiData[i];
+			avgAcc += hiData[i] > loData[i] ? 1.0f : 0.0f;
+		}
 	}
+
+	nn::utils::clip_grad_norm_(sors->parameters(), 0.5f);
+	sors->StepOptim();
+	report["SORS/Loss"] = avgLoss.Get();
+	report["SORS/Pair Accuracy"] = avgAcc.Get();
+	report["SORS/Pred Window Return"] = avgPredReturn.Get();
 }
 
 torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
@@ -335,6 +371,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
 	auto criticBefore = models["critic"]->CopyParams();
+	torch::Tensor sharedHeadBefore;
+	if (models["shared_head"]) sharedHeadBefore = models["shared_head"]->CopyParams();
 	torch::Tensor gcrlGoalBefore, gcrlAntiBefore, gcrlCarBefore;
 	if (models["goal_critic"]) gcrlGoalBefore = models["goal_critic"]->CopyParams();
 	if (models["anti_critic"]) gcrlAntiBefore = models["anti_critic"]->CopyParams();
@@ -586,6 +624,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
+	float sharedHeadUpdateMagnitude = 0;
+	if (sharedHeadBefore.defined())
+		sharedHeadUpdateMagnitude = (sharedHeadBefore - models["shared_head"]->CopyParams()).norm().item<float>();
 	float gcrlGoalUpdateMagnitude = 0;
 	float gcrlAntiUpdateMagnitude = 0;
 	float gcrlCarUpdateMagnitude = 0;
@@ -636,6 +677,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["SB3 Clip Fraction"] = avgClip.Get();
 		report["Policy Update Magnitude"] = policyUpdateMagnitude;
 		report["Critic Update Magnitude"] = criticUpdateMagnitude;
+		if (sharedHeadBefore.defined())
+			report["Shared Head Update Magnitude"] = sharedHeadUpdateMagnitude;
 	}
 }
 
@@ -769,35 +812,30 @@ void GGL::PPOLearner::SaveSORSState(std::filesystem::path folderPath) {
 	}
 
 	size_t totalSteps = 0;
-	size_t totalStateVals = 0;
-	size_t totalActionVals = 0;
 	std::vector<int64_t> lengths = {};
 	FList labels = {};
+	std::vector<torch::Tensor> statesList = {}, actionsList = {};
+	statesList.reserve(sorsReplay.size());
+	actionsList.reserve(sorsReplay.size());
 	for (const auto& window : sorsReplay) {
 		totalSteps += window.length;
-		totalStateVals += window.states.size();
-		totalActionVals += window.actionComps.size();
 		lengths.push_back(window.length);
 		labels.push_back(window.label);
+		statesList.push_back(window.states.flatten());
+		actionsList.push_back(window.actionComps.flatten());
 	}
 
-	FList states = {};
-	FList actionComps = {};
-	states.reserve(totalStateVals);
-	actionComps.reserve(totalActionVals);
-	for (const auto& window : sorsReplay) {
-		states.insert(states.end(), window.states.begin(), window.states.end());
-		actionComps.insert(actionComps.end(), window.actionComps.begin(), window.actionComps.end());
-	}
+	auto tStates = torch::cat(statesList);
+	auto tActions = torch::cat(actionsList);
 
-	torch::save(torch::tensor(states), (folderPath / SORS_REPLAY_STATES_FILE_NAME).string());
-	torch::save(torch::tensor(actionComps), (folderPath / SORS_REPLAY_ACTIONS_FILE_NAME).string());
+	torch::save(tStates, (folderPath / SORS_REPLAY_STATES_FILE_NAME).string());
+	torch::save(tActions, (folderPath / SORS_REPLAY_ACTIONS_FILE_NAME).string());
 	torch::save(torch::tensor(lengths, torch::TensorOptions().dtype(torch::kInt64)), (folderPath / SORS_REPLAY_LENGTHS_FILE_NAME).string());
 	torch::save(torch::tensor(labels), (folderPath / SORS_REPLAY_LABELS_FILE_NAME).string());
 
 	j["total_steps"] = totalSteps;
-	j["total_state_values"] = totalStateVals;
-	j["total_action_values"] = totalActionVals;
+	j["total_state_values"] = (size_t)tStates.numel();
+	j["total_action_values"] = (size_t)tActions.numel();
 	fOut << j.dump(4);
 }
 
@@ -848,8 +886,6 @@ void GGL::PPOLearner::LoadSORSState(std::filesystem::path folderPath) {
 	if ((size_t)tLengths.numel() != windowCount || (size_t)tLabels.numel() != windowCount)
 		RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Corrupt SORS replay metadata in " << folderPath);
 
-	const float* statesData = tStates.data_ptr<float>();
-	const float* actionsData = tActions.data_ptr<float>();
 	const int64_t* lengthsData = tLengths.data_ptr<int64_t>();
 	const float* labelsData = tLabels.data_ptr<float>();
 
@@ -868,8 +904,12 @@ void GGL::PPOLearner::LoadSORSState(std::filesystem::path folderPath) {
 		size_t actionCount = (size_t)window.length * sors->action_dim;
 		if (stateOffset + stateCount > (size_t)tStates.numel() || actionOffset + actionCount > (size_t)tActions.numel())
 			RG_ERR_CLOSE("PPOLearner::LoadSORSState(): Corrupt SORS replay tensor sizes in " << folderPath);
-		window.states.assign(statesData + stateOffset, statesData + stateOffset + stateCount);
-		window.actionComps.assign(actionsData + actionOffset, actionsData + actionOffset + actionCount);
+
+		// Clone so each window owns its memory instead of keeping the big flat tensors alive
+		window.states = tStates.slice(0, stateOffset, stateOffset + stateCount)
+			.reshape({ (int64_t)window.length, (int64_t)sors->obs_dim }).clone();
+		window.actionComps = tActions.slice(0, actionOffset, actionOffset + actionCount)
+			.reshape({ (int64_t)window.length, (int64_t)sors->action_dim }).clone();
 		stateOffset += stateCount;
 		actionOffset += actionCount;
 	}

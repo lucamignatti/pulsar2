@@ -9,14 +9,12 @@ GGL::ExperienceBuffer::ExperienceBuffer(int seed, torch::Device device) :
 
 GGL::ExperienceTensors GGL::ExperienceBuffer::_GetSamples(const int64_t* indices, size_t size) const {
 
-	// TODO: Slow, use blob
-	Tensor tIndices = torch::tensor(IList(indices, indices + size));
+	// Non-owning view over the caller's index array; index_select copies what it needs,
+	// and the caller's vector outlives this call.
+	Tensor tIndices = torch::from_blob(
+		(void*)indices, { (int64_t)size }, torch::TensorOptions().dtype(torch::kLong));
 
 	ExperienceTensors result;
-	auto fnSlice = [=](torch::Tensor t) -> torch::Tensor {
-		return torch::index_select(t, 0, tIndices);
-	};
-
 	auto* toItr = result.begin();
 	auto* fromItr = data.begin();
 	for (; toItr != result.end(); toItr++, fromItr++)
@@ -31,6 +29,13 @@ std::vector<GGL::ExperienceTensors> GGL::ExperienceBuffer::GetAllBatchesShuffled
 	RG_NO_GRAD;
 
 	size_t expSize = data.states.size(0);
+
+	if ((int64_t)expSize < batchSize)
+		RG_ERR_CLOSE(
+			"ExperienceBuffer::GetAllBatchesShuffled(): Collected experience (" << expSize << ") is smaller than the batch size (" << batchSize << "), " <<
+			"so no batches can be made and nothing would be learned.\n" <<
+			"Lower config.ppo.batchSize or raise config.ppo.tsPerItr."
+		);
 
 	// Make list of shuffled sample indices
 	std::vector<int64_t> indices(expSize);
