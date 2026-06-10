@@ -204,12 +204,12 @@ torch::Tensor GGL::Model::CopyParams() const {
 GGL::QuasimetricCritic::QuasimetricCritic(
 	const char* _modelName,
 	int obs_dim, int _action_dim, int goal_dim,
-	const std::vector<int>& hiddenSizes, int repr_dim,
+	const std::vector<int>& hiddenSizes, int _repr_dim,
 	ModelActivationType activation, bool addLayerNorm,
 	float _tau, float _var_reg, float _infonce_penalty,
 	ModelOptimType optimType,
 	torch::Device device) :
-	Model(), tau(_tau), var_reg(_var_reg), infonce_penalty(_infonce_penalty), action_dim(_action_dim) {
+	Model(), tau(_tau), var_reg(_var_reg), infonce_penalty(_infonce_penalty), action_dim(_action_dim), repr_dim(_repr_dim) {
 
 	this->modelName = _modelName;
 	this->device = device;
@@ -271,7 +271,8 @@ torch::Tensor GGL::QuasimetricCritic::score_q(torch::Tensor obs, torch::Tensor a
 torch::Tensor GGL::QuasimetricCritic::infonce_loss(
 	torch::Tensor obs, torch::Tensor actions, torch::Tensor goals,
 	float tau_override,
-	torch::Tensor sampleWeights) {
+	torch::Tensor sampleWeights,
+	torch::Tensor* outRaw, torch::Tensor* outReg1, torch::Tensor* outReg2) {
 
 	float t = tau_override > 0 ? tau_override : tau;
 
@@ -284,37 +285,38 @@ torch::Tensor GGL::QuasimetricCritic::infonce_loss(
 
 	auto arange = torch::arange(B, torch::TensorOptions().dtype(torch::kLong).device(dev));
 
+	auto rowVals = -torch::log_softmax(logits, 1).index({arange, arange});
+	auto colVals = -torch::log_softmax(logits, 0).index({arange, arange});
+
+	torch::Tensor loss;
+	bool useWeights = false;
 	if (sampleWeights.defined() && sampleWeights.size(0) == B) {
 		auto w = sampleWeights.to(dev);
 		auto wSum = w.sum();
 		if (wSum.item<float>() > 1e-8f) {
-			auto rowVals = -torch::log_softmax(logits, 1).index({arange, arange});
-			auto colVals = -torch::log_softmax(logits, 0).index({arange, arange});
-			auto loss_row = (rowVals * w).sum() / wSum;
-			auto loss_col = (colVals * w).sum() / wSum;
-			auto loss = loss_row + loss_col;
-
-			auto reg1 = infonce_penalty * (
-				torch::logsumexp(logits, 1, false).square().mean() +
-				torch::logsumexp(logits, 0, false).square().mean()
-			);
-			auto reg2 = var_reg * (1.0f / (sa.std(0).mean() + 1e-4f) +
-			                       1.0f / (g.std(0).mean() + 1e-4f));
-			return loss + reg1 + reg2;
+			loss = (rowVals * w).sum() / wSum + (colVals * w).sum() / wSum;
+			useWeights = true;
 		}
 	}
-
-	auto loss_row = -torch::log_softmax(logits, 1).index({arange, arange}).mean();
-	auto loss_col = -torch::log_softmax(logits, 0).index({arange, arange}).mean();
-	auto loss = loss_row + loss_col;
+	if (!useWeights)
+		loss = rowVals.mean() + colVals.mean();
 
 	auto reg1 = infonce_penalty * (
 		torch::logsumexp(logits, 1, false).square().mean() +
 		torch::logsumexp(logits, 0, false).square().mean()
 	);
 
-	auto reg2 = var_reg * (1.0f / (sa.std(0).mean() + 1e-4f) +
-	                       1.0f / (g.std(0).mean() + 1e-4f));
+	// The embeddings are L2-normalized, so per-dim std tops out around 1/sqrt(repr_dim);
+	// scale by sqrt(repr_dim) so a fully-spread embedding scores ~1 regardless of dim.
+	// (Unscaled, 1/std is ~sqrt(repr_dim)=16 at repr_dim 256, making this term a large
+	// constant that dominates the loss and fights the contrastive objective.)
+	float stdNorm = std::sqrt((float)repr_dim);
+	auto reg2 = var_reg * (1.0f / (sa.std(0).mean() * stdNorm + 1e-4f) +
+	                       1.0f / (g.std(0).mean() * stdNorm + 1e-4f));
+
+	if (outRaw)  *outRaw = loss.detach();
+	if (outReg1) *outReg1 = reg1.detach();
+	if (outReg2) *outReg2 = reg2.detach();
 
 	return loss + reg1 + reg2;
 }

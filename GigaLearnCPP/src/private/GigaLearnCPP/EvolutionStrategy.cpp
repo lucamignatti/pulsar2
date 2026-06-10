@@ -431,10 +431,10 @@ void GGL::EvolutionStrategy::EvaluateChunk(
 		torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 		torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
-		torch::Tensor tNewStates = tStates.index_select(0, tNewPlayerIndices).to(device, true);
-		torch::Tensor tOldStates = tStates.index_select(0, tOldPlayerIndices).to(device, true);
-		torch::Tensor tNewMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(device, true);
-		torch::Tensor tOldMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(device, true);
+		torch::Tensor tNewStates = tStates.index_select(0, tNewPlayerIndices).to(device, RG_H2D_NONBLOCKING(device));
+		torch::Tensor tOldStates = tStates.index_select(0, tOldPlayerIndices).to(device, RG_H2D_NONBLOCKING(device));
+		torch::Tensor tNewMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(device, RG_H2D_NONBLOCKING(device));
+		torch::Tensor tOldMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(device, RG_H2D_NONBLOCKING(device));
 
 		envSet->StepFirstHalf(true);
 

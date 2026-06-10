@@ -735,32 +735,63 @@ namespace RLGC {
 	public:
 		float maxPredTime, maxRewardedBallSpeed;
 
+		// Whether the ball was already on a scoring trajectory toward each team's target goal
+		// last step (indexed by the shooting team). Payment is edge-triggered on this:
+		// only the touch that PUTS the ball on frame pays. Without the edge trigger, every
+		// touch of an on-target dribble pays again, and a slow on-frame dribble can out-earn
+		// the goal itself (which would also teach not finishing, since scoring ends the farm).
+		bool wasOnFrame[2] = {};
+
 		ShotOnFrameReward(float maxPredTime = 2.0f, float maxRewardedBallSpeed = RLGC::Math::KPHToVel(120))
 			: maxPredTime(maxPredTime), maxRewardedBallSpeed(maxRewardedBallSpeed) {}
 
-		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
-			if (!state.prev || !player.ballTouchedStep)
-				return 0;
+		virtual void Reset(const GameState& initialState) override {
+			wasOnFrame[0] = wasOnFrame[1] = false;
+		}
 
-			float targetY = player.team == Team::BLUE ? CommonValues::BACK_WALL_Y : -CommonValues::BACK_WALL_Y;
+		static bool IsBallOnFrame(const GameState& state, Team shootingTeam, float maxPredTime) {
+			float targetY = shootingTeam == Team::BLUE ? CommonValues::BACK_WALL_Y : -CommonValues::BACK_WALL_Y;
 			float velY = state.ball.vel.y;
 			float yDelta = targetY - state.ball.pos.y;
 			if (velY * yDelta <= 0)
-				return 0;
+				return false;
 
 			float t = yDelta / velY;
 			if (t <= 0 || t > maxPredTime)
-				return 0;
+				return false;
 
 			Vec targetPos = state.ball.pos + state.ball.vel * t;
 			if (fabsf(targetPos.x) > CommonValues::GOAL_WIDTH_FROM_CENTER || targetPos.z > CommonValues::GOAL_HEIGHT || targetPos.z < 0)
-				return 0;
+				return false;
 
-			Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
-			Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
-			float alignment = RS_CLAMP(state.ball.vel.Normalized().Dot(ballDirToGoal), 0, 1);
-			float speedFrac = RS_CLAMP(state.ball.vel.Length() / maxRewardedBallSpeed, 0, 1);
-			return alignment * speedFrac;
+			return true;
+		}
+
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			bool onFrameNow[2] = {
+				IsBallOnFrame(state, Team::BLUE, maxPredTime),
+				IsBallOnFrame(state, Team::ORANGE, maxPredTime)
+			};
+
+			std::vector<float> rewards(state.players.size(), 0);
+			if (state.prev) {
+				for (int i = 0; i < state.players.size(); i++) {
+					const Player& player = state.players[i];
+					int teamIdx = (int)player.team;
+					if (!player.ballTouchedStep || !onFrameNow[teamIdx] || wasOnFrame[teamIdx])
+						continue;
+
+					Vec targetGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+					Vec ballDirToGoal = (targetGoal - state.ball.pos).Normalized();
+					float alignment = RS_CLAMP(state.ball.vel.Normalized().Dot(ballDirToGoal), 0, 1);
+					float speedFrac = RS_CLAMP(state.ball.vel.Length() / maxRewardedBallSpeed, 0, 1);
+					rewards[i] = alignment * speedFrac;
+				}
+			}
+
+			wasOnFrame[0] = onFrameNow[0];
+			wasOnFrame[1] = onFrameNow[1];
+			return rewards;
 		}
 	};
 

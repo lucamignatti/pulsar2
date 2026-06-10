@@ -30,7 +30,19 @@ namespace GGL {
 		int obsSize;
 		int numActions;
 
-		struct WelfordStat* returnStat;
+		// Game modes: (RocketSim GameMode, playersPerTeam) pairs mapped to dense ids,
+		// used for per-mode normalization of returns, GCRL advantages and gate deltas
+		int numModes = 1;
+		std::vector<int> playerModeIds;
+		std::vector<std::string> modeNames;
+
+		// Per-mode running EMA of the GCRL reward gate delta (mean/variance). Using slow
+		// running stats instead of per-batch z-scores keeps the gate's semantics stationary
+		// so the critic isn't chasing a batch-dependent reward scale.
+		std::vector<double> gateDeltaMeanEMA, gateDeltaVarEMA;
+
+		// One return stat per game mode (pointer because WelfordStat is a private type)
+		std::vector<struct WelfordStat>* returnStats;
 		struct BatchedWelfordStat* obsStat;
 
 		std::string runID = {};

@@ -3,8 +3,9 @@
 void GGL::GAE::Compute(
 	torch::Tensor rews, torch::Tensor terminals, torch::Tensor valPreds, torch::Tensor truncValPreds,
 	torch::Tensor& outAdvantages, torch::Tensor& outTargetValues, torch::Tensor& outReturns, float& outRewClipPortion,
-	float gamma, float lambda, float returnStd, float clipRange
+	float gamma, float lambda, const FList& returnStds, const int8_t* modeIds, float clipRange
 ) {
+	RG_ASSERT(!returnStds.empty());
 
 	bool hasTruncValPreds = truncValPreds.defined();
 
@@ -47,6 +48,8 @@ void GGL::GAE::Compute(
 		uint8_t terminal = _terminals[step];
 		float done = terminal == RLGC::TerminalType::NORMAL;
 		float trunc = terminal == RLGC::TerminalType::TRUNCATED;
+
+		float returnStd = returnStds[modeIds ? modeIds[step] : 0];
 
 		float curReward;
 		if (returnStd != 0) {

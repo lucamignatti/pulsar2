@@ -209,6 +209,12 @@ namespace GGL {
 		// This will only happen if the amount of remaining experience is < batchSize*2.
 		bool overbatching = true;
 
+		// Step the optimizers after every minibatch instead of accumulating gradients
+		// over the whole batch and stepping once. More optimizer steps per batch often
+		// buys sample efficiency; watch Mean KL Divergence and lower policyLR if it
+		// rises above ~0.01 sustained.
+		bool stepPerMiniBatch = false;
+
 		// Collect the next batch while the current one trains (1 update off-policy). Big speedup when env-step-bound.
 		bool asyncCollection = true;
 
@@ -278,6 +284,11 @@ namespace GGL {
 		int gcrlInfoSubSample = 512;      // Sub-batch size for the InfoNCE contrastive matrix
 		int gcrlReprDim = 128;            // Embedding (output) dim; phi and psi MUST share it
 		float gcrlLR = 0;                 // GCRL critic learning rate; 0 -> use policyLR
+		// Counterfactual action baseline for the GCRL advantage: K extra no-grad critic
+		// forwards with within-batch shuffled actions, subtracted from Q before normalization.
+		// Turns "this state is near a goal" into "this action beats a typical action here".
+		// 0 disables (raw Q is used, as before).
+		int gcrlBaselineSamples = 0;
 		bool useGCRLRewardGate = false;   // Gate selected dense rewards with terminal-oriented GCRL progress
 		float gcrlRewardGateInfluence = 1.0f; // 0 -> ungated, 1 -> full gate
 		int64_t gcrlRewardGateAnnealStart = -1; // Timesteps to start gate influence ramp; -1 -> current checkpoint

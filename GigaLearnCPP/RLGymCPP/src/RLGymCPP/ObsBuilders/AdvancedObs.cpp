@@ -148,5 +148,8 @@ RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& s
 	for (auto& opponent : opponents)
 		obs += opponent;
 
+	// User-supplied constants (e.g. game mode flags), always last so fixed offsets above hold
+	obs += extraObs;
+
 	return obs;
 }

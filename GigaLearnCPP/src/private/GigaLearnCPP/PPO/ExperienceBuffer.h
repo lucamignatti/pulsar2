@@ -6,6 +6,9 @@ namespace GGL {
 	struct ExperienceTensors {
 		torch::Tensor
 			states, actions, logProbs, targetValues, actionMasks, advantages,
+			// Per-step game-mode id (int64), used for per-mode advantage normalization.
+			// Left undefined when only one mode exists (sampler skips undefined fields).
+			modeIds,
 			// GCRL fields (only populated when useGCRL); left undefined otherwise and
 			// skipped by the sampler. actionComps: 8-dim continuous action taken.
 			// futureGoals/carFutureGoals: hindsight-relabeled global / car-local ball goal.

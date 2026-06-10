@@ -10,6 +10,7 @@
 #include <pybind11/embed.h>
 
 #include <optional>
+#include <limits>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
@@ -85,23 +86,23 @@ namespace {
 	) {
 		if (ppo->device.is_cpu()) {
 			return ppo->InferGCRLTerminalScores(
-				states.to(ppo->device, true, true),
-				actionComps.to(ppo->device, true, true),
-				goalTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, true, true),
-				antiTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, true, true)
+				states.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
+				actionComps.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
+				goalTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
+				antiTargetRow.expand({ length, GCRL_GATE_GOAL_DIM }).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)
 			).cpu();
 		}
 
-		torch::Tensor goalTargetDev = goalTargetRow.to(ppo->device, true, true);
-		torch::Tensor antiTargetDev = antiTargetRow.to(ppo->device, true, true);
+		torch::Tensor goalTargetDev = goalTargetRow.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true);
+		torch::Tensor antiTargetDev = antiTargetRow.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true);
 		torch::Tensor terminalScores = torch::zeros({ (int64_t)length, 2 });
 		for (int i = 0; i < length; i += ppo->config.miniBatchSize) {
 			int start = i;
 			int end = RS_MIN(i + ppo->config.miniBatchSize, length);
 			int batchSize = end - start;
 			auto scorePart = ppo->InferGCRLTerminalScores(
-				states.slice(0, start, end).to(ppo->device, true, true),
-				actionComps.slice(0, start, end).to(ppo->device, true, true),
+				states.slice(0, start, end).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
+				actionComps.slice(0, start, end).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
 				goalTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM }),
 				antiTargetDev.expand({ batchSize, GCRL_GATE_GOAL_DIM })
 			).cpu();
@@ -208,10 +209,49 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	}
 
 	{
+		// Map each arena's (gameMode, playersPerTeam) to a dense mode id; per-mode
+		// normalization (returns, GCRL advantages, gate deltas) groups by these ids
+		std::map<std::pair<int, int>, int> modeKeyToId = {};
+		playerModeIds.resize(envSet->state.numPlayers);
+		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
+			Arena* arena = envSet->arenas[arenaIdx];
+			auto& gs = envSet->state.gameStates[arenaIdx];
+
+			int teamCounts[2] = { 0, 0 };
+			for (auto& player : gs.players)
+				teamCounts[(int)player.team]++;
+
+			auto key = std::make_pair((int)arena->gameMode, RS_MAX(teamCounts[0], teamCounts[1]));
+			auto itr = modeKeyToId.find(key);
+			int modeId;
+			if (itr != modeKeyToId.end()) {
+				modeId = itr->second;
+			} else {
+				modeId = (int)modeNames.size();
+				modeKeyToId[key] = modeId;
+				const char* modeStr = (key.first < 4) ? GAMEMODE_STRS[key.first] : "unknown";
+				modeNames.push_back(RS_STR(modeStr << "_" << teamCounts[0] << "v" << teamCounts[1]));
+			}
+
+			int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
+			for (int i = 0; i < (int)gs.players.size(); i++)
+				playerModeIds[startIdx + i] = modeId;
+		}
+		numModes = (int)modeNames.size();
+
+		RG_LOG("\tGame modes (" << numModes << "):");
+		for (int m = 0; m < numModes; m++)
+			RG_LOG("\t > [" << m << "] " << modeNames[m]);
+
+		gateDeltaMeanEMA.assign(numModes, 0.0);
+		gateDeltaVarEMA.assign(numModes, 1.0);
+	}
+
+	{
 		if (config.standardizeReturns) {
-			this->returnStat = new WelfordStat();
+			this->returnStats = new std::vector<WelfordStat>(numModes);
 		} else {
-			this->returnStat = NULL;
+			this->returnStats = NULL;
 		}
 
 		if (config.standardizeObs) {
@@ -227,6 +267,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
 	}
+	ppo->numModes = numModes;
 
 	if (config.renderMode) {
 		renderSender = new RenderSender(config.renderTimeScale);
@@ -305,10 +346,21 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (config.sendMetrics)
 		j["run_id"] = metricSender->curRunID;
 
-	if (returnStat)
-		j["return_stat"] = returnStat->ToJSON();
+	if (returnStats) {
+		json returnStatsJ = {};
+		for (int m = 0; m < numModes; m++)
+			returnStatsJ[modeNames[m]] = (*returnStats)[m].ToJSON();
+		j["return_stats_per_mode"] = returnStatsJ;
+	}
 	if (obsStat)
 		j["obs_stat"] = obsStat->ToJSON();
+
+	{
+		json gateEMAJ = {};
+		for (int m = 0; m < numModes; m++)
+			gateEMAJ[modeNames[m]] = { { "mean", gateDeltaMeanEMA[m] }, { "var", gateDeltaVarEMA[m] } };
+		j["gcrl_gate_delta_ema"] = gateEMAJ;
+	}
 
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
@@ -346,10 +398,24 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (j.contains("run_id"))
 		runID = j["run_id"];
 
-	if (returnStat)
-		returnStat->ReadFromJSON(j["return_stat"]);
+	if (returnStats && j.contains("return_stats_per_mode")) {
+		const json& returnStatsJ = j["return_stats_per_mode"];
+		for (int m = 0; m < numModes; m++)
+			if (returnStatsJ.contains(modeNames[m]))
+				(*returnStats)[m].ReadFromJSON(returnStatsJ[modeNames[m]]);
+	}
 	if (obsStat)
 		obsStat->ReadFromJSON(j["obs_stat"]);
+
+	if (j.contains("gcrl_gate_delta_ema")) {
+		const json& gateEMAJ = j["gcrl_gate_delta_ema"];
+		for (int m = 0; m < numModes; m++) {
+			if (gateEMAJ.contains(modeNames[m])) {
+				gateDeltaMeanEMA[m] = gateEMAJ[modeNames[m]]["mean"];
+				gateDeltaVarEMA[m] = gateEMAJ[modeNames[m]]["var"];
+			}
+		}
+	}
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
@@ -533,7 +599,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 					envSet->StepFirstHalf(true);
 
 					ppo->InferActions(
-						tStates.to(ppo->device, true), tActionMasks.to(ppo->device, true),
+						tStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), tActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)),
 						&tActions, &tLogProbs
 					);
 
@@ -654,6 +720,10 @@ void GGL::Learner::Start() {
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
+			// Per-step game mode id (for per-mode normalization) and obs x-mirror flag
+			// (for mirror-consistent hindsight goal relabeling).
+			std::vector<int8_t> modeIds;
+			std::vector<uint8_t> mirrored;
 
 			void Clear() {
 				states.clear();
@@ -671,6 +741,8 @@ void GGL::Learner::Start() {
 				actionMasks.clear();
 				terminals.clear();
 				actions.clear();
+				modeIds.clear();
+				mirrored.clear();
 			}
 
 			void Append(const Trajectory& other) {
@@ -689,6 +761,8 @@ void GGL::Learner::Start() {
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
+				modeIds += other.modeIds;
+				mirrored += other.mirrored;
 			}
 
 			size_t Length() const {
@@ -712,6 +786,8 @@ void GGL::Learner::Start() {
 			traj.logProbs.reserve(maxEpisodeLength);
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
+			traj.modeIds.reserve(maxEpisodeLength);
+			traj.mirrored.reserve(maxEpisodeLength);
 			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
 			if (useActionComps)
 				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
@@ -858,6 +934,8 @@ void GGL::Learner::Start() {
 				combinedTraj.logProbs.reserve(expTs);
 				combinedTraj.actions.reserve(expTs);
 				combinedTraj.terminals.reserve(expTs);
+				combinedTraj.modeIds.reserve(expTs);
+				combinedTraj.mirrored.reserve(expTs);
 				combinedTraj.actionMasks.reserve(expTs * numActions);
 				if (useActionComps)
 					combinedTraj.actionComps.reserve(expTs * 8);
@@ -910,6 +988,14 @@ void GGL::Learner::Start() {
 						for (int newPlayerIdx : newPlayerIndices) {
 							envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
 							envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
+							trajectories[newPlayerIdx].modeIds.push_back((int8_t)playerModeIds[newPlayerIdx]);
+
+							// Mirror flag must be read here, before StepFirstHalf mutates the game
+							// states, so it matches the state this obs row was built from.
+							int arenaIdx = playerArenaIdx[newPlayerIdx];
+							const Player& player = envSet->state.gameStates[arenaIdx].players[playerLocalIdx[newPlayerIdx]];
+							trajectories[newPlayerIdx].mirrored.push_back(
+								envSet->obsBuilders[arenaIdx]->IsObsMirroredX(player) ? 1 : 0);
 						}
 					}
 
@@ -918,10 +1004,10 @@ void GGL::Learner::Start() {
 					Timer inferTimer = {};
 
 					if (oldVersion) {
-						torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-						torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-						torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-						torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+						torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
+						torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
+						torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
+						torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
 
 						torch::Tensor tNewActions;
 						torch::Tensor tOldActions;
@@ -933,8 +1019,8 @@ void GGL::Learner::Start() {
 						tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
 						tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
 					} else {
-						torch::Tensor tdStates = tStates.to(ppo->device, true);
-						torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
+						torch::Tensor tdStates = tStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
+						torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device));
 						ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, &inferModels);
 						tActions = tActions.cpu();
 					}
@@ -1125,6 +1211,7 @@ void GGL::Learner::Start() {
 								int N = traj.Length();
 								int H = config.ppo.gcrlHorizon;
 								int minH = config.ppo.gcrlMinHorizon;
+								bool hasMirrorFlags = traj.mirrored.size() == (size_t)N;
 								traj.futureGoals.resize(N * 6);
 								traj.carFutureGoals.resize(N * 6);
 								for (int t = 0; t < N; t++) {
@@ -1137,11 +1224,31 @@ void GGL::Learner::Start() {
 										t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
 									else
 										t_target = hi;
+
+									// The obs x-mirror flips whenever the player crosses x=0, so a goal
+									// copied from t_target's obs may be in the opposite mirror frame to
+									// step t's features. Flip its lateral components back when the flags
+									// differ. (With standardizeObs this negates the *normalized* value;
+									// exact only if the running mean of these dims is ~0, which holds by
+									// the game's left/right symmetry.)
+									bool flip = hasMirrorFlags && (traj.mirrored[t] != traj.mirrored[t_target]);
+
 									for (int d = 0; d < 6; d++)
 										traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
+									if (flip) {
+										// Global ball: negate x of pos and vel
+										traj.futureGoals[t * 6 + 0] = -traj.futureGoals[t * 6 + 0];
+										traj.futureGoals[t * 6 + 3] = -traj.futureGoals[t * 6 + 3];
+									}
 									if (carLocalBallOffset >= 0) {
 										for (int d = 0; d < 6; d++)
 											traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + carLocalBallOffset + d];
+										if (flip) {
+											// Car-local ball: negate the right-axis components
+											// (RotMat::Dot returns (forward, right, up) projections)
+											traj.carFutureGoals[t * 6 + 1] = -traj.carFutureGoals[t * 6 + 1];
+											traj.carFutureGoals[t * 6 + 4] = -traj.carFutureGoals[t * 6 + 4];
+										}
 									}
 								}
 							}
@@ -1352,6 +1459,11 @@ void GGL::Learner::Start() {
 			if (config.ppo.useSORS)
 				ppo->TrainSORS(report);
 
+			// Refresh the own-goal target the anti critic's advantage queries
+			// (depends on obs standardization stats when standardizeObs is on)
+			if (config.ppo.useGCRL)
+				ppo->curGCRLAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
+
 			Timer consumptionTimer = {};
 			{ // Process timesteps
 					RG_NO_GRAD;
@@ -1368,6 +1480,11 @@ void GGL::Learner::Start() {
 					torch::Tensor tActionComps;
 					if (!combinedTraj.actionComps.empty())
 						tActionComps = torch::tensor(combinedTraj.actionComps).reshape({ -1, 8 });
+
+					// Per-step game-mode ids (kLong, CPU) for per-mode normalization/reporting
+					torch::Tensor tModeIds = torch::from_blob(
+						(void*)combinedTraj.modeIds.data(), { (int64_t)combinedTraj.modeIds.size() },
+						torch::TensorOptions().dtype(torch::kChar)).to(torch::kLong);
 
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
 					bool hasCurriculumRewards = !combinedTraj.curriculumRewards.empty();
@@ -1429,7 +1546,26 @@ void GGL::Learner::Start() {
 
 							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
 							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
-							torch::Tensor tNormGateDelta = (tGateDelta - tGateDelta.mean()) / (tGateDelta.std(false) + 1e-8f);
+
+							// Normalize the gate delta with slow per-mode EMA stats instead of a
+							// per-batch z-score: the gate's meaning then drifts over ~1/(1-decay)
+							// iterations instead of jumping with each batch's composition, and one
+							// mode's dynamics (e.g. heatseeker ball speeds) can't reprice another's.
+							constexpr double GATE_EMA_DECAY = 0.99;
+							torch::Tensor tNormGateDelta = torch::empty_like(tGateDelta);
+							for (int m = 0; m < numModes; m++) {
+								torch::Tensor mask = (tModeIds == m);
+								torch::Tensor vals = tGateDelta.masked_select(mask);
+								if (vals.numel() == 0)
+									continue;
+
+								gateDeltaMeanEMA[m] = GATE_EMA_DECAY * gateDeltaMeanEMA[m] + (1 - GATE_EMA_DECAY) * vals.mean().item<double>();
+								gateDeltaVarEMA[m] = GATE_EMA_DECAY * gateDeltaVarEMA[m] + (1 - GATE_EMA_DECAY) * vals.var(false).item<double>();
+
+								torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
+								tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+							}
+
 							torch::Tensor tGate = torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
 							torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
 							torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
@@ -1439,6 +1575,13 @@ void GGL::Learner::Start() {
 
 							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
 							report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
+							if (numModes > 1) {
+								for (int m = 0; m < numModes; m++) {
+									torch::Tensor modeGate = tEffectiveGate.masked_select(tModeIds == m);
+									if (modeGate.numel() > 0)
+										report["GCRL Gate/Mean/" + modeNames[m]] = modeGate.mean().item<float>();
+								}
+							}
 							report["GCRL Aerial Gate/Mean"] = tEffectiveAerialGate.mean().item<float>();
 							report["GCRL Aerial Gate/STD"] = tEffectiveAerialGate.std(false).item<float>();
 							report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
@@ -1459,15 +1602,15 @@ void GGL::Learner::Start() {
 					if (config.ppo.useSORS && tActionComps.defined()) {
 						torch::Tensor tSORSRewards;
 						if (ppo->device.is_cpu()) {
-							tSORSRewards = ppo->InferSORSRewards(tStates.to(ppo->device, true, true), tActionComps.to(ppo->device, true, true)).cpu();
+							tSORSRewards = ppo->InferSORSRewards(tStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true), tActionComps.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 						} else {
 							tSORSRewards = torch::zeros({ (int64_t)combinedTraj.Length() });
 							for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
 								int start = i;
 								int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
 								auto rewardPart = ppo->InferSORSRewards(
-									tStates.slice(0, start, end).to(ppo->device, true, true),
-									tActionComps.slice(0, start, end).to(ppo->device, true, true)
+									tStates.slice(0, start, end).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true),
+									tActionComps.slice(0, start, end).to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)
 								).cpu();
 								tSORSRewards.slice(0, start, end).copy_(rewardPart, true);
 							}
@@ -1494,9 +1637,9 @@ void GGL::Learner::Start() {
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
-						tValPreds = ppo->InferCritic(tStates.to(ppo->device, true, true)).cpu();
+						tValPreds = ppo->InferCritic(tStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 						if (tNextTruncStates.defined())
-							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 					} else {
 						// Predict values using minibatching
 						tValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
@@ -1505,7 +1648,7 @@ void GGL::Learner::Start() {
 							int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
 							torch::Tensor tStatesPart = tStates.slice(0, start, end);
 
-							auto valPredsPart = ppo->InferCritic(tStatesPart.to(ppo->device, true, true)).cpu();
+							auto valPredsPart = ppo->InferCritic(tStatesPart.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 							RG_ASSERT(valPredsPart.size(0) == (end - start));
 							tValPreds.slice(0, start, end).copy_(valPredsPart, true);
 						}
@@ -1515,7 +1658,7 @@ void GGL::Learner::Start() {
 							// If this is ever actually a real problem in a legitimate use case, ping Zealan in the dead of night
 							RG_ASSERT(tNextTruncStates.size(0) <= ppo->config.miniBatchSize);
 
-							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 						}
 					}
 
@@ -1525,24 +1668,35 @@ void GGL::Learner::Start() {
 						report["Episode Length"] = 1.f / terminalPortion;
 
 					Timer gaeTimer = {};
-					// Run GAE
+					// Run GAE (rewards standardized by each step's own mode's return STD)
+					// Default 1 (not 0) preserves the old standardizeReturns=false behavior of
+					// clipping raw rewards at rewardClipRange.
+					FList returnStds(numModes, 1.0f);
+					if (returnStats)
+						for (int m = 0; m < numModes; m++)
+							returnStds[m] = (float)(*returnStats)[m].GetSTD();
+
 					torch::Tensor tAdvantages, tTargetVals, tReturns;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
 						tAdvantages, tTargetVals, tReturns, rewClipPortion,
-						config.ppo.gaeGamma, config.ppo.gaeLambda, returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange
+						config.ppo.gaeGamma, config.ppo.gaeLambda,
+						returnStds, combinedTraj.modeIds.data(),
+						config.ppo.rewardClipRange
 					);
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
 
-					if (returnStat) {
-						report["GAE/Returns STD"] = returnStat->GetSTD();
+					if (returnStats) {
+						for (int m = 0; m < numModes; m++)
+							report[numModes > 1 ? ("GAE/Returns STD/" + modeNames[m]) : "GAE/Returns STD"] = returnStds[m];
 
 						int numToIncrement = RS_MIN(config.maxReturnSamples, tReturns.size(0));
-						if (numToIncrement > 0) {
-							auto selectedReturns = tReturns.index_select(0, torch::randint(tReturns.size(0), { (int64_t)numToIncrement }));
-							returnStat->Increment(TENSOR_TO_VEC<float>(selectedReturns));
+						const float* returnsData = tReturns.contiguous().data_ptr<float>();
+						for (int i = 0; i < numToIncrement; i++) {
+							int idx = Math::RandInt(0, (int)tReturns.size(0));
+							(*returnStats)[combinedTraj.modeIds[idx]].Increment(returnsData[idx]);
 						}
 					}
 					report["GAE/Avg Return"] = tReturns.abs().mean().item<float>();
@@ -1556,6 +1710,8 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (numModes > 1)
+						experience.data.modeIds = tModeIds;
 
 					if (config.ppo.useGCRL) {
 						experience.data.actionComps    = tActionComps;
@@ -1684,7 +1840,7 @@ GGL::Learner::~Learner() {
 	delete metricSender;
 	delete renderSender;
 	delete envSet;
-	delete returnStat;
+	delete returnStats;
 	delete obsStat;
 	pybind11::finalize_interpreter();
 }

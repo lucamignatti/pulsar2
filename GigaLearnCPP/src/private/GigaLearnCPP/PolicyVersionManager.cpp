@@ -239,11 +239,11 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		torch::Tensor _tLogProbs;
 
 		PPOLearner::InferActionsFromModels(
-			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true), 
+			ppo->models, tNewStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), tNewActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), 
 			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, 
 			&tNewActions, &_tLogProbs);
 		PPOLearner::InferActionsFromModels(
-			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true), 
+			oldVersion.models, tOldStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), tOldActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), 
 			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
 			&tOldActions, &_tLogProbs);
 

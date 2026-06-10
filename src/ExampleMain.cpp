@@ -82,6 +82,21 @@ EnvCreateResult EnvCreateFunc(int index) {
 		default: playersPerTeam = 2; gameMode = GameMode::HEATSEEKER; break; // Heatseeker 2v2
 	}
 
+	// Fraction of individual event rewards (shots, saves, strong touches) shared with the
+	// team average, so enabling plays (passes, leave-its) earn credit too. opponentScale 0
+	// keeps these team-distributed WITHOUT making them zero-sum. In 1v1 the team average
+	// equals the player's own reward, so this is mathematically a no-op there.
+	constexpr float TEAM_SPIRIT = 0.4f;
+
+	// Chase incentive scaled down in team modes: paying every player to drive at the ball
+	// is the classic cause of double/triple commits in 2v2/3v3.
+	float chaseWeight;
+	switch (playersPerTeam) {
+		case 1:  chaseWeight = 6.0f; break;
+		case 2:  chaseWeight = 3.0f; break;
+		default: chaseWeight = 2.0f; break;
+	}
+
 	std::vector<WeightedReward> rewards = {
 
 		// Ball-goal
@@ -96,11 +111,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Game events — shot/save callbacks are NULL in Heatseeker (no event tracker),
 		// so ShotReward and SaveReward naturally return 0 there.
-		{ new ShotReward(), 15.f },
-		{ new ShotOnFrameReward(), 35.f },
-		{ new SaveReward(), 20.f },
+		{ new ZeroSumReward(new ShotReward(), TEAM_SPIRIT, 0.0f), 15.f },
+		{ new ZeroSumReward(new ShotOnFrameReward(), TEAM_SPIRIT, 0.0f), 35.f },
+		{ new ZeroSumReward(new SaveReward(), TEAM_SPIRIT, 0.0f), 20.f },
 		{ new ZeroSumReward(new KickoffOnlyReward(new KickoffTouchReward(3.0f)), 0.0f), 5.0f },
 		{ new GoalReward(), 275 },
+
+		// Getting demoed costs the team a defender for 3 seconds
+		{ new DemoedPenalty(), 5.f },
 
 		// time penalty
 		{ new TimePenalty(-0.075f), 1.0f }
@@ -109,19 +127,23 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
 		// Ground/contact rewards are filtered by GCRL terminal progress.
-		{ new StrongTouchReward(20, 100), 90.f }
+		// (Weight cut from 90: the sigmoid gate revert roughly doubled this reward's
+		// expected value vs the signed-tanh runs.)
+		{ new ZeroSumReward(new StrongTouchReward(20, 100), TEAM_SPIRIT, 0.0f), 60.f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
 
 		// Temporary chase incentive; GCRL gate suppresses steps with below-average progress toward goal.
-		{ new VelocityPlayerToBallReward(), 6.f }
+		{ new VelocityPlayerToBallReward(), chaseWeight }
 	};
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
 
 		// Aerial rewards use a slower gate anneal so bootstrap signals are not filtered out early.
-		{ new AirReward(), 0.02f },
+		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
+		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
+		// the ball to actually be up and/or productive contact.
 		{ new HeightWeightedAerialApproachReward(), 1.5f },
 		{ new UsefulAirTouchReward(), 25.0f },
 		{ new SecondTouchReward(), 12.0f },
@@ -148,7 +170,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
-	result.obsBuilder = new AdvancedObs(3, true, true); // maxPlayers=3 → fixed obs size for all modes
+	// maxPlayers=3 → fixed obs size for all modes; extraObs tells the policy which mode
+	// it's in (a heatseeker kickoff is otherwise indistinguishable from a soccar one)
+	result.obsBuilder = new AdvancedObs(
+		3, true, true, { 0.25f, 0.5f, 1.0f, 1.5f, 2.0f },
+		{ gameMode == GameMode::HEATSEEKER ? 1.0f : 0.0f, playersPerTeam / 3.0f });
 	result.stateSetter = new CombinedState({
 		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
 		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
@@ -231,8 +257,11 @@ int main(int argc, char* argv[]) {
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 150'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 37'500; // Lower this if too much VRAM is being allocated
 	cfg.ppo.overbatching = true;
+	// 4 optimizer steps per batch (one per minibatch) instead of one accumulated step.
+	// If Mean KL Divergence sits above ~0.01, lower policyLR or flip this off.
+	cfg.ppo.stepPerMiniBatch = true;
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -242,14 +271,18 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	cfg.ppo.targetEntropy = 0.70f;
+	// 0.70 was unreachable: the controller pinned at maxEntropyScale for entire runs and the
+	// entropy term dwarfed the PPO surrogate. 0.60 is still exploratory for ~40 actions.
+	cfg.ppo.targetEntropy = 0.60f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
 	cfg.ppo.maxEntropyScale = 0.10f;
 
 	// Rate of reward decay
-	// Starting low tends to work out
-	cfg.ppo.gaeGamma = 0.99;
+	// At tickSkip 4 (30 steps/sec) 0.995 gives a ~6.6s credit half-life -- the same time
+	// horizon 0.99 gives at tickSkip 8. (0.99 here was only ~3.3s, too short to propagate
+	// goal credit back through buildup play.)
+	cfg.ppo.gaeGamma = 0.995;
 
 	// Good learning rate to start
 	cfg.ppo.policyLR = 4e-4;
@@ -268,12 +301,16 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlAdvScale = 0.75f;   // Target GCRL advantage weight after annealing
 	cfg.ppo.gcrlAdvScaleAnnealStart = -1; // Start ramping from the current checkpoint/load point
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
-	cfg.ppo.gcrlAntiScale = 0.85f;   // pessimistic "anti" critic weight in the GCRL advantage
+	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
+	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
+	// noise. Start moderate; raise if defense lags.
+	cfg.ppo.gcrlAntiScale = 0.4f;
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
+	cfg.ppo.gcrlBaselineSamples = 4; // counterfactual action baseline (K shuffled-action forwards)
 	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
 	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
 	cfg.ppo.gcrlUseVariableHER = true; // sample goal offset uniformly in [minH, H]; else fixed H
-	cfg.ppo.gcrlTau = 0.02f;         // embedding temperature (lower = sharper contrast)
+	cfg.ppo.gcrlTau = 0.05f;         // embedding temperature; 0.02 scaled logits 50x and was the likely NaN source
 	cfg.ppo.gcrlReprDim = 256;       // phi/psi embedding dimension (the metric-space capacity)
 	cfg.ppo.gcrlInfoNCECoef = 0.75f;  // weight of the InfoNCE loss in the combined objective
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE

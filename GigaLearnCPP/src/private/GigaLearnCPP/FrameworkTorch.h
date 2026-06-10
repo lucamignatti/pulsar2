@@ -22,6 +22,15 @@ at::autocast::set_enabled(false); \
 
 #define RG_HALFPERC_TYPE torch::ScalarType::BFloat16
 
+// Whether host->device copies may be non-blocking on this device.
+// On CUDA/ROCm, pageable-memory H2D copies complete synchronously with respect to the
+// source buffer before returning, so non_blocking is safe even for tensors that wrap
+// externally-owned memory (e.g. env obs buffers via DIMLIST2_TO_TENSOR).
+// MPS commits command buffers lazily: a non_blocking copy can execute AFTER the caller
+// has overwritten the source, silently shipping garbage to the GPU (this corrupted the
+// policy input and crashed multinomial with NaN probs). Block everywhere except CUDA.
+#define RG_H2D_NONBLOCKING(device) ((device).is_cuda())
+
 namespace GGL {
 	template <typename T>
 	inline torch::Tensor DIMLIST2_TO_TENSOR(const RLGC::DimList2<T>& list) {

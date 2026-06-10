@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ObsBuilder.h"
+#include "../Gamestates/StateUtil.h"
 #include "../../../RocketSim/src/Sim/BallPredTracker/BallPredTracker.h"
 #include <memory>
 
@@ -18,6 +19,9 @@ namespace RLGC {
 		bool mirrorX;
 		bool includeBallPred;
 		std::vector<float> ballPredTimes;
+		// Constant values appended at the end of every obs (e.g. game mode flags).
+		// Appended last so they don't shift the global-ball/car-local-ball offsets GCRL relies on.
+		FList extraObs;
 
 		std::unique_ptr<RocketSim::BallPredTracker> ballPredTracker;
 		Arena* ballPredArena = nullptr;
@@ -26,8 +30,9 @@ namespace RLGC {
 			int maxPlayers = 0,
 			bool mirrorX = false,
 			bool includeBallPred = false,
-			std::vector<float> ballPredTimes = { 0.25f, 0.5f, 1.0f, 1.5f, 2.0f }
-		) : maxPlayers(maxPlayers), mirrorX(mirrorX), includeBallPred(includeBallPred), ballPredTimes(ballPredTimes) {}
+			std::vector<float> ballPredTimes = { 0.25f, 0.5f, 1.0f, 1.5f, 2.0f },
+			FList extraObs = {}
+		) : maxPlayers(maxPlayers), mirrorX(mirrorX), includeBallPred(includeBallPred), ballPredTimes(ballPredTimes), extraObs(extraObs) {}
 
 		virtual void AddPlayerToObs(FList& obs, const Player& player, bool inv, bool xMirror, const PhysState& ball);
 		virtual void AddBallPredToObs(FList& obs, const Player& player, const GameState& state, bool inv, bool xMirror);
@@ -42,6 +47,11 @@ namespace RLGC {
 				selfStart += 9 * (int)ballPredTimes.size();
 			// Within self player: pos(3)+fwd(3)+up(3)+vel(3)+angVel(3)+localAngVel(3) = 18 before car-local ball
 			return selfStart + 18;
+		}
+
+		bool IsObsMirroredX(const Player& player) const override {
+			// Must match the xMirror expression in BuildObs exactly
+			return mirrorX && ShouldMirrorXForPlayer(player);
 		}
 	};
 }

@@ -11,15 +11,18 @@ namespace GGL {
 
 		WelfordStat() {};
 
-		void Increment(const FList& samples) {
-			for (float sample : samples) {
-				double delta = (double)sample - runningMean;
-				double deltaN = delta / (count + 1);
+		void Increment(float sample) {
+			double delta = (double)sample - runningMean;
+			double deltaN = delta / (count + 1);
 
-				runningMean += deltaN;
-				runningVariance += delta * deltaN * count;
-				count++;
-			}
+			runningMean += deltaN;
+			runningVariance += delta * deltaN * count;
+			count++;
+		}
+
+		void Increment(const FList& samples) {
+			for (float sample : samples)
+				Increment(sample);
 		}
 
 		void Reset() {

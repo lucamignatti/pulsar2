@@ -27,6 +27,16 @@ namespace GGL {
 		float curAerialCurriculumRewardScale;
 		float curSORSRewardScale;
 
+		// Own-goal terminal target ([1, 6] CPU tensor), set by the Learner each iteration.
+		// The anti critic's advantage queries this instead of the hindsight future goals,
+		// so it measures "does this action move toward conceding" (matching the reward
+		// gate's usage) instead of duplicating the goal critic.
+		torch::Tensor curGCRLAntiTargetRow;
+
+		// Number of distinct game modes, set by the Learner; >1 enables per-mode
+		// advantage normalization (batch.modeIds must then be populated).
+		int numModes = 1;
+
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
 

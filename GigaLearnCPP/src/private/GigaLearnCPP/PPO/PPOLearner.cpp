@@ -6,6 +6,9 @@
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <nlohmann/json.hpp>
 
+#include <cmath>
+#include <limits>
+
 using namespace torch;
 
 namespace {
@@ -283,9 +286,9 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 			}
 		}
 
-		auto obs = torch::cat(statesList).to(device, true, true);
-		auto acts = torch::cat(actionsList).to(device, true, true);
-		auto tWindowIds = torch::tensor(windowIds, torch::TensorOptions().dtype(torch::kLong)).to(device, true, true);
+		auto obs = torch::cat(statesList).to(device, RG_H2D_NONBLOCKING(device), true);
+		auto acts = torch::cat(actionsList).to(device, RG_H2D_NONBLOCKING(device), true);
+		auto tWindowIds = torch::tensor(windowIds, torch::TensorOptions().dtype(torch::kLong)).to(device, RG_H2D_NONBLOCKING(device), true);
 
 		// Per-step rewards -> per-window return sums -> per-pair preference loss
 		auto stepRewards = sors->Forward(obs, acts);
@@ -339,34 +342,50 @@ float GGL::PPOLearner::GetEntropyScale() const {
 	return config.adaptiveEntropy ? curEntropyScale : config.entropyScale;
 }
 
+// Z-score x within each mode group (heatseeker/soccar team sizes have very different
+// dynamics, so pooled normalization lets one mode dominate the tails of another).
+// Uses biased std so single-sample groups normalize to 0 instead of NaN.
+// No host syncs: empty groups produce empty masked_selects and scatter nothing.
+static torch::Tensor NormalizePerMode(const torch::Tensor& x, const torch::Tensor& modeIds, int numModes) {
+	if (!modeIds.defined() || numModes <= 1)
+		return (x - x.mean()) / (x.std(false) + 1e-8f);
+
+	torch::Tensor result = x.clone();
+	for (int m = 0; m < numModes; m++) {
+		auto mask = (modeIds == m);
+		auto vals = x.masked_select(mask);
+		auto norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
+		result = result.masked_scatter(mask, norm);
+	}
+	return result;
+}
+
+namespace {
+	// Per-minibatch training metrics, accumulated as detached device scalars and synced
+	// to the host once per batch (each .item<float>() in the hot loop is a full GPU sync).
+	// Slots that don't apply to a minibatch stay NaN; AvgTracker::Add ignores NaN.
+	enum MetricSlot : int {
+		M_ENTROPY, M_DIVERGENCE, M_POLICY_LOSS, M_REL_ENTROPY_LOSS, M_CRITIC_LOSS,
+		M_GUIDING_LOSS, M_RATIO, M_CLIP,
+		M_INFONCE, M_INFONCE_GOAL, M_INFONCE_ANTI, M_INFONCE_CAR,
+		M_INFONCE_RAW, M_INFONCE_REG1, M_INFONCE_REG2,
+		M_GCRL_ADV, M_GCRL_GOAL_ADV, M_GCRL_ANTI_ADV, M_GCRL_CAR_ADV, M_GCRL_REW_ADV, M_GCRL_FINAL_ADV,
+		M_GCRL_GOAL_Q, M_GCRL_ANTI_Q, M_GCRL_CAR_Q,
+		M_GCRL_GOAL_QSTD, M_GCRL_ANTI_QSTD, M_GCRL_CAR_QSTD,
+		METRIC_SLOT_COUNT
+	};
+}
+
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration) {
 	auto mseLoss = torch::nn::MSELoss();
 
-	MutAvgTracker
-		avgEntropy,
-		avgDivergence,
-		avgPolicyLoss,
-		avgRelEntropyLoss,
-		avgCriticLoss,
-		avgGuidingLoss,
-		avgRatio,
-		avgClip,
-		avgInfoNCELoss,
-		avgInfoNCEGoalLoss,
-		avgInfoNCEAntiLoss,
-		avgInfoNCECarLoss,
-		avgGcrlAdv,
-		avgGcrlGoalAdv,
-		avgGcrlAntiAdv,
-		avgGcrlCarAdv,
-		avgGcrlRewardAdv,
-		avgGcrlFinalAdv,
-		avgGcrlGoalQ,
-		avgGcrlAntiQ,
-		avgGcrlCarQ,
-		avgGcrlGoalQStd,
-		avgGcrlAntiQStd,
-		avgGcrlCarQStd;
+	AvgTracker avg[METRIC_SLOT_COUNT] = {};
+
+	// Device-side metric staging (see MetricSlot)
+	auto nanScalar = torch::full({}, std::numeric_limits<float>::quiet_NaN(),
+		torch::TensorOptions().dtype(torch::kFloat32).device(device));
+	std::vector<torch::Tensor> mbMetricsList;
+	std::vector<torch::Tensor> mbSlots;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
@@ -408,28 +427,36 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
 			auto batchAdvantages = batch.advantages;
+			auto batchModeIds = batch.modeIds;
 			auto batchActionComps = batch.actionComps;
 			auto batchFutureGoals = batch.futureGoals;
 			auto batchCarFutureGoals = batch.carFutureGoals;
 
 			auto fnRunMinibatch = [&](int start, int stop) {
 
-				float batchSizeRatio = (stop - start) / (float)config.batchSize;
+				// When stepping per minibatch there is no cross-minibatch accumulation to rescale for
+				float batchSizeRatio = config.stepPerMiniBatch ? 1.0f : (stop - start) / (float)config.batchSize;
+
+				mbSlots.assign(METRIC_SLOT_COUNT, nanScalar);
 
 				// Send everything to the device and enforce correct shapes
-				auto acts = batchActs.slice(0, start, stop).to(device, true, true);
-				auto obs = batchObs.slice(0, start, stop).to(device, true, true);
-				auto actionMasks = batchActionMasks.slice(0, start, stop).to(device, true, true);
-				
-				auto advantages = batchAdvantages.slice(0, start, stop).to(device, true, true);
-				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
-				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
+				auto acts = batchActs.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+				auto obs = batchObs.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+				auto actionMasks = batchActionMasks.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+
+				auto advantages = batchAdvantages.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+
+				torch::Tensor modeIds;
+				if (batchModeIds.defined())
+					modeIds = batchModeIds.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
 
 				torch::Tensor actionComps, futureGoals, carFutureGoals;
 				if (trainGCRL) {
-					actionComps    = batchActionComps.slice(0, start, stop).to(device, true, true);
-					futureGoals    = batchFutureGoals.slice(0, start, stop).to(device, true, true);
-					carFutureGoals = batchCarFutureGoals.slice(0, start, stop).to(device, true, true);
+					actionComps    = batchActionComps.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+					futureGoals    = batchFutureGoals.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
+					carFutureGoals = batchCarFutureGoals.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
 				}
 
 				// Shared encoder forward once; policy, value critic and GCRL critics read it
@@ -441,38 +468,69 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// Both channels are unit-normalized so gcrlAdvScale is a meaningful weight.
 				if (trainGCRL) {
 					RG_NO_GRAD;
+
+					// The anti critic scores progress toward the own-goal target (conceding danger),
+					// matching how the reward gate queries it. Querying it with futureGoals like the
+					// goal critic would make it a near-identical twin whose z-scored difference is
+					// mostly inter-seed noise.
+					torch::Tensor antiGoals;
+					if (curGCRLAntiTargetRow.defined())
+						antiGoals = curGCRLAntiTargetRow.to(device).expand({ features.size(0), curGCRLAntiTargetRow.size(1) });
+					else
+						antiGoals = futureGoals;
+
 					auto q_goal = gc_goal->score_q(features, actionComps, futureGoals);
-					auto q_anti = gc_anti->score_q(features, actionComps, futureGoals);
+					auto q_anti = gc_anti->score_q(features, actionComps, antiGoals);
 					auto q_car  = gc_car->score_q(features, actionComps, carFutureGoals);
-					avgGcrlGoalQ += q_goal.mean().item<float>();
-					avgGcrlAntiQ += q_anti.mean().item<float>();
-					avgGcrlCarQ += q_car.mean().item<float>();
-					avgGcrlGoalQStd += q_goal.std().item<float>();
-					avgGcrlAntiQStd += q_anti.std().item<float>();
-					avgGcrlCarQStd += q_car.std().item<float>();
+					mbSlots[M_GCRL_GOAL_Q] = q_goal.mean();
+					mbSlots[M_GCRL_ANTI_Q] = q_anti.mean();
+					mbSlots[M_GCRL_CAR_Q]  = q_car.mean();
+					mbSlots[M_GCRL_GOAL_QSTD] = q_goal.std();
+					mbSlots[M_GCRL_ANTI_QSTD] = q_anti.std();
+					mbSlots[M_GCRL_CAR_QSTD]  = q_car.std();
 
-					auto adv_goal = (q_goal - q_goal.mean()) / (q_goal.std() + 1e-8f);
-					auto adv_anti = (q_anti - q_anti.mean()) / (q_anti.std() + 1e-8f);
-					auto adv_car  = (q_car  - q_car.mean())  / (q_car.std()  + 1e-8f);
-					avgGcrlGoalAdv += adv_goal.abs().mean().item<float>();
-					avgGcrlAntiAdv += adv_anti.abs().mean().item<float>();
-					avgGcrlCarAdv += adv_car.abs().mean().item<float>();
+					// Counterfactual action baseline: subtracting the mean Q of shuffled actions
+					// turns "this state is near a goal" into "this action beats a typical action
+					// from this state", removing state-value leakage from the advantage.
+					if (config.gcrlBaselineSamples > 0) {
+						int64_t n = features.size(0);
+						auto idxOpts = torch::TensorOptions().dtype(torch::kLong).device(device);
+						auto bGoal = torch::zeros_like(q_goal);
+						auto bAnti = torch::zeros_like(q_anti);
+						auto bCar  = torch::zeros_like(q_car);
+						for (int k = 0; k < config.gcrlBaselineSamples; k++) {
+							auto shuffledActs = actionComps.index_select(0, torch::randperm(n, idxOpts));
+							bGoal += gc_goal->score_q(features, shuffledActs, futureGoals);
+							bAnti += gc_anti->score_q(features, shuffledActs, antiGoals);
+							bCar  += gc_car->score_q(features, shuffledActs, carFutureGoals);
+						}
+						float invK = 1.0f / config.gcrlBaselineSamples;
+						q_goal = q_goal - bGoal * invK;
+						q_anti = q_anti - bAnti * invK;
+						q_car  = q_car  - bCar  * invK;
+					}
 
-					// goal pursuit, "anti" pessimism (double-critic), car positioning
+					auto adv_goal = NormalizePerMode(q_goal, modeIds, numModes);
+					auto adv_anti = NormalizePerMode(q_anti, modeIds, numModes);
+					auto adv_car  = NormalizePerMode(q_car,  modeIds, numModes);
+					mbSlots[M_GCRL_GOAL_ADV] = adv_goal.abs().mean();
+					mbSlots[M_GCRL_ANTI_ADV] = adv_anti.abs().mean();
+					mbSlots[M_GCRL_CAR_ADV]  = adv_car.abs().mean();
+
+					// goal pursuit, "anti" own-goal danger, car positioning
 					auto adv_gcrl = adv_goal - config.gcrlAntiScale * adv_anti + config.gcrlCarScale * adv_car;
-					avgGcrlAdv += adv_gcrl.abs().mean().item<float>();
+					mbSlots[M_GCRL_ADV] = adv_gcrl.abs().mean();
 
-					auto adv_rew = (advantages - advantages.mean()) / (advantages.std() + 1e-8f);
-					avgGcrlRewardAdv += adv_rew.abs().mean().item<float>();
+					auto adv_rew = NormalizePerMode(advantages, modeIds, numModes);
+					mbSlots[M_GCRL_REW_ADV] = adv_rew.abs().mean();
 					advantages = adv_rew + curGCRLAdvScale * adv_gcrl;
-					avgGcrlFinalAdv += advantages.abs().mean().item<float>();
+					mbSlots[M_GCRL_FINAL_ADV] = advantages.abs().mean();
 				}
 
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy (from the shared features)
-					float curEntropy;
 					{
 						auto maskBool = actionMasks.to(torch::kBool);
 						auto logits = m_policy->Forward(features, false) / config.policyTemperature;
@@ -480,8 +538,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							.view({ -1, m_policy->config.numOutputs }).clamp(1e-11f, 1);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
-						curEntropy = entropy.detach().cpu().item<float>();
-						avgEntropy += curEntropy;
+						mbSlots[M_ENTROPY] = entropy.detach();
 					}
 
 					logProbs = logProbs.view_as(oldProbs);
@@ -489,7 +546,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					// Compute PPO loss
 					ratio = exp(logProbs - oldProbs);
-					avgRatio += ratio.mean().detach().cpu().item<float>();
+					mbSlots[M_RATIO] = ratio.mean().detach();
 					clipped = clamp(
 						ratio, 1 - config.clipRange, 1 + config.clipRange
 					);
@@ -498,17 +555,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					policyLoss = -min(
 						ratio * advantages, clipped * advantages
 					).mean();
-					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
-					avgPolicyLoss += curPolicyLoss;
-
-					avgRelEntropyLoss += (curEntropy * entropyScale) / curPolicyLoss;
+					mbSlots[M_POLICY_LOSS] = policyLoss.detach();
+					mbSlots[M_REL_ENTROPY_LOSS] = (entropy.detach() * entropyScale) / policyLoss.detach();
 
 					ppoLoss = (policyLoss - entropy * entropyScale) * batchSizeRatio;
 
-					if (config.adaptiveEntropy) {
-						curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - curEntropy);
-						curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
-					}
+					// NOTE: The adaptive entropy controller is updated once per batch (after the
+					// host metric sync), not here per-minibatch.
 
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
@@ -518,7 +571,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
-						avgGuidingLoss.Add(guidingLoss.detach().cpu().item<float>());
+						mbSlots[M_GUIDING_LOSS] = guidingLoss.detach();
 						guidingLoss = guidingLoss * config.guidingStrength;
 						ppoLoss = ppoLoss + guidingLoss;
 					}
@@ -531,7 +584,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// Compute value loss
 					vals = vals.view_as(targetValues);
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
-					avgCriticLoss += criticLoss.detach().cpu().item<float>();
+					mbSlots[M_CRITIC_LOSS] = criticLoss.detach();
 				}
 
 				if (trainPolicy) {
@@ -541,10 +594,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 						auto logRatio = logProbs - oldProbs;
 						auto klTensor = (exp(logRatio) - 1) - logRatio;
-						avgDivergence += klTensor.mean().detach().cpu().item<float>();
+						mbSlots[M_DIVERGENCE] = klTensor.mean();
 
-						auto clipFraction = mean((abs(ratio - 1) > config.clipRange).to(kFloat));
-						avgClip += clipFraction.cpu().item<float>();
+						mbSlots[M_CLIP] = mean((abs(ratio - 1) > config.clipRange).to(kFloat));
 					}
 				}
 
@@ -562,14 +614,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						auto sub_goals = futureGoals.index_select(0, idxs);
 						auto sub_car_goals = carFutureGoals.index_select(0, idxs);
 
-						auto il_goal = gc_goal->infonce_loss(sub_obs, sub_actions, sub_goals);
-						auto il_anti = gc_anti->infonce_loss(sub_obs, sub_actions, sub_goals);
-						auto il_car  = gc_car->infonce_loss(sub_obs, sub_actions, sub_car_goals);
+						torch::Tensor rawG, reg1G, reg2G, rawA, reg1A, reg2A, rawC, reg1C, reg2C;
+						auto il_goal = gc_goal->infonce_loss(sub_obs, sub_actions, sub_goals, -1, {}, &rawG, &reg1G, &reg2G);
+						auto il_anti = gc_anti->infonce_loss(sub_obs, sub_actions, sub_goals, -1, {}, &rawA, &reg1A, &reg2A);
+						auto il_car  = gc_car->infonce_loss(sub_obs, sub_actions, sub_car_goals, -1, {}, &rawC, &reg1C, &reg2C);
 						infoNCELoss = (il_goal + il_anti + il_car) * batchSizeRatio;
-						avgInfoNCELoss += infoNCELoss.detach().cpu().item<float>();
-						avgInfoNCEGoalLoss += il_goal.detach().cpu().item<float>();
-						avgInfoNCEAntiLoss += il_anti.detach().cpu().item<float>();
-						avgInfoNCECarLoss += il_car.detach().cpu().item<float>();
+						mbSlots[M_INFONCE] = infoNCELoss.detach();
+						mbSlots[M_INFONCE_GOAL] = il_goal.detach();
+						mbSlots[M_INFONCE_ANTI] = il_anti.detach();
+						mbSlots[M_INFONCE_CAR] = il_car.detach();
+						mbSlots[M_INFONCE_RAW]  = rawG + rawA + rawC;
+						mbSlots[M_INFONCE_REG1] = reg1G + reg1A + reg1C;
+						mbSlots[M_INFONCE_REG2] = reg2G + reg2A + reg2C;
 					}
 				}
 
@@ -585,36 +641,64 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				}
 				if (combinedLoss.defined())
 					combinedLoss.backward();
+
+				mbMetricsList.push_back(torch::stack(mbSlots));
 			};
 
-			
+			auto fnClipAndStep = [&] {
+				if (trainPolicy)
+					nn::utils::clip_grad_norm_(m_policy->parameters(), 0.5f);
+				if (trainCritic)
+					nn::utils::clip_grad_norm_(m_critic->parameters(), 0.5f);
+
+				if (trainSharedHead)
+					nn::utils::clip_grad_norm_(m_sharedHead->parameters(), 0.5f);
+
+				if (trainGCRL) {
+					nn::utils::clip_grad_norm_(gc_goal->parameters(), 0.5f);
+					nn::utils::clip_grad_norm_(gc_anti->parameters(), 0.5f);
+					nn::utils::clip_grad_norm_(gc_car->parameters(), 0.5f);
+				}
+
+				models.StepOptims();
+			};
+
 			// Use actual tensor size so overbatched tail samples aren't silently discarded.
 			int actualBatchSize = (int)batchObs.size(0);
 			if (device.is_cpu()) {
 				fnRunMinibatch(0, actualBatchSize);
+				if (config.stepPerMiniBatch)
+					fnClipAndStep();
 			} else {
 				for (int mbs = 0; mbs < actualBatchSize; mbs += config.miniBatchSize) {
 					int start = mbs;
 					int stop = RS_MIN(start + config.miniBatchSize, actualBatchSize);
 					fnRunMinibatch(start, stop);
+					if (config.stepPerMiniBatch)
+						fnClipAndStep();
 				}
 			}
 
-			if (trainPolicy)
-				nn::utils::clip_grad_norm_(models["policy"]->parameters(), 0.5f);
-			if (trainCritic)
-				nn::utils::clip_grad_norm_(models["critic"]->parameters(), 0.5f);
+			if (!config.stepPerMiniBatch)
+				fnClipAndStep();
 
-			if (trainSharedHead)
-				nn::utils::clip_grad_norm_(models["shared_head"]->parameters(), 0.5f);
+			// Sync this batch's staged metrics to the host in one transfer
+			// (NaN slots are "metric not applicable" and are skipped by AvgTracker)
+			if (!mbMetricsList.empty()) {
+				auto batchMetrics = torch::stack(mbMetricsList).nanmean(0).cpu();
+				mbMetricsList.clear();
+				const float* m = batchMetrics.data_ptr<float>();
+				for (int i = 0; i < METRIC_SLOT_COUNT; i++)
+					avg[i] += m[i];
 
-			if (trainGCRL) {
-				nn::utils::clip_grad_norm_(gc_goal->parameters(), 0.5f);
-				nn::utils::clip_grad_norm_(gc_anti->parameters(), 0.5f);
-				nn::utils::clip_grad_norm_(gc_car->parameters(), 0.5f);
+				// Adaptive entropy controller, once per batch from the batch-mean entropy.
+				// (Was per-minibatch; with the old accumulate-then-step config there was one
+				// minibatch per batch anyway, so the effective cadence is unchanged.)
+				if (config.adaptiveEntropy && trainPolicy && !std::isnan(m[M_ENTROPY])) {
+					curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - m[M_ENTROPY]);
+					curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
+				}
 			}
-
-			models.StepOptims();
 		}
 	}
 
@@ -637,44 +721,47 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	}
 
 	// Assemble and return report
-	report["Policy Entropy"] = avgEntropy.Get();
+	report["Policy Entropy"] = avg[M_ENTROPY].Get();
 	report["Entropy Scale"] = GetEntropyScale();
 	if (config.adaptiveEntropy)
 		report["Target Entropy"] = config.targetEntropy;
-	report["Mean KL Divergence"] = avgDivergence.Get();
+	report["Mean KL Divergence"] = avg[M_DIVERGENCE].Get();
 	if (!isFirstIteration) {
 		// These metrics give bad data on the first iteration, which will mess up graph scaling
 		// So we'll just skip them for the first iteration
-		report["Policy Loss"] = avgPolicyLoss.Get();
-		report["Policy Relative Entropy Loss"] = avgRelEntropyLoss.Get();
-		report["Critic Loss"] = avgCriticLoss.Get();
+		report["Policy Loss"] = avg[M_POLICY_LOSS].Get();
+		report["Policy Relative Entropy Loss"] = avg[M_REL_ENTROPY_LOSS].Get();
+		report["Critic Loss"] = avg[M_CRITIC_LOSS].Get();
 
 		if (trainGCRL) {
-			report["InfoNCE Loss"] = avgInfoNCELoss.Get();
-			report["GCRL/InfoNCE Goal Loss"] = avgInfoNCEGoalLoss.Get();
-			report["GCRL/InfoNCE Anti Loss"] = avgInfoNCEAntiLoss.Get();
-			report["GCRL/InfoNCE Car Loss"] = avgInfoNCECarLoss.Get();
-			report["GCRL/Avg Advantage"] = avgGcrlAdv.Get();
-			report["GCRL/Goal Advantage"] = avgGcrlGoalAdv.Get();
-			report["GCRL/Anti Advantage"] = avgGcrlAntiAdv.Get();
-			report["GCRL/Car Advantage"] = avgGcrlCarAdv.Get();
-			report["GCRL/Reward Advantage"] = avgGcrlRewardAdv.Get();
-			report["GCRL/Final Advantage"] = avgGcrlFinalAdv.Get();
-			report["GCRL/Goal Q Mean"] = avgGcrlGoalQ.Get();
-			report["GCRL/Anti Q Mean"] = avgGcrlAntiQ.Get();
-			report["GCRL/Car Q Mean"] = avgGcrlCarQ.Get();
-			report["GCRL/Goal Q STD"] = avgGcrlGoalQStd.Get();
-			report["GCRL/Anti Q STD"] = avgGcrlAntiQStd.Get();
-			report["GCRL/Car Q STD"] = avgGcrlCarQStd.Get();
+			report["InfoNCE Loss"] = avg[M_INFONCE].Get();
+			report["GCRL/InfoNCE Goal Loss"] = avg[M_INFONCE_GOAL].Get();
+			report["GCRL/InfoNCE Anti Loss"] = avg[M_INFONCE_ANTI].Get();
+			report["GCRL/InfoNCE Car Loss"] = avg[M_INFONCE_CAR].Get();
+			report["GCRL/InfoNCE Raw"] = avg[M_INFONCE_RAW].Get();
+			report["GCRL/InfoNCE LogSumExp Reg"] = avg[M_INFONCE_REG1].Get();
+			report["GCRL/InfoNCE Var Reg"] = avg[M_INFONCE_REG2].Get();
+			report["GCRL/Avg Advantage"] = avg[M_GCRL_ADV].Get();
+			report["GCRL/Goal Advantage"] = avg[M_GCRL_GOAL_ADV].Get();
+			report["GCRL/Anti Advantage"] = avg[M_GCRL_ANTI_ADV].Get();
+			report["GCRL/Car Advantage"] = avg[M_GCRL_CAR_ADV].Get();
+			report["GCRL/Reward Advantage"] = avg[M_GCRL_REW_ADV].Get();
+			report["GCRL/Final Advantage"] = avg[M_GCRL_FINAL_ADV].Get();
+			report["GCRL/Goal Q Mean"] = avg[M_GCRL_GOAL_Q].Get();
+			report["GCRL/Anti Q Mean"] = avg[M_GCRL_ANTI_Q].Get();
+			report["GCRL/Car Q Mean"] = avg[M_GCRL_CAR_Q].Get();
+			report["GCRL/Goal Q STD"] = avg[M_GCRL_GOAL_QSTD].Get();
+			report["GCRL/Anti Q STD"] = avg[M_GCRL_ANTI_QSTD].Get();
+			report["GCRL/Car Q STD"] = avg[M_GCRL_CAR_QSTD].Get();
 			report["GCRL/Goal Update Magnitude"] = gcrlGoalUpdateMagnitude;
 			report["GCRL/Anti Update Magnitude"] = gcrlAntiUpdateMagnitude;
 			report["GCRL/Car Update Magnitude"] = gcrlCarUpdateMagnitude;
 		}
 
 		if (config.useGuidingPolicy)
-			report["Guiding Loss"] = avgGuidingLoss.Get();
+			report["Guiding Loss"] = avg[M_GUIDING_LOSS].Get();
 
-		report["SB3 Clip Fraction"] = avgClip.Get();
+		report["SB3 Clip Fraction"] = avg[M_CLIP].Get();
 		report["Policy Update Magnitude"] = policyUpdateMagnitude;
 		report["Critic Update Magnitude"] = criticUpdateMagnitude;
 		if (sharedHeadBefore.defined())

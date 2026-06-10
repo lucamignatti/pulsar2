@@ -178,6 +178,7 @@ namespace GGL {
 		float var_reg;
 		float infonce_penalty;
 		int action_dim;
+		int repr_dim;
 
 		// hiddenSizes defines the phi/psi tower hidden layers; the output is always repr_dim
 		// (phi and psi MUST share it for the cosine metric to be valid). obs_dim/action_dim/
@@ -195,10 +196,13 @@ namespace GGL {
 		std::pair<torch::Tensor, torch::Tensor> embed(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
 		torch::Tensor forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
 		torch::Tensor score_q(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
+		// outRaw/outReg1/outReg2 optionally receive the detached loss components
+		// (contrastive term, logsumexp penalty, variance regularizer) for reporting.
 		torch::Tensor infonce_loss(
 			torch::Tensor obs, torch::Tensor actions, torch::Tensor goals,
 			float tau_override = -1,
-			torch::Tensor sampleWeights = {}
+			torch::Tensor sampleWeights = {},
+			torch::Tensor* outRaw = nullptr, torch::Tensor* outReg1 = nullptr, torch::Tensor* outReg2 = nullptr
 		);
 
 		virtual void Save(std::filesystem::path folder, bool saveOptim = true) override;
