@@ -313,12 +313,17 @@ namespace GGL {
 		float aerialCurriculumRewardScale = 1.0f; // Temporary aerial approach reward scale
 		int64_t aerialCurriculumRewardAnnealStart = -1; // Timesteps to start decaying the curriculum reward; -1 -> current checkpoint
 		int64_t aerialCurriculumRewardAnnealSteps = 800'000'000; // Timesteps to decay curriculum reward scale to 0
-		// Competence gates for the curriculum anneals: anneal progress only accumulates while
+		// Competence gates for the timestep anneals: anneal progress only accumulates while
 		// the EMA competence ratio is at/above the gate, so the scaffolding can't expire while
 		// the policy still needs it (run rwkkyfej: chase/touch curriculum hit ~7% strength at
 		// 2.3B ts with touch ratio still ~0.001, leaving only the time penalty). <= 0 disables
-		// the gate (pure timestep anneal). Non-aerial gate reads the live-player ball-touch
-		// ratio; the aerial gate reads the high air touch ratio (airborne touch, ball z >= 500).
+		// the gate (pure timestep anneal). curriculumAnnealTouchRatioGate reads the live-player
+		// ball-touch ratio and holds BOTH the curriculum reward anneal AND the two GCRL reward
+		// gate influence ramps (the gate filters rewards by critic-judged terminal progress,
+		// which is noise until the critics have seen ball touches — run tkpk0780 ramped
+		// influence to 1.0 on its wall clock over a touchless world and the touch-teaching
+		// rewards spent ~3B steps multiplied by sigmoid(noise)). The aerial gate reads the
+		// high air touch ratio (airborne touch, ball z >= 500).
 		float curriculumAnnealTouchRatioGate = 0.0f;
 		float aerialCurriculumAnnealAirTouchRatioGate = 0.0f;
 		float competenceEMADecay = 0.99f; // Per-iteration decay of the competence EMAs (~10M ts horizon at 150k ts/itr)

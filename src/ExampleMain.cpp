@@ -62,30 +62,19 @@ public:
 };
 
 // Create the RLGymCPP environment for each of our games
-// Cycles through four modes every 4 arenas so the fleet is evenly split:
-// 1v1-heavy mix: ball-touch competence has to come from somewhere, and 1v1 soccar is
-// where touch density per player is highest. The even 25/25/25/25 split (run rwkkyfej)
-// gave 1v1 only ~12% of player-steps and the bot never learned to touch the ball at all.
-// 5/8 1v1 arenas ≈ 42% of player-steps; widen toward an even split once the touch
-// competence gate (below) is comfortably passed.
-//   index % 8 == 0..4 → 1v1 SOCCAR
-//   index % 8 == 5    → 2v2 SOCCAR
-//   index % 8 == 6    → 3v3 SOCCAR
-//   index % 8 == 7    → Heatseeker 2v2
-// AdvancedObs(maxPlayers=3) pads every obs to the same fixed size regardless of
-// how many cars are actually present, so all modes share one policy network.
+// PHASE 1 — single mode: 1v1 SOCCAR everywhere. Every multi-mode-from-scratch run
+// (rwkkyfej 25/25/25/25, tkpk0780 5/8-1v1-heavy) failed to learn ball touches by 2.5-3.4B
+// steps; the only run that ever played ball (g7jf6cwc) was pure 1v1. Team modes split the
+// gradient across conflicting behaviors and heatseeker pumps zero-agency goals into the
+// returns/GCRL critics (its returns-STD ran ~320 vs soccar's ~115). Reintroduce 2v2/3v3/
+// heatseeker from a checkpoint AFTER the touch EMA is comfortably past its gate.
+// AdvancedObs(maxPlayers=3) pads the obs as if up to 3v3 were present and keeps the
+// mode/team-size extraObs inputs, so the obs layout stays identical for that later phase.
 EnvCreateResult EnvCreateFunc(int index) {
 	EnvResetInfo* resetInfo = new EnvResetInfo();
 
-	int modeIdx = index % 8;
-	int playersPerTeam;
-	GameMode gameMode;
-	switch (modeIdx) {
-		case 5:  playersPerTeam = 2; gameMode = GameMode::SOCCAR;     break; // 2v2
-		case 6:  playersPerTeam = 3; gameMode = GameMode::SOCCAR;     break; // 3v3
-		case 7:  playersPerTeam = 2; gameMode = GameMode::HEATSEEKER; break; // Heatseeker 2v2
-		default: playersPerTeam = 1; gameMode = GameMode::SOCCAR;     break; // 1v1 (cases 0-4)
-	}
+	int playersPerTeam = 1;
+	GameMode gameMode = GameMode::SOCCAR;
 
 	// Fraction of individual event rewards (shots, saves, strong touches) shared with the
 	// team average, so enabling plays (passes, leave-its) earn credit too. opponentScale 0
@@ -134,14 +123,19 @@ EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
 		// Ground/contact rewards are filtered by GCRL terminal progress.
-		// (Weight cut from 90: the sigmoid gate revert roughly doubled this reward's
-		// expected value vs the signed-tanh runs.)
-		{ new ZeroSumReward(new StrongTouchReward(20, 100), TEAM_SPIRIT, 0.0f), 60.f }
+		// Back to 90 (from 60): the floorless sigmoid gate means ~0.5x expected multiplier,
+		// so 90 x 0.5 ≈ the healthy run g7jf6cwc's effective 90 x 0.6-with-floor.
+		{ new ZeroSumReward(new StrongTouchReward(20, 100), TEAM_SPIRIT, 0.0f), 90.f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
 
-		// Temporary chase incentive; GCRL gate suppresses steps with below-average progress toward goal.
+		// Temporary chase incentive. NOTE: this group IS multiplied by the GCRL reward gate
+		// (Learner combines it with gcrlGatedRewards before gating) — which is why the gate
+		// influence anneal is now held back by the touch-competence gate: in tkpk0780 the
+		// influence ramp hit 1.0 on its 400M wall clock while the critics were still
+		// touchless, and the only touch-teaching rewards spent 3B steps multiplied by
+		// sigmoid(noise) ≈ 0.5 ± 0.2.
 		{ new VelocityPlayerToBallReward(), chaseWeight },
 
 		// Bottom rung of the touch ladder: StrongTouchReward pays zero below 20kph hit
@@ -190,9 +184,13 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.obsBuilder = new AdvancedObs(
 		3, true, true, { 0.25f, 0.5f, 1.0f, 1.5f, 2.0f },
 		{ gameMode == GameMode::HEATSEEKER ? 1.0f : 0.0f, playersPerTeam / 3.0f });
+	// PHASE 1: 100% kickoffs (the g7jf6cwc recipe). Random resets put the ball anywhere
+	// (often airborne/unreachable for a noob bot) and most episodes ended on the 10s
+	// NoTouchCondition; kickoffs spawn both bots facing a reachable ball, which is the
+	// fastest path to touch competence. Reintroduce RandomState in phase 2 — it's the
+	// data source for defense/high-ball positions and is checkpoint-compatible.
 	result.stateSetter = new CombinedState({
-		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
-		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
+		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 1.00f }
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
@@ -302,10 +300,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.maxEntropyScale = 0.10f;
 
 	// Rate of reward decay
-	// At tickSkip 4 (30 steps/sec) 0.995 gives a ~6.6s credit half-life -- the same time
-	// horizon 0.99 gives at tickSkip 8. (0.99 here was only ~3.3s, too short to propagate
-	// goal credit back through buildup play.)
-	cfg.ppo.gaeGamma = 0.995;
+	// PHASE 1: back to 0.99 (the g7jf6cwc value at this tickSkip). The 0.995 argument was
+	// propagating goal credit through buildup play -- but there are no goals to propagate
+	// yet, and the shorter ~3.3s half-life concentrates credit on the approach->touch
+	// sequence we're trying to bootstrap. Revisit 0.995 in phase 2 once goals exist.
+	cfg.ppo.gaeGamma = 0.99;
 
 	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
 	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets

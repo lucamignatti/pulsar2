@@ -344,6 +344,8 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["sors_reward_scale_anneal_start_ts"] = sorsRewardScaleAnnealStartTS;
 	j["curriculum_anneal_progress_ts"] = curriculumAnnealProgressTS;
 	j["aerial_curriculum_anneal_progress_ts"] = aerialCurriculumAnnealProgressTS;
+	j["gcrl_reward_gate_anneal_progress_ts"] = gcrlRewardGateAnnealProgressTS;
+	j["gcrl_aerial_reward_gate_anneal_progress_ts"] = gcrlAerialRewardGateAnnealProgressTS;
 	j["touch_ratio_ema"] = touchRatioEMA;
 	j["high_air_touch_ratio_ema"] = highAirTouchRatioEMA;
 
@@ -402,6 +404,10 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		curriculumAnnealProgressTS = j["curriculum_anneal_progress_ts"];
 	if (j.contains("aerial_curriculum_anneal_progress_ts"))
 		aerialCurriculumAnnealProgressTS = j["aerial_curriculum_anneal_progress_ts"];
+	if (j.contains("gcrl_reward_gate_anneal_progress_ts"))
+		gcrlRewardGateAnnealProgressTS = j["gcrl_reward_gate_anneal_progress_ts"];
+	if (j.contains("gcrl_aerial_reward_gate_anneal_progress_ts"))
+		gcrlAerialRewardGateAnnealProgressTS = j["gcrl_aerial_reward_gate_anneal_progress_ts"];
 	if (j.contains("touch_ratio_ema"))
 		touchRatioEMA = j["touch_ratio_ema"];
 	if (j.contains("high_air_touch_ratio_ema"))
@@ -1420,21 +1426,6 @@ void GGL::Learner::Start() {
 				float progress = (float)((double)(totalTimesteps - startTS) / (double)annealSteps);
 				return targetScale * RS_CLAMP(progress, 0.0f, 1.0f);
 			};
-			auto fnGetAnnealedRange = [&](float startScale, float targetScale, int64_t configStart, int64_t annealSteps, uint64_t& startTS) {
-				if (annealSteps <= 0)
-					return targetScale;
-
-				if (startTS == UINT64_MAX)
-					startTS = configStart >= 0 ? (uint64_t)configStart : totalTimesteps;
-
-				if (totalTimesteps <= startTS)
-					return startScale;
-
-				float progress = (float)((double)(totalTimesteps - startTS) / (double)annealSteps);
-				progress = RS_CLAMP(progress, 0.0f, 1.0f);
-				return startScale + (targetScale - startScale) * progress;
-			};
-
 			// Update the competence EMAs that gate the curriculum anneals
 			{
 				double d = RS_CLAMP(config.ppo.competenceEMADecay, 0.0, 1.0);
@@ -1472,18 +1463,30 @@ void GGL::Learner::Start() {
 				config.ppo.gcrlAdvScaleAnnealSteps,
 				gcrlAdvScaleAnnealStartTS
 			);
-			ppo->curGCRLRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetAnnealedScale(
+			// Gate influence ramps are competence-gated on the touch EMA: the gate filters
+			// rewards by GCRL terminal progress, and the critics only know anything about
+			// terminal progress once the policy actually touches the ball. On a wall clock
+			// (run tkpk0780) influence hit 1.0 over a touchless world and the curriculum/
+			// gated rewards spent ~3B steps multiplied by sigmoid(noise) ≈ 0.5 ± 0.2.
+			ppo->curGCRLRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetGatedAnnealedRange(
+				0.0f,
 				config.ppo.gcrlRewardGateInfluence,
 				config.ppo.gcrlRewardGateAnnealStart,
 				config.ppo.gcrlRewardGateAnnealSteps,
-				gcrlRewardGateAnnealStartTS
+				gcrlRewardGateAnnealStartTS,
+				gcrlRewardGateAnnealProgressTS,
+				config.ppo.curriculumAnnealTouchRatioGate,
+				touchRatioEMA
 			) : 0.0f;
-			ppo->curGCRLAerialRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetAnnealedRange(
+			ppo->curGCRLAerialRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetGatedAnnealedRange(
 				config.ppo.gcrlAerialRewardGateStartInfluence,
 				config.ppo.gcrlAerialRewardGateInfluence,
 				config.ppo.gcrlAerialRewardGateAnnealStart,
 				config.ppo.gcrlAerialRewardGateAnnealSteps,
-				gcrlAerialRewardGateAnnealStartTS
+				gcrlAerialRewardGateAnnealStartTS,
+				gcrlAerialRewardGateAnnealProgressTS,
+				config.ppo.curriculumAnnealTouchRatioGate,
+				touchRatioEMA
 			) : 0.0f;
 			ppo->curCurriculumRewardScale = fnGetGatedAnnealedRange(
 				config.ppo.curriculumRewardScale,
