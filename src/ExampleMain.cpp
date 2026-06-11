@@ -63,23 +63,28 @@ public:
 
 // Create the RLGymCPP environment for each of our games
 // Cycles through four modes every 4 arenas so the fleet is evenly split:
-//   index % 4 == 0 → 1v1 SOCCAR
-//   index % 4 == 1 → 2v2 SOCCAR
-//   index % 4 == 2 → 3v3 SOCCAR
-//   index % 4 == 3 → Heatseeker 2v2
+// 1v1-heavy mix: ball-touch competence has to come from somewhere, and 1v1 soccar is
+// where touch density per player is highest. The even 25/25/25/25 split (run rwkkyfej)
+// gave 1v1 only ~12% of player-steps and the bot never learned to touch the ball at all.
+// 5/8 1v1 arenas ≈ 42% of player-steps; widen toward an even split once the touch
+// competence gate (below) is comfortably passed.
+//   index % 8 == 0..4 → 1v1 SOCCAR
+//   index % 8 == 5    → 2v2 SOCCAR
+//   index % 8 == 6    → 3v3 SOCCAR
+//   index % 8 == 7    → Heatseeker 2v2
 // AdvancedObs(maxPlayers=3) pads every obs to the same fixed size regardless of
 // how many cars are actually present, so all modes share one policy network.
 EnvCreateResult EnvCreateFunc(int index) {
 	EnvResetInfo* resetInfo = new EnvResetInfo();
 
-	int modeIdx = index % 4;
+	int modeIdx = index % 8;
 	int playersPerTeam;
 	GameMode gameMode;
 	switch (modeIdx) {
-		case 0:  playersPerTeam = 1; gameMode = GameMode::SOCCAR;     break; // 1v1
-		case 1:  playersPerTeam = 2; gameMode = GameMode::SOCCAR;     break; // 2v2
-		case 2:  playersPerTeam = 3; gameMode = GameMode::SOCCAR;     break; // 3v3
-		default: playersPerTeam = 2; gameMode = GameMode::HEATSEEKER; break; // Heatseeker 2v2
+		case 5:  playersPerTeam = 2; gameMode = GameMode::SOCCAR;     break; // 2v2
+		case 6:  playersPerTeam = 3; gameMode = GameMode::SOCCAR;     break; // 3v3
+		case 7:  playersPerTeam = 2; gameMode = GameMode::HEATSEEKER; break; // Heatseeker 2v2
+		default: playersPerTeam = 1; gameMode = GameMode::SOCCAR;     break; // 1v1 (cases 0-4)
 	}
 
 	// Fraction of individual event rewards (shots, saves, strong touches) shared with the
@@ -151,7 +156,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
 		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
 		// the ball to actually be up and/or productive contact.
-		{ new HeightWeightedAerialApproachReward(), 1.5f },
+		// 3.0 (was 1.5): going up for a high ball has to compete with the ground chase reward
+		// (weight 6, pays on every ball). This only pays airborne with ball z >= 500, so it
+		// can't be hover-farmed like AirReward was.
+		{ new HeightWeightedAerialApproachReward(), 3.0f },
 		{ new UsefulAirTouchReward(), 25.0f },
 		{ new SecondTouchReward(), 12.0f },
 		{ new FlipResetFollowupReward(), 8.0f },
@@ -280,13 +288,18 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	cfg.ppo.targetEntropy = 0.70f;
+	// 0.65: the controller saturates its ceiling trying to hold 0.70; the healthy reference
+	// run (g7jf6cwc) lived at 0.63 with the controller pinned, and learned fine.
+	cfg.ppo.targetEntropy = 0.65f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
-	// 0.10 was too weak a ceiling: in run bgksd0wi the controller pinned there for 9k
-	// iterations while entropy sat at 0.14-0.42. The controller needs authority to actually
-	// arrest a collapse; it only spends what it needs.
-	cfg.ppo.maxEntropyScale = 0.25f;
+	// Back to 0.10. The 0.25 ceiling (added after bgksd0wi's entropy collapse) backfired in
+	// run rwkkyfej: with reward income starved to ~0.01/step, the controller ramped the
+	// entropy bonus to 0.20 and the objective paid more for staying random than for playing
+	// -- touches never sharpened up. The collapse 0.25 was meant to arrest was actually
+	// caused by the old policyLR 4e-4 x 8 steps/iter, which policyLR 1.5e-4 + maxMeanKL
+	// already fix at the source. g7jf6cwc trained pinned at 0.10 the whole run and was good.
+	cfg.ppo.maxEntropyScale = 0.10f;
 
 	// Rate of reward decay
 	// At tickSkip 4 (30 steps/sec) 0.995 gives a ~6.6s credit half-life -- the same time
@@ -346,10 +359,20 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
 	cfg.ppo.curriculumRewardScale = 1.0f;
 	cfg.ppo.curriculumRewardAnnealStart = -1;
-	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000; // must outlive incompetence: 800M expired while touch ratio was still ~0.001
+	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000;
 	cfg.ppo.aerialCurriculumRewardScale = 1.0f;
 	cfg.ppo.aerialCurriculumRewardAnnealStart = -1;
 	cfg.ppo.aerialCurriculumRewardAnnealSteps = 2'500'000'000;
+	// Competence gates: anneal progress only accumulates while the EMA ratio is at/above
+	// the gate, so the curricula literally cannot expire while the bot still needs them
+	// (rwkkyfej spent 2.3B steps at touch ratio ~0.001 watching its chase reward anneal
+	// away; lengthening the window keeps losing that bet, the gate ends it). Reference
+	// points: blended-competent touch ratio across this mode mix is ~0.007 (good 1v1 run
+	// sat at 0.009-0.0105); 0.0002 high-air touches/step ≈ a few percent of touches being
+	// real aerials. Watch "Curriculum/Touch Ratio EMA" + "Curriculum/High Air Touch Ratio
+	// EMA" against these gates in wandb.
+	cfg.ppo.curriculumAnnealTouchRatioGate = 0.006f;
+	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0002f;
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;

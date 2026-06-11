@@ -342,6 +342,10 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["aerial_curriculum_reward_anneal_start_ts"] = aerialCurriculumRewardAnnealStartTS;
 	if (sorsRewardScaleAnnealStartTS != UINT64_MAX)
 		j["sors_reward_scale_anneal_start_ts"] = sorsRewardScaleAnnealStartTS;
+	j["curriculum_anneal_progress_ts"] = curriculumAnnealProgressTS;
+	j["aerial_curriculum_anneal_progress_ts"] = aerialCurriculumAnnealProgressTS;
+	j["touch_ratio_ema"] = touchRatioEMA;
+	j["high_air_touch_ratio_ema"] = highAirTouchRatioEMA;
 
 	if (config.sendMetrics)
 		j["run_id"] = metricSender->curRunID;
@@ -394,6 +398,14 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		aerialCurriculumRewardAnnealStartTS = j["aerial_curriculum_reward_anneal_start_ts"];
 	if (j.contains("sors_reward_scale_anneal_start_ts"))
 		sorsRewardScaleAnnealStartTS = j["sors_reward_scale_anneal_start_ts"];
+	if (j.contains("curriculum_anneal_progress_ts"))
+		curriculumAnnealProgressTS = j["curriculum_anneal_progress_ts"];
+	if (j.contains("aerial_curriculum_anneal_progress_ts"))
+		aerialCurriculumAnnealProgressTS = j["aerial_curriculum_anneal_progress_ts"];
+	if (j.contains("touch_ratio_ema"))
+		touchRatioEMA = j["touch_ratio_ema"];
+	if (j.contains("high_air_touch_ratio_ema"))
+		highAirTouchRatioEMA = j["high_air_touch_ratio_ema"];
 
 	if (j.contains("run_id"))
 		runID = j["run_id"];
@@ -860,6 +872,8 @@ void GGL::Learner::Start() {
 			Trajectory combinedTraj;
 			Report report;
 			int stepsCollected = 0;
+			// Live-player touch counts for the curriculum anneal competence gates
+			int touchCount = 0, highAirTouchCount = 0;
 			float collectionTime = 0, inferTime = 0, envStepTime = 0;
 		};
 
@@ -917,6 +931,8 @@ void GGL::Learner::Start() {
 
 			int numRealPlayers = oldVersion ? (int)newPlayerIndices.size() : envSet->state.numPlayers;
 			out.stepsCollected = 0;
+			out.touchCount = 0;
+			out.highAirTouchCount = 0;
 			out.inferTime = 0;
 			out.envStepTime = 0;
 
@@ -1061,6 +1077,18 @@ void GGL::Learner::Start() {
 					if (render) {
 						renderSender->Send(envSet->state.gameStates[0]);
 						continue;
+					}
+
+					// Count live-policy touches for the curriculum anneal competence gates
+					for (int newPlayerIdx : newPlayerIndices) {
+						int arenaIdx = playerArenaIdx[newPlayerIdx];
+						const GameState& gs = envSet->state.gameStates[arenaIdx];
+						const Player& player = gs.players[playerLocalIdx[newPlayerIdx]];
+						if (player.ballTouchedStep) {
+							out.touchCount++;
+							if (!player.isOnGround && gs.ball.pos.z >= 500)
+								out.highAirTouchCount++;
+						}
 					}
 
 					// Calc average rewards
@@ -1407,6 +1435,37 @@ void GGL::Learner::Start() {
 				return startScale + (targetScale - startScale) * progress;
 			};
 
+			// Update the competence EMAs that gate the curriculum anneals
+			{
+				double d = RS_CLAMP(config.ppo.competenceEMADecay, 0.0, 1.0);
+				double touchRatio = stepsCollected > 0 ? (double)batch.touchCount / stepsCollected : 0.0;
+				double highAirTouchRatio = stepsCollected > 0 ? (double)batch.highAirTouchCount / stepsCollected : 0.0;
+				touchRatioEMA = touchRatioEMA * d + touchRatio * (1.0 - d);
+				highAirTouchRatioEMA = highAirTouchRatioEMA * d + highAirTouchRatio * (1.0 - d);
+				report["Curriculum/Touch Ratio EMA"] = (float)touchRatioEMA;
+				report["Curriculum/High Air Touch Ratio EMA"] = (float)highAirTouchRatioEMA;
+			}
+
+			// Like fnGetAnnealedRange, but progress is an accumulated counter that only advances
+			// while the competence EMA is at/above its gate (gate <= 0 -> always advances, which
+			// matches the old wall-clock behavior). Keeps curricula at full strength however long
+			// the policy stays below the gate.
+			auto fnGetGatedAnnealedRange = [&](float startScale, float targetScale, int64_t configStart, int64_t annealSteps,
+				uint64_t& startTS, uint64_t& progressTS, float competenceGate, double competenceEMA) {
+				if (annealSteps <= 0)
+					return targetScale;
+
+				if (startTS == UINT64_MAX)
+					startTS = configStart >= 0 ? (uint64_t)configStart : totalTimesteps;
+
+				if (totalTimesteps > startTS && (competenceGate <= 0 || competenceEMA >= competenceGate))
+					progressTS += (uint64_t)stepsCollected;
+
+				float progress = (float)((double)progressTS / (double)annealSteps);
+				progress = RS_CLAMP(progress, 0.0f, 1.0f);
+				return startScale + (targetScale - startScale) * progress;
+			};
+
 			ppo->curGCRLAdvScale = fnGetAnnealedScale(
 				config.ppo.gcrlAdvScale,
 				config.ppo.gcrlAdvScaleAnnealStart,
@@ -1426,19 +1485,25 @@ void GGL::Learner::Start() {
 				config.ppo.gcrlAerialRewardGateAnnealSteps,
 				gcrlAerialRewardGateAnnealStartTS
 			) : 0.0f;
-			ppo->curCurriculumRewardScale = fnGetAnnealedRange(
+			ppo->curCurriculumRewardScale = fnGetGatedAnnealedRange(
 				config.ppo.curriculumRewardScale,
 				0.0f,
 				config.ppo.curriculumRewardAnnealStart,
 				config.ppo.curriculumRewardAnnealSteps,
-				curriculumRewardAnnealStartTS
+				curriculumRewardAnnealStartTS,
+				curriculumAnnealProgressTS,
+				config.ppo.curriculumAnnealTouchRatioGate,
+				touchRatioEMA
 			);
-			ppo->curAerialCurriculumRewardScale = fnGetAnnealedRange(
+			ppo->curAerialCurriculumRewardScale = fnGetGatedAnnealedRange(
 				config.ppo.aerialCurriculumRewardScale,
 				0.0f,
 				config.ppo.aerialCurriculumRewardAnnealStart,
 				config.ppo.aerialCurriculumRewardAnnealSteps,
-				aerialCurriculumRewardAnnealStartTS
+				aerialCurriculumRewardAnnealStartTS,
+				aerialCurriculumAnnealProgressTS,
+				config.ppo.aerialCurriculumAnnealAirTouchRatioGate,
+				highAirTouchRatioEMA
 			);
 			ppo->curSORSRewardScale = config.ppo.useSORS ? fnGetAnnealedScale(
 				config.ppo.sorsRewardScale,
@@ -1811,6 +1876,11 @@ void GGL::Learner::Start() {
 						"GCRL Gate/Delta Mean",
 						"GCRL Gate/Gated Reward Raw",
 						"GCRL Gate/Gated Reward Applied",
+						"",
+						"Curriculum/Scale",
+						"Curriculum/Touch Ratio EMA",
+						"Aerial Curriculum/Scale",
+						"Curriculum/High Air Touch Ratio EMA",
 						"SORS/Reward Scale",
 						"SORS/Loss",
 						"SORS/Pair Accuracy",

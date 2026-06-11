@@ -59,6 +59,14 @@ namespace GGL {
 			aerialCurriculumRewardAnnealStartTS = UINT64_MAX,
 			sorsRewardScaleAnnealStartTS = UINT64_MAX;
 
+		// Competence-gated curriculum anneal state: the progress counters only advance while
+		// the matching EMA is at/above its configured gate (see PPOLearnerConfig), so curricula
+		// hold full strength until the policy can actually do the thing they teach.
+		uint64_t
+			curriculumAnnealProgressTS = 0,
+			aerialCurriculumAnnealProgressTS = 0;
+		double touchRatioEMA = 0, highAirTouchRatioEMA = 0;
+
 		StepCallbackFn stepCallback = NULL;
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);
