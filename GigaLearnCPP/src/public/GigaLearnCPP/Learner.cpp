@@ -11,6 +11,7 @@
 
 #include <optional>
 #include <limits>
+#include <deque>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
@@ -887,9 +888,26 @@ void GGL::Learner::Start() {
 		// Fills one iteration's worth of experience into `out`.
 		// Uses `inferModels` for new-policy InferActions; old-version uses its own models.
 		// Takes shared_lock on versionsMutex for the duration so AddVersion/erase can't dangle the pointer.
+		// ── Old-version stint state (persists across batches, owned by the collector) ──
+		// The assignment is re-rolled every trainAgainstOldStintBatches batches instead of
+		// every batch: each re-roll that changes a player's controller interrupts their
+		// in-flight episode (the partial trajectory must be truncated at the handoff), so
+		// per-batch re-rolls were interrupting half the population every ~1/chance batches
+		// -- flooding training with truncated tails and switching opponents mid-episode.
+		int oldStintBatchesLeft = 0;
+		bool oldStintActive = false;
+		uint64_t oldStintVersionTS = 0;
+		Team oldStintTeam = Team::BLUE;
+
+		// Trajectories truncated at an old-version handoff, queued for consumption.
+		// Drained oldest-first into each batch under a per-batch cap, so one stint
+		// boundary's flush (potentially millions of steps) is spread over several
+		// iterations instead of forming a single mega-batch of stale tails.
+		std::deque<Trajectory> preservedTrajs;
+		size_t preservedTrajSteps = 0;
+
 		auto fnCollectBatch = [&](ModelSet& inferModels, CollectedBatch& out) {
 
-			// TODO: Old version switching messes up the gameplay potentially
 			GGL::PolicyVersion* oldVersion = NULL;
 			std::vector<bool> oldVersionPlayerMask;
 			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
@@ -903,16 +921,42 @@ void GGL::Learner::Start() {
 			if (config.trainAgainstOldVersions && versionMgr) {
 				versionLock = std::shared_lock<std::shared_mutex>(versionMgr->versionsMutex);
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				bool shouldTrainAgainstOld =
-					(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
-					&& !versionMgr->versions.empty()
-					&& !render;
 
-				if (shouldTrainAgainstOld) {
-					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-					oldVersion = &versionMgr->versions[oldVersionIdx];
+				if (oldStintBatchesLeft <= 0) {
+					// Re-roll the stint assignment
+					oldStintBatchesLeft = RS_MAX(1, config.trainAgainstOldStintBatches);
+					oldStintActive =
+						(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
+						&& !versionMgr->versions.empty()
+						&& !render;
+					if (oldStintActive) {
+						int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
+						oldStintVersionTS = versionMgr->versions[oldVersionIdx].timesteps;
+						oldStintTeam = Team(RocketSim::Math::RandInt(0, 2));
+					}
+				}
+				oldStintBatchesLeft--;
 
-					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2));
+				if (oldStintActive) {
+					// Re-resolve the stint's version by timesteps each batch: the versions
+					// vector can grow/prune between batches, so a pointer or index cached
+					// from the previous batch would dangle.
+					for (auto& version : versionMgr->versions) {
+						if (version.timesteps == oldStintVersionTS) {
+							oldVersion = &version;
+							break;
+						}
+					}
+					if (!oldVersion && !versionMgr->versions.empty()) {
+						// The stint's version was pruned mid-stint; fall back to the oldest
+						// remaining (versions are sorted by timesteps ascending).
+						oldVersion = &versionMgr->versions.front();
+						oldStintVersionTS = oldVersion->timesteps;
+					}
+				}
+
+				if (oldVersion) {
+					Team oldVersionTeam = oldStintTeam;
 
 					newPlayerIndices.clear();
 					oldVersionPlayerMask.resize(numPlayers);
@@ -972,11 +1016,10 @@ void GGL::Learner::Start() {
 			auto& report = out.report;
 			report = Report{};
 
-			// Finalize a completed (or just-truncated) trajectory: hindsight-relabel GCRL
-			// goals, build SORS windows, move it into the combined batch, and reset it.
-			// Callers must have pushed the final terminal type (and, for truncations, the
-			// bootstrap next-state) before calling.
-			auto fnFinalizeTrajectory = [&](Trajectory& traj) {
+			// Relabel a completed (or just-truncated) trajectory in place: hindsight-relabel
+			// GCRL goals and build SORS windows. Callers must have pushed the final terminal
+			// type (and, for truncations, the bootstrap next-state) before calling.
+			auto fnRelabelTrajectory = [&](Trajectory& traj) {
 				// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
 				// the goal. goal/anti critics use the global ball (obs[0:6]); the car
 				// critic uses the car-local ball at carLocalBallOffset (layout-dependent).
@@ -1028,7 +1071,11 @@ void GGL::Learner::Start() {
 
 				if (config.ppo.useSORS)
 					ppo->AddSORSWindows(fnBuildSORSWindows(traj));
+			};
 
+			// Relabel, move into the combined batch, and reset (the normal episode-end path).
+			auto fnFinalizeTrajectory = [&](Trajectory& traj) {
+				fnRelabelTrajectory(traj);
 				combinedTraj.Append(traj);
 				traj.Clear();
 			};
@@ -1059,7 +1106,29 @@ void GGL::Learner::Start() {
 					float* ptr = traj.nextStates.data() + traj.nextStates.size() - obsSize;
 					ApplyObsNorm(ptr, 1, obsSize, _normOffset, _normInvStd);
 				}
-				fnFinalizeTrajectory(traj);
+				// Relabel now (the trajectory is final), then queue it for capped draining
+				// below instead of dumping it all into this batch.
+				fnRelabelTrajectory(traj);
+				preservedTrajSteps += traj.Length();
+				preservedTrajs.push_back(std::move(traj));
+				traj.Clear();
+			}
+
+			// Drain the preserved queue into this batch, oldest-first (bounds staleness),
+			// capped per batch so one stint boundary's flush is spread over several
+			// iterations: an uncapped flush formed mega-batches of stale tails followed by
+			// starved batches of short post-flush fragments, oscillating the composition of
+			// every per-batch metric (gate rewards, avg reward, batch size) in a sawtooth.
+			size_t drainedSteps = 0;
+			{
+				size_t drainBudget = (size_t)(config.ppo.tsPerItr / 2);
+				while (!preservedTrajs.empty() && drainedSteps < drainBudget) {
+					Trajectory& pres = preservedTrajs.front();
+					drainedSteps += pres.Length();
+					preservedTrajSteps -= pres.Length();
+					combinedTraj.Append(pres);
+					preservedTrajs.pop_front();
+				}
 			}
 
 			Timer collectionTimer = {};
@@ -1340,16 +1409,19 @@ void GGL::Learner::Start() {
 				report["Env Step Time"] = out.envStepTime;
 
 				// ── Data-pipeline conservation audit ──
-				// Across the run: sum(Collected) == sum(Consumed) + delta(In-Flight). If these
-				// ever drift apart, experience is being silently destroyed somewhere (this is
-				// exactly how the old-version trajectory-discard bug stayed invisible: every
-				// run since trainAgainstOldVersions landed collected 2-2.5x what it consumed).
+				// Across the run: sum(Collected) == sum(Consumed) + delta(In-Flight) +
+				// delta(Preserved Queue). If these ever drift apart, experience is being
+				// silently destroyed somewhere (this is exactly how the old-version
+				// trajectory-discard bug stayed invisible: every run since
+				// trainAgainstOldVersions landed collected 2-2.5x what it consumed).
 				size_t inFlightSteps = 0;
 				for (auto& traj : trajectories)
 					inFlightSteps += traj.Length();
 				report["Data/Consumed Timesteps"] = combinedTraj.Length();
 				report["Data/In-Flight Timesteps"] = inFlightSteps;
 				report["Data/Preserved Truncated Timesteps"] = preservedSteps;
+				report["Data/Preserved Queue Timesteps"] = preservedTrajSteps;
+				report["Data/Drained Timesteps"] = drainedSteps;
 			}
 
 			// Safety net: old-version players' trajectories were finalized as TRUNCATED at the

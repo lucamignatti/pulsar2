@@ -68,6 +68,12 @@ namespace GGL {
 
 		bool trainAgainstOldVersions = false;
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
+		// How many consecutive iterations an old-version assignment (or the absence of one)
+		// persists before being re-rolled. Re-rolling every iteration interrupts half the
+		// population's in-flight episodes every ~1/chance iterations (their trajectories
+		// must be truncated when their controller changes) and switches opponents
+		// mid-episode; longer stints keep opponents consistent and the data pipeline calm.
+		int trainAgainstOldStintBatches = 16;
 
 		SkillTrackerConfig skillTracker = {};
 
