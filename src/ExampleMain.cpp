@@ -93,8 +93,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 5.0f },
+		// Ball-goal. 15 (was 5): the negative side of this zero-sum term is the only dense
+		// defensive gradient in the stack -- at 5 it was drowned out by the ~90-weight
+		// offensive rewards and the bot never paid for letting the ball travel at its net.
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 15.0f },
 
 		// Ungated aerial bootstrap; completed aerial touches/followups remain GCRL-gated.
 		{ new AerialCommitReward(), 6.0f },
@@ -184,13 +186,13 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.obsBuilder = new AdvancedObs(
 		3, true, true, { 0.25f, 0.5f, 1.0f, 1.5f, 2.0f },
 		{ gameMode == GameMode::HEATSEEKER ? 1.0f : 0.0f, playersPerTeam / 3.0f });
-	// PHASE 1: 100% kickoffs (the g7jf6cwc recipe). Random resets put the ball anywhere
-	// (often airborne/unreachable for a noob bot) and most episodes ended on the 10s
-	// NoTouchCondition; kickoffs spawn both bots facing a reachable ball, which is the
-	// fastest path to touch competence. Reintroduce RandomState in phase 2 — it's the
-	// data source for defense/high-ball positions and is checkpoint-compatible.
+	// PHASE 2: 20% random resets back in. Touch competence is established (touch ratio
+	// ~0.010 in ryp4gxwv), and random states are the data source for defensive and
+	// high-ball positions -- with 100% kickoffs the bot never spawned behind the ball
+	// facing a threat, so saves/defense had no training data.
 	result.stateSetter = new CombinedState({
-		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 1.00f }
+		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
+		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
@@ -286,25 +288,23 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	// 0.65: the controller saturates its ceiling trying to hold 0.70; the healthy reference
-	// run (g7jf6cwc) lived at 0.63 with the controller pinned, and learned fine.
-	cfg.ppo.targetEntropy = 0.65f;
+	// Back to 0.70: in ryp4gxwv entropy sat at ~0.55 with the controller pinned at the 0.10
+	// ceiling -- the policy is committing too hard too early for the exploration we want.
+	cfg.ppo.targetEntropy = 0.70f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
-	// Back to 0.10. The 0.25 ceiling (added after bgksd0wi's entropy collapse) backfired in
-	// run rwkkyfej: with reward income starved to ~0.01/step, the controller ramped the
-	// entropy bonus to 0.20 and the objective paid more for staying random than for playing
-	// -- touches never sharpened up. The collapse 0.25 was meant to arrest was actually
-	// caused by the old policyLR 4e-4 x 8 steps/iter, which policyLR 1.5e-4 + maxMeanKL
-	// already fix at the source. g7jf6cwc trained pinned at 0.10 the whole run and was good.
-	cfg.ppo.maxEntropyScale = 0.10f;
+	// 0.20 (was 0.10): the 0.10 ceiling left the controller saturated ~0.15 below target.
+	// The bgksd0wi-era fear of a high ceiling (0.25 let the entropy bonus dominate a starved
+	// ~0.01/step reward income in rwkkyfej) no longer applies: income is healthy (~0.2+/step)
+	// and policyLR 1.5e-4 + maxMeanKL guard the collapse failure mode at the source.
+	cfg.ppo.maxEntropyScale = 0.20f;
 
 	// Rate of reward decay
-	// PHASE 1: back to 0.99 (the g7jf6cwc value at this tickSkip). The 0.995 argument was
-	// propagating goal credit through buildup play -- but there are no goals to propagate
-	// yet, and the shorter ~3.3s half-life concentrates credit on the approach->touch
-	// sequence we're trying to bootstrap. Revisit 0.995 in phase 2 once goals exist.
-	cfg.ppo.gaeGamma = 0.99;
+	// PHASE 2: back to 0.995. The 0.99 phase-1 value concentrated credit on approach->touch,
+	// which worked (touch ratio ~0.010) -- but its ~100-step horizon is shorter than the
+	// 250-450 step episodes, so the -275 concede penalty never reached the positioning
+	// mistakes that caused it. Goals exist now; propagate their credit.
+	cfg.ppo.gaeGamma = 0.995;
 
 	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
 	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets
@@ -322,11 +322,12 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// 0.75 nominal delivered a 2:1 GCRL:reward gradient after the anti-critic fix (the old
-	// runs' 0.65-0.75 was mostly twin-noise that cancelled; the channel is coherent now).
-	// 0.3 restores the old EFFECTIVE influence. Delayed start: GCRL critics should refine a
+	// 0.65 (was 0.3): GCRL is the positioning/anticipation channel -- including the anti
+	// critic's own-goal-danger signal, which is most of our defensive gradient. 0.3 was a
+	// cautious restore of the pre-anti-fix effective influence; the channel proved coherent
+	// in ryp4gxwv, so weight it up. Delayed start unchanged: GCRL critics should refine a
 	// ball-playing policy, not shape a random one with self-referential goals.
-	cfg.ppo.gcrlAdvScale = 0.3f;
+	cfg.ppo.gcrlAdvScale = 0.65f;
 	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
