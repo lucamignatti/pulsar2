@@ -288,16 +288,16 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	// Back to 0.70: in ryp4gxwv entropy sat at ~0.55 with the controller pinned at the 0.10
-	// ceiling -- the policy is committing too hard too early for the exploration we want.
-	cfg.ppo.targetEntropy = 0.70f;
+	// Back to 0.65/0.10 (the ryp4gxwv values). The 0.70/0.20 bump was premised on healthy
+	// reward income from a competent checkpoint; from scratch, e79pvv92's entropy fell to
+	// 0.48 ANYWAY with the controller pinned at the 0.20 ceiling -- the bonus term ran ~10x
+	// the policy loss (Policy Relative Entropy Loss ~9.8) without buying any exploration,
+	// it just diluted the reward gradient during the income-starved bootstrap (the rwkkyfej
+	// failure mode). Re-raise only when resuming a checkpoint with established income.
+	cfg.ppo.targetEntropy = 0.65f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
-	// 0.20 (was 0.10): the 0.10 ceiling left the controller saturated ~0.15 below target.
-	// The bgksd0wi-era fear of a high ceiling (0.25 let the entropy bonus dominate a starved
-	// ~0.01/step reward income in rwkkyfej) no longer applies: income is healthy (~0.2+/step)
-	// and policyLR 1.5e-4 + maxMeanKL guard the collapse failure mode at the source.
-	cfg.ppo.maxEntropyScale = 0.20f;
+	cfg.ppo.maxEntropyScale = 0.10f;
 
 	// Rate of reward decay
 	// PHASE 2: back to 0.995. The 0.99 phase-1 value concentrated credit on approach->touch,
@@ -322,12 +322,13 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// 0.65 (was 0.3): GCRL is the positioning/anticipation channel -- including the anti
-	// critic's own-goal-danger signal, which is most of our defensive gradient. 0.3 was a
-	// cautious restore of the pre-anti-fix effective influence; the channel proved coherent
-	// in ryp4gxwv, so weight it up. Delayed start unchanged: GCRL critics should refine a
-	// ball-playing policy, not shape a random one with self-referential goals.
-	cfg.ppo.gcrlAdvScale = 0.65f;
+	// Back to 0.3. At 0.65 the from-scratch run e79pvv92 showed GCRL/Final Advantage 0.69
+	// vs GCRL/Reward Advantage 0.33 -- the same 2:1 GCRL-over-reward gradient dominance
+	// that preceded the bgksd0wi collapse, with critics that had barely seen ball touches
+	// steering most of the policy gradient. 0.65 was premised on RESUMING a checkpoint
+	// whose critics were already trained on competent play (ryp4gxwv); re-raise it only
+	// from such a checkpoint, and watch the Final-vs-Reward advantage ratio (~1:1 target).
+	cfg.ppo.gcrlAdvScale = 0.3f;
 	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of

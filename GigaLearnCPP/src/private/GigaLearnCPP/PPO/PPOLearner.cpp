@@ -939,8 +939,13 @@ void GGL::PPOLearner::LoadPPOState(std::filesystem::path folderPath) {
 			RG_ERR_CLOSE("PPOLearner::LoadPPOState(): Can't open file at " << path);
 
 		json j = json::parse(fIn);
-		if (j.contains("cur_entropy_scale"))
+		if (j.contains("cur_entropy_scale")) {
 			curEntropyScale = j["cur_entropy_scale"];
+			// Re-clamp against the CURRENT config: if min/maxEntropyScale changed since the
+			// checkpoint was written, the saved controller state can sit outside the new range
+			// (and would otherwise be used un-clamped for the first iteration after resume).
+			curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
+		}
 		if (j.contains("sors_train_calls"))
 			sorsTrainCalls = j["sors_train_calls"];
 	} else {

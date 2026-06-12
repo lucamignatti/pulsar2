@@ -972,11 +972,104 @@ void GGL::Learner::Start() {
 			auto& report = out.report;
 			report = Report{};
 
+			// Finalize a completed (or just-truncated) trajectory: hindsight-relabel GCRL
+			// goals, build SORS windows, move it into the combined batch, and reset it.
+			// Callers must have pushed the final terminal type (and, for truncations, the
+			// bootstrap next-state) before calling.
+			auto fnFinalizeTrajectory = [&](Trajectory& traj) {
+				// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
+				// the goal. goal/anti critics use the global ball (obs[0:6]); the car
+				// critic uses the car-local ball at carLocalBallOffset (layout-dependent).
+				if (config.ppo.useGCRL) {
+					int N = traj.Length();
+					int H = config.ppo.gcrlHorizon;
+					int minH = config.ppo.gcrlMinHorizon;
+					bool hasMirrorFlags = traj.mirrored.size() == (size_t)N;
+					traj.futureGoals.resize(N * 6);
+					traj.carFutureGoals.resize(N * 6);
+					for (int t = 0; t < N; t++) {
+						// Goal is a future ball state sampled within [minH, H] steps ahead,
+						// capped at the episode end -- so gcrlHorizon bounds the goal window.
+						int lo = t + minH;
+						int hi = RS_MIN(t + H, N - 1);
+						int t_target;
+						if (config.ppo.gcrlUseVariableHER && hi > lo)
+							t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
+						else
+							t_target = hi;
+
+						// The obs x-mirror flips whenever the player crosses x=0, so a goal
+						// copied from t_target's obs may be in the opposite mirror frame to
+						// step t's features. Flip its lateral components back when the flags
+						// differ. (With standardizeObs this negates the *normalized* value;
+						// exact only if the running mean of these dims is ~0, which holds by
+						// the game's left/right symmetry.)
+						bool flip = hasMirrorFlags && (traj.mirrored[t] != traj.mirrored[t_target]);
+
+						for (int d = 0; d < 6; d++)
+							traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
+						if (flip) {
+							// Global ball: negate x of pos and vel
+							traj.futureGoals[t * 6 + 0] = -traj.futureGoals[t * 6 + 0];
+							traj.futureGoals[t * 6 + 3] = -traj.futureGoals[t * 6 + 3];
+						}
+						if (carLocalBallOffset >= 0) {
+							for (int d = 0; d < 6; d++)
+								traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + carLocalBallOffset + d];
+							if (flip) {
+								// Car-local ball: negate the right-axis components
+								// (RotMat::Dot returns (forward, right, up) projections)
+								traj.carFutureGoals[t * 6 + 1] = -traj.carFutureGoals[t * 6 + 1];
+								traj.carFutureGoals[t * 6 + 4] = -traj.carFutureGoals[t * 6 + 4];
+							}
+						}
+					}
+				}
+
+				if (config.ppo.useSORS)
+					ppo->AddSORSWindows(fnBuildSORSWindows(traj));
+
+				combinedTraj.Append(traj);
+				traj.Clear();
+			};
+
+			// Players being handed to an old version mid-episode: finalize their in-flight
+			// partial episodes as TRUNCATED (bootstrapping from the current obs) instead of
+			// discarding them. The old behavior (Clear() at batch end) silently destroyed
+			// >half of all collected experience once episodes outlived the ~8-batch mean
+			// gap between old-version stints (collected/iter ran 2-2.5x tsPerItr on every
+			// run since trainAgainstOldVersions landed; the good run g7jf6cwc consumed ~all
+			// of it), and it biased the surviving data toward episode TAILS -- early-episode
+			// play (kickoff positioning, buildup, defense) almost never reached training.
+			// state.obs still holds the obs built after the previous batch's last step, which
+			// is exactly the next-state these trajectories' last actions led to; players whose
+			// arena terminated on that step have already-finalized (empty) trajectories.
+			size_t preservedSteps = 0;
+			for (int oldPlayerIdx : oldPlayerIndices) {
+				auto& traj = trajectories[oldPlayerIdx];
+				if (traj.Length() == 0)
+					continue;
+
+				preservedSteps += traj.Length();
+				traj.terminals.back() = RLGC::TerminalType::TRUNCATED;
+				envSet->state.obs.AppendRow(oldPlayerIdx, traj.nextStates);
+				// Normalize the just-appended next-state with the previous iteration's stats,
+				// matching the normalization its trajectory states were stored with.
+				if (obsStat && !_normOffset.empty()) {
+					float* ptr = traj.nextStates.data() + traj.nextStates.size() - obsSize;
+					ApplyObsNorm(ptr, 1, obsSize, _normOffset, _normInvStd);
+				}
+				fnFinalizeTrajectory(traj);
+			}
+
 			Timer collectionTimer = {};
 			{
 				RG_NO_GRAD;
 
-				for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, out.stepsCollected += numRealPlayers) {
+				// step == 0: always take at least one env step, even when the truncated
+				// trajectories preserved from an old-version handoff already exceed tsPerItr
+				// (otherwise stepsCollected would be 0 and total timesteps would stall).
+				for (int step = 0; step == 0 || combinedTraj.Length() < config.ppo.tsPerItr || render; step++, out.stepsCollected += numRealPlayers) {
 					Timer stepTimer = {};
 					envSet->Reset();
 					out.envStepTime += stepTimer.Elapsed();
@@ -1238,70 +1331,31 @@ void GGL::Learner::Start() {
 								}
 							}
 
-							// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
-							// the goal. goal/anti critics use the global ball (obs[0:6]); the car
-							// critic uses the car-local ball at carLocalBallOffset (layout-dependent).
-							if (config.ppo.useGCRL) {
-								int N = traj.Length();
-								int H = config.ppo.gcrlHorizon;
-								int minH = config.ppo.gcrlMinHorizon;
-								bool hasMirrorFlags = traj.mirrored.size() == (size_t)N;
-								traj.futureGoals.resize(N * 6);
-								traj.carFutureGoals.resize(N * 6);
-								for (int t = 0; t < N; t++) {
-									// Goal is a future ball state sampled within [minH, H] steps ahead,
-									// capped at the episode end -- so gcrlHorizon bounds the goal window.
-									int lo = t + minH;
-									int hi = RS_MIN(t + H, N - 1);
-									int t_target;
-									if (config.ppo.gcrlUseVariableHER && hi > lo)
-										t_target = Math::RandInt(lo, hi + 1); // seeded; inclusive of hi
-									else
-										t_target = hi;
-
-									// The obs x-mirror flips whenever the player crosses x=0, so a goal
-									// copied from t_target's obs may be in the opposite mirror frame to
-									// step t's features. Flip its lateral components back when the flags
-									// differ. (With standardizeObs this negates the *normalized* value;
-									// exact only if the running mean of these dims is ~0, which holds by
-									// the game's left/right symmetry.)
-									bool flip = hasMirrorFlags && (traj.mirrored[t] != traj.mirrored[t_target]);
-
-									for (int d = 0; d < 6; d++)
-										traj.futureGoals[t * 6 + d] = traj.states[t_target * obsSize + d];
-									if (flip) {
-										// Global ball: negate x of pos and vel
-										traj.futureGoals[t * 6 + 0] = -traj.futureGoals[t * 6 + 0];
-										traj.futureGoals[t * 6 + 3] = -traj.futureGoals[t * 6 + 3];
-									}
-									if (carLocalBallOffset >= 0) {
-										for (int d = 0; d < 6; d++)
-											traj.carFutureGoals[t * 6 + d] = traj.states[t_target * obsSize + carLocalBallOffset + d];
-										if (flip) {
-											// Car-local ball: negate the right-axis components
-											// (RotMat::Dot returns (forward, right, up) projections)
-											traj.carFutureGoals[t * 6 + 1] = -traj.carFutureGoals[t * 6 + 1];
-											traj.carFutureGoals[t * 6 + 4] = -traj.carFutureGoals[t * 6 + 4];
-										}
-									}
-								}
-							}
-
-							if (config.ppo.useSORS)
-								ppo->AddSORSWindows(fnBuildSORSWindows(traj));
-
-							combinedTraj.Append(traj);
-							traj.Clear();
+							fnFinalizeTrajectory(traj);
 						}
 					}
 				}
 
 				report["Inference Time"] = out.inferTime;
 				report["Env Step Time"] = out.envStepTime;
+
+				// ── Data-pipeline conservation audit ──
+				// Across the run: sum(Collected) == sum(Consumed) + delta(In-Flight). If these
+				// ever drift apart, experience is being silently destroyed somewhere (this is
+				// exactly how the old-version trajectory-discard bug stayed invisible: every
+				// run since trainAgainstOldVersions landed collected 2-2.5x what it consumed).
+				size_t inFlightSteps = 0;
+				for (auto& traj : trajectories)
+					inFlightSteps += traj.Length();
+				report["Data/Consumed Timesteps"] = combinedTraj.Length();
+				report["Data/In-Flight Timesteps"] = inFlightSteps;
+				report["Data/Preserved Truncated Timesteps"] = preservedSteps;
 			}
 
-			// Clear old-version players' in-progress trajectories so stale data from a previous
-			// batch (under a different old-version assignment) is never stitched to new-policy steps.
+			// Safety net: old-version players' trajectories were finalized as TRUNCATED at the
+			// start of this batch and receive no appends during it, so these should already be
+			// empty. Clearing again guarantees no old-version-era data is ever stitched to
+			// new-policy steps if that invariant is ever broken.
 			for (int oldPlayerIdx : oldPlayerIndices)
 				trajectories[oldPlayerIdx].Clear();
 
