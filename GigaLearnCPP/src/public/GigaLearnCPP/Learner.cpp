@@ -1725,7 +1725,7 @@ void GGL::Learner::Start() {
 			collectorStream = c10_gpu::getStreamFromPool(/*isHighPriority=*/false, ppo->device.index());
 #endif
 
-		struct {
+		struct AsyncHandoff {
 			std::mutex m;
 			std::condition_variable cvReady, cvGo;
 			bool batchReady = false, collectGo = false, stop = false;
@@ -1735,7 +1735,7 @@ void GGL::Learner::Start() {
 		CollectedBatch pendingBatch;
 		std::thread collectorThread;
 		struct CollectorThreadGuard {
-			decltype(handoff)& handoff;
+			AsyncHandoff& handoff;
 			std::thread& thread;
 
 			~CollectorThreadGuard() noexcept {
