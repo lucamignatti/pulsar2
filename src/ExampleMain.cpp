@@ -525,7 +525,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.optRefineGoals = true;             // Phase 2: locally refine top real bank goals before Phi(s)
 	cfg.ppo.optRefineTopK = 4;
 	cfg.ppo.optRefineSteps = 3;
-	cfg.ppo.optRefineMaxStates = 0;
+	cfg.ppo.optRefineMaxStates = 4096;
 	cfg.ppo.optRefineStepSize = 0.08f;
 	cfg.ppo.optRefineMaxDelta = 0.25f;
 	cfg.ppo.optRefineTrustPenalty = 0.1f;
