@@ -470,6 +470,9 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (config.ppo.useOptionality) {
 		j["opt_reward_mean_ema"] = optRewardMeanEMA;
 		j["opt_reward_var_ema"] = optRewardVarEMA;
+		j["opt_phi_mean_ema"] = optPhiMeanEMA;
+		j["opt_phi_var_ema"] = optPhiVarEMA;
+		j["opt_phi_stats_iters_done"] = optPhiStatsItersDone;
 		j["opt_burn_in_iters_done"] = optBurnInItersDone;
 		if (optWeightAnnealStartTS != UINT64_MAX)
 			j["opt_weight_anneal_start_ts"] = optWeightAnnealStartTS;
@@ -557,6 +560,12 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		optRewardMeanEMA = j["opt_reward_mean_ema"];
 	if (j.contains("opt_reward_var_ema"))
 		optRewardVarEMA = j["opt_reward_var_ema"];
+	if (j.contains("opt_phi_mean_ema"))
+		optPhiMeanEMA = j["opt_phi_mean_ema"];
+	if (j.contains("opt_phi_var_ema"))
+		optPhiVarEMA = j["opt_phi_var_ema"];
+	if (j.contains("opt_phi_stats_iters_done"))
+		optPhiStatsItersDone = j["opt_phi_stats_iters_done"];
 	if (j.contains("opt_burn_in_iters_done"))
 		optBurnInItersDone = j["opt_burn_in_iters_done"];
 	if (j.contains("opt_weight_anneal_start_ts"))
@@ -2502,8 +2511,28 @@ void GGL::Learner::Start() {
 						torch::Tensor phiReachOnly;
 						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
 						if (phiOpt.defined()) {
-							report["Opt/Phi Mean"] = phiOpt.mean().item<float>();
-							report["Opt/Phi Std"] = phiOpt.std(false).item<float>();
+							double batchPhiMean = phiOpt.mean().item<double>();
+							double batchPhiVar = phiOpt.var(false).item<double>();
+							constexpr double OPT_PHI_DECAY = 0.999;
+							if (optPhiStatsItersDone <= 0) {
+								optPhiMeanEMA = batchPhiMean;
+								optPhiVarEMA = batchPhiVar;
+							} else {
+								optPhiMeanEMA = OPT_PHI_DECAY * optPhiMeanEMA + (1 - OPT_PHI_DECAY) * batchPhiMean;
+								optPhiVarEMA = OPT_PHI_DECAY * optPhiVarEMA + (1 - OPT_PHI_DECAY) * batchPhiVar;
+							}
+							optPhiStatsItersDone++;
+
+							double phiStdEMA = std::sqrt(RS_MAX(optPhiVarEMA, 0.0) + 1e-8);
+							float phiFloor = (float)(optPhiMeanEMA - config.ppo.optDeficitFloorStd * phiStdEMA);
+							float deficitClip = RS_MAX(0.0f, config.ppo.optDeficitClip);
+							torch::Tensor optDeficit = (phiFloor - phiOpt).clamp(0.0f, deficitClip);
+
+							report["Opt/Phi Mean"] = (float)batchPhiMean;
+							report["Opt/Phi Std"] = (float)std::sqrt(RS_MAX(batchPhiVar, 0.0));
+							report["Opt/Phi Floor"] = phiFloor;
+							report["Opt/Deficit Mean"] = optDeficit.mean().item<float>();
+							report["Opt/Deficit Fraction"] = (optDeficit > 0.0f).to(torch::kFloat32).mean().item<float>();
 							if (phiReachOnly.defined()) {
 								torch::Tensor phiLift = phiOpt - phiReachOnly;
 								report["Opt/Phi ReachOnly Mean"] = phiReachOnly.mean().item<float>();
@@ -2516,19 +2545,21 @@ void GGL::Learner::Start() {
 							report["OptRefine/Goal Delta Norm"] = opt->lastRefineGoalDeltaNorm;
 							report["OptRefine/Score Gain Mean"] = opt->lastRefineScoreGainMean;
 							report["OptRefine/Phi Lift Mean"] = opt->lastRefinePhiLiftMean;
+							torch::Tensor tTouch;
 							if (hasFlags) {
 								std::vector<uint8_t> touchMask(trajN);
 								for (int t = 0; t < trajN; t++)
 									touchMask[t] = (combinedTraj.stratumFlags[t] & OPT_FLAG_TOUCH) ? 1 : 0;
-								torch::Tensor tTouch = torch::from_blob(touchMask.data(), { trajN },
+								tTouch = torch::from_blob(touchMask.data(), { trajN },
 									torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool);
-								if (tTouch.any().item<bool>())
+								if (tTouch.any().item<bool>()) {
 									report["Opt/Phi At Touch"] = phiOpt.masked_select(tTouch).mean().item<float>();
+									report["Opt/Deficit At Touch"] = optDeficit.masked_select(tTouch).mean().item<float>();
+								}
 							}
 
-							// 5. Masked potential delta + running normalizer
-							torch::Tensor rOptRaw = GCRLOptionality::MaskedPotentialDelta(
-								phiOpt, combinedTraj.terminals.data(), trajN, config.ppo.gaeGamma);
+							// 5. One-sided option-collapse penalty + running normalizer.
+							torch::Tensor rOptRaw = -optDeficit;
 
 							if (config.ppo.optCommitReliefScale > 0.0f) {
 								torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
@@ -2824,8 +2855,12 @@ void GGL::Learner::Start() {
 						"Adaptive/StrongTouch Floor",
 						"Adaptive/Touch Samples Per Iter",
 						"Opt/Phi Mean",
+						"Opt/Phi Floor",
 						"Opt/Phi ReachOnly Mean",
 						"Opt/Phi Value Lift Mean",
+						"Opt/Deficit Mean",
+						"Opt/Deficit Fraction",
+						"Opt/Deficit At Touch",
 						"Opt/Bank Value Std",
 						"Opt/Value Weight",
 						"Opt/Reward Share",

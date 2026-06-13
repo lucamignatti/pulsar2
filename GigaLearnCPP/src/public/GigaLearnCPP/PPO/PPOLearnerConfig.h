@@ -442,17 +442,17 @@ namespace GGL {
 		std::atomic<float>* adaptiveStrongTouchFloorAtomic = nullptr;
 
 		// ── Optionality shaping (Feature D; requires useGCRL) ──
-		// Potential-based shaping on phi_opt(s) = T*logsumexp(V(g)-d(s,G)/T) - T*log|G| over
-		// a stratified goal bank: pays for being in states with many cheap, valuable
-		// continuations under the (frozen target) quasimetric. Candidate values are normalized
-		// inside the bank and come from existing terminal GCRL scores, not a new trainable
-		// model. Delivered strictly as reward-side potential shaping (gamma*phi(s')-phi(s),
-		// masked to 0 across episode boundaries) pre-GAE — NOT an advantage stream, NOT
-		// blended via gcrlAdvScale. Optional GCRL commit relief only softens negative
-		// optionality deltas when terminal prospects improve. Scoring uses ONLY frozen
-		// Polyak-target copies of the goal critic's phi/psi (a fast-moving potential breaks
-		// the policy-invariance argument), with action components pinned to zero so the
-		// potential is a function of state only.
+		// One-sided option-collapse penalty on phi_opt(s) =
+		// T*logsumexp(V(g)-d(s,G)/T) - T*log|G| over a stratified goal bank. It does
+		// not pay for marginally more options once phi_opt is above the running floor;
+		// it only punishes states with unusually few cheap, valuable continuations.
+		// Candidate values are normalized inside the bank and come from existing terminal
+		// GCRL scores, not a new trainable model. Delivered strictly as reward-side
+		// shaping pre-GAE, NOT an advantage stream and NOT blended via gcrlAdvScale.
+		// Optional GCRL commit relief softens collapse penalties when terminal prospects
+		// improve. Scoring uses ONLY frozen Polyak-target copies of the goal critic's
+		// phi/psi, with action components pinned to zero so the potential is a function
+		// of state only.
 		bool useOptionality = false;
 		// Weight vs the normalized reward stream; a shaping voice, not a lead. Anneals to
 		// optWeightFinal (not zero) on the same touch-competence gate as the main curriculum.
@@ -465,6 +465,8 @@ namespace GGL {
 		float optCommitReliefScale = 0.0f; // Fraction of negative opt reward relieved when GCRL terminal progress is positive
 		float optCommitReliefSharpness = 1.0f; // Sigmoid sharpness over normalized terminal-progress delta
 		float optTemp = 1.0f;            // soft-min temperature over goal-bank distances
+		float optDeficitFloorStd = 0.75f; // Penalize phi_opt below running mean - this many running stddevs
+		float optDeficitClip = 3.0f;     // Cap raw one-sided deficit before normalization/weighting
 		float optValueWeight = 0.0f;     // 0 -> reach-only optionality; >0 adds normalized V(g) to bank logits
 		float optValueClip = 3.0f;       // clip normalized bank values before multiplying by optValueWeight
 		bool optRefineGoals = false;     // Locally gradient-refine top real bank goals before computing phi_opt

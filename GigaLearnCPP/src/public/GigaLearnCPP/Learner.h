@@ -85,6 +85,8 @@ namespace GGL {
 		// re-run the burn-in or cold-start the normalizer; the bank/target nets refill/
 		// re-sync instead).
 		double optRewardMeanEMA = 0, optRewardVarEMA = 1;
+		double optPhiMeanEMA = 0, optPhiVarEMA = 1;
+		int64_t optPhiStatsItersDone = 0;
 		int64_t optBurnInItersDone = 0;
 
 		StepCallbackFn stepCallback = NULL;
