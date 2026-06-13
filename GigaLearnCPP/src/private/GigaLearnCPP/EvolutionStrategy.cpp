@@ -254,9 +254,9 @@ GGL::EvolutionStrategy::EvolutionStrategy(
 		RLGC::EnvSetConfig esEnvSetConfig = envSetConfig;
 		es.envSet = new RLGC::EnvSet(esEnvSetConfig);
 
-		// Full-game scoring: kickoff + goal terminal (like SkillTracker) so each arena plays
-		// repeated kickoff->goal cycles. KEEP the reward functions (do NOT clear) -- they feed
-		// the fitness tie-breaker.
+		// Full-game scoring: kickoff + goal terminal so each arena plays repeated kickoff->goal
+		// cycles, giving the goal-differential fitness (the true objective) something to measure.
+		// KEEP the reward functions (do NOT clear) -- they feed the reward-diff tie-breaker.
 		for (int i = 0; i < (int)es.envSet->arenas.size(); i++) {
 			es.envSet->stateSetters[i] = { new RLGC::FuzzedKickoffState() };
 			es.envSet->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
@@ -342,7 +342,7 @@ void GGL::EvolutionStrategy::RunESStep(PPOLearner* ppo, Report& report) {
 			shaped[m] = (float)((goalDiff[m] - mean) / stdv);
 	}
 
-	ApplyUpdate(ppo, baseSeed, shaped, report);
+	ApplyUpdate(ppo, baseSeed, shaped, order, report);
 
 	double meanGoalDiff = 0;
 	int scoring = 0, bestGoalDiff = INT_MIN;
@@ -500,24 +500,53 @@ void GGL::EvolutionStrategy::EvaluateChunk(
 	}
 }
 
-void GGL::EvolutionStrategy::ApplyUpdate(PPOLearner* ppo, int64_t baseSeed, const std::vector<float>& shaped, Report& report) {
+void GGL::EvolutionStrategy::ApplyUpdate(PPOLearner* ppo, int64_t baseSeed, const std::vector<float>& shaped,
+	const std::vector<int>& order, Report& report) {
 	RG_NO_GRAD;
 
 	int P = (int)shaped.size();
 	int r = es.config.lowRankRank;
 	float lr = es.config.learningRate;
 	float wd = es.config.weightDecay;
-	float scaleW = 1.0f / ((float)P * std::sqrt((float)r));
-	float scaleB = 1.0f / (float)P;
+	float sigma = es.config.sigma;
 	torch::Device device = ppo->device;
+	auto mode = es.config.updateMode;
 
 	bool sharedLowRank = (es.config.scope == EvolutionStrategyConfig::Scope::POLICY_AND_SHARED_HEAD);
 
+	// All three modes accumulate gW = sum_m w[m]*(A_m B_m^T) over the perturbations (regenerated
+	// from seeds) and apply theta += eScaleW * gW. Only the member weights `w` and the effective
+	// step `eScale*` differ. order[] is best->worst by fitness.
+	std::vector<float> w(P, 0.0f);
+	float eScaleW, eScaleB;
+	bool decay = true;
+	switch (mode) {
+	case EvolutionStrategyConfig::UpdateMode::CEM_BEST:
+		// Re-anchor onto the single best member's perturbation -- a decisive jump (no lr/decay).
+		w[order[0]] = 1.0f;
+		eScaleW = sigma / std::sqrt((float)r);
+		eScaleB = sigma;
+		decay = false;
+		break;
+	case EvolutionStrategyConfig::UpdateMode::CEM_ELITE: {
+		// Step lr along the MEAN perturbation of the top-cemElites members.
+		int E = RS_CLAMP(es.config.cemElites, 1, P);
+		for (int i = 0; i < E; i++)
+			w[order[i]] = 1.0f / (float)E;
+		eScaleW = lr * sigma / std::sqrt((float)r);
+		eScaleB = lr * sigma;
+		break;
+	}
+	default: // RANK_GRADIENT: centered-rank weighted sum of all members (OpenAI-ES gradient).
+		for (int m = 0; m < P; m++)
+			w[m] = shaped[m];
+		eScaleW = lr / ((float)P * std::sqrt((float)r));
+		eScaleB = lr / (float)P;
+		break;
+	}
+
 	double updateNormSq = 0;
 
-	// The gradient uses the nominal (float32) perturbation directions, which is correct even when
-	// the fitness forward ran in bf16: that lower-precision forward is just a faster, slightly
-	// noisier fitness evaluator -- we still want to step along the intended direction.
 	auto fnUpdateModel = [&](Model* model, int modelSalt) {
 		if (!model)
 			return;
@@ -536,7 +565,7 @@ void GGL::EvolutionStrategy::ApplyUpdate(PPOLearner* ppo, int64_t baseSeed, cons
 
 			std::vector<float> A((size_t)outDim * r), B((size_t)inDim * r), nb((size_t)outDim);
 			for (int m = 0; m < P; m++) {
-				float s = shaped[m];
+				float s = w[m];
 				if (s == 0.0f)
 					continue;
 
@@ -551,16 +580,17 @@ void GGL::EvolutionStrategy::ApplyUpdate(PPOLearner* ppo, int64_t baseSeed, cons
 				gB.add_(nbt, s);               // gB += s * n
 			}
 
-			gW = gW.to(device) * scaleW;
-			gB = gB.to(device) * scaleB;
+			gW = gW.to(device) * eScaleW;
+			gB = gB.to(device) * eScaleB;
 
-			updateNormSq += (gW.square().sum().item<double>() + gB.square().sum().item<double>()) * (double)(lr * lr);
+			updateNormSq += gW.square().sum().item<double>() + gB.square().sum().item<double>();
 
-			// θ += lr·g, then decoupled weight decay.
-			lin->weight.add_(gW, lr);
-			lin->weight.mul_(1.0f - lr * wd);
-			lin->bias.add_(gB, lr);
-			lin->bias.mul_(1.0f - lr * wd);
+			lin->weight.add_(gW);
+			lin->bias.add_(gB);
+			if (decay) {
+				lin->weight.mul_(1.0f - lr * wd);
+				lin->bias.mul_(1.0f - lr * wd);
+			}
 
 			layerIdx++;
 		}
@@ -572,3 +602,4 @@ void GGL::EvolutionStrategy::ApplyUpdate(PPOLearner* ppo, int64_t baseSeed, cons
 
 	report["ES/UpdateNorm"] = std::sqrt(updateNormSq);
 }
+

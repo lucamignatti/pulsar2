@@ -60,8 +60,11 @@ namespace GGL {
 			struct PPOLearner* ppo, int64_t baseSeed, int chunkOffset, int numMembers, int P,
 			std::vector<int>& outGoalDiff, std::vector<float>& outRewardDiff);
 
-		// Accumulates the ES gradient from shaped fitness (regenerating perturbations from seeds)
-		// and applies it in-place to the live policy params under no-grad.
-		void ApplyUpdate(struct PPOLearner* ppo, int64_t baseSeed, const std::vector<float>& shapedFitness, Report& report);
+		// Applies the population update to the live policy in-place under no-grad: RANK_GRADIENT
+		// (centered-rank weighted sum of all members), CEM_ELITE (top-cemElites mean), or CEM_BEST
+		// (re-anchor onto the single best member's perturbation). All regenerate perturbations from
+		// seeds. `order` is the member indices sorted best->worst by fitness.
+		void ApplyUpdate(struct PPOLearner* ppo, int64_t baseSeed, const std::vector<float>& shapedFitness,
+			const std::vector<int>& order, Report& report);
 	};
 }

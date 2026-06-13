@@ -47,5 +47,24 @@ namespace GGL {
 		// critic's input distribution) stable; POLICY_AND_SHARED_HEAD also perturbs the encoder.
 		enum class Scope { POLICY_ONLY, POLICY_AND_SHARED_HEAD };
 		Scope scope = Scope::POLICY_ONLY;
+
+		// ── Update rule ──────────────────────────────────────────────────────────────
+		// How the evaluated population (goal-differential fitness, the TRUE objective) updates the
+		// live policy. All three reuse the SAME large-pop low-rank eval (EvaluateChunk); only the
+		// step differs:
+		//   RANK_GRADIENT -- centered-rank weighted sum of all members (OpenAI-ES gradient). Gentle;
+		//                    a small step PPO's own gradient can out-weigh.
+		//   CEM_ELITE     -- average only the top-`cemElites` members' perturbations, applied with
+		//                    `learningRate` as the step. Harder selection; tolerates a larger `sigma`.
+		//   CEM_BEST      -- re-anchor the live policy directly onto the single best member's
+		//                    perturbation (a decisive jump PPO doesn't dilute). The most reach with a
+		//                    large `sigma`, the most aggressive. Selection picks the winner, so a big
+		//                    sigma that would wreck a gradient is fine here.
+		// SELECTION (CEM_*) + a large `sigma` is the lever for reaching behaviors PPO is stuck short
+		// of, optimizing the true objective rather than the shaped proxy.
+		enum class UpdateMode { RANK_GRADIENT, CEM_ELITE, CEM_BEST };
+		UpdateMode updateMode = UpdateMode::RANK_GRADIENT;
+		// CEM_ELITE: how many top members to average (out of the effective population P).
+		int cemElites = 256;
 	};
 }

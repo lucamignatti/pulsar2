@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cmath>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
@@ -53,6 +54,67 @@ public:
 		if (frontierBuffer && frontierTag != FrontierStateBuffer::TAG_NONE)
 			frontierBuffer->TagArenaReset(arena, frontierTag);
 		child->ResetArena(arena);
+	}
+};
+
+// ── Aerial curriculum state-setter ──
+// Spawns the ball up in the air and one car positioned to go up and TOUCH it, so the policy
+// actually experiences aerial touches (the existing aerial rewards then reinforce them) instead
+// of having to stumble into one in open play -- the deep-basin reachability problem behind the
+// ~0 high-air-touch ratio. The other car is parked downfield so it doesn't contest the rep.
+// difficulty in [0,1]: 0 = car already airborne just under the ball, moving at it, pointed at it,
+// full boost (a near-gimme touch); 1 = car on the ground, must jump + boost + air-control the
+// whole way. Start easy so reps succeed; ramp up as high-air-touch competence grows (a fixed
+// value here; an adaptive hook can publish a rising difficulty later, like the StrongTouch floor).
+class AerialState : public StateSetter {
+public:
+	float difficulty;
+	AerialState(float difficulty) : difficulty(RS_CLAMP(difficulty, 0.0f, 1.0f)) {}
+
+	virtual void ResetArena(Arena* arena) override {
+		using RocketSim::Math::RandFloat;
+		using RocketSim::Math::RandInt;
+		arena->ResetToRandomKickoff();
+
+		float d = difficulty;
+
+		// Ball: high, roughly central, gently moving -- a catchable aerial target.
+		float ballZ = RandFloat(700, 1300);
+		Vec ballPos = Vec(RandFloat(-2200, 2200), RandFloat(-2200, 2200), ballZ);
+		BallState bs = {};
+		bs.pos = ballPos;
+		bs.vel = Vec(RandFloat(-250, 250), RandFloat(-250, 250), RandFloat(-100, 150));
+		arena->ball->SetState(bs);
+
+		int nCars = (int)arena->_cars.size();
+		int aerialist = RandInt(0, nCars);
+		int idx = 0;
+		for (Car* car : arena->_cars) {
+			CarState cs = {};
+			if (idx == aerialist) {
+				// Start height: just under the ball (easy) down to the floor (hard).
+				float topZ = ballZ - 250.0f;
+				float carZ = RS_MAX(17.0f, topZ - d * (topZ - 17.0f));
+				// Horizontal: under / short of the ball, farther back as it gets harder.
+				float back = 250.0f + 500.0f * d;
+				cs.pos = Vec(ballPos.x + RandFloat(-250, 250), ballPos.y - back, carZ);
+				Vec toBall = (ballPos - cs.pos).Normalized();
+				cs.vel = toBall * (RandFloat(300, 700) * (1.0f - 0.7f * d)); // toward the ball
+				float yaw = std::atan2(toBall.y, toBall.x);
+				float pitch = std::asin(RS_CLAMP(toBall.z, -1.0f, 1.0f)) * (1.0f - 0.6f * d);
+				if (carZ <= 18.0f) { cs.pos.z = 17.0f; cs.vel.z = 0; pitch = 0; } // grounded at high difficulty
+				cs.rotMat = Angle(yaw, pitch, 0).ToRotMat();
+				cs.boost = RandFloat(70, 100); // aerials need boost
+			} else {
+				// Park the other car downfield on the ground, out of the rep.
+				float side = (RandInt(0, 2) == 0) ? -1.0f : 1.0f;
+				cs.pos = Vec(RandFloat(-1500, 1500), side * 4200.0f, 17.0f);
+				cs.rotMat = Angle(side < 0 ? (float)(-M_PI / 2) : (float)(M_PI / 2), 0, 0).ToRotMat();
+				cs.boost = RandFloat(0, 60);
+			}
+			car->SetState(cs);
+			idx++;
+		}
 	}
 };
 
@@ -233,9 +295,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 				resetInfo, false), f }
 		});
 	} else {
+		// Aerial curriculum: 15% of resets seed an aerial situation so the bot actually gets
+		// aerial-touch reps (high-air-touch ratio has been ~0 -- the basin exists but PPO never
+		// reaches it). difficulty 0.35 = mostly-airborne, achievable touches to start; raise it
+		// as the high-air-touch competence EMA climbs. If this alone cracks aerials, no ERL needed.
 		result.stateSetter = new CombinedState({
-			{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
-			{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
+			{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.65f },
+			{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f },
+			{ new ResetModeStateSetter(new AerialState(0.35f), resetInfo, false), 0.15f }
 		});
 	}
 	result.terminalConditions = terminalConditions;
@@ -388,12 +455,13 @@ int main(int argc, char* argv[]) {
 	// noise. Start moderate; raise if defense lags.
 	cfg.ppo.gcrlAntiScale = 0.4f;
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
-	// ── Gradient surgery (TESTING) ──
-	// Project the reward advantage off its game-sense-opposing component per sample instead of
-	// summing it. Anti-reward-shaping; expected to stabilize and widen usable LR. Watch
-	// "GCRL/Surgery Conflict Fraction" (how often shaped reward fights the true objective).
-	cfg.ppo.gcrlSurgery = true;
-	cfg.ppo.gcrlSurgeryStrength = 1.0f;
+	// ── Gradient surgery: OFF ──
+	// The magnitude-gated diagnostics settled it: HiMag Conflict ~0.45 (<0.5, i.e. reward and
+	// game-sense are if anything mildly aligned, not opposed) -> no systematic misalignment to
+	// fix, and at strength 1.0 it was cutting ~10% of reward signal on chance disagreements (a
+	// drag). Left wired (gcrlSurgery + magThreshold) for a future run if mechanics rewards
+	// create real shaped-vs-true tension.
+	cfg.ppo.gcrlSurgery = false;
 	cfg.ppo.gcrlBaselineSamples = 4; // counterfactual action baseline (K shuffled-action forwards)
 	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
 	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
@@ -510,10 +578,22 @@ int main(int argc, char* argv[]) {
 	cfg.evolutionStrategy.weightDecay = 0.005f;
 	cfg.evolutionStrategy.gameSimTime = 60.0f;     // sim-seconds per full game (longer = better scoring signal, slower)
 	cfg.evolutionStrategy.maxSimTime = 90.0f;      // hard cap per game
-	cfg.evolutionStrategy.updateInterval = 25;    // run ES every N training iters; main dial for ES wall-time cost (watch ES/StepTime)
+	cfg.evolutionStrategy.updateInterval = 25;    // run ES/ERL every N training iters; main dial for wall-time cost (watch ES/StepTime or ERL/Step Time)
 	cfg.evolutionStrategy.antithetic = true;       // evaluate +/- pairs (variance reduction)
 	cfg.evolutionStrategy.rankNormalize = true;    // centered-rank fitness shaping
 	// cfg.evolutionStrategy.scope = EvolutionStrategyConfig::Scope::POLICY_ONLY; // default; only perturb the policy head
+
+	// ── Update rule: SELECTION instead of the ES gradient ──
+	// Same 8192-member low-rank eval on goal-differential (the true objective), but the update is
+	// CEM_BEST -- re-anchor the live policy onto the single best member's perturbation, a decisive
+	// jump PPO doesn't dilute. With a larger sigma this reaches behaviors PPO is stuck short of,
+	// while optimizing true scoring rather than the shaped proxy. (RANK_GRADIENT = old ES gradient;
+	// CEM_ELITE = top-cemElites mean.) LEFT OFF: run the aerial curriculum first; flip
+	// `enabled = true` if you want selection-ES alongside it. Watch "ES/MeanGoalDiff" + "ES/UpdateNorm".
+	cfg.evolutionStrategy.updateMode = EvolutionStrategyConfig::UpdateMode::CEM_BEST;
+	cfg.evolutionStrategy.cemElites = 256;           // only used by CEM_ELITE
+	cfg.evolutionStrategy.sigma = 0.04f;             // larger than the gradient's 0.02 -- selection tolerates it for reach
+	// enabled stays false above -- flip it to true to run selection-ES.
 
 
 	auto optim = ModelOptimType::MUON;
@@ -550,15 +630,6 @@ int main(int argc, char* argv[]) {
 	if (const char* s = getenv("GGL_SURGERY")) cfg.ppo.gcrlSurgery = (atoi(s) != 0);
 	if (const char* s = getenv("GGL_CKPT"))    cfg.checkpointFolder = s;
 	if (const char* s = getenv("GGL_RUNNAME")) cfg.metricsRunName = s;
-	// Tiny-memory smoke config (Mac MPS unified memory): per-player trajectory buffers
-	// pre-reserve maxEpisodeLength*obsSize floats, so RAM scales with numGames. 96 games
-	// (~1GB) instead of 5120 (~40GB). Small batch so iterations complete fast.
-	if (getenv("GGL_SMOKE")) {
-		cfg.numGames = 96;
-		cfg.ppo.tsPerItr = 20000;
-		cfg.ppo.batchSize = 20000;
-		cfg.ppo.miniBatchSize = 10000;
-	}
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
