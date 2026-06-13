@@ -441,10 +441,10 @@ int main(int argc, char* argv[]) {
 	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
 	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets
 	// the healthy ~0.03/iter update magnitude; maxMeanKL below is the hard backstop.
-	cfg.ppo.policyLR = 3e-4;
-	cfg.ppo.criticLR = 3e-4;
-	cfg.ppo.gcrlLR = 3e-4;
-	cfg.ppo.sorsLR = 3e-4f;
+	cfg.ppo.policyLR = 1.5e-4;
+	cfg.ppo.criticLR = 2e-4;
+	cfg.ppo.gcrlLR = 2e-4;
+	cfg.ppo.sorsLR = 2e-4f;
 
 	// faster but broken on rocm
 	cfg.ppo.useHalfPrecision = false;
