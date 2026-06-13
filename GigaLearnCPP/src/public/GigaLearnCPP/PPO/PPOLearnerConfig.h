@@ -464,6 +464,12 @@ namespace GGL {
 		float optTemp = 1.0f;            // soft-min temperature over goal-bank distances
 		float optValueWeight = 0.0f;     // 0 -> reach-only optionality; >0 adds normalized V(g) to bank logits
 		float optValueClip = 3.0f;       // clip normalized bank values before multiplying by optValueWeight
+		bool optRefineGoals = false;     // Locally gradient-refine top real bank goals before computing phi_opt
+		int optRefineTopK = 4;           // Per-state real bank candidates refined; small to bound learner cost
+		int optRefineSteps = 2;          // Gradient ascent steps in 6-dim goal-row space
+		float optRefineStepSize = 0.05f; // Per-step normalized gradient length in obs-space goal coordinates
+		float optRefineMaxDelta = 0.20f; // Trust radius from the original real bank goal row
+		float optRefineTrustPenalty = 0.1f; // Quadratic penalty inside the refinement objective
 		int optBankSize = 2048;
 		float optBankRefreshFrac = 0.05f; // FIFO replacement per stratum per iteration; starved strata carry their quota over
 		float optBankOffensiveFrac = 0.40f; // achieved ball goals, value-filtered by the goal critic (top half of terminal

@@ -2477,6 +2477,11 @@ void GGL::Learner::Start() {
 								report["Opt/Phi Value Lift Mean"] = phiLift.mean().item<float>();
 								report["Opt/Phi Value Lift Std"] = phiLift.std(false).item<float>();
 							}
+							report["OptRefine/Enabled"] = config.ppo.optRefineGoals ? 1.0 : 0.0;
+							report["OptRefine/Accepted Fraction"] = opt->lastRefineAcceptedFraction;
+							report["OptRefine/Goal Delta Norm"] = opt->lastRefineGoalDeltaNorm;
+							report["OptRefine/Score Gain Mean"] = opt->lastRefineScoreGainMean;
+							report["OptRefine/Phi Lift Mean"] = opt->lastRefinePhiLiftMean;
 							if (hasFlags) {
 								std::vector<uint8_t> touchMask(trajN);
 								for (int t = 0; t < trajN; t++)
@@ -2742,6 +2747,11 @@ void GGL::Learner::Start() {
 						"Opt/Reward Share",
 						"Opt/Effective Weight",
 						"Opt/Interlock Active",
+						"OptRefine/Enabled",
+						"OptRefine/Accepted Fraction",
+						"OptRefine/Goal Delta Norm",
+						"OptRefine/Score Gain Mean",
+						"OptRefine/Phi Lift Mean",
 						"SORS/Reward Scale",
 						"SORS/Loss",
 						"SORS/Pair Accuracy",

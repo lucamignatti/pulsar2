@@ -42,12 +42,17 @@ namespace GGL {
 		std::vector<float> bankRows;        // [optBankSize * 6], raw goal rows (CPU)
 		std::vector<float> bankValues;      // [optBankSize], raw terminal utility values (CPU)
 		std::vector<int64_t> bankInsertItr; // insert iteration per slot (age metric)
+		torch::Tensor bankGoalRows;         // [2 * fill, 6] frozen scorer goal rows (device), duplicated for x-twins
 		torch::Tensor bankPsi;              // [2 * fill, reprDim] frozen psi embeddings (device)
 		torch::Tensor bankValueLogits;      // [2 * fill] normalized V(g) logits (device), duplicated for x-twins
 		int64_t bankPsiRows = 0;            // bank fill at the last re-embed
 		float bankValueMean = 0.0f;
 		float bankValueStd = 0.0f;
 		float bankValueLogitStd = 0.0f;
+		float lastRefineAcceptedFraction = 0.0f;
+		float lastRefineGoalDeltaNorm = 0.0f;
+		float lastRefineScoreGainMean = 0.0f;
+		float lastRefinePhiLiftMean = 0.0f;
 
 		GCRLOptionality(
 			const PPOLearnerConfig& config, int featureDim,

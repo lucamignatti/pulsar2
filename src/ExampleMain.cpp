@@ -520,6 +520,12 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useOptionality = true;             // Feature D
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
+	cfg.ppo.optRefineGoals = true;             // Phase 2: locally refine top real bank goals before Phi(s)
+	cfg.ppo.optRefineTopK = 4;
+	cfg.ppo.optRefineSteps = 3;
+	cfg.ppo.optRefineStepSize = 0.08f;
+	cfg.ppo.optRefineMaxDelta = 0.25f;
+	cfg.ppo.optRefineTrustPenalty = 0.1f;
 
 	std::unique_ptr<RLGC::FrontierStateBuffer> frontierBufferOwner;
 	if (cfg.ppo.useFrontierResets) {
@@ -635,13 +641,6 @@ int main(int argc, char* argv[]) {
 	cfg.renderMode = false; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
 
-	// ── Overnight A/B env overrides (surgery test harness) ──
-	// One binary, two phases: GGL_SURGERY toggles gradient surgery, GGL_CKPT isolates the
-	// checkpoint folder (so a fresh dir == from scratch and never touches the main run),
-	// GGL_RUNNAME sets the wandb run name. All optional; absent -> the defaults above.
-	if (const char* s = getenv("GGL_SURGERY")) cfg.ppo.gcrlSurgery = (atoi(s) != 0);
-	if (const char* s = getenv("GGL_CKPT"))    cfg.checkpointFolder = s;
-	if (const char* s = getenv("GGL_RUNNAME")) cfg.metricsRunName = s;
 
 	// Make the learner with the environment creation function and the config we just made
 	auto learner = std::make_unique<Learner>(EnvCreateFunc, cfg, StepCallback);
