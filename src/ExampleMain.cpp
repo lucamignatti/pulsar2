@@ -470,7 +470,7 @@ int main(int argc, char* argv[]) {
 	// drag). Left wired (gcrlSurgery + magThreshold) for a future run if mechanics rewards
 	// create real shaped-vs-true tension.
 	cfg.ppo.gcrlSurgery = false;
-	cfg.ppo.gcrlBaselineSamples = 4; // counterfactual action baseline (K shuffled-action forwards)
+	cfg.ppo.gcrlBaselineSamples = 2; // counterfactual action baseline (K shuffled-action forwards)
 	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
 	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
 	cfg.ppo.gcrlUseVariableHER = true; // sample goal offset uniformly in [minH, H]; else fixed H
@@ -515,6 +515,7 @@ int main(int argc, char* argv[]) {
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
 	cfg.ppo.useFrontierResets = true;          // Feature A
 	cfg.ppo.useDifficultyHER = true;           // Feature B
+	cfg.ppo.herCandidates = 4;                 // Cheaper difficulty-HER candidate set; watch selected percentile/offsets
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
 	cfg.ppo.useOptionality = true;             // Feature D
@@ -522,7 +523,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
-	cfg.ppo.optRefineGoals = true;             // Phase 2: locally refine top real bank goals before Phi(s)
+	cfg.ppo.optRefineGoals = false;             // Phase 2: locally refine top real bank goals before Phi(s)
 	cfg.ppo.optRefineTopK = 4;
 	cfg.ppo.optRefineSteps = 3;
 	cfg.ppo.optRefineMaxStates = 4096;
