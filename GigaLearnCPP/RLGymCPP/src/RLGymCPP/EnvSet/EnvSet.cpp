@@ -77,9 +77,10 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 				// NOTE: no second eventCallbackInfos push here — one entry per arena is correct
 			}
 
-			userInfos.push_back(createResult.userInfo);
+				userInfos.push_back(createResult.userInfo);
+				userInfoDeleters.push_back(createResult.userInfoDeleter);
 
-			rewards.push_back(createResult.rewards);
+				rewards.push_back(createResult.rewards);
 			gcrlGatedRewards.push_back(createResult.gcrlGatedRewards);
 			curriculumRewards.push_back(createResult.curriculumRewards);
 			aerialGCRLGatedRewards.push_back(createResult.aerialGCRLGatedRewards);

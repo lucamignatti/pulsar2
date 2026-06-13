@@ -24,6 +24,7 @@ namespace RLGC {
 		StateSetter* stateSetter;
 
 		void* userInfo; // Optional userinfo pointer if you want to track some data per-env
+		void (*userInfoDeleter)(void*) = nullptr;
 	};
 	typedef std::function<EnvCreateResult(int index)> EnvCreateFn;
 
@@ -92,6 +93,7 @@ namespace RLGC {
 
 		std::vector<CallbackUserInfo*> eventCallbackInfos;
 		std::vector<void*> userInfos;
+		std::vector<void (*)(void*)> userInfoDeleters;
 
 		EnvSetConfig config;
 
@@ -117,13 +119,45 @@ namespace RLGC {
 		RG_NO_COPY(EnvSet);
 
 		~EnvSet() {
-			for (Arena* arena : arenas)
-				delete arena;
+			auto deleteRewardGroup = [](std::vector<WeightedReward>& rewardGroup) {
+				for (auto& weightedReward : rewardGroup)
+					delete weightedReward.reward;
+				rewardGroup.clear();
+			};
+
+			for (auto& rewardGroup : rewards)
+				deleteRewardGroup(rewardGroup);
+			for (auto& rewardGroup : gcrlGatedRewards)
+				deleteRewardGroup(rewardGroup);
+			for (auto& rewardGroup : curriculumRewards)
+				deleteRewardGroup(rewardGroup);
+			for (auto& rewardGroup : aerialGCRLGatedRewards)
+				deleteRewardGroup(rewardGroup);
+			for (auto& rewardGroup : aerialCurriculumRewards)
+				deleteRewardGroup(rewardGroup);
+
+			for (auto& conditions : terminalConditions)
+				for (auto& condition : conditions)
+					delete condition;
+
+			for (auto& obsBuilder : obsBuilders)
+				delete obsBuilder;
+			for (auto& actionParser : actionParsers)
+				delete actionParser;
+			for (auto& stateSetter : stateSetters)
+				delete stateSetter;
 
 			for (auto& eventTracker : eventTrackers)
 				delete eventTracker;
 			for (auto& eventCallbackInfo : eventCallbackInfos)
 				delete eventCallbackInfo;
+
+			for (int i = 0; i < userInfos.size(); i++)
+				if (userInfoDeleters[i])
+					userInfoDeleters[i](userInfos[i]);
+
+			for (Arena* arena : arenas)
+				delete arena;
 		}
 
 		////////////////////

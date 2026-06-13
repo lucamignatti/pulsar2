@@ -31,6 +31,11 @@ namespace RLGC {
 			}
 		}
 
+		virtual ~CombinedState() override {
+			for (StateSetter* setter : setters)
+				delete setter;
+		}
+
 		void ResetArena(Arena* arena) override {
 			float f = RocketSim::Math::RandFloat(0, totalWeight);
 

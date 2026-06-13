@@ -12,6 +12,8 @@ namespace RLGC {
 
 	class TerminalCondition {
 	public:
+		virtual ~TerminalCondition() = default;
+
 		virtual void Reset(const GameState& initialState) {};
 		virtual bool IsTerminal(const GameState& currentState) = 0;
 

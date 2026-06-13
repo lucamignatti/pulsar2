@@ -85,6 +85,10 @@ namespace RLGC {
 			buffer(buffer), fallback(fallback), minFill(minFill) {
 		}
 
+		virtual ~FrontierState() override {
+			delete fallback;
+		}
+
 		virtual void ResetArena(Arena* arena) override;
 	};
 }

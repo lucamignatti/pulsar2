@@ -8,6 +8,8 @@ namespace RLGC {
 	// TODO: Only designed for discrete actions currently 
 	class ActionParser {
 	public:
+		virtual ~ActionParser() = default;
+
 		virtual Action ParseAction(int actionIdx, const Player& player, const GameState& state) = 0;
 		virtual int GetActionAmount() = 0;
 

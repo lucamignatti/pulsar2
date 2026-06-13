@@ -7,6 +7,8 @@
 namespace RLGC {
 	class ObsBuilder {
 	public:
+		virtual ~ObsBuilder() = default;
+
 		virtual void Reset(const GameState& initialState) {}
 
 		// NOTE: May be called once during environment initialization to determine policy neuron size

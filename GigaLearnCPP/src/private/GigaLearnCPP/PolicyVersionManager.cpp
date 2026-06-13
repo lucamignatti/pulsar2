@@ -25,9 +25,23 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 		RLGC::EnvSetConfig skillEnvSetConfig = envSetConfig;
 		skillEnvSetConfig.numArenas = skill.config.numArenas;
 		skill.envSet = new RLGC::EnvSet(skillEnvSetConfig);
+		auto deleteRewardGroup = [](std::vector<RLGC::WeightedReward>& rewardGroup) {
+			for (auto& weightedReward : rewardGroup)
+				delete weightedReward.reward;
+			rewardGroup.clear();
+		};
 		for (int i = 0; i < skill.envSet->arenas.size(); i++) {
-			skill.envSet->rewards[i].clear();
-			skill.envSet->stateSetters[i] = { new RLGC::FuzzedKickoffState() };
+			deleteRewardGroup(skill.envSet->rewards[i]);
+			deleteRewardGroup(skill.envSet->gcrlGatedRewards[i]);
+			deleteRewardGroup(skill.envSet->curriculumRewards[i]);
+			deleteRewardGroup(skill.envSet->aerialGCRLGatedRewards[i]);
+			deleteRewardGroup(skill.envSet->aerialCurriculumRewards[i]);
+
+			delete skill.envSet->stateSetters[i];
+			skill.envSet->stateSetters[i] = new RLGC::FuzzedKickoffState();
+
+			for (auto& condition : skill.envSet->terminalConditions[i])
+				delete condition;
 			skill.envSet->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
 		}
 	} else {

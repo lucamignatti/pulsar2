@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cmath>
+#include <memory>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
@@ -47,6 +48,10 @@ public:
 		FrontierStateBuffer* frontierBuffer = nullptr, uint8_t frontierTag = FrontierStateBuffer::TAG_NONE) :
 		child(child), resetInfo(resetInfo), isKickoffReset(isKickoffReset),
 		frontierBuffer(frontierBuffer), frontierTag(frontierTag) {
+	}
+
+	virtual ~ResetModeStateSetter() override {
+		delete child;
 	}
 
 	virtual void ResetArena(Arena* arena) override {
@@ -312,6 +317,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.aerialGCRLGatedRewards = aerialGCRLGatedRewards;
 	result.aerialCurriculumRewards = aerialCurriculumRewards;
 	result.userInfo = resetInfo;
+	result.userInfoDeleter = [](void* ptr) {
+		delete (EnvResetInfo*)ptr;
+	};
 
 	result.arena = arena;
 
@@ -511,8 +519,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
 	cfg.ppo.useOptionality = true;             // Feature D
 
+	std::unique_ptr<RLGC::FrontierStateBuffer> frontierBufferOwner;
 	if (cfg.ppo.useFrontierResets) {
-		g_FrontierBuffer = new RLGC::FrontierStateBuffer(cfg.ppo.frontierBufferSize);
+		frontierBufferOwner = std::make_unique<RLGC::FrontierStateBuffer>(cfg.ppo.frontierBufferSize);
+		g_FrontierBuffer = frontierBufferOwner.get();
 		cfg.ppo.frontierBuffer = g_FrontierBuffer;
 		g_FrontierResetFraction = cfg.ppo.frontierResetFraction;
 		g_FrontierBufferMinFill = cfg.ppo.frontierBufferMinFill;
@@ -632,7 +642,7 @@ int main(int argc, char* argv[]) {
 	if (const char* s = getenv("GGL_RUNNAME")) cfg.metricsRunName = s;
 
 	// Make the learner with the environment creation function and the config we just made
-	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
+	auto learner = std::make_unique<Learner>(EnvCreateFunc, cfg, StepCallback);
 
 	if (!scoreOptPath.empty()) {
 		learner->DebugScoreOptionality(scoreOptPath);
