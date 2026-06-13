@@ -4,6 +4,7 @@
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <RLGymCPP/CommonValues.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
+#include <RLGymCPP/StateSetters/FrontierState.h>
 
 #include <torch/cuda.h>
 #include <nlohmann/json.hpp>
@@ -36,6 +37,8 @@ using GpuStreamGuard = c10::cuda::CUDAStreamGuard;
 
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
+#include <private/GigaLearnCPP/Util/EMAHistogram.h>
+#include <private/GigaLearnCPP/PPO/GCRLOptionality.h>
 #include "Util/AvgTracker.h"
 
 using namespace RLGC;
@@ -43,15 +46,19 @@ using namespace RLGC;
 namespace {
 	constexpr int GCRL_GATE_GOAL_DIM = 6;
 
+	// targetVel is passed in (not read from config) because Feature C can adapt it at
+	// runtime; when useAdaptiveGateTargetVel is off the Learner's member never moves
+	// from the config seed, so the rows are bit-identical to the old behavior.
 	torch::Tensor MakeGCRLTerminalTargetRow(
 		bool ownGoal,
 		const GGL::LearnerConfig& config,
-		GGL::BatchedWelfordStat* obsStat
+		GGL::BatchedWelfordStat* obsStat,
+		float targetVel
 	) {
 		// AdvancedObs inverts orange-player states into blue perspective, so these
 		// opponent/own targets are already correct for every player's obs row.
 		Vec pos = ownGoal ? CommonValues::BLUE_GOAL_BACK : CommonValues::ORANGE_GOAL_BACK;
-		float yVel = ownGoal ? -config.ppo.gcrlRewardGateTargetVel : config.ppo.gcrlRewardGateTargetVel;
+		float yVel = ownGoal ? -targetVel : targetVel;
 		float vals[GCRL_GATE_GOAL_DIM] = {
 			pos.x * AdvancedObs::POS_COEF,
 			pos.y * AdvancedObs::POS_COEF,
@@ -110,6 +117,85 @@ namespace {
 			terminalScores.slice(0, start, end).copy_(scorePart, true);
 		}
 		return terminalScores;
+	}
+
+	// ── Feature A: frontier resets ──
+	// Consistency probe step: d(s_t, g_t) vs d(s_{t+k}, g_t) along the trajectory. Small
+	// so the comparison stays within the same play; the magnitude of violations is what
+	// gets percentile-thresholded, so the exact k is not load-bearing.
+	constexpr int FRONTIER_CONSISTENCY_STEP = 4;
+	// Per-iteration insert cap so one pathological batch can't flush the whole ring
+	// (ring 4096 / cap 1024 -> worst-case full turnover every 4 iterations).
+	constexpr int FRONTIER_MAX_INSERTS_PER_ITER = 1024;
+
+	// Full-physics reset candidate from a live game state; null if any car is demoed
+	// (cheap pre-filter; the geometric sanity filter runs at harvest time).
+	std::shared_ptr<const RLGC::FrontierSnapshot> MakeFrontierSnapshot(const RLGC::GameState& gs, int gameMode) {
+		for (auto& player : gs.players)
+			if (player.isDemoed)
+				return nullptr;
+
+		auto snap = std::make_shared<RLGC::FrontierSnapshot>();
+		snap->ball = gs.ball;
+		snap->cars.reserve(gs.players.size());
+		for (auto& player : gs.players) {
+			RLGC::FrontierCarSnapshot cs = {};
+			cs.pos = player.pos;
+			cs.vel = player.vel;
+			cs.angVel = player.angVel;
+			cs.rotMat = player.rotMat;
+			cs.boost = player.boost;
+			cs.team = player.team;
+			snap->cars.push_back(cs);
+		}
+		snap->padsActive = gs.boostPads;
+		snap->padTimers = gs.boostPadTimers;
+		snap->gameMode = gameMode;
+		return snap;
+	}
+
+	// ── Feature C: adaptive target histograms ──
+	// 50 bins over [0, 6000] (ball speeds and hit forces both live well inside this),
+	// decay 0.999/iter ≈ a ~1000-iteration estimation horizon — much slower than the
+	// policy, as the slew-limited targets require.
+	constexpr int ADAPTIVE_HIST_BINS = 50;
+	constexpr float ADAPTIVE_HIST_MAX = 6000.0f;
+	constexpr double ADAPTIVE_HIST_DECAY = 0.999;
+
+	// ── Feature D: optionality stratum flags (per step, collector side) ──
+	constexpr uint8_t OPT_FLAG_DEFENSIVE = 1, OPT_FLAG_RESOURCE = 2, OPT_FLAG_TOUCH = 4;
+	// Defensive-region geometry: ball deeper toward own net than the car AND in the
+	// defensive third, or car within this radius of its own net.
+	constexpr float OPT_DEFENSIVE_THIRD_Y = 2500.0f, OPT_OWN_NET_RADIUS = 1500.0f;
+	// Per-stratum candidate cap handed to the bank each iteration (the bank only takes
+	// ~refreshFrac*cap anyway; this just bounds the sampling work).
+	constexpr int OPT_MAX_CANDS_PER_STRATUM = 256;
+
+	// World-space ball state -> obs-space 6-dim goal row (same POS/VEL_COEF +
+	// standardization path as MakeGCRLTerminalTargetRow). invert = orange perspective
+	// (AdvancedObs rotates orange players' world 180°: x and y negate).
+	void MakeObsSpaceBallRow(
+		const BallState& bs, bool invert,
+		const GGL::LearnerConfig& config, GGL::BatchedWelfordStat* obsStat,
+		float* out6
+	) {
+		float sgn = invert ? -1.0f : 1.0f;
+		out6[0] = sgn * bs.pos.x * AdvancedObs::POS_COEF;
+		out6[1] = sgn * bs.pos.y * AdvancedObs::POS_COEF;
+		out6[2] = bs.pos.z * AdvancedObs::POS_COEF;
+		out6[3] = sgn * bs.vel.x * AdvancedObs::VEL_COEF;
+		out6[4] = sgn * bs.vel.y * AdvancedObs::VEL_COEF;
+		out6[5] = bs.vel.z * AdvancedObs::VEL_COEF;
+
+		if (config.standardizeObs && obsStat) {
+			const auto& meanVec = obsStat->GetMean();
+			auto stdVec = obsStat->GetSTD();
+			for (int d = 0; d < 6; d++) {
+				float offset = RS_CLAMP((float)meanVec[d], -config.maxObsMeanRange, config.maxObsMeanRange);
+				float invStd = 1.0f / RS_MAX((float)stdVec[d], config.minObsSTD);
+				out6[d] = (out6[d] - offset) * invStd;
+			}
+		}
 	}
 }
 
@@ -270,6 +356,22 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	}
 	ppo->numModes = numModes;
 
+	// Feature C: seed the adaptive targets at today's hand-tuned constants. The seed is
+	// the initial condition, not a permanent constant — but a cold or sparse histogram
+	// can never move it (min-samples hold), and LoadStats() below restores the ratcheted
+	// values across restarts. The StrongTouch floor seeds from the user atomic's initial
+	// value, which IS the reward's constructor threshold.
+	adaptiveGateTargetVel = config.ppo.gcrlRewardGateTargetVel;
+	// KPHToVel(20): RLGC::Math isn't usable in this TU (it aliases RocketSim::Math via the
+	// namespace using-directive), so apply the conversion constant (250/9 uu/s per kph).
+	adaptiveStrongTouchFloor = config.ppo.adaptiveStrongTouchFloorAtomic
+		? (double)config.ppo.adaptiveStrongTouchFloorAtomic->load(std::memory_order_relaxed)
+		: (20.0 * (250.0 / 9.0));
+	if (config.ppo.useAdaptiveGateTargetVel)
+		contactBallSpeedHist = new EMAHistogram(ADAPTIVE_HIST_BINS, ADAPTIVE_HIST_MAX, ADAPTIVE_HIST_DECAY);
+	if (config.ppo.useAdaptiveStrongTouchFloor)
+		contactHitForceHist = new EMAHistogram(ADAPTIVE_HIST_BINS, ADAPTIVE_HIST_MAX, ADAPTIVE_HIST_DECAY);
+
 	if (config.renderMode) {
 		renderSender = new RenderSender(config.renderTimeScale);
 	} else {
@@ -350,6 +452,29 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	j["touch_ratio_ema"] = touchRatioEMA;
 	j["high_air_touch_ratio_ema"] = highAirTouchRatioEMA;
 
+	// Feature C: persist the ratcheted targets + histograms so the crash-restart loop
+	// doesn't re-seed to the hand value and replay the slew climb (~35 iters per 2x at
+	// 2%/iter). Flag-off runs write nothing new.
+	if (config.ppo.useAdaptiveGateTargetVel || config.ppo.useAdaptiveStrongTouchFloor) {
+		j["adaptive_gate_target_vel"] = adaptiveGateTargetVel;
+		j["adaptive_strong_touch_floor"] = adaptiveStrongTouchFloor;
+		if (contactBallSpeedHist)
+			j["contact_ball_speed_hist"] = contactBallSpeedHist->ToJSON();
+		if (contactHitForceHist)
+			j["contact_hit_force_hist"] = contactHitForceHist->ToJSON();
+	}
+
+	// Feature D: persist the rOpt normalizer + burn-in + anneal progress (the goal bank
+	// and target nets are deliberately NOT checkpointed — they refill/re-sync on restart).
+	if (config.ppo.useOptionality) {
+		j["opt_reward_mean_ema"] = optRewardMeanEMA;
+		j["opt_reward_var_ema"] = optRewardVarEMA;
+		j["opt_burn_in_iters_done"] = optBurnInItersDone;
+		if (optWeightAnnealStartTS != UINT64_MAX)
+			j["opt_weight_anneal_start_ts"] = optWeightAnnealStartTS;
+		j["opt_weight_anneal_progress_ts"] = optWeightAnnealProgressTS;
+	}
+
 	if (config.sendMetrics)
 		j["run_id"] = metricSender->curRunID;
 
@@ -414,6 +539,30 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (j.contains("high_air_touch_ratio_ema"))
 		highAirTouchRatioEMA = j["high_air_touch_ratio_ema"];
 
+	if (j.contains("adaptive_gate_target_vel"))
+		adaptiveGateTargetVel = j["adaptive_gate_target_vel"];
+	if (j.contains("adaptive_strong_touch_floor")) {
+		adaptiveStrongTouchFloor = j["adaptive_strong_touch_floor"];
+		// Re-publish immediately so workers don't run the first batch on the seed value
+		if (config.ppo.useAdaptiveStrongTouchFloor && config.ppo.adaptiveStrongTouchFloorAtomic)
+			config.ppo.adaptiveStrongTouchFloorAtomic->store((float)adaptiveStrongTouchFloor, std::memory_order_relaxed);
+	}
+	if (contactBallSpeedHist && j.contains("contact_ball_speed_hist"))
+		contactBallSpeedHist->ReadFromJSON(j["contact_ball_speed_hist"]);
+	if (contactHitForceHist && j.contains("contact_hit_force_hist"))
+		contactHitForceHist->ReadFromJSON(j["contact_hit_force_hist"]);
+
+	if (j.contains("opt_reward_mean_ema"))
+		optRewardMeanEMA = j["opt_reward_mean_ema"];
+	if (j.contains("opt_reward_var_ema"))
+		optRewardVarEMA = j["opt_reward_var_ema"];
+	if (j.contains("opt_burn_in_iters_done"))
+		optBurnInItersDone = j["opt_burn_in_iters_done"];
+	if (j.contains("opt_weight_anneal_start_ts"))
+		optWeightAnnealStartTS = j["opt_weight_anneal_start_ts"];
+	if (j.contains("opt_weight_anneal_progress_ts"))
+		optWeightAnnealProgressTS = j["opt_weight_anneal_progress_ts"];
+
 	if (j.contains("run_id"))
 		runID = j["run_id"];
 
@@ -438,6 +587,12 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
+}
+
+void GGL::Learner::DebugScoreOptionality(const std::string& path) {
+	if (!config.ppo.useOptionality || !ppo->optionality)
+		RG_ERR_CLOSE("Learner::DebugScoreOptionality(): requires config.ppo.useOptionality");
+	ppo->optionality->DebugScoreStates(path, obsSize);
 }
 
 // Different than RLGym-PPO to show that they are not compatible
@@ -743,6 +898,11 @@ void GGL::Learner::Start() {
 			// (for mirror-consistent hindsight goal relabeling).
 			std::vector<int8_t> modeIds;
 			std::vector<uint8_t> mirrored;
+			// Frontier curriculum (Feature A): per-step shared physics snapshot — null on
+			// non-sampled steps, shared between all players of an arena. Empty when off.
+			std::vector<std::shared_ptr<const RLGC::FrontierSnapshot>> snapshots;
+			// Optionality (Feature D): per-step stratum flags (OPT_FLAG_*). Empty when off.
+			std::vector<uint8_t> stratumFlags;
 
 			void Clear() {
 				states.clear();
@@ -762,6 +922,8 @@ void GGL::Learner::Start() {
 				actions.clear();
 				modeIds.clear();
 				mirrored.clear();
+				snapshots.clear();
+				stratumFlags.clear();
 			}
 
 			void Append(const Trajectory& other) {
@@ -782,6 +944,8 @@ void GGL::Learner::Start() {
 				actions += other.actions;
 				modeIds += other.modeIds;
 				mirrored += other.mirrored;
+				snapshots += other.snapshots;
+				stratumFlags += other.stratumFlags;
 			}
 
 			size_t Length() const {
@@ -812,6 +976,10 @@ void GGL::Learner::Start() {
 				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
 			if (config.ppo.useSORS)
 				traj.sorsSteps.reserve(maxEpisodeLength);
+			if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
+				traj.snapshots.reserve(maxEpisodeLength);
+			if (config.ppo.useOptionality)
+				traj.stratumFlags.reserve(maxEpisodeLength);
 		}
 
 		// Scratch buffers reused across batches to avoid per-call realloc (owned by collector).
@@ -881,6 +1049,12 @@ void GGL::Learner::Start() {
 			int stepsCollected = 0;
 			// Live-player touch counts for the curriculum anneal competence gates
 			int touchCount = 0, highAirTouchCount = 0;
+			// Per-touch achieved contact stats for the adaptive targets (Feature C):
+			// resulting ball speed (gate-target analog) and ball-vel delta (StrongTouch's
+			// exact hitForce formula). Empty when both flags are off.
+			FList touchBallSpeeds, touchHitForces;
+			// Arena resets this batch (denominator for Frontier/Reset Fraction Actual)
+			int arenaResets = 0;
 			float collectionTime = 0, inferTime = 0, envStepTime = 0;
 		};
 
@@ -983,8 +1157,16 @@ void GGL::Learner::Start() {
 			out.stepsCollected = 0;
 			out.touchCount = 0;
 			out.highAirTouchCount = 0;
+			out.touchBallSpeeds.clear();
+			out.touchHitForces.clear();
+			out.arenaResets = 0;
 			out.inferTime = 0;
 			out.envStepTime = 0;
+
+			// Self-tuning curriculum collector hooks (all dead branches when off)
+			bool doFrontier = config.ppo.useFrontierResets && config.ppo.frontierBuffer && config.ppo.useGCRL;
+			bool doAdaptiveTargets = config.ppo.useAdaptiveGateTargetVel || config.ppo.useAdaptiveStrongTouchFloor;
+			bool doOptionality = config.ppo.useOptionality && config.ppo.useGCRL;
 
 			// Reset and pre-reserve the combined trajectory.
 			auto& combinedTraj = out.combinedTraj;
@@ -1011,6 +1193,10 @@ void GGL::Learner::Start() {
 				}
 				if (config.ppo.useSORS)
 					combinedTraj.sorsSteps.reserve(expTs);
+				if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
+					combinedTraj.snapshots.reserve(expTs);
+				if (config.ppo.useOptionality)
+					combinedTraj.stratumFlags.reserve(expTs);
 			}
 
 			auto& report = out.report;
@@ -1023,7 +1209,10 @@ void GGL::Learner::Start() {
 				// ── GCRL hindsight relabeling: per timestep pick a future ball state as ──
 				// the goal. goal/anti critics use the global ball (obs[0:6]); the car
 				// critic uses the car-local ball at carLocalBallOffset (layout-dependent).
-				if (config.ppo.useGCRL) {
+				// With useDifficultyHER (Feature B) relabeling is DEFERRED to one batched
+				// learner-thread pass over the combined batch (futureGoals stay empty here;
+				// they're only consumed at experience tensor creation and in Learn()).
+				if (config.ppo.useGCRL && !config.ppo.useDifficultyHER) {
 					int N = traj.Length();
 					int H = config.ppo.gcrlHorizon;
 					int minH = config.ppo.gcrlMinHorizon;
@@ -1169,6 +1358,19 @@ void GGL::Learner::Start() {
 					torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
 					if (!render) {
+						// Frontier snapshot capture (Feature A): at most one snapshot per arena
+						// per sampled step, shared between all of the arena's players. Taken
+						// here — before StepFirstHalf mutates the game states — so it matches
+						// the state this step's obs rows were built from (same reasoning as
+						// the mirror flag below).
+						std::vector<std::shared_ptr<const RLGC::FrontierSnapshot>> curArenaSnaps;
+						if (doFrontier && (step % RS_MAX(1, config.ppo.frontierSnapshotInterval) == 0)) {
+							curArenaSnaps.resize(envSet->arenas.size());
+							for (int arenaIdx = 0; arenaIdx < (int)envSet->arenas.size(); arenaIdx++)
+								curArenaSnaps[arenaIdx] = MakeFrontierSnapshot(
+									envSet->state.gameStates[arenaIdx], (int)envSet->arenas[arenaIdx]->gameMode);
+						}
+
 						for (int newPlayerIdx : newPlayerIndices) {
 							envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
 							envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
@@ -1180,6 +1382,10 @@ void GGL::Learner::Start() {
 							const Player& player = envSet->state.gameStates[arenaIdx].players[playerLocalIdx[newPlayerIdx]];
 							trajectories[newPlayerIdx].mirrored.push_back(
 								envSet->obsBuilders[arenaIdx]->IsObsMirroredX(player) ? 1 : 0);
+
+							if (doFrontier)
+								trajectories[newPlayerIdx].snapshots.push_back(
+									curArenaSnaps.empty() ? nullptr : curArenaSnaps[arenaIdx]);
 						}
 					}
 
@@ -1256,6 +1462,14 @@ void GGL::Learner::Start() {
 							out.touchCount++;
 							if (!player.isOnGround && gs.ball.pos.z >= 500)
 								out.highAirTouchCount++;
+
+							// Achieved contact stats for the adaptive targets (Feature C).
+							// gs.prev is null only on the first step after an arena reset;
+							// the hit force is StrongTouchReward's exact formula.
+							if (doAdaptiveTargets && gs.prev) {
+								out.touchBallSpeeds.push_back(gs.ball.vel.Length());
+								out.touchHitForces.push_back((gs.ball.vel - gs.prev->ball.vel).Length());
+							}
 						}
 					}
 
@@ -1361,6 +1575,39 @@ void GGL::Learner::Start() {
 							sorsStep.firstToBall = ownDist <= bestOppDist;
 							trajectories[newPlayerIdx].sorsSteps.push_back(sorsStep);
 						}
+
+						// Optionality stratum flags (Feature D): cheap CPU tags that mark which
+						// steps' achieved ball states qualify for the defensive/resource bank
+						// strata (plus the touch mask for Opt/Phi At Touch). Flags describe the
+						// post-step state, one step (~33ms) after the obs row they select — an
+						// acceptable approximation for goal-bank purposes.
+						if (doOptionality) {
+							int arenaIdx = playerArenaIdx[newPlayerIdx];
+							const GameState& gs = envSet->state.gameStates[arenaIdx];
+							const Player& player = gs.players[playerLocalIdx[newPlayerIdx]];
+							const Player* prevPlayer = player.prev;
+
+							uint8_t flags = 0;
+							if (player.ballTouchedStep)
+								flags |= OPT_FLAG_TOUCH;
+							if (!player.isDemoed) {
+								// Defensive: ball deeper toward own net than the car and in the
+								// defensive third, or car parked near its own net.
+								float s = (player.team == Team::BLUE) ? -1.0f : 1.0f;
+								Vec ownNet = (player.team == Team::BLUE) ?
+									CommonValues::BLUE_GOAL_CENTER : CommonValues::ORANGE_GOAL_CENTER;
+								bool ballBehind = (gs.ball.pos.y * s > player.pos.y * s) && (gs.ball.pos.y * s > OPT_DEFENSIVE_THIRD_Y);
+								if (ballBehind || player.pos.Dist(ownNet) < OPT_OWN_NET_RADIUS)
+									flags |= OPT_FLAG_DEFENSIVE;
+
+								// Resource: big-pad pickup (small pads give exactly 12) or
+								// supersonic with a healthy boost reserve.
+								bool bigPadPickup = prevPlayer && (player.boost - prevPlayer->boost > 12.5f);
+								if (bigPadPickup || (player.isSupersonic && player.boost >= 50))
+									flags |= OPT_FLAG_RESOURCE;
+							}
+							trajectories[newPlayerIdx].stratumFlags.push_back(flags);
+						}
 						i++;
 					}
 
@@ -1369,6 +1616,9 @@ void GGL::Learner::Start() {
 						uint8_t terminalType = envSet->state.terminals[idx];
 						if (!terminalType)
 							continue;
+
+						// These are exactly the arenas envSet->Reset() will reset next step
+						out.arenaResets++;
 
 						auto playerStartIdx = envSet->state.arenaPlayerStartIdx[idx];
 						int playersInArena = envSet->state.gameStates[idx].players.size();
@@ -1398,6 +1648,23 @@ void GGL::Learner::Start() {
 									float* ptr = traj.nextStates.data() + traj.nextStates.size() - obsSize;
 									ApplyObsNorm(ptr, 1, obsSize, _normOffset, _normInvStd);
 								}
+							}
+
+							// Frontier episode-return comparison (Feature A): on a real
+							// episode end (not a max-length truncation), bucket the episode
+							// return by the reset source that started it. A max-length
+							// truncation doesn't reset the arena, so the next episode keeps
+							// the previous tag — acceptable approximation.
+							if (doFrontier && terminalType != RLGC::TerminalType::TRUNCATED) {
+								int arenaIdx = playerArenaIdx[newPlayerIdx];
+								uint8_t tag = config.ppo.frontierBuffer->GetArenaTag(envSet->arenas[arenaIdx]);
+								double epReturn = 0;
+								for (float r : traj.rewards)
+									epReturn += r;
+								if (tag == RLGC::FrontierStateBuffer::TAG_FRONTIER)
+									report.AddAvg("Frontier/Episode Return (Frontier Resets)", epReturn);
+								else if (tag == RLGC::FrontierStateBuffer::TAG_KICKOFF)
+									report.AddAvg("Frontier/Episode Return (Kickoff Resets)", epReturn);
 							}
 
 							fnFinalizeTrajectory(traj);
@@ -1563,6 +1830,51 @@ void GGL::Learner::Start() {
 				report["Curriculum/High Air Touch Ratio EMA"] = (float)highAirTouchRatioEMA;
 			}
 
+			// ── Feature C: adaptive (ratcheted-quantile) targets ──
+			// Update the EMA histograms from this iteration's touch events, then ratchet each
+			// enabled target toward the configured quantile under the three stability rules:
+			// hold below min-samples (cold buffer can't move the seed), rise at most
+			// maxSlewPerIter, fall at most decayPerIter (default 0 = pure ratchet). The gate
+			// target is learner-side only; the StrongTouch floor is published to workers via
+			// the config atomic.
+			if (config.ppo.useAdaptiveGateTargetVel || config.ppo.useAdaptiveStrongTouchFloor) {
+				int nTouchSamples = (int)batch.touchHitForces.size(); // == touchBallSpeeds size
+				report["Adaptive/Touch Samples Per Iter"] = nTouchSamples;
+
+				// Decay+accumulate every iteration (sparse iterations decay correctly); the
+				// min-samples gate only controls whether the TARGET moves, not the histogram.
+				if (contactBallSpeedHist)
+					contactBallSpeedHist->Update(batch.touchBallSpeeds);
+				if (contactHitForceHist)
+					contactHitForceHist->Update(batch.touchHitForces);
+
+				auto fnRatchet = [&](double& cur, EMAHistogram* hist, float q) {
+					if (!hist || nTouchSamples < config.ppo.adaptiveTargetMinSamples)
+						return; // hold
+					double raw = hist->Quantile(q);
+					if (raw > cur)
+						cur = RS_MIN(raw, cur * (1.0 + config.ppo.adaptiveTargetMaxSlewPerIter));
+					else if (raw < cur)
+						cur = RS_MAX(raw, cur * (1.0 - config.ppo.adaptiveTargetDecayPerIter));
+				};
+
+				if (config.ppo.useAdaptiveGateTargetVel) {
+					fnRatchet(adaptiveGateTargetVel, contactBallSpeedHist, config.ppo.adaptiveGateTargetVelQuantile);
+					report["Adaptive/Gate Target Vel"] = (float)adaptiveGateTargetVel;
+					report["Adaptive/Contact Vel P70 (Raw)"] = contactBallSpeedHist ?
+						(float)contactBallSpeedHist->Quantile(config.ppo.adaptiveGateTargetVelQuantile) : 0.0f;
+				}
+				if (config.ppo.useAdaptiveStrongTouchFloor) {
+					fnRatchet(adaptiveStrongTouchFloor, contactHitForceHist, config.ppo.adaptiveStrongTouchFloorQuantile);
+					if (config.ppo.adaptiveStrongTouchFloorAtomic)
+						config.ppo.adaptiveStrongTouchFloorAtomic->store((float)adaptiveStrongTouchFloor, std::memory_order_relaxed);
+					report["Adaptive/StrongTouch Floor"] = (float)adaptiveStrongTouchFloor;
+					report["Adaptive/StrongTouch Floor KPH"] = (float)(adaptiveStrongTouchFloor / (250.0 / 9.0));
+					report["Adaptive/Hit Force P40 (Raw)"] = contactHitForceHist ?
+						(float)contactHitForceHist->Quantile(config.ppo.adaptiveStrongTouchFloorQuantile) : 0.0f;
+				}
+			}
+
 			// Like fnGetAnnealedRange, but progress is an accumulated counter that only advances
 			// while the competence EMA is at/above its gate (gate <= 0 -> always advances, which
 			// matches the old wall-clock behavior). Keeps curricula at full strength however long
@@ -1656,7 +1968,7 @@ void GGL::Learner::Start() {
 			// Refresh the own-goal target the anti critic's advantage queries
 			// (depends on obs standardization stats when standardizeObs is on)
 			if (config.ppo.useGCRL)
-				ppo->curGCRLAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
+				ppo->curGCRLAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
 
 			Timer consumptionTimer = {};
 			{ // Process timesteps
@@ -1679,6 +1991,145 @@ void GGL::Learner::Start() {
 					torch::Tensor tModeIds = torch::from_blob(
 						(void*)combinedTraj.modeIds.data(), { (int64_t)combinedTraj.modeIds.size() },
 						torch::TensorOptions().dtype(torch::kChar)).to(torch::kLong);
+
+					// LIVE goal-critic phi(s,a) over the whole batch — computed once, lazily,
+					// and shared by difficulty-HER (Feature B) and frontier scoring (Feature A).
+					torch::Tensor tSharedPhi;
+					auto fnGetSharedPhi = [&]() -> torch::Tensor {
+						if (!tSharedPhi.defined() && tActionComps.defined())
+							tSharedPhi = ppo->InferGCRLPhiEmbeddings(tStates, tActionComps);
+						return tSharedPhi;
+					};
+
+					// Per-step goal-critic terminal score [N], shared between the gate block
+					// (which already computes it) and the optionality offensive-stratum filter.
+					torch::Tensor tGoalScoreShared;
+
+					// Episode segment end per index (terminals[epEnd] != 0), shared by the
+					// HER pass and the frontier scan. Built only when a feature needs it.
+					int trajN = (int)combinedTraj.Length();
+					std::vector<int> epEndOf, epStartOf;
+					auto fnBuildEpBounds = [&]() {
+						if (!epEndOf.empty() || trajN == 0)
+							return;
+						epEndOf.resize(trajN);
+						epStartOf.resize(trajN);
+						for (int epStart = 0; epStart < trajN;) {
+							int epEnd = epStart;
+							while (epEnd < trajN - 1 && combinedTraj.terminals[epEnd] == 0)
+								epEnd++;
+							for (int i = epStart; i <= epEnd; i++) {
+								epEndOf[i] = epEnd;
+								epStartOf[i] = epStart;
+							}
+							epStart = epEnd + 1;
+						}
+					};
+
+					// ── Feature B: difficulty-aware HER (deferred batched relabel) ──
+					// Relabeling was skipped on the collector when useDifficultyHER is on; do it
+					// here in one batched pass. The uniform-floor branch reproduces today's
+					// sampling byte-for-byte; the candidate branch prefers goals near the middle
+					// of the batch distance distribution.
+					if (config.ppo.useGCRL && config.ppo.useDifficultyHER && trajN > 0 && tActionComps.defined()) {
+						RG_NO_GRAD;
+						fnBuildEpBounds();
+						const float* states = combinedTraj.states.data();
+						int H = config.ppo.gcrlHorizon, minH = config.ppo.gcrlMinHorizon;
+						int K = RS_MAX(1, config.ppo.herCandidates);
+						bool hasMirror = combinedTraj.mirrored.size() == (size_t)trajN;
+
+						std::vector<int> tTarget(trajN);
+						std::vector<int> candAnchors; candAnchors.reserve(trajN);
+						int uniformCount = 0;
+						for (int t = 0; t < trajN; t++) {
+							int lo = t + minH;
+							int hi = RS_MIN(t + H, epEndOf[t]);
+							if (hi <= lo) { tTarget[t] = hi; continue; } // degenerate (as today)
+							if (RocketSim::Math::RandFloat() < config.ppo.herUniformFraction) {
+								tTarget[t] = Math::RandInt(lo, hi + 1); // byte-identical uniform floor
+								uniformCount++;
+							} else {
+								tTarget[t] = -1;
+								candAnchors.push_back(t);
+							}
+						}
+
+						int Nsel = (int)candAnchors.size();
+						if (Nsel > 0) {
+							torch::Tensor tPhi = fnGetSharedPhi();
+							std::vector<int> candOffsets((size_t)Nsel * K);
+							FList candGoals((size_t)Nsel * K * 6);
+							for (int s = 0; s < Nsel; s++) {
+								int t = candAnchors[s];
+								int lo = t + minH;
+								int hi = RS_MIN(t + H, epEndOf[t]);
+								for (int k = 0; k < K; k++) {
+									int kt = Math::RandInt(lo, hi + 1);
+									candOffsets[(size_t)s * K + k] = kt;
+									bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[kt]);
+									float* dst = candGoals.data() + ((size_t)s * K + k) * 6;
+									for (int d = 0; d < 6; d++)
+										dst[d] = states[(size_t)kt * obsSize + d];
+									if (flip) { dst[0] = -dst[0]; dst[3] = -dst[3]; }
+								}
+							}
+							torch::Tensor tCandGoals = torch::tensor(candGoals).reshape({ (int64_t)Nsel * K, 6 });
+							torch::Tensor tCandPsi = ppo->InferGCRLPsiEmbeddings(tCandGoals);
+
+							torch::Tensor tAnchorIdx = torch::tensor(candAnchors, torch::TensorOptions().dtype(torch::kLong));
+							torch::Tensor phiSel = tPhi.index_select(0, tAnchorIdx);
+							torch::Tensor phiRep = phiSel.unsqueeze(1).expand({ Nsel, K, phiSel.size(1) }).reshape({ (int64_t)Nsel * K, -1 });
+							torch::Tensor d = -(phiRep * tCandPsi).sum(1) / config.ppo.gcrlTau; // [Nsel*K]
+
+							// Self-normalization: percentile within the batch's distance distribution
+							torch::Tensor sortedD = std::get<0>(d.sort());
+							torch::Tensor p = torch::searchsorted(sortedD, d).to(torch::kFloat32) / (float)(Nsel * K);
+							float sigma = RS_MAX(1e-3f, config.ppo.herDifficultySigma);
+							torch::Tensor w = torch::exp(-(p - 0.5f).square() / (2.0f * sigma * sigma)).reshape({ Nsel, K });
+							torch::Tensor chosen = torch::multinomial(w, 1).flatten(); // [Nsel] in [0, K)
+
+							torch::Tensor pSel = p.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).flatten();
+							report["HER/Selected Distance Percentile Mean"] = pSel.mean().item<float>();
+
+							torch::Tensor chosenCpu = chosen.to(torch::kCPU).contiguous();
+							const int64_t* chosenData = chosenCpu.data_ptr<int64_t>();
+							for (int s = 0; s < Nsel; s++)
+								tTarget[candAnchors[s]] = candOffsets[(size_t)s * K + (int)chosenData[s]];
+						}
+
+						// Write back futureGoals / carFutureGoals — verbatim port of the
+						// collector relabel flip logic; one t_target drives both arrays.
+						combinedTraj.futureGoals.resize((size_t)trajN * 6);
+						combinedTraj.carFutureGoals.resize((size_t)trajN * 6);
+						FList selectedOffsets; selectedOffsets.reserve(trajN);
+						for (int t = 0; t < trajN; t++) {
+							int tt = tTarget[t];
+							bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[tt]);
+							for (int d = 0; d < 6; d++)
+								combinedTraj.futureGoals[(size_t)t * 6 + d] = states[(size_t)tt * obsSize + d];
+							if (flip) {
+								combinedTraj.futureGoals[(size_t)t * 6 + 0] = -combinedTraj.futureGoals[(size_t)t * 6 + 0];
+								combinedTraj.futureGoals[(size_t)t * 6 + 3] = -combinedTraj.futureGoals[(size_t)t * 6 + 3];
+							}
+							if (carLocalBallOffset >= 0) {
+								for (int d = 0; d < 6; d++)
+									combinedTraj.carFutureGoals[(size_t)t * 6 + d] = states[(size_t)tt * obsSize + carLocalBallOffset + d];
+								if (flip) {
+									combinedTraj.carFutureGoals[(size_t)t * 6 + 1] = -combinedTraj.carFutureGoals[(size_t)t * 6 + 1];
+									combinedTraj.carFutureGoals[(size_t)t * 6 + 4] = -combinedTraj.carFutureGoals[(size_t)t * 6 + 4];
+								}
+							}
+							selectedOffsets.push_back((float)(tt - t));
+						}
+
+						torch::Tensor tOff = torch::tensor(selectedOffsets);
+						report["HER/Selected Offset Mean"] = tOff.mean().item<float>();
+						report["HER/Selected Offset P10"] = tOff.quantile(0.1).item<float>();
+						report["HER/Selected Offset P50"] = tOff.quantile(0.5).item<float>();
+						report["HER/Selected Offset P90"] = tOff.quantile(0.9).item<float>();
+						report["HER/Uniform Fraction Actual"] = trajN > 0 ? (float)uniformCount / trajN : 0.0f;
+					}
 
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
 					bool hasCurriculumRewards = !combinedTraj.curriculumRewards.empty();
@@ -1708,8 +2159,8 @@ void GGL::Learner::Start() {
 						torch::Tensor tNormalRewards = tGatedRewards + tScaledCurriculumRewards;
 						torch::Tensor tAerialRewards = tAerialGatedRewards + tScaledAerialCurriculumRewards;
 						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
-						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat);
-						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat);
+						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
 						torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
 							ppo,
 							tStates,
@@ -1722,6 +2173,7 @@ void GGL::Learner::Start() {
 						if (tTerminalScores.defined()) {
 							torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
 							torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
+							tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
 							torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
 							torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
 							torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
@@ -1793,6 +2245,84 @@ void GGL::Learner::Start() {
 						}
 					}
 
+					// ── Feature A: frontier reset curriculum (consistency scoring) ──
+					// Find timesteps where the goal critic contradicts itself (moving a few
+					// steps along the trajectory toward an achieved goal increases d), backtrack
+					// ~1s, and harvest the physics snapshot there. Runs after the gate (and after
+					// Feature B fills futureGoals). Snapshots must align 1:1 with states; if a
+					// just-enabled run drained pre-snapshot preserved trajectories the vectors
+					// would be shorter, so guard on the exact size.
+					if (config.ppo.useFrontierResets && config.ppo.frontierBuffer && config.ppo.useGCRL
+						&& tActionComps.defined() && trajN > 0
+						&& (int)combinedTraj.futureGoals.size() == trajN * 6
+						&& combinedTraj.snapshots.size() == (size_t)trajN) {
+						RG_NO_GRAD;
+						fnBuildEpBounds();
+
+						torch::Tensor tPhi = fnGetSharedPhi();
+						torch::Tensor tGoals = torch::tensor(combinedTraj.futureGoals).reshape({ trajN, 6 });
+						torch::Tensor tGoalsFlip = tGoals.clone();
+						tGoalsFlip.select(1, 0).neg_();
+						tGoalsFlip.select(1, 3).neg_();
+						torch::Tensor tPsiGoal = ppo->InferGCRLPsiEmbeddings(tGoals);
+						torch::Tensor tPsiGoalFlip = ppo->InferGCRLPsiEmbeddings(tGoalsFlip);
+
+						std::vector<int64_t> jIdx(trajN);
+						for (int t = 0; t < trajN; t++)
+							jIdx[t] = RS_MIN(t + FRONTIER_CONSISTENCY_STEP, epEndOf[t]);
+						torch::Tensor tJIdx = torch::tensor(jIdx, torch::TensorOptions().dtype(torch::kLong));
+
+						// Anchor-t's goal re-expressed in step-j's mirror frame (same
+						// normalized-x-negation argument as the relabeler).
+						bool hasMirror = combinedTraj.mirrored.size() == (size_t)trajN;
+						torch::Tensor psiG_j = tPsiGoal;
+						if (hasMirror) {
+							std::vector<uint8_t> fm(trajN);
+							for (int t = 0; t < trajN; t++)
+								fm[t] = (combinedTraj.mirrored[t] != combinedTraj.mirrored[jIdx[t]]) ? 1 : 0;
+							torch::Tensor flipMask = torch::from_blob(fm.data(), { trajN },
+								torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool).unsqueeze(1);
+							psiG_j = torch::where(flipMask, tPsiGoalFlip, tPsiGoal);
+						}
+
+						float tau = config.ppo.gcrlTau;
+						torch::Tensor d_t = -(tPhi * tPsiGoal).sum(1) / tau;
+						torch::Tensor phi_j = tPhi.index_select(0, tJIdx);
+						torch::Tensor d_j = -(phi_j * psiG_j).sum(1) / tau;
+						torch::Tensor score = torch::relu(d_j - d_t); // [N]
+
+						float thresh = score.quantile(config.ppo.frontierSpikePercentile).item<float>();
+						report["Frontier/Mean Uncertainty Score"] = score.mean().item<float>();
+						report["Frontier/Spike Threshold"] = thresh;
+
+						torch::Tensor scoreCpu = score.to(torch::kCPU).contiguous();
+						const float* scoreData = scoreCpu.data_ptr<float>();
+						int inserts = 0;
+						for (int t = 0; t < trajN && inserts < FRONTIER_MAX_INSERTS_PER_ITER; t++) {
+							if (!(scoreData[t] > thresh) || scoreData[t] <= 0)
+								continue;
+							int target = RS_MAX(epStartOf[t], t - config.ppo.frontierBacktrackSteps);
+							int floor = RS_MAX(epStartOf[t], target - 2 * RS_MAX(1, config.ppo.frontierSnapshotInterval));
+							for (int idx = target; idx >= floor; idx--) {
+								const auto& snap = combinedTraj.snapshots[idx];
+								if (!snap)
+									continue;
+								if (RLGC::FrontierStateBuffer::PassesSanityFilter(*snap)) {
+									config.ppo.frontierBuffer->Insert(*snap);
+									inserts++;
+								}
+								break; // first non-null snapshot at/below target
+							}
+						}
+
+						report["Frontier/Candidates Per Iter"] = inserts;
+						report["Frontier/Buffer Fill"] = (double)config.ppo.frontierBuffer->Size();
+						uint64_t fRes = config.ppo.frontierBuffer->frontierResets.exchange(0, std::memory_order_relaxed);
+						uint64_t fbRes = config.ppo.frontierBuffer->fallbackResets.exchange(0, std::memory_order_relaxed);
+						report["Frontier/Fallback Resets"] = (double)fbRes;
+						report["Frontier/Reset Fraction Actual"] = batch.arenaResets > 0 ? (double)fRes / batch.arenaResets : 0.0;
+					}
+
 					if (config.ppo.useSORS && tActionComps.defined()) {
 						torch::Tensor tSORSRewards;
 						if (ppo->device.is_cpu()) {
@@ -1815,6 +2345,162 @@ void GGL::Learner::Start() {
 							report["SORS/Avg Reward"] = tSORSRewards.mean().item<float>();
 							report["SORS/Avg Abs Reward"] = tSORSRewards.abs().mean().item<float>();
 							tRewards = tRewards + tSORSRewards * ppo->curSORSRewardScale;
+						}
+					}
+
+					// ── Feature D: optionality potential shaping ──
+					// Polyak the frozen scorer, refresh the stratified goal bank, compute
+					// phi_opt over the batch, and inject the masked potential delta into
+					// tRewards — AFTER all multiplicative gating (it is never gated) and
+					// BEFORE GAE (it flows through the normal value/GAE path, not as an
+					// advantage stream). Burn-in injects zero while the normalizer seeds.
+					if (config.ppo.useOptionality && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
+						RG_NO_GRAD;
+						GCRLOptionality* opt = ppo->optionality;
+
+						// 1. Polyak the frozen scorer toward the live nets
+						opt->PolyakUpdate(
+							dynamic_cast<QuasimetricCritic*>(ppo->models["goal_critic"]), ppo->models["shared_head"]);
+
+						// 2. Build stratified candidate ball-goal rows (obs space, canonicalized
+						// to the unmirrored frame so phi_opt's frame-symmetry holds).
+						auto fnPushBankRow = [&](RLGC::FList& dst, int t) {
+							const float* src = combinedTraj.states.data() + (size_t)t * obsSize;
+							float row[6];
+							for (int d = 0; d < 6; d++)
+								row[d] = src[d];
+							if (combinedTraj.mirrored.size() == (size_t)trajN && combinedTraj.mirrored[t]) {
+								row[0] = -row[0];
+								row[3] = -row[3];
+							}
+							dst.insert(dst.end(), row, row + 6);
+						};
+
+						RLGC::FList candRows[GCRLOptionality::STRATUM_AMOUNT];
+
+						// Offensive: achieved ball goals in the top half of goal-critic terminal
+						// score (commitment bias / hover guard). Reuse the gate's score or
+						// compute it standalone when the gate didn't run.
+						torch::Tensor goalScore = tGoalScoreShared;
+						if (!goalScore.defined()) {
+							torch::Tensor gRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+							torch::Tensor aRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
+							torch::Tensor ts = InferGCRLTerminalScoresBatched(ppo, tStates, tActionComps, gRow, aRow, trajN);
+							if (ts.defined())
+								goalScore = ts.select(1, 0);
+						}
+
+						// Reservoir sampler so each stratum draws an unbiased subset under its cap
+						auto fnReservoir = [&](std::vector<int>& res, int& seen, int t, int cap) {
+							seen++;
+							if ((int)res.size() < cap)
+								res.push_back(t);
+							else {
+								int j = Math::RandInt(0, seen);
+								if (j < cap)
+									res[j] = t;
+							}
+						};
+
+						std::vector<int> offSel, defSel, resSel;
+						int offSeen = 0, defSeen = 0, resSeen = 0;
+						float goalMedian = goalScore.defined() ? goalScore.median().item<float>() : 0.0f;
+						torch::Tensor goalScoreCpu = goalScore.defined() ? goalScore.to(torch::kCPU).contiguous() : torch::Tensor();
+						const float* goalScoreData = goalScore.defined() ? goalScoreCpu.data_ptr<float>() : nullptr;
+						bool hasFlags = combinedTraj.stratumFlags.size() == (size_t)trajN;
+						for (int t = 0; t < trajN; t++) {
+							if (goalScoreData && goalScoreData[t] >= goalMedian)
+								fnReservoir(offSel, offSeen, t, OPT_MAX_CANDS_PER_STRATUM);
+							if (hasFlags) {
+								if (combinedTraj.stratumFlags[t] & OPT_FLAG_DEFENSIVE)
+									fnReservoir(defSel, defSeen, t, OPT_MAX_CANDS_PER_STRATUM);
+								if (combinedTraj.stratumFlags[t] & OPT_FLAG_RESOURCE)
+									fnReservoir(resSel, resSeen, t, OPT_MAX_CANDS_PER_STRATUM);
+							}
+						}
+						for (int t : offSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_OFFENSIVE], t);
+						for (int t : defSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_DEFENSIVE], t);
+						for (int t : resSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_RESOURCE], t);
+
+						// Optionally top up the defensive stratum from the frontier buffer
+						// (states already at the competence frontier in own-net regions).
+						if (config.ppo.frontierBuffer && (int)config.ppo.frontierBuffer->Size() >= config.ppo.frontierBufferMinFill) {
+							int extra = OPT_MAX_CANDS_PER_STRATUM / 2;
+							for (int i = 0; i < extra; i++) {
+								RLGC::FrontierSnapshot snap;
+								if (!config.ppo.frontierBuffer->Sample(snap))
+									break;
+								// Defensive third in the canonical (blue) frame: ball deep at y < 0
+								if (snap.ball.pos.y < -OPT_DEFENSIVE_THIRD_Y) {
+									float row[6];
+									MakeObsSpaceBallRow(snap.ball, false, config, obsStat, row);
+									candRows[GCRLOptionality::STRATUM_DEFENSIVE].insert(
+										candRows[GCRLOptionality::STRATUM_DEFENSIVE].end(), row, row + 6);
+								}
+							}
+						}
+
+						// 3. Refresh the bank (FIFO per stratum) + re-embed under the frozen psi
+						opt->RefreshBank(candRows, (int64_t)totalIterations, report);
+
+						// 4. phi_opt over the batch
+						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates); // [N] cpu, or {} if bank empty
+						if (phiOpt.defined()) {
+							report["Opt/Phi Mean"] = phiOpt.mean().item<float>();
+							report["Opt/Phi Std"] = phiOpt.std(false).item<float>();
+							if (hasFlags) {
+								std::vector<uint8_t> touchMask(trajN);
+								for (int t = 0; t < trajN; t++)
+									touchMask[t] = (combinedTraj.stratumFlags[t] & OPT_FLAG_TOUCH) ? 1 : 0;
+								torch::Tensor tTouch = torch::from_blob(touchMask.data(), { trajN },
+									torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool);
+								if (tTouch.any().item<bool>())
+									report["Opt/Phi At Touch"] = phiOpt.masked_select(tTouch).mean().item<float>();
+							}
+
+							// 5. Masked potential delta + running normalizer
+							torch::Tensor rOptRaw = GCRLOptionality::MaskedPotentialDelta(
+								phiOpt, combinedTraj.terminals.data(), trajN, config.ppo.gaeGamma);
+							double batchMean = rOptRaw.mean().item<double>();
+							double batchVar = rOptRaw.var(false).item<double>();
+							constexpr double OPT_NORM_DECAY = 0.999;
+							optRewardMeanEMA = OPT_NORM_DECAY * optRewardMeanEMA + (1 - OPT_NORM_DECAY) * batchMean;
+							optRewardVarEMA = OPT_NORM_DECAY * optRewardVarEMA + (1 - OPT_NORM_DECAY) * batchVar;
+							double normStd = std::sqrt(optRewardVarEMA + 1e-8);
+
+							// 6. Weight schedule + interlock
+							float effectiveOptWeight = fnGetGatedAnnealedRange(
+								config.ppo.optWeight, config.ppo.optWeightFinal,
+								-1, config.ppo.optAnnealSteps,
+								optWeightAnnealStartTS, optWeightAnnealProgressTS,
+								config.ppo.curriculumAnnealTouchRatioGate, touchRatioEMA);
+							bool interlock = ppo->curGCRLAdvScale >= 0.5f;
+							if (interlock)
+								effectiveOptWeight *= 0.5f;
+							report["Opt/Interlock Active"] = interlock ? 1.0 : 0.0;
+
+							bool burnIn = optBurnInItersDone < config.ppo.optBurnInIters;
+							optBurnInItersDone++;
+
+							torch::Tensor injected = rOptRaw * (effectiveOptWeight / (float)normStd);
+							report["Opt/Reward Std (pre-norm)"] = (float)std::sqrt(RS_MAX(batchVar, 0.0));
+							report["Opt/Effective Weight"] = burnIn ? 0.0f : effectiveOptWeight;
+							report["Opt/Reward Mean"] = burnIn ? 0.0f : injected.mean().item<float>();
+							float meanAbsTotal = tRewards.abs().mean().item<float>();
+							report["Opt/Reward Share"] = (!burnIn && meanAbsTotal > 1e-8f)
+								? injected.abs().mean().item<float>() / meanAbsTotal : 0.0f;
+
+							// Hover monitor: Pearson(rOpt, curriculum reward — dominant term is the chase reward)
+							if (combinedTraj.curriculumRewards.size() == (size_t)trajN) {
+								torch::Tensor tChase = torch::tensor(combinedTraj.curriculumRewards);
+								torch::Tensor a = rOptRaw - rOptRaw.mean();
+								torch::Tensor b = tChase - tChase.mean();
+								float denom = (a.norm() * b.norm()).item<float>();
+								report["Opt/Corr With Chase"] = denom > 1e-8f ? (a * b).sum().item<float>() / denom : 0.0f;
+							}
+
+							if (!burnIn)
+								tRewards = tRewards + injected;
 						}
 					}
 
@@ -2010,6 +2696,19 @@ void GGL::Learner::Start() {
 						"Curriculum/Touch Ratio EMA",
 						"Aerial Curriculum/Scale",
 						"Curriculum/High Air Touch Ratio EMA",
+						"",
+						"Frontier/Buffer Fill",
+						"Frontier/Candidates Per Iter",
+						"Frontier/Reset Fraction Actual",
+						"HER/Selected Offset P50",
+						"HER/Uniform Fraction Actual",
+						"Adaptive/Gate Target Vel",
+						"Adaptive/StrongTouch Floor",
+						"Adaptive/Touch Samples Per Iter",
+						"Opt/Phi Mean",
+						"Opt/Reward Share",
+						"Opt/Effective Weight",
+						"Opt/Interlock Active",
 						"SORS/Reward Scale",
 						"SORS/Loss",
 						"SORS/Pair Accuracy",
@@ -2041,5 +2740,7 @@ GGL::Learner::~Learner() {
 	delete envSet;
 	delete returnStats;
 	delete obsStat;
+	delete contactBallSpeedHist;
+	delete contactHitForceHist;
 	pybind11::finalize_interpreter();
 }

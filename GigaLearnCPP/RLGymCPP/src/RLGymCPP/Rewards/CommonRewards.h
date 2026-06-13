@@ -6,6 +6,7 @@
 #include <memory>
 #include <cfloat>
 #include <cmath>
+#include <atomic>
 
 namespace RLGC {
 
@@ -798,7 +799,12 @@ namespace RLGC {
 	class StrongTouchReward : public Reward {
 	public:
 		float minRewardedVel, maxRewardedVel;
-		StrongTouchReward(float minSpeedKPH = 20, float maxSpeedKPH = 130) {
+		// Optional adaptive floor (uu/s), published once per iteration by the learner
+		// (Feature C). NULL -> the constructor threshold is used, byte-identical behavior.
+		// Raw pointer to a user-owned atomic, matching the codebase's userInfo convention.
+		const std::atomic<float>* minVelOverride;
+		StrongTouchReward(float minSpeedKPH = 20, float maxSpeedKPH = 130, const std::atomic<float>* minVelOverride = nullptr)
+			: minVelOverride(minVelOverride) {
 			minRewardedVel = RLGC::Math::KPHToVel(minSpeedKPH);
 			maxRewardedVel = RLGC::Math::KPHToVel(maxSpeedKPH);
 		}
@@ -809,7 +815,8 @@ namespace RLGC {
 
 			if (player.ballTouchedStep) {
 				float hitForce = (state.ball.vel - state.prev->ball.vel).Length();
-				if (hitForce < minRewardedVel)
+				float minVel = minVelOverride ? minVelOverride->load(std::memory_order_relaxed) : minRewardedVel;
+				if (hitForce < minVel)
 					return 0;
 
 				return RS_MIN(1, hitForce / maxRewardedVel);

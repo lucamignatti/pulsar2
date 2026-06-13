@@ -1,4 +1,5 @@
 #include "PPOLearner.h"
+#include "GCRLOptionality.h"
 
 #include <torch/nn/utils/convert_parameters.h>
 #include <torch/nn/utils/clip_grad.h>
@@ -32,6 +33,15 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.useGCRLRewardGate && !config.useGCRL)
 		RG_ERR_CLOSE("PPOLearner: useGCRLRewardGate requires useGCRL");
 
+	// The self-tuning curriculum features all score with the GCRL embedding nets
+	if ((config.useFrontierResets || config.useDifficultyHER || config.useOptionality) && !config.useGCRL)
+		RG_ERR_CLOSE("PPOLearner: useFrontierResets/useDifficultyHER/useOptionality require useGCRL");
+
+	// ENSEMBLE is a planned fallback (extra phi/psi heads) — error instead of silently
+	// no-opping if it's ever selected before being implemented.
+	if (config.useFrontierResets && config.frontierUncertaintyMode == PPOLearnerConfig::FrontierUncertaintyMode::ENSEMBLE)
+		RG_ERR_CLOSE("PPOLearner: frontierUncertaintyMode ENSEMBLE is not implemented; use CONSISTENCY");
+
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
 
@@ -59,6 +69,17 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		models.Add(makeGCRLCritic("goal_critic"));
 		models.Add(makeGCRLCritic("anti_critic"));
 		models.Add(makeGCRLCritic("car_critic"));
+
+		// Optionality shaping (Feature D): self-test the math, then build the frozen
+		// scorer as a copy of the freshly-made goal critic. After a checkpoint load the
+		// Learner re-syncs it via PolyakUpdate-from-loaded-weights (see Learner::Load).
+		if (config.useOptionality) {
+			GCRLOptionality::RunSelfTests();
+			optionality = new GCRLOptionality(
+				config, featureDim,
+				dynamic_cast<QuasimetricCritic*>(models["goal_critic"]), models["shared_head"],
+				device);
+		}
 	}
 
 	if (config.useSORS) {
@@ -190,6 +211,49 @@ torch::Tensor GGL::PPOLearner::InferGCRLTerminalScores(torch::Tensor obs, torch:
 	auto qGoal = gcGoal->score_q(obs, actionComps, goalTargets).flatten();
 	auto qAnti = gcAnti->score_q(obs, actionComps, antiTargets).flatten();
 	return torch::stack({ qGoal, qAnti }, 1);
+}
+
+torch::Tensor GGL::PPOLearner::InferGCRLPhiEmbeddings(torch::Tensor obs, torch::Tensor actionComps) {
+	if (!config.useGCRL || !models["goal_critic"])
+		return {};
+
+	torch::NoGradGuard noGrad;
+
+	auto* gcGoal = dynamic_cast<QuasimetricCritic*>(models["goal_critic"]);
+	RG_ASSERT(gcGoal);
+
+	int64_t N = obs.size(0);
+	torch::Tensor out = torch::empty({ N, (int64_t)config.gcrlReprDim });
+	int64_t step = device.is_cpu() ? N : (int64_t)config.miniBatchSize;
+	for (int64_t i = 0; i < N; i += step) {
+		int64_t start = i, end = RS_MIN(i + step, N);
+		torch::Tensor o = obs.slice(0, start, end).to(device, RG_H2D_NONBLOCKING(device), true);
+		torch::Tensor a = actionComps.slice(0, start, end).to(device, RG_H2D_NONBLOCKING(device), true);
+		if (models["shared_head"])
+			o = models["shared_head"]->Forward(o, config.useHalfPrecision);
+		out.slice(0, start, end).copy_(gcGoal->embed_phi(o, a).cpu(), true);
+	}
+	return out;
+}
+
+torch::Tensor GGL::PPOLearner::InferGCRLPsiEmbeddings(torch::Tensor goals) {
+	if (!config.useGCRL || !models["goal_critic"])
+		return {};
+
+	torch::NoGradGuard noGrad;
+
+	auto* gcGoal = dynamic_cast<QuasimetricCritic*>(models["goal_critic"]);
+	RG_ASSERT(gcGoal);
+
+	int64_t N = goals.size(0);
+	torch::Tensor out = torch::empty({ N, (int64_t)config.gcrlReprDim });
+	int64_t step = device.is_cpu() ? N : (int64_t)config.miniBatchSize;
+	for (int64_t i = 0; i < N; i += step) {
+		int64_t start = i, end = RS_MIN(i + step, N);
+		torch::Tensor g = goals.slice(0, start, end).to(device, RG_H2D_NONBLOCKING(device), true);
+		out.slice(0, start, end).copy_(gcGoal->embed_psi(g).cpu(), true);
+	}
+	return out;
 }
 
 torch::Tensor GGL::PPOLearner::InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps) {
@@ -909,6 +973,12 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 
 	models.Load(folderPath, true, true);
 	LoadPPOState(folderPath);
+
+	// The frozen optionality scorer was copied from the FRESH goal critic in the ctor;
+	// re-sync it to the just-loaded weights (the targets themselves aren't checkpointed).
+	if (optionality)
+		optionality->HardSyncFromLive(
+			dynamic_cast<QuasimetricCritic*>(models["goal_critic"]), models["shared_head"]);
 
 	SetLearningRates(config.policyLR, config.criticLR);
 }

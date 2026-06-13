@@ -262,19 +262,22 @@ GGL::QuasimetricCritic::QuasimetricCritic(
 	optim = MakeOptimizer(optimType, this->parameters(), 0);
 }
 
-std::pair<torch::Tensor, torch::Tensor> GGL::QuasimetricCritic::embed(
-	torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {
-
+torch::Tensor GGL::QuasimetricCritic::embed_phi(torch::Tensor obs, torch::Tensor actions) {
 	auto sa_input = torch::cat({obs, actions.to(torch::kFloat32).to(obs.device())}, -1);
 	auto sa_raw = phi_net->forward(sa_input);
+	return torch::nn::functional::normalize(sa_raw,
+		torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+}
+
+torch::Tensor GGL::QuasimetricCritic::embed_psi(torch::Tensor goals) {
 	auto g_raw = psi_net->forward(goals.to(torch::kFloat32));
-
-	auto sa_emb = torch::nn::functional::normalize(sa_raw,
+	return torch::nn::functional::normalize(g_raw,
 		torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
-	auto g_emb = torch::nn::functional::normalize(g_raw,
-		torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+}
 
-	return {sa_emb, g_emb};
+std::pair<torch::Tensor, torch::Tensor> GGL::QuasimetricCritic::embed(
+	torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {
+	return {embed_phi(obs, actions), embed_psi(goals)};
 }
 
 torch::Tensor GGL::QuasimetricCritic::forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals) {

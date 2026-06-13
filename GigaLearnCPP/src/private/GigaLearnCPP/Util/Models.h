@@ -225,6 +225,11 @@ namespace GGL {
 			torch::Device device
 		);
 
+		// Single-tower embeddings (both L2-normalized). Split out so batched inference
+		// passes (gate scoring, HER candidate scoring, frontier consistency, optionality)
+		// can run one tower without paying for the other; embed() composes them.
+		torch::Tensor embed_phi(torch::Tensor obs, torch::Tensor actions);
+		torch::Tensor embed_psi(torch::Tensor goals);
 		std::pair<torch::Tensor, torch::Tensor> embed(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
 		torch::Tensor forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
 		torch::Tensor score_q(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);

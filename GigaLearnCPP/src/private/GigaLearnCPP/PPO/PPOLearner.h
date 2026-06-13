@@ -51,6 +51,11 @@ namespace GGL {
 		std::deque<SORSWindow> sorsReplay;
 		int64_t sorsTrainCalls = 0;
 
+		// Optionality shaping (Feature D): frozen scorer + stratified goal bank.
+		// Constructed only when config.useOptionality; its target nets live outside
+		// `models`, so they get no optimizer, no checkpoint files, and no training.
+		class GCRLOptionality* optionality = nullptr;
+
 		PPOLearnerConfig config;
 		torch::Device device;
 
@@ -71,6 +76,11 @@ namespace GGL {
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		torch::Tensor InferGCRLTerminalScores(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets);
+		// Batched no-grad embedding inference on the LIVE goal critic, used by the
+		// difficulty-HER sampler and the frontier consistency scorer. CPU in, CPU out
+		// ([N, gcrlReprDim], L2-normalized), minibatched on the training device.
+		torch::Tensor InferGCRLPhiEmbeddings(torch::Tensor obs, torch::Tensor actionComps);
+		torch::Tensor InferGCRLPsiEmbeddings(torch::Tensor goals);
 		torch::Tensor InferSORSRewards(torch::Tensor obs, torch::Tensor actionComps);
 		void AddSORSWindows(std::vector<SORSWindow>&& windows);
 		void TrainSORS(Report& report);

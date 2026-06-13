@@ -9,10 +9,24 @@
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
+#include <RLGymCPP/StateSetters/FrontierState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
+
+#include <atomic>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
+
+// ── Self-tuning curriculum shared state ──
+// Created in main() before the Learner (EnvCreateFunc runs inside the Learner ctor),
+// raw pointers/globals like `resetInfo`. All inert unless the matching flag is set.
+static RLGC::FrontierStateBuffer* g_FrontierBuffer = nullptr; // Feature A buffer (also fed to PPO config)
+static float g_FrontierResetFraction = 0;
+static int g_FrontierBufferMinFill = 256;
+// Feature C: worker-read adaptive StrongTouch floor, seeded at the reward's hand value
+// (20 kph). The learner publishes the ratcheted value here once per iteration.
+static std::atomic<float> g_StrongTouchMinVel{ RLGC::Math::KPHToVel(20) };
+static bool g_UseAdaptiveStrongTouchFloor = false;
 
 struct EnvResetInfo {
 	bool isKickoffReset = true;
@@ -23,13 +37,20 @@ public:
 	StateSetter* child;
 	EnvResetInfo* resetInfo;
 	bool isKickoffReset;
+	// Optional frontier reset-source tagging (Feature A episode-return metric); NULL = off.
+	FrontierStateBuffer* frontierBuffer;
+	uint8_t frontierTag;
 
-	ResetModeStateSetter(StateSetter* child, EnvResetInfo* resetInfo, bool isKickoffReset) :
-		child(child), resetInfo(resetInfo), isKickoffReset(isKickoffReset) {
+	ResetModeStateSetter(StateSetter* child, EnvResetInfo* resetInfo, bool isKickoffReset,
+		FrontierStateBuffer* frontierBuffer = nullptr, uint8_t frontierTag = FrontierStateBuffer::TAG_NONE) :
+		child(child), resetInfo(resetInfo), isKickoffReset(isKickoffReset),
+		frontierBuffer(frontierBuffer), frontierTag(frontierTag) {
 	}
 
 	virtual void ResetArena(Arena* arena) override {
 		resetInfo->isKickoffReset = isKickoffReset;
+		if (frontierBuffer && frontierTag != FrontierStateBuffer::TAG_NONE)
+			frontierBuffer->TagArenaReset(arena, frontierTag);
 		child->ResetArena(arena);
 	}
 };
@@ -127,7 +148,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Ground/contact rewards are filtered by GCRL terminal progress.
 		// Back to 90 (from 60): the floorless sigmoid gate means ~0.5x expected multiplier,
 		// so 90 x 0.5 ≈ the healthy run g7jf6cwc's effective 90 x 0.6-with-floor.
-		{ new ZeroSumReward(new StrongTouchReward(20, 100), TEAM_SPIRIT, 0.0f), 90.f }
+		{ new ZeroSumReward(new StrongTouchReward(20, 100,
+			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
+
+		// Small energy reward: encourages speed, boost, flip availability, and forward velocity.
+		// GCRL-gated so it only pays when the agent is making terminal progress.
+		{ new EnergyReward(), 1.0f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
@@ -190,10 +216,27 @@ EnvCreateResult EnvCreateFunc(int index) {
 	// ~0.010 in ryp4gxwv), and random states are the data source for defensive and
 	// high-ball positions -- with 100% kickoffs the bot never spawned behind the ball
 	// facing a threat, so saves/defense had no training data.
-	result.stateSetter = new CombinedState({
-		{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
-		{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
-	});
+	// Feature A: when the frontier buffer exists, route frontierResetFraction of resets to
+	// FrontierState (sampling learner-harvested critic-uncertainty states; RandomState
+	// fallback below min fill), splitting the remainder across the existing kickoff/random
+	// mix. When it's null, build exactly today's two-entry tree (bit-identical off-path).
+	if (g_FrontierBuffer) {
+		float f = g_FrontierResetFraction;
+		result.stateSetter = new CombinedState({
+			{ new ResetModeStateSetter(new KickoffState(), resetInfo, true,
+				g_FrontierBuffer, FrontierStateBuffer::TAG_KICKOFF), 0.80f * (1 - f) },
+			{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false,
+				g_FrontierBuffer, FrontierStateBuffer::TAG_RANDOM), 0.20f * (1 - f) },
+			{ new ResetModeStateSetter(
+				new FrontierState(g_FrontierBuffer, new RandomState(true, true, false), g_FrontierBufferMinFill),
+				resetInfo, false), f }
+		});
+	} else {
+		result.stateSetter = new CombinedState({
+			{ new ResetModeStateSetter(new KickoffState(), resetInfo, true), 0.80f },
+			{ new ResetModeStateSetter(new RandomState(true, true, false), resetInfo, false), 0.20f }
+		});
+	}
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
@@ -247,6 +290,14 @@ int main(int argc, char* argv[]) {
 	// Initialize RocketSim with collision meshes
 	// Change this path to point to your meshes!
 	RocketSim::Init("collision_meshes");
+
+	// Feature D offline harness: `--score-opt <file>` loads the checkpoint, scores the
+	// hand-supplied states in <file> through the frozen optionality scorer, prints
+	// phi_opt per row, and exits. Requires useOptionality (set below).
+	std::string scoreOptPath;
+	for (int i = 1; i + 1 < argc; i++)
+		if (std::string(argv[i]) == "--score-opt")
+			scoreOptPath = argv[i + 1];
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
@@ -375,6 +426,27 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.curriculumAnnealTouchRatioGate = 0.006f;
 	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0002f;
 
+	// ── Self-tuning curriculum (all OFF by default; flip one line to trial each) ──
+	// A: uncertainty-triggered frontier resets. B: difficulty-aware HER goal sampling.
+	// C: adaptive ratcheted-quantile gate target / StrongTouch floor. D: optionality
+	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
+	cfg.ppo.useFrontierResets = false;          // Feature A
+	cfg.ppo.useDifficultyHER = false;           // Feature B
+	cfg.ppo.useAdaptiveGateTargetVel = false;   // Feature C.1
+	cfg.ppo.useAdaptiveStrongTouchFloor = false;// Feature C.2
+	cfg.ppo.useOptionality = false;             // Feature D
+
+	if (cfg.ppo.useFrontierResets) {
+		g_FrontierBuffer = new RLGC::FrontierStateBuffer(cfg.ppo.frontierBufferSize);
+		cfg.ppo.frontierBuffer = g_FrontierBuffer;
+		g_FrontierResetFraction = cfg.ppo.frontierResetFraction;
+		g_FrontierBufferMinFill = cfg.ppo.frontierBufferMinFill;
+	}
+	if (cfg.ppo.useAdaptiveStrongTouchFloor) {
+		g_UseAdaptiveStrongTouchFloor = true;
+		cfg.ppo.adaptiveStrongTouchFloorAtomic = &g_StrongTouchMinVel;
+	}
+
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;
 	cfg.ppo.sorsRewardScaleAnnealStart = -1; // Train SORS immediately, but delay reward influence
@@ -466,6 +538,11 @@ int main(int argc, char* argv[]) {
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
+
+	if (!scoreOptPath.empty()) {
+		learner->DebugScoreOptionality(scoreOptPath);
+		return EXIT_SUCCESS;
+	}
 
 	// Start learning!
 	learner->Start();

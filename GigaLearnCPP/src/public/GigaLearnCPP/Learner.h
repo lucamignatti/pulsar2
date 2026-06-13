@@ -57,7 +57,8 @@ namespace GGL {
 			gcrlAerialRewardGateAnnealStartTS = UINT64_MAX,
 			curriculumRewardAnnealStartTS = UINT64_MAX,
 			aerialCurriculumRewardAnnealStartTS = UINT64_MAX,
-			sorsRewardScaleAnnealStartTS = UINT64_MAX;
+			sorsRewardScaleAnnealStartTS = UINT64_MAX,
+			optWeightAnnealStartTS = UINT64_MAX;
 
 		// Competence-gated anneal state: the progress counters only advance while the matching
 		// EMA is at/above its configured gate (see PPOLearnerConfig), so curricula hold full
@@ -67,8 +68,24 @@ namespace GGL {
 			curriculumAnnealProgressTS = 0,
 			aerialCurriculumAnnealProgressTS = 0,
 			gcrlRewardGateAnnealProgressTS = 0,
-			gcrlAerialRewardGateAnnealProgressTS = 0;
+			gcrlAerialRewardGateAnnealProgressTS = 0,
+			optWeightAnnealProgressTS = 0;
 		double touchRatioEMA = 0, highAirTouchRatioEMA = 0;
+
+		// Feature C: adaptive (ratcheted-quantile) targets. Seeded in the ctor at today's
+		// hand constants (gate target vel from config; StrongTouch floor from the user
+		// atomic's initial value, i.e. the reward's constructor threshold), persisted in
+		// RUNNING_STATS.json so crash-restarts don't replay the slew climb. Learner-thread
+		// only; the floor is published to workers through the config atomic once per iter.
+		double adaptiveGateTargetVel = -1, adaptiveStrongTouchFloor = -1;
+		struct EMAHistogram* contactBallSpeedHist = nullptr;
+		struct EMAHistogram* contactHitForceHist = nullptr;
+
+		// Feature D: rOpt normalizer EMA + burn-in counter (persisted — a restart must not
+		// re-run the burn-in or cold-start the normalizer; the bank/target nets refill/
+		// re-sync instead).
+		double optRewardMeanEMA = 0, optRewardVarEMA = 1;
+		int64_t optBurnInItersDone = 0;
 
 		StepCallbackFn stepCallback = NULL;
 
@@ -83,6 +100,11 @@ namespace GGL {
 		void Load();
 		void SaveStats(std::filesystem::path path);
 		void LoadStats(std::filesystem::path path);
+
+		// Feature D offline harness: scores hand-supplied states through the frozen
+		// optionality scorer (see GCRLOptionality::DebugScoreStates for the file format).
+		// Requires config.ppo.useOptionality.
+		void DebugScoreOptionality(const std::string& path);
 
 		RG_NO_COPY(Learner);
 

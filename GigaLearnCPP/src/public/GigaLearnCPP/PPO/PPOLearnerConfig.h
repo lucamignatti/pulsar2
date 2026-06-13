@@ -4,6 +4,12 @@
 
 #include "../Util/ModelConfig.h"
 
+#include <atomic>
+
+namespace RLGC {
+	class FrontierStateBuffer;
+}
+
 namespace GGL {
 
 	struct SORSStep {
@@ -349,6 +355,110 @@ namespace GGL {
 		int sorsWindowAfter = 30;
 		std::vector<WeightedSORSLabel> sorsLabels;
 		PartialModelConfig sorsReward;
+
+		// ── Frontier reset curriculum (Feature A; requires useGCRL) ──
+		// Harvests full physics states from rollouts at timesteps where the goal critic
+		// contradicts itself (quasimetric self-consistency: moving a few steps along the
+		// trajectory toward a goal that WAS achieved must not increase d(s, g); positive
+		// increments are self-inconsistency), backtracks ~1s, and feeds the snapshots to a
+		// FrontierState setter so episodes start at the edge of critic competence instead
+		// of always at kickoff/random. Scoring is one batched no-grad pass on the learner
+		// thread next to the existing GCRL gate pass; workers only sample a mutexed ring.
+		bool useFrontierResets = false;
+		// consistency = monotonicity violation of d(s_t, g_t) along the trajectory (implemented).
+		// ensemble = variance over extra phi/psi heads (planned fallback if consistency proves
+		// too noisy; selecting it errors at startup so a typo can't silently no-op).
+		enum class FrontierUncertaintyMode { CONSISTENCY, ENSEMBLE };
+		FrontierUncertaintyMode frontierUncertaintyMode = FrontierUncertaintyMode::CONSISTENCY;
+		float frontierSpikePercentile = 0.90f; // self-normalized spike threshold (batch quantile, no absolute scale)
+		int frontierBacktrackSteps = 30;       // reset candidate is the state ~1s before the spike (tickSkip 4)
+		// Capture a physics snapshot every Nth env step. Bounds the in-flight snapshot memory:
+		// at 5120 1v1 arenas / ~300-step episodes / interval 16, ~100k snapshots x ~400B ≈ 40-50MB.
+		// Longer episodes or team modes scale this linearly; raise the interval if RAM matters.
+		int frontierSnapshotInterval = 16;
+		int frontierBufferSize = 4096;     // ring capacity; FIFO turnover every ~4-8 iters keeps it tracking the current policy
+		int frontierBufferMinFill = 256;   // FrontierState falls back to its child setter below this
+		float frontierResetFraction = 0.15f; // share of resets routed to FrontierState (read by user code when building CombinedState)
+		// Learner-side handle to the buffer FrontierState samples from. Owned by user code
+		// (created in main() before the Learner, alongside the state setters — see ExampleMain);
+		// raw pointer matching the envSet userInfo convention. NULL disables capture even if
+		// useFrontierResets is set.
+		RLGC::FrontierStateBuffer* frontierBuffer = nullptr;
+
+		// ── Difficulty-aware HER goal sampling (Feature B; requires useGCRL) ──
+		// Instead of a uniform tau in [gcrlMinHorizon, gcrlHorizon], score K candidate
+		// future-ball goals with the current goal critic and prefer goals near the middle of
+		// the batch's distance distribution (too close = trivial positives, too far = noise;
+		// "intermediate" is a batch percentile, so it tracks competence with no hardcoded
+		// difficulty). Relabeling moves from the per-trajectory collector path to one batched
+		// learner-thread pass over the combined batch — safe because futureGoals are only
+		// consumed at experience tensor creation and in Learn().
+		bool useDifficultyHER = false;
+		int herCandidates = 8;           // K candidate offsets per anchor
+		float herDifficultySigma = 0.2f; // width of the percentile preference around p=0.5
+		// Probability of keeping today's uniform offset sampling per anchor. CRITICAL — DO NOT
+		// remove: a purely difficulty-shaped positive distribution biases InfoNCE so the
+		// critic's calibration at distance extremes degrades, corrupting the very distance
+		// estimates this sampler depends on. The uniform floor breaks that feedback loop.
+		float herUniformFraction = 0.4f;
+
+		// ── Adaptive (ratcheted-quantile) targets (Feature C) ──
+		// Replaces two hand-tuned thresholds with quantiles of what the policy actually
+		// achieves, estimated from per-iteration touch events via slow EMA histograms.
+		// Stability rules (all mandatory): each target is SEEDED at the hand value (a cold
+		// or sparse buffer can never move it), holds unless >= adaptiveTargetMinSamples
+		// touches arrived this iteration, rises under a slew limit, and falls only at
+		// adaptiveTargetDecayPerIter (default 0 = pure ratchet) — so policy regression can't
+		// lower the bar and mask itself with easy reward income. NOTE: raising the gate
+		// target re-prices the gate delta; the per-mode gate EMA (~100-iter horizon) absorbs
+		// it because the 2%/iter slew moves the target much slower than the EMA adapts. If
+		// reward income ever oscillates in phase with target updates, halve the slew limit.
+		bool useAdaptiveGateTargetVel = false;        // gcrlRewardGateTargetVel <- quantile of achieved ball speeds at contact
+		float adaptiveGateTargetVelQuantile = 0.70f;
+		bool useAdaptiveStrongTouchFloor = false;     // StrongTouchReward min threshold <- quantile of achieved hit forces
+		float adaptiveStrongTouchFloorQuantile = 0.40f;
+		float adaptiveTargetMaxSlewPerIter = 0.02f;   // max relative rise per iteration (2%)
+		float adaptiveTargetDecayPerIter = 0.0f;      // max relative fall per iteration (0 = ratchet)
+		int adaptiveTargetMinSamples = 32;            // hold the target if fewer touch events this iter
+		// Worker-read publication point for the adaptive StrongTouch floor (uu/s). User code
+		// creates the atomic, passes it to StrongTouchReward AND sets this pointer; the
+		// learner seeds the ratchet from its initial value (the reward's constructor
+		// threshold) and stores the ratcheted value here once per iteration (relaxed — a
+		// one-iteration-stale read in workers is benign, same as the obsStat torn-read).
+		std::atomic<float>* adaptiveStrongTouchFloorAtomic = nullptr;
+
+		// ── Optionality shaping (Feature D; requires useGCRL) ──
+		// Potential-based shaping on phi_opt(s) = T*logsumexp(-d(s,G)/T) - T*log|G| over a
+		// stratified goal bank: pays for being in states with many cheap continuations under
+		// the (frozen target) quasimetric. Mechanics-chaining emerges as the cheapest way to
+		// keep phi_opt high; no skill labels anywhere. Delivered strictly as reward-side
+		// potential shaping (gamma*phi(s')-phi(s), masked to 0 across episode boundaries)
+		// pre-GAE — NOT an advantage stream, NOT blended via gcrlAdvScale, NOT multiplied by
+		// any GCRL reward gate — so it cannot introduce new optima. Scoring uses ONLY frozen
+		// Polyak-target copies of the goal critic's phi/psi (a fast-moving potential breaks
+		// the policy-invariance argument), with action components pinned to zero so the
+		// potential is a function of state only. No new trained parameters.
+		bool useOptionality = false;
+		// Weight vs the normalized reward stream; a shaping voice, not a lead. Anneals to
+		// optWeightFinal (not zero) on the same touch-competence gate as the main curriculum.
+		// Burn-in: the quasimetric's raw scale drifts as the embedding trains, so an
+		// unnormalized weight is meaningless — the first optBurnInIters iterations compute
+		// and log everything but inject exactly zero, seeding the reward normalizer.
+		float optWeight = 0.05f;
+		float optWeightFinal = 0.01f;
+		int64_t optAnnealSteps = 2'000'000'000;
+		float optTemp = 1.0f;            // soft-min temperature over goal-bank distances
+		int optBankSize = 2048;
+		float optBankRefreshFrac = 0.05f; // FIFO replacement per stratum per iteration; starved strata carry their quota over
+		float optBankOffensiveFrac = 0.40f; // achieved ball goals, value-filtered by the goal critic (top half of terminal
+		                                    // score — biases optionality toward commitment, the hover-pathology guard)
+		float optBankDefensiveFrac = 0.30f; // ball states from own-net-adjacent / ball-behind-car configurations
+		float optBankResourceFrac = 0.30f;  // ball states at big-pad pickups and supersonic+boosted moments
+		float optTargetTau = 0.005f;      // Polyak coefficient for the frozen scorer nets (once per iteration)
+		// Interlock: if the live gcrlAdvScale is >= 0.5 the effective optWeight is halved —
+		// two strong critic-derived gradient channels share the miscalibrated-embedding
+		// failure mode and must not both be loud (see Opt/Interlock Active).
+		int optBurnInIters = 20;
 
 		PPOLearnerConfig() {
 			policy = {};
