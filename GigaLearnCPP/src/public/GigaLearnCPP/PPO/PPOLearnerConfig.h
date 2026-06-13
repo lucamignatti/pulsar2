@@ -442,16 +442,16 @@ namespace GGL {
 		std::atomic<float>* adaptiveStrongTouchFloorAtomic = nullptr;
 
 		// ── Optionality shaping (Feature D; requires useGCRL) ──
-		// Potential-based shaping on phi_opt(s) = T*logsumexp(-d(s,G)/T) - T*log|G| over a
-		// stratified goal bank: pays for being in states with many cheap continuations under
-		// the (frozen target) quasimetric. Mechanics-chaining emerges as the cheapest way to
-		// keep phi_opt high; no skill labels anywhere. Delivered strictly as reward-side
-		// potential shaping (gamma*phi(s')-phi(s), masked to 0 across episode boundaries)
-		// pre-GAE — NOT an advantage stream, NOT blended via gcrlAdvScale, NOT multiplied by
-		// any GCRL reward gate — so it cannot introduce new optima. Scoring uses ONLY frozen
-		// Polyak-target copies of the goal critic's phi/psi (a fast-moving potential breaks
-		// the policy-invariance argument), with action components pinned to zero so the
-		// potential is a function of state only. No new trained parameters.
+		// Potential-based shaping on phi_opt(s) = T*logsumexp(V(g)-d(s,G)/T) - T*log|G| over
+		// a stratified goal bank: pays for being in states with many cheap, valuable
+		// continuations under the (frozen target) quasimetric. Candidate values are normalized
+		// inside the bank and come from existing terminal GCRL scores, not a new trainable
+		// model. Delivered strictly as reward-side potential shaping (gamma*phi(s')-phi(s),
+		// masked to 0 across episode boundaries) pre-GAE — NOT an advantage stream, NOT
+		// blended via gcrlAdvScale, NOT multiplied by any GCRL reward gate — so it cannot
+		// introduce new optima. Scoring uses ONLY frozen Polyak-target copies of the goal
+		// critic's phi/psi (a fast-moving potential breaks the policy-invariance argument),
+		// with action components pinned to zero so the potential is a function of state only.
 		bool useOptionality = false;
 		// Weight vs the normalized reward stream; a shaping voice, not a lead. Anneals to
 		// optWeightFinal (not zero) on the same touch-competence gate as the main curriculum.
@@ -462,6 +462,8 @@ namespace GGL {
 		float optWeightFinal = 0.01f;
 		int64_t optAnnealSteps = 2'000'000'000;
 		float optTemp = 1.0f;            // soft-min temperature over goal-bank distances
+		float optValueWeight = 0.0f;     // 0 -> reach-only optionality; >0 adds normalized V(g) to bank logits
+		float optValueClip = 3.0f;       // clip normalized bank values before multiplying by optValueWeight
 		int optBankSize = 2048;
 		float optBankRefreshFrac = 0.05f; // FIFO replacement per stratum per iteration; starved strata carry their quota over
 		float optBankOffensiveFrac = 0.40f; // achieved ball goals, value-filtered by the goal critic (top half of terminal

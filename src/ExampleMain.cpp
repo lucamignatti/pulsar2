@@ -518,6 +518,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
 	cfg.ppo.useOptionality = true;             // Feature D
+	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
+	cfg.ppo.optValueClip = 3.0f;
 
 	std::unique_ptr<RLGC::FrontierStateBuffer> frontierBufferOwner;
 	if (cfg.ppo.useFrontierResets) {

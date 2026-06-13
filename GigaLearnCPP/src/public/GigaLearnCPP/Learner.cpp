@@ -2004,6 +2004,9 @@ void GGL::Learner::Start() {
 					// Per-step goal-critic terminal score [N], shared between the gate block
 					// (which already computes it) and the optionality offensive-stratum filter.
 					torch::Tensor tGoalScoreShared;
+					// Raw terminal utility [N] for value-weighted optionality:
+					// opponent-goal reachability minus own-goal danger, normalized later inside the bank.
+					torch::Tensor tOptionalityValueShared;
 
 					// Episode segment end per index (terminals[epEnd] != 0), shared by the
 					// HER pass and the frontier scan. Built only when a feature needs it.
@@ -2174,6 +2177,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
 							torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
 							tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
+							tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
 							torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
 							torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
 							torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
@@ -2364,7 +2368,7 @@ void GGL::Learner::Start() {
 
 						// 2. Build stratified candidate ball-goal rows (obs space, canonicalized
 						// to the unmirrored frame so phi_opt's frame-symmetry holds).
-						auto fnPushBankRow = [&](RLGC::FList& dst, int t) {
+						auto fnPushBankRow = [&](RLGC::FList& dstRows, RLGC::FList& dstValues, int t, float value) {
 							const float* src = combinedTraj.states.data() + (size_t)t * obsSize;
 							float row[6];
 							for (int d = 0; d < 6; d++)
@@ -2373,21 +2377,27 @@ void GGL::Learner::Start() {
 								row[0] = -row[0];
 								row[3] = -row[3];
 							}
-							dst.insert(dst.end(), row, row + 6);
+							dstRows.insert(dstRows.end(), row, row + 6);
+							dstValues.push_back(value);
 						};
 
 						RLGC::FList candRows[GCRLOptionality::STRATUM_AMOUNT];
+						RLGC::FList candValues[GCRLOptionality::STRATUM_AMOUNT];
 
 						// Offensive: achieved ball goals in the top half of goal-critic terminal
 						// score (commitment bias / hover guard). Reuse the gate's score or
 						// compute it standalone when the gate didn't run.
 						torch::Tensor goalScore = tGoalScoreShared;
-						if (!goalScore.defined()) {
+						torch::Tensor optValue = tOptionalityValueShared;
+						if (!goalScore.defined() || !optValue.defined()) {
 							torch::Tensor gRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
 							torch::Tensor aRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
 							torch::Tensor ts = InferGCRLTerminalScoresBatched(ppo, tStates, tActionComps, gRow, aRow, trajN);
-							if (ts.defined())
+							if (ts.defined()) {
 								goalScore = ts.select(1, 0);
+								torch::Tensor antiScore = ts.select(1, 1);
+								optValue = goalScore - config.ppo.gcrlRewardGateAntiScale * antiScore;
+							}
 						}
 
 						// Reservoir sampler so each stratum draws an unbiased subset under its cap
@@ -2407,6 +2417,8 @@ void GGL::Learner::Start() {
 						float goalMedian = goalScore.defined() ? goalScore.median().item<float>() : 0.0f;
 						torch::Tensor goalScoreCpu = goalScore.defined() ? goalScore.to(torch::kCPU).contiguous() : torch::Tensor();
 						const float* goalScoreData = goalScore.defined() ? goalScoreCpu.data_ptr<float>() : nullptr;
+						torch::Tensor optValueCpu = optValue.defined() ? optValue.to(torch::kCPU).contiguous() : torch::Tensor();
+						const float* optValueData = optValue.defined() ? optValueCpu.data_ptr<float>() : nullptr;
 						bool hasFlags = combinedTraj.stratumFlags.size() == (size_t)trajN;
 						for (int t = 0; t < trajN; t++) {
 							if (goalScoreData && goalScoreData[t] >= goalMedian)
@@ -2418,9 +2430,18 @@ void GGL::Learner::Start() {
 									fnReservoir(resSel, resSeen, t, OPT_MAX_CANDS_PER_STRATUM);
 							}
 						}
-						for (int t : offSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_OFFENSIVE], t);
-						for (int t : defSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_DEFENSIVE], t);
-						for (int t : resSel) fnPushBankRow(candRows[GCRLOptionality::STRATUM_RESOURCE], t);
+						auto fnValueAt = [&](int t) {
+							return optValueData ? optValueData[t] : 0.0f;
+						};
+						for (int t : offSel) fnPushBankRow(
+							candRows[GCRLOptionality::STRATUM_OFFENSIVE],
+							candValues[GCRLOptionality::STRATUM_OFFENSIVE], t, fnValueAt(t));
+						for (int t : defSel) fnPushBankRow(
+							candRows[GCRLOptionality::STRATUM_DEFENSIVE],
+							candValues[GCRLOptionality::STRATUM_DEFENSIVE], t, fnValueAt(t));
+						for (int t : resSel) fnPushBankRow(
+							candRows[GCRLOptionality::STRATUM_RESOURCE],
+							candValues[GCRLOptionality::STRATUM_RESOURCE], t, fnValueAt(t));
 
 						// Optionally top up the defensive stratum from the frontier buffer
 						// (states already at the competence frontier in own-net regions).
@@ -2436,18 +2457,26 @@ void GGL::Learner::Start() {
 									MakeObsSpaceBallRow(snap.ball, false, config, obsStat, row);
 									candRows[GCRLOptionality::STRATUM_DEFENSIVE].insert(
 										candRows[GCRLOptionality::STRATUM_DEFENSIVE].end(), row, row + 6);
+									candValues[GCRLOptionality::STRATUM_DEFENSIVE].push_back(0.0f);
 								}
 							}
 						}
 
 						// 3. Refresh the bank (FIFO per stratum) + re-embed under the frozen psi
-						opt->RefreshBank(candRows, (int64_t)totalIterations, report);
+						opt->RefreshBank(candRows, candValues, (int64_t)totalIterations, report);
 
 						// 4. phi_opt over the batch
-						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates); // [N] cpu, or {} if bank empty
+						torch::Tensor phiReachOnly;
+						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
 						if (phiOpt.defined()) {
 							report["Opt/Phi Mean"] = phiOpt.mean().item<float>();
 							report["Opt/Phi Std"] = phiOpt.std(false).item<float>();
+							if (phiReachOnly.defined()) {
+								torch::Tensor phiLift = phiOpt - phiReachOnly;
+								report["Opt/Phi ReachOnly Mean"] = phiReachOnly.mean().item<float>();
+								report["Opt/Phi Value Lift Mean"] = phiLift.mean().item<float>();
+								report["Opt/Phi Value Lift Std"] = phiLift.std(false).item<float>();
+							}
 							if (hasFlags) {
 								std::vector<uint8_t> touchMask(trajN);
 								for (int t = 0; t < trajN; t++)
@@ -2706,6 +2735,10 @@ void GGL::Learner::Start() {
 						"Adaptive/StrongTouch Floor",
 						"Adaptive/Touch Samples Per Iter",
 						"Opt/Phi Mean",
+						"Opt/Phi ReachOnly Mean",
+						"Opt/Phi Value Lift Mean",
+						"Opt/Bank Value Std",
+						"Opt/Value Weight",
 						"Opt/Reward Share",
 						"Opt/Effective Weight",
 						"Opt/Interlock Active",

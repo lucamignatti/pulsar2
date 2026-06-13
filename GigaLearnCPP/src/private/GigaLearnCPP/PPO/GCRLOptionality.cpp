@@ -2,6 +2,7 @@
 
 #include <torch/nn/functional/normalization.h>
 
+#include <cmath>
 #include <fstream>
 #include <sstream>
 
@@ -68,6 +69,7 @@ GGL::GCRLOptionality::GCRLOptionality(
 	strata[STRATUM_RESOURCE] = { capOff + capDef, capRes };
 
 	bankRows.assign((size_t)size * GOAL_DIM, 0.0f);
+	bankValues.assign(size, 0.0f);
 	bankInsertItr.assign(size, 0);
 }
 
@@ -118,10 +120,16 @@ double GGL::GCRLOptionality::BankAgeMean(int64_t iteration) const {
 	return fill > 0 ? (double)totalAge / fill : 0.0;
 }
 
-void GGL::GCRLOptionality::RefreshBank(const RLGC::FList candRows[STRATUM_AMOUNT], int64_t iteration, Report& report) {
+void GGL::GCRLOptionality::RefreshBank(
+	const RLGC::FList candRows[STRATUM_AMOUNT],
+	const RLGC::FList candValues[STRATUM_AMOUNT],
+	int64_t iteration,
+	Report& report
+) {
 	static const char* STRATUM_NAMES[STRATUM_AMOUNT] = { "Offensive", "Defensive", "Resource" };
 
 	int insertedTotal = 0;
+	double insertedValueSum = 0.0;
 	for (int s = 0; s < STRATUM_AMOUNT; s++) {
 		BankStratum& stratum = strata[s];
 		int numCands = (int)(candRows[s].size() / GOAL_DIM);
@@ -135,9 +143,14 @@ void GGL::GCRLOptionality::RefreshBank(const RLGC::FList candRows[STRATUM_AMOUNT
 		for (int i = 0; i < toInsert; i++) {
 			int slot = stratum.offset + stratum.cursor;
 			memcpy(bankRows.data() + (size_t)slot * GOAL_DIM, candRows[s].data() + (size_t)i * GOAL_DIM, GOAL_DIM * sizeof(float));
+			float value = i < (int)candValues[s].size() ? candValues[s][i] : 0.0f;
+			if (!std::isfinite(value))
+				value = 0.0f;
+			bankValues[slot] = value;
 			bankInsertItr[slot] = iteration;
 			stratum.cursor = (stratum.cursor + 1) % stratum.cap;
 			stratum.count = RS_MIN(stratum.count + 1, stratum.cap);
+			insertedValueSum += value;
 		}
 		insertedTotal += toInsert;
 
@@ -147,11 +160,16 @@ void GGL::GCRLOptionality::RefreshBank(const RLGC::FList candRows[STRATUM_AMOUNT
 
 	report["Opt/Bank Fill"] = BankFill();
 	report["Opt/Bank Inserted"] = insertedTotal;
+	report["Opt/Bank Inserted Value Mean"] = insertedTotal > 0 ? insertedValueSum / insertedTotal : 0.0;
 	report["Opt/Bank Age Mean"] = BankAgeMean(iteration);
 
 	// The frozen psi just moved (Polyak), so the whole bank re-embeds regardless of
 	// whether anything was inserted — one [2*fill, 6] forward, negligible.
 	ReembedBank();
+	report["Opt/Bank Value Mean"] = bankValueMean;
+	report["Opt/Bank Value Std"] = bankValueStd;
+	report["Opt/Bank Value Logit Std"] = bankValueLogitStd;
+	report["Opt/Value Weight"] = config.optValueWeight;
 }
 
 void GGL::GCRLOptionality::ReembedBank() {
@@ -161,30 +179,59 @@ void GGL::GCRLOptionality::ReembedBank() {
 	bankPsiRows = fill;
 	if (fill == 0) {
 		bankPsi = torch::Tensor();
+		bankValueLogits = torch::Tensor();
+		bankValueMean = bankValueStd = bankValueLogitStd = 0.0f;
 		return;
 	}
 
 	// Gather filled rows (strata are contiguous slot ranges)
 	torch::Tensor rows = torch::empty({ fill, GOAL_DIM });
+	torch::Tensor values = torch::empty({ fill }, torch::TensorOptions().dtype(torch::kFloat32));
 	int outIdx = 0;
 	for (const BankStratum& s : strata) {
 		if (s.count > 0) {
 			rows.slice(0, outIdx, outIdx + s.count).copy_(
 				torch::from_blob((void*)(bankRows.data() + (size_t)s.offset * GOAL_DIM),
 					{ s.count, GOAL_DIM }, torch::TensorOptions().dtype(torch::kFloat32)));
+			values.slice(0, outIdx, outIdx + s.count).copy_(
+				torch::from_blob((void*)(bankValues.data() + (size_t)s.offset),
+					{ s.count }, torch::TensorOptions().dtype(torch::kFloat32)));
 			outIdx += s.count;
 		}
 	}
 
 	torch::Tensor doubled = RowsWithFlippedTwins(rows).to(device, RG_H2D_NONBLOCKING(device), true);
 	bankPsi = targetCritic->embed_psi(doubled);
+
+	bankValueMean = values.mean().item<float>();
+	bankValueStd = fill > 1 ? values.std(false).item<float>() : 0.0f;
+	if (config.optValueWeight > 0.0f && bankValueStd > 1e-6f) {
+		float clip = RS_MAX(0.0f, config.optValueClip);
+		torch::Tensor norm = ((values - bankValueMean) / bankValueStd)
+			.clamp(-clip, clip) * config.optValueWeight;
+		bankValueLogits = torch::cat({ norm, norm }, 0).to(device, RG_H2D_NONBLOCKING(device), true);
+		bankValueLogitStd = bankValueLogits.std(false).item<float>();
+	} else {
+		bankValueLogits = torch::Tensor();
+		bankValueLogitStd = 0.0f;
+	}
 }
 
-torch::Tensor GGL::GCRLOptionality::PhiOptFromEmbeddings(torch::Tensor phiS, torch::Tensor bankPsi, float quasiTau, float optTemp) {
+torch::Tensor GGL::GCRLOptionality::PhiOptFromEmbeddings(
+	torch::Tensor phiS,
+	torch::Tensor bankPsi,
+	float quasiTau,
+	float optTemp,
+	torch::Tensor bankValueLogits
+) {
 	// Exact scoring-time distance composition: d = -cos(phi, psi) / tau over the
-	// L2-normalized embeddings, soft-min'd over the (doubled) bank.
+	// L2-normalized embeddings, soft-min'd over the (doubled) bank. Optional value
+	// logits rerank real bank states; they never create off-manifold targets.
 	torch::Tensor D = -torch::matmul(phiS, bankPsi.transpose(0, 1)) / quasiTau;
-	return optTemp * (torch::logsumexp(-D / optTemp, 1) - std::log((double)bankPsi.size(0)));
+	torch::Tensor score = -D;
+	if (bankValueLogits.defined() && bankValueLogits.numel() == bankPsi.size(0))
+		score = score + bankValueLogits.to(score.device()).unsqueeze(0);
+	return optTemp * (torch::logsumexp(score / optTemp, 1) - std::log((double)bankPsi.size(0)));
 }
 
 torch::Tensor GGL::GCRLOptionality::MaskedPotentialDelta(torch::Tensor phiOpt, const int8_t* terminals, int64_t n, float gamma) {
@@ -202,7 +249,7 @@ torch::Tensor GGL::GCRLOptionality::MaskedPotentialDelta(torch::Tensor phiOpt, c
 	return out;
 }
 
-torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu) {
+torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu, torch::Tensor* outReachOnly) {
 	if (bankPsiRows == 0 || !bankPsi.defined())
 		return {};
 
@@ -210,6 +257,9 @@ torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu) {
 
 	int64_t N = tStatesCpu.size(0);
 	torch::Tensor out = torch::empty({ N }, torch::TensorOptions().dtype(torch::kFloat32));
+	torch::Tensor reachOnly;
+	if (outReachOnly)
+		reachOnly = torch::empty({ N }, torch::TensorOptions().dtype(torch::kFloat32));
 	int64_t step = device.is_cpu() ? N : (int64_t)config.miniBatchSize;
 
 	for (int64_t i = 0; i < N; i += step) {
@@ -221,9 +271,15 @@ torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu) {
 		torch::Tensor zeroActs = torch::zeros({ end - start, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		torch::Tensor phi = targetCritic->embed_phi(obs, zeroActs);
 		out.slice(0, start, end).copy_(
-			PhiOptFromEmbeddings(phi, bankPsi, config.gcrlTau, config.optTemp).cpu(), true);
+			PhiOptFromEmbeddings(phi, bankPsi, config.gcrlTau, config.optTemp, bankValueLogits).cpu(), true);
+		if (outReachOnly) {
+			reachOnly.slice(0, start, end).copy_(
+				PhiOptFromEmbeddings(phi, bankPsi, config.gcrlTau, config.optTemp).cpu(), true);
+		}
 	}
 
+	if (outReachOnly)
+		*outReachOnly = reachOnly;
 	return out;
 }
 
@@ -260,6 +316,21 @@ void GGL::GCRLOptionality::RunSelfTests() {
 		float maxErr = (phiOpt - expected).abs().max().item<float>();
 		if (maxErr > 1e-4f)
 			RG_ERR_CLOSE(ERROR_PREFIX << "logsumexp identity failed (max err " << maxErr << ")");
+	}
+
+	{ // Value logits rerank real bank entries inside the same logsumexp.
+		const float quasiTau = 0.05f, optTemp = 1.0f;
+		torch::Tensor phiS = torch::nn::functional::normalize(torch::randn({ 3, 8 }),
+			torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+		torch::Tensor bank = torch::nn::functional::normalize(torch::randn({ 5, 8 }),
+			torch::nn::functional::NormalizeFuncOptions().p(2).dim(-1));
+		torch::Tensor vals = torch::tensor({ -1.0f, 0.5f, 0.0f, 1.25f, -0.25f });
+		torch::Tensor scored = PhiOptFromEmbeddings(phiS, bank, quasiTau, optTemp, vals);
+		torch::Tensor D = -torch::matmul(phiS, bank.transpose(0, 1)) / quasiTau;
+		torch::Tensor expected = optTemp * (torch::logsumexp((-D + vals.unsqueeze(0)) / optTemp, 1) - std::log(5.0));
+		float maxErr = (scored - expected).abs().max().item<float>();
+		if (maxErr > 1e-4f)
+			RG_ERR_CLOSE(ERROR_PREFIX << "value-logit composition failed (max err " << maxErr << ")");
 	}
 
 	RG_LOG("GCRLOptionality::RunSelfTests(): All passed");

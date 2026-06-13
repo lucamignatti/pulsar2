@@ -17,7 +17,7 @@ namespace GGL {
 	//     with its x-flipped twin, which makes phi_opt invariant to the obs x-mirror
 	//     frame without any per-state frame bookkeeping (by left/right symmetry the
 	//     twin is an equally valid goal).
-	//  3. phi_opt(s) = T * logsumexp_g(-d(s,g)/T) - T * log|G| over the doubled bank,
+	//  3. phi_opt(s) = T * logsumexp_g(V(g)-d(s,g)/T) - T * log|G| over the doubled bank,
 	//     with action components pinned to ZERO so the potential is a function of
 	//     state only (phi takes (s, a); a fixed constant action input keeps it a pure
 	//     state function, which the policy-invariance argument requires).
@@ -40,9 +40,14 @@ namespace GGL {
 		};
 		BankStratum strata[STRATUM_AMOUNT];
 		std::vector<float> bankRows;        // [optBankSize * 6], raw goal rows (CPU)
+		std::vector<float> bankValues;      // [optBankSize], raw terminal utility values (CPU)
 		std::vector<int64_t> bankInsertItr; // insert iteration per slot (age metric)
 		torch::Tensor bankPsi;              // [2 * fill, reprDim] frozen psi embeddings (device)
+		torch::Tensor bankValueLogits;      // [2 * fill] normalized V(g) logits (device), duplicated for x-twins
 		int64_t bankPsiRows = 0;            // bank fill at the last re-embed
+		float bankValueMean = 0.0f;
+		float bankValueStd = 0.0f;
+		float bankValueLogitStd = 0.0f;
 
 		GCRLOptionality(
 			const PPOLearnerConfig& config, int featureDim,
@@ -69,17 +74,28 @@ namespace GGL {
 		// Once per training iteration. candRows[s] are flat 6-dim candidate goal rows
 		// for stratum s (pre-sampled by the Learner); inserts up to this iteration's
 		// quota (+ carried debt) per stratum, then re-embeds the bank under frozen psi.
-		void RefreshBank(const RLGC::FList candRows[STRATUM_AMOUNT], int64_t iteration, Report& report);
+		void RefreshBank(
+			const RLGC::FList candRows[STRATUM_AMOUNT],
+			const RLGC::FList candValues[STRATUM_AMOUNT],
+			int64_t iteration,
+			Report& report
+		);
 
 		// [N] CPU phi_opt over the batch states; {} while the bank is empty.
 		// Frozen nets, zero action components, minibatched on the training device.
-		torch::Tensor ComputePhiOpt(torch::Tensor tStatesCpu);
+		torch::Tensor ComputePhiOpt(torch::Tensor tStatesCpu, torch::Tensor* outReachOnly = nullptr);
 
 		int BankFill() const;
 		double BankAgeMean(int64_t iteration) const;
 
 		// Math helpers shared by the production path and the self-tests.
-		static torch::Tensor PhiOptFromEmbeddings(torch::Tensor phiS, torch::Tensor bankPsi, float quasiTau, float optTemp);
+		static torch::Tensor PhiOptFromEmbeddings(
+			torch::Tensor phiS,
+			torch::Tensor bankPsi,
+			float quasiTau,
+			float optTemp,
+			torch::Tensor bankValueLogits = {}
+		);
 		// rOptRaw[t] = gamma*phiOpt[t+1] - phiOpt[t], EXACTLY 0 wherever terminals[t] != 0
 		// (NORMAL and TRUNCATED both: a reset is not the policy losing options).
 		static torch::Tensor MaskedPotentialDelta(torch::Tensor phiOpt, const int8_t* terminals, int64_t n, float gamma);
