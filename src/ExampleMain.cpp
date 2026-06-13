@@ -151,9 +151,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
 
-		// Small energy reward: encourages speed, boost, flip availability, and forward velocity.
-		// GCRL-gated so it only pays when the agent is making terminal progress.
-		{ new EnergyReward(), 1.0f }
+		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
+		// // GCRL-gated so it only pays when the agent is making terminal progress.
+		// { new EnergyReward(), 1.0f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
@@ -430,11 +430,11 @@ int main(int argc, char* argv[]) {
 	// A: uncertainty-triggered frontier resets. B: difficulty-aware HER goal sampling.
 	// C: adaptive ratcheted-quantile gate target / StrongTouch floor. D: optionality
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
-	cfg.ppo.useFrontierResets = false;          // Feature A
-	cfg.ppo.useDifficultyHER = false;           // Feature B
-	cfg.ppo.useAdaptiveGateTargetVel = false;   // Feature C.1
-	cfg.ppo.useAdaptiveStrongTouchFloor = false;// Feature C.2
-	cfg.ppo.useOptionality = false;             // Feature D
+	cfg.ppo.useFrontierResets = true;          // Feature A
+	cfg.ppo.useDifficultyHER = true;           // Feature B
+	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
+	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
+	cfg.ppo.useOptionality = true;             // Feature D
 
 	if (cfg.ppo.useFrontierResets) {
 		g_FrontierBuffer = new RLGC::FrontierStateBuffer(cfg.ppo.frontierBufferSize);
