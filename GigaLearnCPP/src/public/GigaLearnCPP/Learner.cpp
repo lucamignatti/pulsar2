@@ -13,6 +13,7 @@
 #include <optional>
 #include <limits>
 #include <deque>
+#include <exception>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
@@ -1728,10 +1729,26 @@ void GGL::Learner::Start() {
 			std::mutex m;
 			std::condition_variable cvReady, cvGo;
 			bool batchReady = false, collectGo = false, stop = false;
+			std::exception_ptr exception;
 		} handoff;
 
 		CollectedBatch pendingBatch;
 		std::thread collectorThread;
+		struct CollectorThreadGuard {
+			decltype(handoff)& handoff;
+			std::thread& thread;
+
+			~CollectorThreadGuard() noexcept {
+				if (!thread.joinable())
+					return;
+				{
+					std::lock_guard<std::mutex> lk(handoff.m);
+					handoff.stop = true;
+				}
+				handoff.cvGo.notify_one();
+				thread.join();
+			}
+		} collectorThreadGuard{ handoff, collectorThread };
 
 		if (doAsync) {
 			collectorThread = std::thread([&] {
@@ -1749,7 +1766,17 @@ void GGL::Learner::Start() {
 						if (handoff.stop) return;
 						handoff.collectGo = false;
 					}
-					fnCollectBatch(inferenceModels, pendingBatch);
+					try {
+						fnCollectBatch(inferenceModels, pendingBatch);
+					} catch (...) {
+						{
+							std::lock_guard<std::mutex> lk(handoff.m);
+							handoff.exception = std::current_exception();
+							handoff.batchReady = true;
+						}
+						handoff.cvReady.notify_one();
+						return;
+					}
 #ifdef RG_CUDA_SUPPORT
 					// Flush all collector GPU work before publishing the batch, so every
 					// device block this batch touched is fully retired before the main
@@ -1783,7 +1810,9 @@ void GGL::Learner::Start() {
 				// Wait for collector to finish the batch it was kicked with last turn
 				{
 					std::unique_lock<std::mutex> lk(handoff.m);
-					handoff.cvReady.wait(lk, [&] { return handoff.batchReady; });
+					handoff.cvReady.wait(lk, [&] { return handoff.batchReady || handoff.exception; });
+					if (handoff.exception)
+						std::rethrow_exception(handoff.exception);
 					handoff.batchReady = false;
 				}
 				batch = std::move(pendingBatch);
