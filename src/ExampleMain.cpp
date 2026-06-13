@@ -518,12 +518,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
 	cfg.ppo.useOptionality = true;             // Feature D
+	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
+	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
 	cfg.ppo.optRefineGoals = true;             // Phase 2: locally refine top real bank goals before Phi(s)
-	cfg.ppo.optRefineTopK = 2;
+	cfg.ppo.optRefineTopK = 1;
 	cfg.ppo.optRefineSteps = 1;
-	cfg.ppo.optRefineMaxStates = 32768;
+	cfg.ppo.optRefineMaxStates = 8192;
 	cfg.ppo.optRefineStepSize = 0.10f;
 	cfg.ppo.optRefineMaxDelta = 0.25f;
 	cfg.ppo.optRefineTrustPenalty = 0.1f;

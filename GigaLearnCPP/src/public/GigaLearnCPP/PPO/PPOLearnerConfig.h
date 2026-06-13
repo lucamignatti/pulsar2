@@ -448,10 +448,11 @@ namespace GGL {
 		// inside the bank and come from existing terminal GCRL scores, not a new trainable
 		// model. Delivered strictly as reward-side potential shaping (gamma*phi(s')-phi(s),
 		// masked to 0 across episode boundaries) pre-GAE — NOT an advantage stream, NOT
-		// blended via gcrlAdvScale, NOT multiplied by any GCRL reward gate — so it cannot
-		// introduce new optima. Scoring uses ONLY frozen Polyak-target copies of the goal
-		// critic's phi/psi (a fast-moving potential breaks the policy-invariance argument),
-		// with action components pinned to zero so the potential is a function of state only.
+		// blended via gcrlAdvScale. Optional GCRL commit relief only softens negative
+		// optionality deltas when terminal prospects improve. Scoring uses ONLY frozen
+		// Polyak-target copies of the goal critic's phi/psi (a fast-moving potential breaks
+		// the policy-invariance argument), with action components pinned to zero so the
+		// potential is a function of state only.
 		bool useOptionality = false;
 		// Weight vs the normalized reward stream; a shaping voice, not a lead. Anneals to
 		// optWeightFinal (not zero) on the same touch-competence gate as the main curriculum.
@@ -461,6 +462,8 @@ namespace GGL {
 		float optWeight = 0.05f;
 		float optWeightFinal = 0.01f;
 		int64_t optAnnealSteps = 2'000'000'000;
+		float optCommitReliefScale = 0.0f; // Fraction of negative opt reward relieved when GCRL terminal progress is positive
+		float optCommitReliefSharpness = 1.0f; // Sigmoid sharpness over normalized terminal-progress delta
 		float optTemp = 1.0f;            // soft-min temperature over goal-bank distances
 		float optValueWeight = 0.0f;     // 0 -> reach-only optionality; >0 adds normalized V(g) to bank logits
 		float optValueClip = 3.0f;       // clip normalized bank values before multiplying by optValueWeight

@@ -55,15 +55,9 @@ GGL::GCRLOptionality::GCRLOptionality(
 	auto dstParams = targetCritic->parameters();
 	auto srcParams = liveGoalCritic->parameters();
 	CopyParamsPairwise(dstParams, srcParams);
-	for (torch::Tensor& p : dstParams)
-		p.set_requires_grad(false);
 
-	if (liveSharedHead) {
+	if (liveSharedHead)
 		targetSharedHead = liveSharedHead->MakeClone();
-		auto headParams = targetSharedHead->parameters();
-		for (torch::Tensor& p : headParams)
-			p.set_requires_grad(false);
-	}
 
 	// Stratum slot partition (last stratum takes the rounding remainder)
 	int size = RS_MAX(config.optBankSize, STRATUM_AMOUNT);
@@ -296,54 +290,57 @@ torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu, torc
 			if (bankValueLogits.defined() && bankValueLogits.numel() == bankPsi.size(0))
 				score = score + bankValueLogits.to(score.device()).unsqueeze(0);
 
-				int64_t B = score.size(0);
-				int64_t M = score.size(1);
-				int64_t RB = B;
-				torch::Tensor refineIdx;
-				if (config.optRefineMaxStates > 0 && B > config.optRefineMaxStates) {
-					RB = config.optRefineMaxStates;
-					refineIdx = torch::arange(RB, torch::TensorOptions().dtype(torch::kLong).device(device)) * B / RB;
-				}
-				torch::Tensor refineScore = refineIdx.defined() ? score.index_select(0, refineIdx) : score;
-				torch::Tensor refinePhi = refineIdx.defined() ? phi.index_select(0, refineIdx) : phi;
+			int64_t B = score.size(0);
+			int64_t M = score.size(1);
+			int64_t RB = B;
+			torch::Tensor refineIdx;
+			if (config.optRefineMaxStates > 0 && B > config.optRefineMaxStates) {
+				RB = config.optRefineMaxStates;
+				refineIdx = torch::arange(RB, torch::TensorOptions().dtype(torch::kLong).device(device)) * B / RB;
+			}
+			torch::Tensor refineScore = refineIdx.defined() ? score.index_select(0, refineIdx) : score;
+			torch::Tensor refinePhi = refineIdx.defined() ? phi.index_select(0, refineIdx) : phi;
 
-				int64_t K = RS_MIN((int64_t)config.optRefineTopK, M);
-				auto top = refineScore.topk(K, 1, true, true);
-				torch::Tensor topVals = std::get<0>(top);
-				torch::Tensor topIdx = std::get<1>(top);
-				torch::Tensor flatIdx = topIdx.reshape({ -1 });
-				torch::Tensor goals0 = bankGoalRows.index_select(0, flatIdx).detach();
-				torch::Tensor goals = goals0.clone();
-				torch::Tensor phiRep = refinePhi.unsqueeze(1).expand({ RB, K, refinePhi.size(1) }).reshape({ RB * K, refinePhi.size(1) }).detach();
-				torch::Tensor valueFlat;
-				if (bankValueLogits.defined() && bankValueLogits.numel() == M)
-					valueFlat = bankValueLogits.index_select(0, flatIdx).detach();
-				else
-					valueFlat = torch::zeros({ RB * K }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+			int64_t K = RS_MIN((int64_t)config.optRefineTopK, M);
+			auto top = refineScore.topk(K, 1, true, true);
+			torch::Tensor topVals = std::get<0>(top);
+			torch::Tensor topIdx = std::get<1>(top);
+			torch::Tensor flatIdx = topIdx.reshape({ -1 });
+			torch::Tensor goals0 = bankGoalRows.index_select(0, flatIdx);
+			torch::Tensor goals = goals0.clone();
+			torch::Tensor phiRep = refinePhi.unsqueeze(1).expand({ RB, K, refinePhi.size(1) }).reshape({ RB * K, refinePhi.size(1) });
+			torch::Tensor valueFlat;
+			if (bankValueLogits.defined() && bankValueLogits.numel() == M)
+				valueFlat = bankValueLogits.index_select(0, flatIdx);
+			else
+				valueFlat = torch::zeros({ RB * K }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 
-			{
-				torch::AutoGradMode enableGrad(true);
-				float maxDelta = RS_MAX(1e-6f, config.optRefineMaxDelta);
-				float stepSize = RS_MAX(1e-6f, config.optRefineStepSize);
-				float trustPenalty = RS_MAX(0.0f, config.optRefineTrustPenalty);
-				for (int r = 0; r < config.optRefineSteps; r++) {
-					goals = goals.detach();
-					goals.set_requires_grad(true);
-					torch::Tensor psi = targetCritic->embed_psi(goals);
-					torch::Tensor delta = goals - goals0;
-					torch::Tensor candidateScore =
-						(phiRep * psi).sum(1) / config.gcrlTau + valueFlat -
-						trustPenalty * delta.square().sum(1);
-					torch::Tensor objective = candidateScore.mean();
-					objective.backward();
-					torch::Tensor grad = goals.grad();
-					torch::Tensor gradNorm = grad.norm(2, 1, true).clamp_min(1e-6f);
-					torch::Tensor next = goals + grad / gradNorm * stepSize;
-					torch::Tensor nextDelta = next - goals0;
-					torch::Tensor deltaNorm = nextDelta.norm(2, 1, true).clamp_min(1e-6f);
-					torch::Tensor scale = (maxDelta / deltaNorm).clamp_max(1.0f);
-					goals = (goals0 + nextDelta * scale).detach();
-				}
+			float maxDelta = RS_MAX(1e-6f, config.optRefineMaxDelta);
+			float stepSize = RS_MAX(1e-6f, config.optRefineStepSize);
+			float trustPenalty = RS_MAX(0.0f, config.optRefineTrustPenalty);
+			torch::Tensor dirs = torch::cat({
+				torch::eye(GOAL_DIM, torch::TensorOptions().dtype(torch::kFloat32).device(device)),
+				-torch::eye(GOAL_DIM, torch::TensorOptions().dtype(torch::kFloat32).device(device))
+			}, 0);
+			for (int r = 0; r < config.optRefineSteps; r++) {
+				int64_t C = goals.size(0);
+				torch::Tensor proposals = goals.unsqueeze(1) + dirs.unsqueeze(0) * stepSize;
+				torch::Tensor proposalDelta = proposals - goals0.unsqueeze(1);
+				torch::Tensor proposalNorm = proposalDelta.norm(2, 2, true).clamp_min(1e-6f);
+				torch::Tensor proposalScale = (maxDelta / proposalNorm).clamp_max(1.0f);
+				proposals = goals0.unsqueeze(1) + proposalDelta * proposalScale;
+
+				torch::Tensor flatProposals = proposals.reshape({ C * dirs.size(0), GOAL_DIM });
+				torch::Tensor propPsi = targetCritic->embed_psi(flatProposals).reshape({ C, dirs.size(0), -1 });
+				torch::Tensor propScore =
+					(phiRep.unsqueeze(1) * propPsi).sum(2) / config.gcrlTau +
+					valueFlat.unsqueeze(1) -
+					trustPenalty * (proposals - goals0.unsqueeze(1)).square().sum(2);
+				torch::Tensor bestIdx = std::get<1>(propScore.max(1));
+				goals = proposals.index({
+					torch::arange(C, torch::TensorOptions().dtype(torch::kLong).device(device)),
+					bestIdx
+				});
 			}
 
 			torch::Tensor finalPsi = targetCritic->embed_psi(goals);

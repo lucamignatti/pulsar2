@@ -2007,6 +2007,9 @@ void GGL::Learner::Start() {
 					// Raw terminal utility [N] for value-weighted optionality:
 					// opponent-goal reachability minus own-goal danger, normalized later inside the bank.
 					torch::Tensor tOptionalityValueShared;
+					// Normalized terminal-progress delta [N], used to soften negative optionality
+					// when a commit improves GCRL terminal prospects.
+					torch::Tensor tOptionalityProgressDeltaShared;
 
 					// Episode segment end per index (terminals[epEnd] != 0), shared by the
 					// HER pass and the frontier scan. Built only when a feature needs it.
@@ -2215,6 +2218,7 @@ void GGL::Learner::Start() {
 								torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
 								tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
 							}
+							tOptionalityProgressDeltaShared = tNormGateDelta;
 
 							torch::Tensor tGate = torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
 							torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
@@ -2496,6 +2500,56 @@ void GGL::Learner::Start() {
 							// 5. Masked potential delta + running normalizer
 							torch::Tensor rOptRaw = GCRLOptionality::MaskedPotentialDelta(
 								phiOpt, combinedTraj.terminals.data(), trajN, config.ppo.gaeGamma);
+
+							if (config.ppo.optCommitReliefScale > 0.0f) {
+								torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
+								if (!optProgressDelta.defined() && optValue.defined()) {
+									fnBuildEpBounds();
+									int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+									std::vector<int64_t> futureIdxs(trajN);
+									for (int t = 0; t < trajN; t++)
+										futureIdxs[t] = RS_MIN(t + lookahead, epEndOf[t]);
+
+									torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+									torch::Tensor rawDelta = optValue.index_select(0, tFutureIdxs) - optValue;
+									optProgressDelta = torch::empty_like(rawDelta);
+									for (int m = 0; m < numModes; m++) {
+										torch::Tensor mask = (tModeIds == m);
+										torch::Tensor vals = rawDelta.masked_select(mask);
+										if (vals.numel() == 0)
+											continue;
+										torch::Tensor norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
+										optProgressDelta = optProgressDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+									}
+								}
+
+								if (optProgressDelta.defined()) {
+									float reliefScale = RS_CLAMP(config.ppo.optCommitReliefScale, 0.0f, 1.0f);
+									float sharpness = RS_MAX(1e-6f, config.ppo.optCommitReliefSharpness);
+									torch::Tensor lossMask = rOptRaw < 0.0f;
+									torch::Tensor positiveProgress = optProgressDelta > 0.0f;
+									torch::Tensor reliefGate = torch::where(
+										positiveProgress,
+										torch::sigmoid(sharpness * optProgressDelta),
+										torch::zeros_like(optProgressDelta)
+									);
+									torch::Tensor relief = reliefGate * reliefScale;
+									torch::Tensor rOptBeforeRelief = rOptRaw;
+									rOptRaw = torch::where(lossMask, rOptRaw * (1.0f - relief), rOptRaw);
+
+									torch::Tensor lossF = lossMask.to(torch::kFloat32);
+									float lossCount = lossF.sum().item<float>();
+									report["Opt Commit/GCRL Delta Mean"] = optProgressDelta.mean().item<float>();
+									report["Opt Commit/Loss Fraction"] = lossF.mean().item<float>();
+									report["Opt Commit/Relief Mean"] =
+										lossCount > 0 ? (relief * lossF).sum().item<float>() / lossCount : 0.0f;
+									float rawLoss = (-rOptBeforeRelief).masked_select(lossMask).sum().item<float>();
+									float relievedLoss = (-rOptRaw).masked_select(lossMask).sum().item<float>();
+									report["Opt Commit/Relieved Loss Share"] =
+										rawLoss > 1e-8f ? (rawLoss - relievedLoss) / rawLoss : 0.0f;
+								}
+							}
+
 							double batchMean = rOptRaw.mean().item<double>();
 							double batchVar = rOptRaw.var(false).item<double>();
 							constexpr double OPT_NORM_DECAY = 0.999;
@@ -2748,6 +2802,9 @@ void GGL::Learner::Start() {
 						"Opt/Reward Share",
 						"Opt/Effective Weight",
 						"Opt/Interlock Active",
+						"Opt Commit/Relief Mean",
+						"Opt Commit/Relieved Loss Share",
+						"Opt Commit/Loss Fraction",
 						"OptRefine/Enabled",
 						"OptRefine/Accepted Fraction",
 						"OptRefine/State Fraction",
