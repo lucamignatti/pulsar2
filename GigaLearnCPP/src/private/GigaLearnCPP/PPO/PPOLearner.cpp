@@ -444,7 +444,7 @@ namespace {
 		M_GCRL_ADV, M_GCRL_GOAL_ADV, M_GCRL_ANTI_ADV, M_GCRL_CAR_ADV, M_GCRL_REW_ADV, M_GCRL_FINAL_ADV,
 		M_GCRL_GOAL_Q, M_GCRL_ANTI_Q, M_GCRL_CAR_Q,
 		M_GCRL_GOAL_QSTD, M_GCRL_ANTI_QSTD, M_GCRL_CAR_QSTD,
-		M_GCRL_SURGERY_CONFLICT,
+		M_GCRL_SURGERY_CONFLICT, M_GCRL_SURGERY_HIMAG_CONFLICT, M_GCRL_SURGERY_REMOVED_FRAC,
 		METRIC_SLOT_COUNT
 	};
 }
@@ -606,21 +606,38 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					auto adv_rew = NormalizePerMode(advantages, modeIds, numModes);
 					mbSlots[M_GCRL_REW_ADV] = adv_rew.abs().mean();
 
-					// ── Gradient surgery (per-sample, reward yields to game-sense) ──────────
+					// ── Gradient surgery (per-sample, MAGNITUDE-GATED) ─────────────────────
 					// Per sample the reward- and GCRL-advantage gradients are colinear (both
-					// scale the same ∇logπ), so PCGrad's "project the conflicting component
-					// out" reduces exactly to: where the reward advantage opposes the GCRL
-					// advantage (product < 0), remove that fraction of the reward advantage.
-					// This stops the shaped reward from reinforcing actions game-sense flags as
-					// bad (the reward-shaping pitfall) instead of merely out-voting it by a
-					// scale factor -- which should remove the destabilizing updates and widen
-					// the usable LR. surgeryStrength 0 == today's pure blend; 1 == full PCGrad.
-					// Conflict uses the product so a ~0 GCRL signal (game-sense neutral) never
-					// triggers surgery.
+					// scale the same ∇logπ), so PCGrad's "project the conflicting component out"
+					// reduces to: where the reward advantage opposes game-sense, remove it.
+					// BUT the raw sign-conflict fraction is dominated by the mass of near-zero
+					// samples flipping sign by chance (~0.5 == the two advantages are
+					// independent), so it can't see real misalignment and blunt projection on
+					// every flip just discards half the reward gradient. Real misalignment lives
+					// where BOTH advantages are SUBSTANTIAL and opposed -- so gate on magnitude
+					// (in per-mode-normalized std units; magThreshold 0 == blunt all-samples).
+					// The two extra diagnostics are the decisive read of "is there anything here":
+					//   HiMag Conflict -- conflict fraction AMONG high-magnitude samples
+					//                     (~0.5 == still independent where it matters; >0.5 ==
+					//                      systematic misalignment worth fixing)
+					//   Removed Frac   -- fraction of total reward-advantage MAGNITUDE surgery
+					//                     cuts (~0 == nothing real to fix; large == real conflict)
 					if (config.gcrlSurgery) {
 						auto conflict = (adv_rew * adv_gcrl) < 0;
 						mbSlots[M_GCRL_SURGERY_CONFLICT] = conflict.to(torch::kFloat).mean();
-						adv_rew = torch::where(conflict, adv_rew * (1.0f - config.gcrlSurgeryStrength), adv_rew);
+
+						float tau = config.gcrlSurgeryMagThreshold;
+						auto bigBoth = (adv_rew.abs() > tau).logical_and(adv_gcrl.abs() > tau);
+						auto himagConflict = conflict.logical_and(bigBoth);
+						auto himagF = himagConflict.to(torch::kFloat);
+
+						mbSlots[M_GCRL_SURGERY_HIMAG_CONFLICT] =
+							himagF.sum() / bigBoth.to(torch::kFloat).sum().clamp_min(1.0f);
+						auto absRew = adv_rew.abs();
+						mbSlots[M_GCRL_SURGERY_REMOVED_FRAC] =
+							(absRew * himagF).sum() * config.gcrlSurgeryStrength / absRew.sum().clamp_min(1e-8f);
+
+						adv_rew = torch::where(himagConflict, adv_rew * (1.0f - config.gcrlSurgeryStrength), adv_rew);
 					}
 
 					// Clamp the blended advantage: GAE advantages are heavy-tailed (rare
@@ -920,11 +937,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Goal Update Magnitude"] = gcrlGoalUpdateMagnitude;
 			report["GCRL/Anti Update Magnitude"] = gcrlAntiUpdateMagnitude;
 			report["GCRL/Car Update Magnitude"] = gcrlCarUpdateMagnitude;
-			// Fraction of samples where the shaped-reward advantage opposed game-sense and
-			// surgery removed (part of) it -- i.e. how often reward shaping fights the
-			// true objective. 0 when surgery is off.
-			if (config.gcrlSurgery)
+			// Surgery diagnostics. Conflict Fraction is the coarse all-samples sign-conflict
+			// (~0.5 == reward & game-sense independent). HiMag Conflict is the conflict fraction
+			// among substantial-magnitude samples (>0.5 there == real systematic misalignment).
+			// Removed Frac is the share of total reward-advantage magnitude surgery actually cut
+			// (~0 == nothing real to fix). The latter two are the decisive read.
+			if (config.gcrlSurgery) {
 				report["GCRL/Surgery Conflict Fraction"] = avg[M_GCRL_SURGERY_CONFLICT].Get();
+				report["GCRL/Surgery HiMag Conflict"] = avg[M_GCRL_SURGERY_HIMAG_CONFLICT].Get();
+				report["GCRL/Surgery Removed Frac"] = avg[M_GCRL_SURGERY_REMOVED_FRAC].Get();
+			}
 		}
 
 		if (config.useGuidingPolicy)

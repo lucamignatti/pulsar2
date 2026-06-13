@@ -291,6 +291,12 @@ namespace GGL {
 		// "GCRL/Surgery Conflict Fraction".
 		bool gcrlSurgery = false;
 		float gcrlSurgeryStrength = 1.0f; // 0 == today's pure blend; 1 == full removal of the conflicting reward component
+		// Magnitude gate (per-mode-normalized std units): surgery only fires where BOTH the
+		// reward and game-sense advantages exceed this AND oppose -- so it targets real
+		// misalignment, not the mass of near-zero sign-flips that pin the raw conflict fraction
+		// at ~0.5. 0 == blunt all-samples (old behavior); ~1.0 == clearly-substantial only.
+		// Watch "GCRL/Surgery HiMag Conflict" (>0.5 == real misalignment) and "Removed Frac".
+		float gcrlSurgeryMagThreshold = 1.0f;
 		float gcrlTau = 0.02f;       // Embedding temperature (sharp contrast)
 		// HER relabeling horizons are in STEPS. At tickSkip 4 there are ~30 steps/sec, so
 		// these defaults span roughly 0.25s..1.05s of "future" — long enough to be strategic.
