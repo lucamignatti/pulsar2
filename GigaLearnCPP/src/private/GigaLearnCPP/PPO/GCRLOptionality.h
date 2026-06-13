@@ -53,6 +53,7 @@ namespace GGL {
 		float lastRefineGoalDeltaNorm = 0.0f;
 		float lastRefineScoreGainMean = 0.0f;
 		float lastRefinePhiLiftMean = 0.0f;
+		float lastRefineStateFraction = 0.0f;
 
 		GCRLOptionality(
 			const PPOLearnerConfig& config, int featureDim,

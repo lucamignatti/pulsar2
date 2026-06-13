@@ -2479,6 +2479,7 @@ void GGL::Learner::Start() {
 							}
 							report["OptRefine/Enabled"] = config.ppo.optRefineGoals ? 1.0 : 0.0;
 							report["OptRefine/Accepted Fraction"] = opt->lastRefineAcceptedFraction;
+							report["OptRefine/State Fraction"] = opt->lastRefineStateFraction;
 							report["OptRefine/Goal Delta Norm"] = opt->lastRefineGoalDeltaNorm;
 							report["OptRefine/Score Gain Mean"] = opt->lastRefineScoreGainMean;
 							report["OptRefine/Phi Lift Mean"] = opt->lastRefinePhiLiftMean;
@@ -2749,6 +2750,7 @@ void GGL::Learner::Start() {
 						"Opt/Interlock Active",
 						"OptRefine/Enabled",
 						"OptRefine/Accepted Fraction",
+						"OptRefine/State Fraction",
 						"OptRefine/Goal Delta Norm",
 						"OptRefine/Score Gain Mean",
 						"OptRefine/Phi Lift Mean",
