@@ -523,10 +523,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
 	cfg.ppo.optRefineGoals = true;             // Phase 2: locally refine top real bank goals before Phi(s)
-	cfg.ppo.optRefineTopK = 1;
-	cfg.ppo.optRefineSteps = 1;
-	cfg.ppo.optRefineMaxStates = 8192;
-	cfg.ppo.optRefineStepSize = 0.10f;
+	cfg.ppo.optRefineTopK = 4;
+	cfg.ppo.optRefineSteps = 3;
+	cfg.ppo.optRefineMaxStates = 0;
+	cfg.ppo.optRefineStepSize = 0.08f;
 	cfg.ppo.optRefineMaxDelta = 0.25f;
 	cfg.ppo.optRefineTrustPenalty = 0.1f;
 
