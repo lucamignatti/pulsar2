@@ -444,6 +444,7 @@ namespace {
 		M_GCRL_ADV, M_GCRL_GOAL_ADV, M_GCRL_ANTI_ADV, M_GCRL_CAR_ADV, M_GCRL_REW_ADV, M_GCRL_FINAL_ADV,
 		M_GCRL_GOAL_Q, M_GCRL_ANTI_Q, M_GCRL_CAR_Q,
 		M_GCRL_GOAL_QSTD, M_GCRL_ANTI_QSTD, M_GCRL_CAR_QSTD,
+		M_GCRL_SURGERY_CONFLICT,
 		METRIC_SLOT_COUNT
 	};
 }
@@ -604,6 +605,24 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					auto adv_rew = NormalizePerMode(advantages, modeIds, numModes);
 					mbSlots[M_GCRL_REW_ADV] = adv_rew.abs().mean();
+
+					// ── Gradient surgery (per-sample, reward yields to game-sense) ──────────
+					// Per sample the reward- and GCRL-advantage gradients are colinear (both
+					// scale the same ∇logπ), so PCGrad's "project the conflicting component
+					// out" reduces exactly to: where the reward advantage opposes the GCRL
+					// advantage (product < 0), remove that fraction of the reward advantage.
+					// This stops the shaped reward from reinforcing actions game-sense flags as
+					// bad (the reward-shaping pitfall) instead of merely out-voting it by a
+					// scale factor -- which should remove the destabilizing updates and widen
+					// the usable LR. surgeryStrength 0 == today's pure blend; 1 == full PCGrad.
+					// Conflict uses the product so a ~0 GCRL signal (game-sense neutral) never
+					// triggers surgery.
+					if (config.gcrlSurgery) {
+						auto conflict = (adv_rew * adv_gcrl) < 0;
+						mbSlots[M_GCRL_SURGERY_CONFLICT] = conflict.to(torch::kFloat).mean();
+						adv_rew = torch::where(conflict, adv_rew * (1.0f - config.gcrlSurgeryStrength), adv_rew);
+					}
+
 					// Clamp the blended advantage: GAE advantages are heavy-tailed (rare
 					// goal-sized spikes), and unclamped outliers both dominate the gradient
 					// and can overflow the backward pass into non-finite gradients.
@@ -901,6 +920,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Goal Update Magnitude"] = gcrlGoalUpdateMagnitude;
 			report["GCRL/Anti Update Magnitude"] = gcrlAntiUpdateMagnitude;
 			report["GCRL/Car Update Magnitude"] = gcrlCarUpdateMagnitude;
+			// Fraction of samples where the shaped-reward advantage opposed game-sense and
+			// surgery removed (part of) it -- i.e. how often reward shaping fights the
+			// true objective. 0 when surgery is off.
+			if (config.gcrlSurgery)
+				report["GCRL/Surgery Conflict Fraction"] = avg[M_GCRL_SURGERY_CONFLICT].Get();
 		}
 
 		if (config.useGuidingPolicy)

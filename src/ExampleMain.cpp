@@ -13,6 +13,7 @@
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 #include <atomic>
+#include <cstdlib>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
@@ -387,6 +388,12 @@ int main(int argc, char* argv[]) {
 	// noise. Start moderate; raise if defense lags.
 	cfg.ppo.gcrlAntiScale = 0.4f;
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
+	// ── Gradient surgery (TESTING) ──
+	// Project the reward advantage off its game-sense-opposing component per sample instead of
+	// summing it. Anti-reward-shaping; expected to stabilize and widen usable LR. Watch
+	// "GCRL/Surgery Conflict Fraction" (how often shaped reward fights the true objective).
+	cfg.ppo.gcrlSurgery = true;
+	cfg.ppo.gcrlSurgeryStrength = 1.0f;
 	cfg.ppo.gcrlBaselineSamples = 4; // counterfactual action baseline (K shuffled-action forwards)
 	cfg.ppo.gcrlHorizon = 128;       // max HER goal offset in steps (upper bound; ~4.3s at tickSkip 4)
 	cfg.ppo.gcrlMinHorizon = 32;     // min HER goal offset in steps (lower bound; ~1.05s at tickSkip 4)
@@ -535,6 +542,23 @@ int main(int argc, char* argv[]) {
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
+
+	// ── Overnight A/B env overrides (surgery test harness) ──
+	// One binary, two phases: GGL_SURGERY toggles gradient surgery, GGL_CKPT isolates the
+	// checkpoint folder (so a fresh dir == from scratch and never touches the main run),
+	// GGL_RUNNAME sets the wandb run name. All optional; absent -> the defaults above.
+	if (const char* s = getenv("GGL_SURGERY")) cfg.ppo.gcrlSurgery = (atoi(s) != 0);
+	if (const char* s = getenv("GGL_CKPT"))    cfg.checkpointFolder = s;
+	if (const char* s = getenv("GGL_RUNNAME")) cfg.metricsRunName = s;
+	// Tiny-memory smoke config (Mac MPS unified memory): per-player trajectory buffers
+	// pre-reserve maxEpisodeLength*obsSize floats, so RAM scales with numGames. 96 games
+	// (~1GB) instead of 5120 (~40GB). Small batch so iterations complete fast.
+	if (getenv("GGL_SMOKE")) {
+		cfg.numGames = 96;
+		cfg.ppo.tsPerItr = 20000;
+		cfg.ppo.batchSize = 20000;
+		cfg.ppo.miniBatchSize = 10000;
+	}
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

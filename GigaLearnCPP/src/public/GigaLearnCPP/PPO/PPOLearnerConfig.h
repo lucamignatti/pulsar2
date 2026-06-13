@@ -283,6 +283,14 @@ namespace GGL {
 		int64_t gcrlAdvScaleAnnealSteps = 0; // Timesteps to ramp from 0 to gcrlAdvScale; 0 disables
 		float gcrlAntiScale = 0.85f; // Weight of the pessimistic "anti" critic in the GCRL advantage
 		float gcrlCarScale = 0.5f;   // Weight of the car-positioning critic in the GCRL advantage
+		// Gradient surgery: instead of summing the reward advantage and the GCRL ("game sense")
+		// advantage, remove the reward-advantage component that OPPOSES game-sense per sample
+		// (per-sample PCGrad; the two channels are colinear per sample so projection == sign
+		// reconciliation). Stops shaped reward from reinforcing actions game-sense flags as bad,
+		// which should remove destabilizing updates and widen the usable LR. Watch
+		// "GCRL/Surgery Conflict Fraction".
+		bool gcrlSurgery = false;
+		float gcrlSurgeryStrength = 1.0f; // 0 == today's pure blend; 1 == full removal of the conflicting reward component
 		float gcrlTau = 0.02f;       // Embedding temperature (sharp contrast)
 		// HER relabeling horizons are in STEPS. At tickSkip 4 there are ~30 steps/sec, so
 		// these defaults span roughly 0.25s..1.05s of "future" — long enough to be strategic.
