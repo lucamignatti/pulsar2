@@ -106,11 +106,19 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	}
 }
 
+GGL::PPOLearner::~PPOLearner() {
+	// Free the models we own. optionality is deleted first (it only references — never owns —
+	// entries in `models`, so order is not strictly required, but it keeps teardown tidy).
+	delete optionality;
+	models.Free();
+	guidingPolicyModels.Free();
+}
+
 void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
-	int obsSize, int numActions, 
+	int obsSize, int numActions,
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
-	torch::Device device, 
+	torch::Device device,
 	ModelSet& outModels) {
 
 	ModelConfig fullPolicyConfig = policyConfig;

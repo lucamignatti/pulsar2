@@ -35,6 +35,12 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 	}
 }
 
+GGL::PolicyVersionManager::~PolicyVersionManager() {
+	for (auto& version : versions)
+		version.models.Free();
+	delete skill.envSet;
+}
+
 GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone, uint64_t timesteps) {
 	RG_NO_GRAD;
 

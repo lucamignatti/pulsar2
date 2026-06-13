@@ -64,6 +64,13 @@ namespace GGL {
 			PPOLearnerConfig config, torch::Device device
 		);
 
+		// `models` and `guidingPolicyModels` own their Model* via new (MakeModels / makeGCRLCritic),
+		// and `optionality` is new'd in the ctor. ModelSet has no destructor (it is also used as a
+		// non-owning view, e.g. GetPolicyModels), so the owner must Free() explicitly. Without this,
+		// destroying a PPOLearner leaked every policy/critic/GCRL-critic/SORS model + the optionality
+		// scorer — the dominant leak when Learners are repeatedly built and torn down (smoke tests).
+		~PPOLearner();
+
 		static void MakeModels(
 			bool makeCritic, 
 			int obsSize, int numActions, 

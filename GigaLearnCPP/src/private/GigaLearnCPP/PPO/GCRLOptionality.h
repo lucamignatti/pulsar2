@@ -50,6 +50,14 @@ namespace GGL {
 			torch::Device device
 		);
 
+		// targetCritic is new'd in the ctor and targetSharedHead is a MakeClone() — both are
+		// owned by this object and alias nothing in the live ModelSet, so they must be freed
+		// here. Without this, every PPOLearner teardown leaks the frozen scorer's full nets.
+		~GCRLOptionality() {
+			delete targetCritic;
+			delete targetSharedHead;
+		}
+
 		// Once per training iteration: target <- (1-tau)*target + tau*live.
 		void PolyakUpdate(QuasimetricCritic* liveGoalCritic, Model* liveSharedHead);
 
