@@ -258,6 +258,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> aerialCurriculumRewards = {
 
+		// Bootstrap rung for real aerial touches: pays only on airborne high-ball contact,
+		// scaled by both time spent airborne and ball height. Unlike AirReward, there is no
+		// per-step hover income; unlike UsefulAirTouchReward, it does not require goalward quality.
+		{ new AirTimeTouchReward(), 10.0f },
+
 		// Temporary capped bootstrap: go make progress toward high balls while airborne.
 		{ new ExponentialAerialBallProgressReward(), 1.0f }
 	};

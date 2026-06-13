@@ -201,6 +201,36 @@ namespace RLGC {
 		}
 	};
 
+	class AirTimeTouchReward : public Reward {
+	public:
+		float minBallHeight, maxBallHeight, minCarHeight, maxAirTime;
+
+		AirTimeTouchReward(
+			float minBallHeight = 500,
+			float maxBallHeight = CommonValues::CEILING_Z,
+			float minCarHeight = 120,
+			float maxAirTime = 1.75f
+		) :
+			minBallHeight(minBallHeight), maxBallHeight(maxBallHeight),
+			minCarHeight(minCarHeight), maxAirTime(maxAirTime) {
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!player.ballTouchedStep || player.isOnGround)
+				return 0;
+			if (player.pos.z < minCarHeight || state.ball.pos.z < minBallHeight)
+				return 0;
+
+			float airFrac = RS_CLAMP(player.airTime / RS_MAX(maxAirTime, 0.001f), 0, 1);
+			float heightFrac = RS_CLAMP(
+				(state.ball.pos.z - minBallHeight) / RS_MAX(1, maxBallHeight - minBallHeight),
+				0, 1
+			);
+
+			return RS_MIN(airFrac, heightFrac);
+		}
+	};
+
 	class AerialCommitReward : public Reward {
 	public:
 		struct PlayerState {
