@@ -1170,7 +1170,7 @@ void GGL::Learner::Start() {
 
 			// Reset and pre-reserve the combined trajectory.
 			auto& combinedTraj = out.combinedTraj;
-			combinedTraj = Trajectory{};
+			combinedTraj.Clear();
 			{
 				size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
 				combinedTraj.states.reserve(expTs * obsSize);

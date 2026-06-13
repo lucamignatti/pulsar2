@@ -103,7 +103,14 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 		obsSize = obsBuilders[0]->BuildObs(testState.players[0], testState).size();
 		state.obs = DimList2<float>(state.numPlayers, obsSize);
 
-		state.actionMasks = DimList2<uint8_t>(state.numPlayers, actionParsers[0]->GetActionAmount());
+		numActions = actionParsers[0]->GetActionAmount();
+		state.actionMasks = DimList2<uint8_t>(state.numPlayers, numActions);
+		obsBuildBuffers.resize(state.numPlayers);
+		actionMaskBuildBuffers.resize(state.numPlayers);
+		for (auto& obsBuffer : obsBuildBuffers)
+			obsBuffer.reserve(obsSize);
+		for (auto& maskBuffer : actionMaskBuildBuffers)
+			maskBuffer.reserve(numActions);
 	}
 
 	// Reset all arenas initially
@@ -271,14 +278,22 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 
 		// Update observations
 		{
-			for (int i = 0; i < gs.players.size(); i++)
-				state.obs.Set(playerStartIdx + i, obsBuilders[arenaIdx]->BuildObs(gs.players[i], gs));
+			for (int i = 0; i < gs.players.size(); i++) {
+				int playerIdx = playerStartIdx + i;
+				auto& obsBuffer = obsBuildBuffers[playerIdx];
+				obsBuilders[arenaIdx]->BuildObsInto(obsBuffer, gs.players[i], gs);
+				state.obs.Set(playerIdx, obsBuffer);
+			}
 		}
 
 		// Update action masks
 		{
-			for (int i = 0; i < gs.players.size(); i++)
-				state.actionMasks.Set(playerStartIdx + i, actionParsers[arenaIdx]->GetActionMask(gs.players[i], gs));
+			for (int i = 0; i < gs.players.size(); i++) {
+				int playerIdx = playerStartIdx + i;
+				auto& maskBuffer = actionMaskBuildBuffers[playerIdx];
+				actionParsers[arenaIdx]->GetActionMaskInto(maskBuffer, gs.players[i], gs);
+				state.actionMasks.Set(playerIdx, maskBuffer);
+			}
 		}
 	};
 
@@ -312,14 +327,17 @@ void RLGC::EnvSet::ResetArena(int index) {
 
 	int playerStartIdx = state.arenaPlayerStartIdx[index];
 	for (int i = 0; i < newState.players.size(); i++) {
+		int playerIdx = playerStartIdx + i;
 
 		// Update obs
-		auto obs = obsBuilders[index]->BuildObs(newState.players[i], newState);
-		state.obs.Set(playerStartIdx + i, obs);
+		auto& obsBuffer = obsBuildBuffers[playerIdx];
+		obsBuilders[index]->BuildObsInto(obsBuffer, newState.players[i], newState);
+		state.obs.Set(playerIdx, obsBuffer);
 
 		// Update action mask
-		auto actionMask = actionParsers[index]->GetActionMask(newState.players[i], newState);
-		state.actionMasks.Set(playerStartIdx + i, actionMask);
+		auto& maskBuffer = actionMaskBuildBuffers[playerIdx];
+		actionParsers[index]->GetActionMaskInto(maskBuffer, newState.players[i], newState);
+		state.actionMasks.Set(playerIdx, maskBuffer);
 	}
 
 	// Remove previous state

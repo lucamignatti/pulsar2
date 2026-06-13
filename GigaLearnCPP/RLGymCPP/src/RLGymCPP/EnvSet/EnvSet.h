@@ -107,6 +107,8 @@ namespace RLGC {
 		std::vector<ObsBuilder*> obsBuilders;
 		std::vector<ActionParser*> actionParsers;
 		std::vector<StateSetter*> stateSetters;
+		std::vector<FList> obsBuildBuffers;
+		std::vector<std::vector<uint8_t>> actionMaskBuildBuffers;
 
 		EnvState state = {};
 

@@ -22,5 +22,6 @@ namespace RLGC {
 		}
 
 		virtual std::vector<uint8_t> GetActionMask(const Player& player, const GameState& state) override;
+		virtual void GetActionMaskInto(std::vector<uint8_t>& result, const Player& player, const GameState& state) override;
 	};
 }

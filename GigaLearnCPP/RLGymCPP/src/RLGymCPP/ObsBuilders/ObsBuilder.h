@@ -12,6 +12,10 @@ namespace RLGC {
 		// NOTE: May be called once during environment initialization to determine policy neuron size
 		virtual FList BuildObs(const Player& player, const GameState& state) = 0;
 
+		virtual void BuildObsInto(FList& obs, const Player& player, const GameState& state) {
+			obs = BuildObs(player, state);
+		}
+
 		// Returns the index of the first car-local ball component (pos+vel, 6 floats) in a built obs.
 		// Returns -1 if not supported by this obs builder (GCRL car_critic will be skipped).
 		virtual int GetCarLocalBallOffset() const { return -1; }

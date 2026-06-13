@@ -89,7 +89,13 @@ RLGC::DefaultAction::DefaultAction() {
 }
 
 std::vector<uint8_t> RLGC::DefaultAction::GetActionMask(const Player& player, const GameState& state) {
-	auto result = std::vector<uint8_t>(actions.size(), false);
+	std::vector<uint8_t> result;
+	GetActionMaskInto(result, player, state);
+	return result;
+}
+
+void RLGC::DefaultAction::GetActionMaskInto(std::vector<uint8_t>& result, const Player& player, const GameState& state) {
+	result.assign(actions.size(), false);
 
 	auto fnApplyMask = [&](const std::vector<uint8_t>& mask, bool add) {
 		if (add) {
@@ -113,6 +119,4 @@ std::vector<uint8_t> RLGC::DefaultAction::GetActionMask(const Player& player, co
 	bool isTurtled = player.worldContact.hasContact && player.worldContact.contactNormal.z > 0.9f;
 	if (player.HasFlipOrJump() || isTurtled)
 		fnApplyMask(jumpMask, true);
-
-	return result;
 }

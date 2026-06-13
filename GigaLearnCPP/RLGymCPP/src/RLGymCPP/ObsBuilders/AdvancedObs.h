@@ -39,6 +39,7 @@ namespace RLGC {
 		void AddPadsToObs(FList& obs, const std::vector<bool>& pads, const std::vector<float>& padTimers, bool xMirror);
 
 		virtual FList BuildObs(const Player& player, const GameState& state) override;
+		virtual void BuildObsInto(FList& obs, const Player& player, const GameState& state) override;
 
 		int GetCarLocalBallOffset() const override {
 			// Layout before self player: ball(9) + prevAction(8) + pads(34) + ballPred(9*n if enabled)

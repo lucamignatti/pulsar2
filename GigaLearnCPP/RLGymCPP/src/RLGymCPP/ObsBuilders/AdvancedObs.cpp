@@ -89,7 +89,13 @@ void RLGC::AdvancedObs::AddPadsToObs(FList& obs, const std::vector<bool>& pads, 
 }
 
 RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& state) {
-	FList obs = {};
+	FList obs;
+	BuildObsInto(obs, player, state);
+	return obs;
+}
+
+void RLGC::AdvancedObs::BuildObsInto(FList& obs, const Player& player, const GameState& state) {
+	obs.clear();
 
 	bool inv = player.team == Team::ORANGE;
 	bool xMirror = mirrorX && ShouldMirrorXForPlayer(player);
@@ -97,6 +103,13 @@ RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& s
 	auto ball = MirrorPhysX(InvertPhys(state.ball, inv), xMirror);
 	auto& pads = state.GetBoostPads(inv);
 	auto& padTimers = state.GetBoostPadTimers(inv);
+
+	constexpr int PLAYER_OBS_SIZE_HINT = 29;
+	int paddedPlayerCount = maxPlayers > 0 ? (maxPlayers * 2) : (int)state.players.size();
+	size_t baseObsSize = 9 + player.prevAction.ELEM_AMOUNT + CommonValues::BOOST_LOCATIONS_AMOUNT + extraObs.size();
+	if (includeBallPred)
+		baseObsSize += 9 * ballPredTimes.size();
+	obs.reserve(baseObsSize + (size_t)paddedPlayerCount * PLAYER_OBS_SIZE_HINT);
 
 	obs += ball.pos * POS_COEF;
 	obs += ball.vel * VEL_COEF;
@@ -111,20 +124,20 @@ RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& s
 	if (includeBallPred)
 		AddBallPredToObs(obs, player, state, inv, xMirror);
 
-	FList selfObs = {};
-	AddPlayerToObs(selfObs, player, inv, xMirror, ball);
-	obs += selfObs;
-	int playerObsSize = selfObs.size();
+	size_t selfObsStart = obs.size();
+	AddPlayerToObs(obs, player, inv, xMirror, ball);
+	int playerObsSize = (int)(obs.size() - selfObsStart);
 
-	std::vector<FList> teammates = {}, opponents = {};
+	std::vector<const Player*> teammates;
+	std::vector<const Player*> opponents;
+	teammates.reserve(maxPlayers > 0 ? maxPlayers - 1 : state.players.size());
+	opponents.reserve(maxPlayers > 0 ? maxPlayers : state.players.size());
 
 	for (auto& otherPlayer : state.players) {
 		if (otherPlayer.carId == player.carId)
 			continue;
 
-		FList playerObs = {};
-		AddPlayerToObs(playerObs, otherPlayer, inv, xMirror, ball);
-		((otherPlayer.team == player.team) ? teammates : opponents).push_back(playerObs);
+		((otherPlayer.team == player.team) ? teammates : opponents).push_back(&otherPlayer);
 	}
 
 	if (maxPlayers > 0) {
@@ -135,21 +148,27 @@ RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& s
 			RG_ERR_CLOSE("AdvancedObs: Too many opponents for Obs, maximum is " << maxPlayers);
 
 		while (teammates.size() < maxPlayers - 1)
-			teammates.push_back(FList(playerObsSize));
+			teammates.push_back(nullptr);
 		while (opponents.size() < maxPlayers)
-			opponents.push_back(FList(playerObsSize));
+			opponents.push_back(nullptr);
 	}
 
 	std::shuffle(teammates.begin(), teammates.end(), ::Math::GetRandEngine());
 	std::shuffle(opponents.begin(), opponents.end(), ::Math::GetRandEngine());
 
-	for (auto& teammate : teammates)
-		obs += teammate;
-	for (auto& opponent : opponents)
-		obs += opponent;
+	for (const Player* teammate : teammates) {
+		if (teammate)
+			AddPlayerToObs(obs, *teammate, inv, xMirror, ball);
+		else
+			obs.insert(obs.end(), playerObsSize, 0.0f);
+	}
+	for (const Player* opponent : opponents) {
+		if (opponent)
+			AddPlayerToObs(obs, *opponent, inv, xMirror, ball);
+		else
+			obs.insert(obs.end(), playerObsSize, 0.0f);
+	}
 
 	// User-supplied constants (e.g. game mode flags), always last so fixed offsets above hold
 	obs += extraObs;
-
-	return obs;
 }
