@@ -304,7 +304,7 @@ torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu, torc
 			torch::Tensor refineIdx;
 			if (config.optRefineMaxStates > 0 && B > config.optRefineMaxStates) {
 				RB = config.optRefineMaxStates;
-				refineIdx = torch::arange(RB, torch::TensorOptions().dtype(torch::kLong).device(device)) * B / RB;
+				refineIdx = (torch::arange(RB, torch::TensorOptions().dtype(torch::kLong).device(device)) * B / RB).to(torch::kLong);
 			}
 			torch::Tensor refineScore = refineIdx.defined() ? score.index_select(0, refineIdx) : score;
 			torch::Tensor refinePhi = refineIdx.defined() ? phi.index_select(0, refineIdx) : phi;
