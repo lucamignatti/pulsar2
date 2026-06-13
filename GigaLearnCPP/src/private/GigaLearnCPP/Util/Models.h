@@ -125,7 +125,7 @@ namespace GGL {
 		bool _seqHalfOutdated = true;
 		ModelConfig config;
 
-		torch::optim::Optimizer* optim;
+		torch::optim::Optimizer* optim = nullptr;
 
 		// Optimizer steps skipped due to non-finite gradients (per model, see StepOptim)
 		uint64_t nanGradSkips = 0;
@@ -194,7 +194,13 @@ namespace GGL {
 			return total;
 		}
 
-		virtual ~Model() = default;
+		// MakeOptimizer() new's the optimizer; the optimizer also holds copies of this
+		// model's parameter tensor handles, so a leaked optim pins the model's full weight
+		// storage alive even after the modules are destroyed. Cloned models (policy versions,
+		// the optionality target nets) are deleted via ModelSet::Free()/delete every version
+		// rotation, so failing to free optim here leaked a full model's worth of weights on
+		// every prune -- unbounded growth over a training run.
+		virtual ~Model() { delete optim; }
 	};
 
 	// ── Quasimetric GCRL critic ──────────────────────────────────────────────
