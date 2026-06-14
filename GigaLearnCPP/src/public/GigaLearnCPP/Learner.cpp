@@ -1943,7 +1943,7 @@ void GGL::Learner::Start() {
 			// rewards by GCRL terminal progress, and the critics only know anything about
 			// terminal progress once the policy actually touches the ball. On a wall clock
 			// (run tkpk0780) influence hit 1.0 over a touchless world and the curriculum/
-			// gated rewards spent ~3B steps multiplied by sigmoid(noise) ≈ 0.5 ± 0.2.
+			// gated rewards spent ~3B steps multiplied by tanh(noise) ≈ 0.0 ± 0.4.
 			ppo->curGCRLRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetGatedAnnealedRange(
 				0.0f,
 				config.ppo.gcrlRewardGateInfluence,
@@ -2182,10 +2182,10 @@ void GGL::Learner::Start() {
 					bool needsGCRLRewardGate =
 						config.ppo.useGCRLRewardGate &&
 						(ppo->curGCRLRewardGateInfluence > 0 || ppo->curGCRLAerialRewardGateInfluence > 0) &&
-						(hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) &&
+						(hasGatedRewards || hasAerialGatedRewards) &&
 						!combinedTraj.actionComps.empty();
 
-					if (needsGCRLRewardGate) {
+					if (hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) {
 						torch::Tensor tGatedRewards = hasGatedRewards ?
 							torch::tensor(combinedTraj.gcrlGatedRewards) :
 							torch::zeros_like(tRewards);
@@ -2200,95 +2200,105 @@ void GGL::Learner::Start() {
 							torch::zeros_like(tRewards);
 						torch::Tensor tScaledCurriculumRewards = tCurriculumRewards * ppo->curCurriculumRewardScale;
 						torch::Tensor tScaledAerialCurriculumRewards = tAerialCurriculumRewards * ppo->curAerialCurriculumRewardScale;
-						torch::Tensor tNormalRewards = tGatedRewards + tScaledCurriculumRewards;
-						torch::Tensor tAerialRewards = tAerialGatedRewards + tScaledAerialCurriculumRewards;
+						torch::Tensor tAppliedGatedRewards = tGatedRewards;
+						torch::Tensor tAppliedAerialRewards = tAerialGatedRewards;
 						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
-						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
-						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
-						torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
-							ppo,
-							tStates,
-							tActionComps,
-							tGoalTargetRow,
-							tAntiTargetRow,
-							combinedTraj.Length()
-						);
 
-						if (tTerminalScores.defined()) {
-							torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
-							torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
-							tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
-							tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
-							torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
-							torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
-							torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
+						if (needsGCRLRewardGate) {
+							torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+							torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
+							torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
+								ppo,
+								tStates,
+								tActionComps,
+								tGoalTargetRow,
+								tAntiTargetRow,
+								combinedTraj.Length()
+							);
 
-							int trajLength = combinedTraj.Length();
-							int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
-							std::vector<int64_t> futureIdxs(trajLength);
-							for (int epStart = 0; epStart < trajLength;) {
-								int epEnd = epStart;
-								while (epEnd < trajLength - 1 && combinedTraj.terminals[epEnd] == 0)
-									epEnd++;
-								for (int i = epStart; i <= epEnd; i++)
-									futureIdxs[i] = RS_MIN(i + lookahead, epEnd);
-								epStart = epEnd + 1;
-							}
+							if (tTerminalScores.defined()) {
+								torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
+								torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
+								tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
+								tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
+								torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
+								torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
+								torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
 
-							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
-							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
-
-							// Normalize the gate delta with slow per-mode EMA stats instead of a
-							// per-batch z-score: the gate's meaning then drifts over ~1/(1-decay)
-							// iterations instead of jumping with each batch's composition, and one
-							// mode's dynamics (e.g. heatseeker ball speeds) can't reprice another's.
-							constexpr double GATE_EMA_DECAY = 0.99;
-							torch::Tensor tNormGateDelta = torch::empty_like(tGateDelta);
-							for (int m = 0; m < numModes; m++) {
-								torch::Tensor mask = (tModeIds == m);
-								torch::Tensor vals = tGateDelta.masked_select(mask);
-								if (vals.numel() == 0)
-									continue;
-
-								gateDeltaMeanEMA[m] = GATE_EMA_DECAY * gateDeltaMeanEMA[m] + (1 - GATE_EMA_DECAY) * vals.mean().item<double>();
-								gateDeltaVarEMA[m] = GATE_EMA_DECAY * gateDeltaVarEMA[m] + (1 - GATE_EMA_DECAY) * vals.var(false).item<double>();
-
-								torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
-								tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
-							}
-							tOptionalityProgressDeltaShared = tNormGateDelta;
-
-							torch::Tensor tGate = torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
-							torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
-							torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
-							torch::Tensor tAppliedGatedRewards = tNormalRewards * tEffectiveGate;
-							torch::Tensor tAppliedAerialRewards = tAerialRewards * tEffectiveAerialGate;
-							tRewards = tBaseRewards + tAppliedGatedRewards + tAppliedAerialRewards;
-
-							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
-							report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
-							if (numModes > 1) {
-								for (int m = 0; m < numModes; m++) {
-									torch::Tensor modeGate = tEffectiveGate.masked_select(tModeIds == m);
-									if (modeGate.numel() > 0)
-										report["GCRL Gate/Mean/" + modeNames[m]] = modeGate.mean().item<float>();
+								int trajLength = combinedTraj.Length();
+								int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+								std::vector<int64_t> futureIdxs(trajLength);
+								for (int epStart = 0; epStart < trajLength;) {
+									int epEnd = epStart;
+									while (epEnd < trajLength - 1 && combinedTraj.terminals[epEnd] == 0)
+										epEnd++;
+									for (int i = epStart; i <= epEnd; i++)
+										futureIdxs[i] = RS_MIN(i + lookahead, epEnd);
+									epStart = epEnd + 1;
 								}
+
+								torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+								torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
+
+								// Normalize the gate delta with slow per-mode EMA stats instead of a
+								// per-batch z-score: the gate's meaning then drifts over ~1/(1-decay)
+								// iterations instead of jumping with each batch's composition, and one
+								// mode's dynamics (e.g. heatseeker ball speeds) can't reprice another's.
+								constexpr double GATE_EMA_DECAY = 0.99;
+								torch::Tensor tNormGateDelta = torch::empty_like(tGateDelta);
+								for (int m = 0; m < numModes; m++) {
+									torch::Tensor mask = (tModeIds == m);
+									torch::Tensor vals = tGateDelta.masked_select(mask);
+									if (vals.numel() == 0)
+										continue;
+
+									gateDeltaMeanEMA[m] = GATE_EMA_DECAY * gateDeltaMeanEMA[m] + (1 - GATE_EMA_DECAY) * vals.mean().item<double>();
+									gateDeltaVarEMA[m] = GATE_EMA_DECAY * gateDeltaVarEMA[m] + (1 - GATE_EMA_DECAY) * vals.var(false).item<double>();
+
+									torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
+									tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+								}
+								tOptionalityProgressDeltaShared = tNormGateDelta;
+
+								torch::Tensor tGate = torch::tanh(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
+								torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
+								torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
+								tAppliedGatedRewards = tGatedRewards * tEffectiveGate;
+								tAppliedAerialRewards = tAerialGatedRewards * tEffectiveAerialGate;
+
+								report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
+								report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
+								if (numModes > 1) {
+									for (int m = 0; m < numModes; m++) {
+										torch::Tensor modeGate = tEffectiveGate.masked_select(tModeIds == m);
+										if (modeGate.numel() > 0)
+											report["GCRL Gate/Mean/" + modeNames[m]] = modeGate.mean().item<float>();
+									}
+								}
+								report["GCRL Aerial Gate/Mean"] = tEffectiveAerialGate.mean().item<float>();
+								report["GCRL Aerial Gate/STD"] = tEffectiveAerialGate.std(false).item<float>();
+								report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
+								report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
+								report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
+								report["GCRL Aerial Gate/Aerial Reward Applied"] = tAppliedAerialRewards.mean().item<float>();
 							}
-							report["GCRL Aerial Gate/Mean"] = tEffectiveAerialGate.mean().item<float>();
-							report["GCRL Aerial Gate/STD"] = tEffectiveAerialGate.std(false).item<float>();
-							report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
-							report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
-							report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
-							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
-							report["GCRL Gate/Curriculum Reward Raw"] = tCurriculumRewards.mean().item<float>();
-							report["GCRL Gate/Curriculum Reward Scaled"] = tScaledCurriculumRewards.mean().item<float>();
-							report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
-							report["GCRL Aerial Gate/Aerial Reward Raw"] = tAerialGatedRewards.mean().item<float>();
-							report["GCRL Aerial Gate/Curriculum Reward Raw"] = tAerialCurriculumRewards.mean().item<float>();
-							report["GCRL Aerial Gate/Curriculum Reward Scaled"] = tScaledAerialCurriculumRewards.mean().item<float>();
-							report["GCRL Aerial Gate/Aerial Reward Applied"] = tAppliedAerialRewards.mean().item<float>();
-							report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
 						}
+
+						tRewards = tBaseRewards + tAppliedGatedRewards + tScaledCurriculumRewards + tScaledAerialCurriculumRewards + tAppliedAerialRewards;
+						report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
+						if (hasGatedRewards)
+							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
+						if (hasCurriculumRewards)
+							report["GCRL Gate/Curriculum Reward Raw"] = tCurriculumRewards.mean().item<float>();
+						if (hasCurriculumRewards)
+							report["GCRL Gate/Curriculum Reward Scaled"] = tScaledCurriculumRewards.mean().item<float>();
+						if (hasAerialGatedRewards)
+							report["GCRL Aerial Gate/Aerial Reward Raw"] = tAerialGatedRewards.mean().item<float>();
+						if (hasAerialCurriculumRewards)
+							report["GCRL Aerial Gate/Curriculum Reward Raw"] = tAerialCurriculumRewards.mean().item<float>();
+						if (hasAerialCurriculumRewards)
+							report["GCRL Aerial Gate/Curriculum Reward Scaled"] = tScaledAerialCurriculumRewards.mean().item<float>();
+						report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
 					}
 
 					// ── Feature A: frontier reset curriculum (consistency scoring) ──

@@ -342,7 +342,7 @@ namespace GGL {
 		// gate influence ramps (the gate filters rewards by critic-judged terminal progress,
 		// which is noise until the critics have seen ball touches — run tkpk0780 ramped
 		// influence to 1.0 on its wall clock over a touchless world and the touch-teaching
-		// rewards spent ~3B steps multiplied by sigmoid(noise)). The aerial gate reads the
+		// rewards spent ~3B steps multiplied by tanh(noise)). The aerial gate reads the
 		// high air touch ratio (airborne touch, ball z >= 500).
 		float curriculumAnnealTouchRatioGate = 0.0f;
 		float aerialCurriculumAnnealAirTouchRatioGate = 0.0f;

@@ -204,7 +204,7 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 }
 
 torch::Tensor GGL::PPOLearner::InferGCRLTerminalScores(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets) {
-	if (!config.useGCRLRewardGate || !config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
+	if (!config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
 		return {};
 
 	torch::NoGradGuard noGrad;

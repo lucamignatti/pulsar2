@@ -465,8 +465,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
 	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
-	// noise. Start moderate; raise if defense lags.
-	cfg.ppo.gcrlAntiScale = 0.4f;
+	// noise. Match goal pursuit strength so last-man defense can veto rebound waiting.
+	cfg.ppo.gcrlAntiScale = 1.0f;
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
 	// ── Gradient surgery: OFF ──
 	// The magnitude-gated diagnostics settled it: HiMag Conflict ~0.45 (<0.5, i.e. reward and
