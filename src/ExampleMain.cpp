@@ -184,7 +184,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Sparse objective and unavoidable costs stay ungated.
 		{ new GoalReward(), 275 },
 		{ new DemoedPenalty(), 5.f },
-		{ new TimePenalty(-0.075f), 1.0f }
+		{ new TimePenalty(-0.075f), 1.0f },
+
+		// Minimal contact bootstrap: these are hard to exploit into passive play and
+		// provide the first-touch data the full GCRL reward gate needs to become useful.
+		{ new ZeroSumReward(new KickoffOnlyReward(new KickoffTouchReward(3.0f)), 0.0f), 5.0f },
+		{ new TouchBallReward(), 2.0f }
 	};
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
@@ -201,13 +206,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ZeroSumReward(new ShotReward(), TEAM_SPIRIT, 0.0f), 15.f },
 		{ new ZeroSumReward(new ShotOnFrameReward(), TEAM_SPIRIT, 0.0f), 35.f },
 		{ new ZeroSumReward(new SaveReward(), TEAM_SPIRIT, 0.0f), 20.f },
-		{ new ZeroSumReward(new KickoffOnlyReward(new KickoffTouchReward(3.0f)), 0.0f), 5.0f },
 
 		// Ground/contact rewards.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
 		{ new VelocityPlayerToBallReward(), chaseWeight },
-		{ new TouchBallReward(), 2.0f },
 
 		// Aerial rewards require the ball to be up and/or productive contact.
 		{ new HeightWeightedAerialApproachReward(), 3.0f },
