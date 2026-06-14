@@ -503,6 +503,23 @@ namespace GGL {
 		// failure mode and must not both be loud (see Opt/Interlock Active).
 		int optBurnInIters = 20;
 
+		// ── Option-conditioned entropy (uses optionality scorer, no reward shaping) ──
+		// Computes a per-transition exploration weight from the optionality bank's score
+		// breadth. Broad states keep the entropy bonus; sharp/execute states lose it or get
+		// a small entropy penalty. This is deliberately independent from useOptionality.
+		bool useOptionEntropy = false;
+		float optionEntropyBreadthTemp = 1.0f;       // softmax temperature over option-bank scores
+		float optionEntropyMinQualityZ = -0.5f;      // phi_opt z-score where exploration starts opening up
+		float optionEntropyQualitySharpness = 0.5f;  // larger = smoother quality gate
+		float optionEntropyMinWeight = 0.0f;
+		float optionEntropyMaxWeight = 1.0f;
+		float optionEntropyCommitPenalty = 0.01f;    // entropy penalty scale when weight is 0
+		float optionEntropyDefaultWeight = 1.0f;     // used before the option bank has filled
+		int optionEntropyKickoffSteps = 90;          // env steps (~3s at tickSkip=4)
+		float optionEntropyKickoffWeight = 0.0f;
+		float optionEntropyOpenNetWeight = 0.10f;
+		float optionEntropyOwnNetWeight = 0.10f;
+
 		PPOLearnerConfig() {
 			policy = {};
 			policy.layerSizes = { 256, 256, 256 };

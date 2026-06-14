@@ -90,6 +90,13 @@ namespace GGL {
 		// [N] CPU phi_opt over the batch states; {} while the bank is empty.
 		// Frozen nets, zero action components, minibatched on the training device.
 		torch::Tensor ComputePhiOpt(torch::Tensor tStatesCpu, torch::Tensor* outReachOnly = nullptr);
+		// [N] CPU normalized effective option count in [0, 1]. Optionally also returns
+		// the matching phi_opt values so callers can quality-gate exploration.
+		torch::Tensor ComputeOptionBreadth(
+			torch::Tensor tStatesCpu,
+			torch::Tensor* outPhiOpt = nullptr,
+			torch::Tensor* outReachOnly = nullptr
+		);
 
 		int BankFill() const;
 		double BankAgeMean(int64_t iteration) const;

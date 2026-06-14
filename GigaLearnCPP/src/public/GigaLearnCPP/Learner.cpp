@@ -14,6 +14,7 @@
 #include <limits>
 #include <deque>
 #include <exception>
+#include <cmath>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
@@ -478,14 +479,16 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 			j["contact_hit_force_hist"] = contactHitForceHist->ToJSON();
 	}
 
-	// Feature D: persist the rOpt normalizer + burn-in + anneal progress (the goal bank
-	// and target nets are deliberately NOT checkpointed — they refill/re-sync on restart).
-	if (config.ppo.useOptionality) {
-		j["opt_reward_mean_ema"] = optRewardMeanEMA;
-		j["opt_reward_var_ema"] = optRewardVarEMA;
+	// Feature D / option entropy: persist phi_opt stats whenever the optionality scorer
+	// is used. Reward normalizer + burn-in + anneal progress remain reward-only state.
+	if (config.ppo.useOptionality || config.ppo.useOptionEntropy) {
 		j["opt_phi_mean_ema"] = optPhiMeanEMA;
 		j["opt_phi_var_ema"] = optPhiVarEMA;
 		j["opt_phi_stats_iters_done"] = optPhiStatsItersDone;
+	}
+	if (config.ppo.useOptionality) {
+		j["opt_reward_mean_ema"] = optRewardMeanEMA;
+		j["opt_reward_var_ema"] = optRewardVarEMA;
 		j["opt_burn_in_iters_done"] = optBurnInItersDone;
 		if (optWeightAnnealStartTS != UINT64_MAX)
 			j["opt_weight_anneal_start_ts"] = optWeightAnnealStartTS;
@@ -613,8 +616,8 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 }
 
 void GGL::Learner::DebugScoreOptionality(const std::string& path) {
-	if (!config.ppo.useOptionality || !ppo->optionality)
-		RG_ERR_CLOSE("Learner::DebugScoreOptionality(): requires config.ppo.useOptionality");
+	if ((!config.ppo.useOptionality && !config.ppo.useOptionEntropy) || !ppo->optionality)
+		RG_ERR_CLOSE("Learner::DebugScoreOptionality(): requires config.ppo.useOptionality or useOptionEntropy");
 	ppo->optionality->DebugScoreStates(path, obsSize);
 }
 
@@ -910,6 +913,7 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, gcrlGatedRewards, curriculumRewards, aerialGCRLGatedRewards, aerialCurriculumRewards, logProbs;
+			FList explorationWeights;
 			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
 			// ball goals (global / car-local), filled at episode end.
 			FList actionComps, futureGoals, carFutureGoals;
@@ -936,6 +940,7 @@ void GGL::Learner::Start() {
 				aerialGCRLGatedRewards.clear();
 				aerialCurriculumRewards.clear();
 				logProbs.clear();
+				explorationWeights.clear();
 				actionComps.clear();
 				futureGoals.clear();
 				carFutureGoals.clear();
@@ -958,6 +963,7 @@ void GGL::Learner::Start() {
 				aerialGCRLGatedRewards += other.aerialGCRLGatedRewards;
 				aerialCurriculumRewards += other.aerialCurriculumRewards;
 				logProbs += other.logProbs;
+				explorationWeights += other.explorationWeights;
 				actionComps += other.actionComps;
 				futureGoals += other.futureGoals;
 				carFutureGoals += other.carFutureGoals;
@@ -1004,6 +1010,8 @@ void GGL::Learner::Start() {
 			if (collectAerialCurriculumRewards)
 				traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
 			traj.logProbs.reserve(maxEpisodeLength);
+			if (config.ppo.useOptionEntropy)
+				traj.explorationWeights.reserve(maxEpisodeLength);
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
 			traj.modeIds.reserve(maxEpisodeLength);
@@ -1015,7 +1023,7 @@ void GGL::Learner::Start() {
 				traj.sorsSteps.reserve(maxEpisodeLength);
 			if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
 				traj.snapshots.reserve(maxEpisodeLength);
-			if (config.ppo.useOptionality)
+			if (config.ppo.useOptionality || config.ppo.useOptionEntropy)
 				traj.stratumFlags.reserve(maxEpisodeLength);
 		}
 
@@ -1024,6 +1032,63 @@ void GGL::Learner::Start() {
 		FList _curActionComps;
 		if (useActionComps)
 			_curActionComps.resize(numPlayers * 8);
+
+		auto fnAlignment = [](Vec a, Vec b) {
+			float al = a.Length();
+			float bl = b.Length();
+			if (al < 1e-4f || bl < 1e-4f)
+				return 0.0f;
+			return a.Dot(b) / (al * bl);
+		};
+
+		auto fnOptionEntropySuppressor = [&](int playerIdx, const Trajectory& traj) {
+			if (!config.ppo.useOptionEntropy)
+				return 1.0f;
+
+			float w = 1.0f;
+			int arenaIdx = playerArenaIdx[playerIdx];
+			const GameState& gs = envSet->state.gameStates[arenaIdx];
+			const Player& player = gs.players[playerLocalIdx[playerIdx]];
+
+			if ((int)traj.Length() < config.ppo.optionEntropyKickoffSteps) {
+				bool taggedKickoff = config.ppo.frontierBuffer &&
+					config.ppo.frontierBuffer->GetArenaTag(envSet->arenas[arenaIdx]) == RLGC::FrontierStateBuffer::TAG_KICKOFF;
+				bool centerBall = std::abs(gs.ball.pos.x) < 25.0f && std::abs(gs.ball.pos.y) < 25.0f &&
+					gs.ball.pos.z < 140.0f && gs.ball.vel.Length() < 250.0f;
+				if (taggedKickoff || centerBall)
+					w = RS_MIN(w, config.ppo.optionEntropyKickoffWeight);
+			}
+
+			Vec oppGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_CENTER : CommonValues::BLUE_GOAL_CENTER;
+			Vec ownGoal = player.team == Team::BLUE ? CommonValues::BLUE_GOAL_CENTER : CommonValues::ORANGE_GOAL_CENTER;
+			Vec ballToOpp = oppGoal - gs.ball.pos;
+			Vec ballToOwn = ownGoal - gs.ball.pos;
+			Vec playerToBall = gs.ball.pos - player.pos;
+
+			float bestOppBallDist = 1e30f;
+			for (const Player& other : gs.players)
+				if (other.team != player.team && !other.isDemoed)
+					bestOppBallDist = RS_MIN(bestOppBallDist, other.pos.Dist(gs.ball.pos));
+
+			float playerBallDist = player.pos.Dist(gs.ball.pos);
+			bool clearOpenNet =
+				ballToOpp.Length() < 3500.0f &&
+				std::abs(gs.ball.pos.x) < 1700.0f &&
+				playerBallDist < 2300.0f &&
+				playerBallDist + 700.0f < bestOppBallDist &&
+				fnAlignment(playerToBall, ballToOpp) > 0.50f;
+			if (clearOpenNet)
+				w = RS_MIN(w, config.ppo.optionEntropyOpenNetWeight);
+
+			float ownNetApproach = gs.ball.vel.Dot(ballToOwn.Normalized());
+			bool ownNetDanger =
+				ballToOwn.Length() < 3200.0f &&
+				(ownNetApproach > 450.0f || std::abs(gs.ball.pos.y) > 3500.0f);
+			if (ownNetDanger)
+				w = RS_MIN(w, config.ppo.optionEntropyOwnNetWeight);
+
+			return RS_CLAMP(w, 0.0f, 1.0f);
+		};
 
 		auto fnInsertCoverageGoalRow = [&](const float* row) {
 			if (!config.ppo.useCoverageHER || config.ppo.herCoverageBankSize <= 0)
@@ -1250,7 +1315,8 @@ void GGL::Learner::Start() {
 			// Self-tuning curriculum collector hooks (all dead branches when off)
 			bool doFrontier = config.ppo.useFrontierResets && config.ppo.frontierBuffer && config.ppo.useGCRL;
 			bool doAdaptiveTargets = config.ppo.useAdaptiveGateTargetVel || config.ppo.useAdaptiveStrongTouchFloor;
-			bool doOptionality = config.ppo.useOptionality && config.ppo.useGCRL;
+			bool doOptionEntropy = config.ppo.useOptionEntropy && config.ppo.useGCRL;
+			bool doOptionalityScoring = (config.ppo.useOptionality || doOptionEntropy) && config.ppo.useGCRL;
 
 			// Reset and pre-reserve the combined trajectory.
 			auto& combinedTraj = out.combinedTraj;
@@ -1268,6 +1334,8 @@ void GGL::Learner::Start() {
 				if (collectAerialCurriculumRewards)
 					combinedTraj.aerialCurriculumRewards.reserve(expTs);
 				combinedTraj.logProbs.reserve(expTs);
+				if (config.ppo.useOptionEntropy)
+					combinedTraj.explorationWeights.reserve(expTs);
 				combinedTraj.actions.reserve(expTs);
 				combinedTraj.terminals.reserve(expTs);
 				combinedTraj.modeIds.reserve(expTs);
@@ -1283,7 +1351,7 @@ void GGL::Learner::Start() {
 					combinedTraj.sorsSteps.reserve(expTs);
 				if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
 					combinedTraj.snapshots.reserve(expTs);
-				if (config.ppo.useOptionality)
+				if (doOptionalityScoring)
 					combinedTraj.stratumFlags.reserve(expTs);
 			}
 
@@ -1463,6 +1531,9 @@ void GGL::Learner::Start() {
 							envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
 							envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
 							trajectories[newPlayerIdx].modeIds.push_back((int8_t)playerModeIds[newPlayerIdx]);
+							if (doOptionEntropy)
+								trajectories[newPlayerIdx].explorationWeights.push_back(
+									fnOptionEntropySuppressor(newPlayerIdx, trajectories[newPlayerIdx]));
 
 							// Mirror flag must be read here, before StepFirstHalf mutates the game
 							// states, so it matches the state this obs row was built from.
@@ -1673,7 +1744,7 @@ void GGL::Learner::Start() {
 						// strata (plus the touch mask for Opt/Phi At Touch). Flags describe the
 						// post-step state, one step (~33ms) after the obs row they select — an
 						// acceptable approximation for goal-bank purposes.
-						if (doOptionality) {
+						if (doOptionalityScoring) {
 							int arenaIdx = playerArenaIdx[newPlayerIdx];
 							const GameState& gs = envSet->state.gameStates[arenaIdx];
 							const Player& player = gs.players[playerLocalIdx[newPlayerIdx]];
@@ -2135,6 +2206,11 @@ void GGL::Learner::Start() {
 					// Episode segment end per index (terminals[epEnd] != 0), shared by the
 					// HER pass and the frontier scan. Built only when a feature needs it.
 					int trajN = (int)combinedTraj.Length();
+					torch::Tensor tExplorationWeights;
+					if (config.ppo.useOptionEntropy && combinedTraj.explorationWeights.size() == (size_t)trajN) {
+						tExplorationWeights = torch::tensor(combinedTraj.explorationWeights).clamp(
+							config.ppo.optionEntropyMinWeight, config.ppo.optionEntropyMaxWeight);
+					}
 					std::vector<int> epEndOf, epStartOf;
 					auto fnBuildEpBounds = [&]() {
 						if (!epEndOf.empty() || trajN == 0)
@@ -2637,13 +2713,13 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					// ── Feature D: optionality potential shaping ──
+					// ── Optionality scorer consumers: reward shaping and option-conditioned entropy ──
 					// Polyak the frozen scorer, refresh the stratified goal bank, compute
 					// phi_opt over the batch, and inject the masked potential delta into
 					// tRewards — AFTER all multiplicative gating (it is never gated) and
 					// BEFORE GAE (it flows through the normal value/GAE path, not as an
 					// advantage stream). Burn-in injects zero while the normalizer seeds.
-					if (config.ppo.useOptionality && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
+					if ((config.ppo.useOptionality || config.ppo.useOptionEntropy) && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
 						RG_NO_GRAD;
 						GCRLOptionality* opt = ppo->optionality;
 
@@ -2750,9 +2826,14 @@ void GGL::Learner::Start() {
 						// 3. Refresh the bank (FIFO per stratum) + re-embed under the frozen psi
 						opt->RefreshBank(candRows, candValues, (int64_t)totalIterations, report);
 
-						// 4. phi_opt over the batch
+						// 4. phi_opt over the batch; option-entropy also asks for normalized
+						// effective option count from the same bank-score distribution.
 						torch::Tensor phiReachOnly;
-						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
+						torch::Tensor optionBreadth;
+						torch::Tensor phiOpt = config.ppo.useOptionEntropy ?
+							torch::Tensor() : opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
+						if (config.ppo.useOptionEntropy)
+							optionBreadth = opt->ComputeOptionBreadth(tStates, &phiOpt, &phiReachOnly); // [N] cpu, or {} if bank empty
 						if (phiOpt.defined()) {
 							double batchPhiMean = phiOpt.mean().item<double>();
 							double batchPhiVar = phiOpt.var(false).item<double>();
@@ -2801,98 +2882,120 @@ void GGL::Learner::Start() {
 								}
 							}
 
-							// 5. One-sided option-collapse penalty + running normalizer.
-							torch::Tensor rOptRaw = -optDeficit;
+							if (config.ppo.useOptionEntropy && optionBreadth.defined()) {
+								torch::Tensor suppressor = tExplorationWeights.defined() ?
+									tExplorationWeights : torch::full_like(optionBreadth, config.ppo.optionEntropyDefaultWeight);
+								torch::Tensor phiZ = (phiOpt - (float)optPhiMeanEMA) / (float)phiStdEMA;
+								float qualitySharpness = RS_MAX(1e-6f, config.ppo.optionEntropyQualitySharpness);
+								torch::Tensor qualityGate = torch::sigmoid(
+									(phiZ - config.ppo.optionEntropyMinQualityZ) / qualitySharpness);
+								tExplorationWeights = (suppressor * optionBreadth * qualityGate).clamp(
+									config.ppo.optionEntropyMinWeight,
+									config.ppo.optionEntropyMaxWeight);
 
-							if (config.ppo.optCommitReliefScale > 0.0f) {
-								torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
-								if (!optProgressDelta.defined() && optValue.defined()) {
-									fnBuildEpBounds();
-									int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
-									std::vector<int64_t> futureIdxs(trajN);
-									for (int t = 0; t < trajN; t++)
-										futureIdxs[t] = RS_MIN(t + lookahead, epEndOf[t]);
+								report["Option Entropy/Breadth Mean"] = optionBreadth.mean().item<float>();
+								report["Option Entropy/Breadth Std"] = optionBreadth.std(false).item<float>();
+								report["Option Entropy/Quality Gate Mean"] = qualityGate.mean().item<float>();
+								report["Option Entropy/Suppressor Mean"] = suppressor.mean().item<float>();
+								report["Option Entropy/Weight Mean Pre-PPO"] = tExplorationWeights.mean().item<float>();
+								report["Option Entropy/Low Weight Fraction"] =
+									(tExplorationWeights < 0.25f).to(torch::kFloat32).mean().item<float>();
+							}
 
-									torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
-									torch::Tensor rawDelta = optValue.index_select(0, tFutureIdxs) - optValue;
-									optProgressDelta = torch::empty_like(rawDelta);
-									for (int m = 0; m < numModes; m++) {
-										torch::Tensor mask = (tModeIds == m);
-										torch::Tensor vals = rawDelta.masked_select(mask);
-										if (vals.numel() == 0)
-											continue;
-										torch::Tensor norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
-										optProgressDelta = optProgressDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+							if (config.ppo.useOptionality) {
+								// 5. One-sided option-collapse penalty + running normalizer.
+								torch::Tensor rOptRaw = -optDeficit;
+
+								if (config.ppo.optCommitReliefScale > 0.0f) {
+									torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
+									if (!optProgressDelta.defined() && optValue.defined()) {
+										fnBuildEpBounds();
+										int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+										std::vector<int64_t> futureIdxs(trajN);
+										for (int t = 0; t < trajN; t++)
+											futureIdxs[t] = RS_MIN(t + lookahead, epEndOf[t]);
+
+										torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+										torch::Tensor rawDelta = optValue.index_select(0, tFutureIdxs) - optValue;
+										optProgressDelta = torch::empty_like(rawDelta);
+										for (int m = 0; m < numModes; m++) {
+											torch::Tensor mask = (tModeIds == m);
+											torch::Tensor vals = rawDelta.masked_select(mask);
+											if (vals.numel() == 0)
+												continue;
+											torch::Tensor norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
+											optProgressDelta = optProgressDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+										}
+									}
+
+									if (optProgressDelta.defined()) {
+										float reliefScale = RS_CLAMP(config.ppo.optCommitReliefScale, 0.0f, 1.0f);
+										float sharpness = RS_MAX(1e-6f, config.ppo.optCommitReliefSharpness);
+										torch::Tensor lossMask = rOptRaw < 0.0f;
+										torch::Tensor positiveProgress = optProgressDelta > 0.0f;
+										torch::Tensor reliefGate = torch::where(
+											positiveProgress,
+											torch::sigmoid(sharpness * optProgressDelta),
+											torch::zeros_like(optProgressDelta)
+										);
+										torch::Tensor relief = reliefGate * reliefScale;
+										torch::Tensor rOptBeforeRelief = rOptRaw;
+										rOptRaw = torch::where(lossMask, rOptRaw * (1.0f - relief), rOptRaw);
+
+										torch::Tensor lossF = lossMask.to(torch::kFloat32);
+										float lossCount = lossF.sum().item<float>();
+										report["Opt Commit/GCRL Delta Mean"] = optProgressDelta.mean().item<float>();
+										report["Opt Commit/Loss Fraction"] = lossF.mean().item<float>();
+										report["Opt Commit/Relief Mean"] =
+											lossCount > 0 ? (relief * lossF).sum().item<float>() / lossCount : 0.0f;
+										float rawLoss = (-rOptBeforeRelief).masked_select(lossMask).sum().item<float>();
+										float relievedLoss = (-rOptRaw).masked_select(lossMask).sum().item<float>();
+										report["Opt Commit/Relieved Loss Share"] =
+											rawLoss > 1e-8f ? (rawLoss - relievedLoss) / rawLoss : 0.0f;
 									}
 								}
 
-								if (optProgressDelta.defined()) {
-									float reliefScale = RS_CLAMP(config.ppo.optCommitReliefScale, 0.0f, 1.0f);
-									float sharpness = RS_MAX(1e-6f, config.ppo.optCommitReliefSharpness);
-									torch::Tensor lossMask = rOptRaw < 0.0f;
-									torch::Tensor positiveProgress = optProgressDelta > 0.0f;
-									torch::Tensor reliefGate = torch::where(
-										positiveProgress,
-										torch::sigmoid(sharpness * optProgressDelta),
-										torch::zeros_like(optProgressDelta)
-									);
-									torch::Tensor relief = reliefGate * reliefScale;
-									torch::Tensor rOptBeforeRelief = rOptRaw;
-									rOptRaw = torch::where(lossMask, rOptRaw * (1.0f - relief), rOptRaw);
+								double batchMean = rOptRaw.mean().item<double>();
+								double batchVar = rOptRaw.var(false).item<double>();
+								constexpr double OPT_NORM_DECAY = 0.999;
+								optRewardMeanEMA = OPT_NORM_DECAY * optRewardMeanEMA + (1 - OPT_NORM_DECAY) * batchMean;
+								optRewardVarEMA = OPT_NORM_DECAY * optRewardVarEMA + (1 - OPT_NORM_DECAY) * batchVar;
+								double normStd = std::sqrt(optRewardVarEMA + 1e-8);
 
-									torch::Tensor lossF = lossMask.to(torch::kFloat32);
-									float lossCount = lossF.sum().item<float>();
-									report["Opt Commit/GCRL Delta Mean"] = optProgressDelta.mean().item<float>();
-									report["Opt Commit/Loss Fraction"] = lossF.mean().item<float>();
-									report["Opt Commit/Relief Mean"] =
-										lossCount > 0 ? (relief * lossF).sum().item<float>() / lossCount : 0.0f;
-									float rawLoss = (-rOptBeforeRelief).masked_select(lossMask).sum().item<float>();
-									float relievedLoss = (-rOptRaw).masked_select(lossMask).sum().item<float>();
-									report["Opt Commit/Relieved Loss Share"] =
-										rawLoss > 1e-8f ? (rawLoss - relievedLoss) / rawLoss : 0.0f;
+								// 6. Weight schedule + interlock
+								float effectiveOptWeight = fnGetGatedAnnealedRange(
+									config.ppo.optWeight, config.ppo.optWeightFinal,
+									-1, config.ppo.optAnnealSteps,
+									optWeightAnnealStartTS, optWeightAnnealProgressTS,
+									config.ppo.curriculumAnnealTouchRatioGate, touchRatioEMA);
+								bool interlock = ppo->curGCRLAdvScale >= 0.5f;
+								if (interlock)
+									effectiveOptWeight *= 0.5f;
+								report["Opt/Interlock Active"] = interlock ? 1.0 : 0.0;
+
+								bool burnIn = optBurnInItersDone < config.ppo.optBurnInIters;
+								optBurnInItersDone++;
+
+								torch::Tensor injected = rOptRaw * (effectiveOptWeight / (float)normStd);
+								report["Opt/Reward Std (pre-norm)"] = (float)std::sqrt(RS_MAX(batchVar, 0.0));
+								report["Opt/Effective Weight"] = burnIn ? 0.0f : effectiveOptWeight;
+								report["Opt/Reward Mean"] = burnIn ? 0.0f : injected.mean().item<float>();
+								float meanAbsTotal = tRewards.abs().mean().item<float>();
+								report["Opt/Reward Share"] = (!burnIn && meanAbsTotal > 1e-8f)
+									? injected.abs().mean().item<float>() / meanAbsTotal : 0.0f;
+
+								// Hover monitor: Pearson(rOpt, curriculum reward — dominant term is the chase reward)
+								if (combinedTraj.curriculumRewards.size() == (size_t)trajN) {
+									torch::Tensor tChase = torch::tensor(combinedTraj.curriculumRewards);
+									torch::Tensor a = rOptRaw - rOptRaw.mean();
+									torch::Tensor b = tChase - tChase.mean();
+									float denom = (a.norm() * b.norm()).item<float>();
+									report["Opt/Corr With Chase"] = denom > 1e-8f ? (a * b).sum().item<float>() / denom : 0.0f;
 								}
+
+								if (!burnIn)
+									tRewards = tRewards + injected;
 							}
-
-							double batchMean = rOptRaw.mean().item<double>();
-							double batchVar = rOptRaw.var(false).item<double>();
-							constexpr double OPT_NORM_DECAY = 0.999;
-							optRewardMeanEMA = OPT_NORM_DECAY * optRewardMeanEMA + (1 - OPT_NORM_DECAY) * batchMean;
-							optRewardVarEMA = OPT_NORM_DECAY * optRewardVarEMA + (1 - OPT_NORM_DECAY) * batchVar;
-							double normStd = std::sqrt(optRewardVarEMA + 1e-8);
-
-							// 6. Weight schedule + interlock
-							float effectiveOptWeight = fnGetGatedAnnealedRange(
-								config.ppo.optWeight, config.ppo.optWeightFinal,
-								-1, config.ppo.optAnnealSteps,
-								optWeightAnnealStartTS, optWeightAnnealProgressTS,
-								config.ppo.curriculumAnnealTouchRatioGate, touchRatioEMA);
-							bool interlock = ppo->curGCRLAdvScale >= 0.5f;
-							if (interlock)
-								effectiveOptWeight *= 0.5f;
-							report["Opt/Interlock Active"] = interlock ? 1.0 : 0.0;
-
-							bool burnIn = optBurnInItersDone < config.ppo.optBurnInIters;
-							optBurnInItersDone++;
-
-							torch::Tensor injected = rOptRaw * (effectiveOptWeight / (float)normStd);
-							report["Opt/Reward Std (pre-norm)"] = (float)std::sqrt(RS_MAX(batchVar, 0.0));
-							report["Opt/Effective Weight"] = burnIn ? 0.0f : effectiveOptWeight;
-							report["Opt/Reward Mean"] = burnIn ? 0.0f : injected.mean().item<float>();
-							float meanAbsTotal = tRewards.abs().mean().item<float>();
-							report["Opt/Reward Share"] = (!burnIn && meanAbsTotal > 1e-8f)
-								? injected.abs().mean().item<float>() / meanAbsTotal : 0.0f;
-
-							// Hover monitor: Pearson(rOpt, curriculum reward — dominant term is the chase reward)
-							if (combinedTraj.curriculumRewards.size() == (size_t)trajN) {
-								torch::Tensor tChase = torch::tensor(combinedTraj.curriculumRewards);
-								torch::Tensor a = rOptRaw - rOptRaw.mean();
-								torch::Tensor b = tChase - tChase.mean();
-								float denom = (a.norm() * b.norm()).item<float>();
-								report["Opt/Corr With Chase"] = denom > 1e-8f ? (a * b).sum().item<float>() / denom : 0.0f;
-							}
-
-							if (!burnIn)
-								tRewards = tRewards + injected;
 						}
 					}
 
@@ -2982,6 +3085,10 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (tExplorationWeights.defined())
+						experience.data.explorationWeights = tExplorationWeights;
+					else
+						experience.data.explorationWeights = torch::Tensor();
 					if (numModes > 1)
 						experience.data.modeIds = tModeIds;
 

@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
 
 	// Feature D offline harness: `--score-opt <file>` loads the checkpoint, scores the
 	// hand-supplied states in <file> through the frozen optionality scorer, prints
-	// phi_opt per row, and exits. Requires useOptionality (set below).
+	// phi_opt per row, and exits. Requires useOptionality or useOptionEntropy (set below).
 	std::string scoreOptPath;
 	for (int i = 1; i + 1 < argc; i++)
 		if (std::string(argv[i]) == "--score-opt")
@@ -475,6 +475,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.useAdaptiveGateTargetVel = false;  // fixed gate target; no moving reward scale
 	cfg.ppo.useAdaptiveStrongTouchFloor = false; // fixed StrongTouch floor
 	cfg.ppo.useOptionality = false;             // Feature D
+	cfg.ppo.useOptionEntropy = true;            // use optionality breadth to suppress/allow entropy, without reward shaping
+	cfg.ppo.optionEntropyCommitPenalty = 0.01f;
+	cfg.ppo.optionEntropyMinQualityZ = -0.5f;
+	cfg.ppo.optionEntropyQualitySharpness = 0.5f;
+	cfg.ppo.optionEntropyBreadthTemp = 1.0f;
+	cfg.ppo.optionEntropyKickoffSteps = 90;
+	cfg.ppo.optionEntropyKickoffWeight = 0.0f;
+	cfg.ppo.optionEntropyOpenNetWeight = 0.10f;
+	cfg.ppo.optionEntropyOwnNetWeight = 0.10f;
 	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optDeficitFloorStd = 0.75f;        // Only punish unusually low optionality; no reward above the floor

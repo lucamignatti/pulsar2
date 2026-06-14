@@ -401,6 +401,72 @@ torch::Tensor GGL::GCRLOptionality::ComputePhiOpt(torch::Tensor tStatesCpu, torc
 	return out;
 }
 
+torch::Tensor GGL::GCRLOptionality::ComputeOptionBreadth(
+	torch::Tensor tStatesCpu,
+	torch::Tensor* outPhiOpt,
+	torch::Tensor* outReachOnly
+) {
+	if (bankPsiRows == 0 || !bankPsi.defined())
+		return {};
+
+	RG_NO_GRAD;
+
+	int64_t N = tStatesCpu.size(0);
+	torch::Tensor out = torch::empty({ N }, torch::TensorOptions().dtype(torch::kFloat32));
+	torch::Tensor phiOpt;
+	if (outPhiOpt)
+		phiOpt = torch::empty({ N }, torch::TensorOptions().dtype(torch::kFloat32));
+	torch::Tensor reachOnly;
+	if (outReachOnly)
+		reachOnly = torch::empty({ N }, torch::TensorOptions().dtype(torch::kFloat32));
+
+	int64_t step = device.is_cpu() ? N : (int64_t)config.miniBatchSize;
+	float breadthTemp = RS_MAX(1e-4f, config.optionEntropyBreadthTemp);
+
+	for (int64_t i = 0; i < N; i += step) {
+		int64_t start = i, end = RS_MIN(i + step, N);
+		torch::Tensor obs = tStatesCpu.slice(0, start, end).to(device, RG_H2D_NONBLOCKING(device), true);
+		if (targetSharedHead)
+			obs = targetSharedHead->Forward(obs, false);
+
+		torch::Tensor zeroActs = torch::zeros({ end - start, 8 }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::Tensor phi = targetCritic->embed_phi(obs, zeroActs);
+		torch::Tensor scoreReach = torch::matmul(phi, bankPsi.transpose(0, 1)) / config.gcrlTau;
+		torch::Tensor score = scoreReach;
+		if (bankValueLogits.defined() && bankValueLogits.numel() == bankPsi.size(0))
+			score = score + bankValueLogits.to(score.device()).unsqueeze(0);
+
+		int64_t bankCount = bankPsi.size(0);
+		torch::Tensor probs = torch::softmax(score / breadthTemp, 1);
+		torch::Tensor optionEntropy = -(probs * probs.clamp_min(1e-12f).log()).sum(1);
+		torch::Tensor breadth;
+		if (bankCount > 1) {
+			torch::Tensor effectiveCount = optionEntropy.exp();
+			breadth = ((effectiveCount - 1.0f) / (float)(bankCount - 1)).clamp(0.0f, 1.0f);
+		} else {
+			breadth = torch::zeros_like(optionEntropy);
+		}
+		out.slice(0, start, end).copy_(breadth.cpu(), true);
+
+		if (outPhiOpt) {
+			torch::Tensor phiPart = config.optTemp *
+				(torch::logsumexp(score / config.optTemp, 1) - std::log((double)bankCount));
+			phiOpt.slice(0, start, end).copy_(phiPart.cpu(), true);
+		}
+		if (outReachOnly) {
+			torch::Tensor phiReach = config.optTemp *
+				(torch::logsumexp(scoreReach / config.optTemp, 1) - std::log((double)bankCount));
+			reachOnly.slice(0, start, end).copy_(phiReach.cpu(), true);
+		}
+	}
+
+	if (outPhiOpt)
+		*outPhiOpt = phiOpt;
+	if (outReachOnly)
+		*outReachOnly = reachOnly;
+	return out;
+}
+
 void GGL::GCRLOptionality::RunSelfTests() {
 	RG_NO_GRAD;
 	constexpr const char* ERROR_PREFIX = "GCRLOptionality::RunSelfTests(): ";

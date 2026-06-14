@@ -6,6 +6,9 @@ namespace GGL {
 	struct ExperienceTensors {
 		torch::Tensor
 			states, actions, logProbs, targetValues, actionMasks, advantages,
+			// Optional per-transition exploration pressure in [0, 1]. When populated,
+			// PPO scales/penalizes entropy per row instead of applying one global bonus.
+			explorationWeights,
 			// Per-step game-mode id (int64), used for per-mode advantage normalization.
 			// Left undefined when only one mode exists (sampler skips undefined fields).
 			modeIds,
