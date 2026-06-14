@@ -415,6 +415,21 @@ namespace GGL {
 		// critic's calibration at distance extremes degrades, corrupting the very distance
 		// estimates this sampler depends on. The uniform floor breaks that feedback loop.
 		float herUniformFraction = 0.4f;
+		// Coverage-balanced useful-goal HER: multiply the difficulty-HER candidate weight by
+		// dynamic undercoverage/usefulness boosts in learned psi(goal) space, then optionally
+		// harvest backtracked reset snapshots for the same rare-useful selected goals. This
+		// attacks the achieved-goal feedback loop without hand-labeled aerial/defense bins.
+		bool useCoverageHER = false;
+		int herCoverageBankSize = 8192;       // Rolling raw 6D HER goal rows; re-embedded each iter to avoid stale psi drift
+		int herCoverageCompareSamples = 64;  // Strided sample from the bank used for density estimates
+		int herCoverageTopK = 4;             // Average top-k cosine similarity to sampled bank rows
+		int herCoverageBankInsertCap = 2048; // Reservoir-sampled selected goals inserted per iteration
+		float herCoverageNoveltyStrength = 1.0f;
+		float herCoverageUtilityStrength = 0.75f;
+		float herCoverageMaxBoost = 3.0f;
+		bool herCoverageHarvestResets = true;
+		int herCoverageResetBacktrackSteps = 30;     // Snapshot before the selected rare-useful goal
+		int herCoverageResetMaxInsertsPerIter = 512; // Cap shared FrontierStateBuffer inserts from coverage HER
 
 		// ── Adaptive (ratcheted-quantile) targets (Feature C) ──
 		// Replaces two hand-tuned thresholds with quantiles of what the policy actually

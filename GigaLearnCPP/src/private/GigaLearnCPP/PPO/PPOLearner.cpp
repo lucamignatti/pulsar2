@@ -34,8 +34,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		RG_ERR_CLOSE("PPOLearner: useGCRLRewardGate requires useGCRL");
 
 	// The self-tuning curriculum features all score with the GCRL embedding nets
-	if ((config.useFrontierResets || config.useDifficultyHER || config.useOptionality) && !config.useGCRL)
-		RG_ERR_CLOSE("PPOLearner: useFrontierResets/useDifficultyHER/useOptionality require useGCRL");
+	if ((config.useFrontierResets || config.useDifficultyHER || config.useCoverageHER || config.useOptionality) && !config.useGCRL)
+		RG_ERR_CLOSE("PPOLearner: useFrontierResets/useDifficultyHER/useCoverageHER/useOptionality require useGCRL");
+
+	if (config.useCoverageHER && !config.useDifficultyHER)
+		RG_ERR_CLOSE("PPOLearner: useCoverageHER requires useDifficultyHER");
 
 	// ENSEMBLE is a planned fallback (extra phi/psi heads) — error instead of silently
 	// no-opping if it's ever selected before being implemented.

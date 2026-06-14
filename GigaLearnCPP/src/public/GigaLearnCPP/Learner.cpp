@@ -198,6 +198,19 @@ namespace {
 			}
 		}
 	}
+
+	torch::Tensor PercentileRank01(torch::Tensor x) {
+		if (!x.defined() || x.numel() <= 0)
+			return {};
+
+		torch::Tensor flat = x.flatten();
+		if (flat.numel() <= 1)
+			return torch::zeros_like(x);
+
+		torch::Tensor sorted = std::get<0>(flat.sort());
+		torch::Tensor ranks = torch::searchsorted(sorted, flat).to(torch::kFloat32) / (float)flat.numel();
+		return ranks.clamp(0.0f, 1.0f).view_as(x);
+	}
 }
 
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
@@ -997,6 +1010,53 @@ void GGL::Learner::Start() {
 		FList _curActionComps;
 		if (useActionComps)
 			_curActionComps.resize(numPlayers * 8);
+
+		auto fnInsertCoverageGoalRow = [&](const float* row) {
+			if (!config.ppo.useCoverageHER || config.ppo.herCoverageBankSize <= 0)
+				return;
+
+			const int goalDim = GCRL_GATE_GOAL_DIM;
+			int cap = RS_MAX(1, config.ppo.herCoverageBankSize);
+			if ((int)coverageGoalRows.size() != cap * goalDim) {
+				coverageGoalRows.assign((size_t)cap * goalDim, 0.0f);
+				coverageGoalWriteIdx = 0;
+				coverageGoalCount = 0;
+			}
+
+			float* dst = coverageGoalRows.data() + (size_t)coverageGoalWriteIdx * goalDim;
+			for (int d = 0; d < goalDim; d++)
+				dst[d] = row[d];
+			coverageGoalWriteIdx = (coverageGoalWriteIdx + 1) % cap;
+			coverageGoalCount = RS_MIN(coverageGoalCount + 1, cap);
+		};
+
+		auto fnCoverageGoalBankRows = [&]() -> torch::Tensor {
+			if (!config.ppo.useCoverageHER || coverageGoalCount <= 0 || coverageGoalRows.empty())
+				return {};
+
+			const int goalDim = GCRL_GATE_GOAL_DIM;
+			int sampleCount = RS_MIN(coverageGoalCount, RS_MAX(1, config.ppo.herCoverageCompareSamples));
+			if (sampleCount >= coverageGoalCount) {
+				return torch::from_blob(
+					(void*)coverageGoalRows.data(),
+					{ (int64_t)coverageGoalCount, (int64_t)goalDim },
+					torch::TensorOptions().dtype(torch::kFloat32)).clone();
+			}
+
+			FList sampledRows;
+			sampledRows.resize((size_t)sampleCount * goalDim);
+			for (int i = 0; i < sampleCount; i++) {
+				int srcIdx = (int)((int64_t)i * coverageGoalCount / sampleCount);
+				const float* src = coverageGoalRows.data() + (size_t)srcIdx * goalDim;
+				float* dst = sampledRows.data() + (size_t)i * goalDim;
+				for (int d = 0; d < goalDim; d++)
+					dst[d] = src[d];
+			}
+			return torch::from_blob(
+				(void*)sampledRows.data(),
+				{ (int64_t)sampleCount, (int64_t)goalDim },
+				torch::TensorOptions().dtype(torch::kFloat32)).clone();
+		};
 
 		auto fnBuildSORSWindows = [&](const Trajectory& traj) {
 			std::vector<PPOLearner::SORSWindow> windows;
@@ -2042,6 +2102,7 @@ void GGL::Learner::Start() {
 					// Per-step goal-critic terminal score [N], shared between the gate block
 					// (which already computes it) and the optionality offensive-stratum filter.
 					torch::Tensor tGoalScoreShared;
+					torch::Tensor tAntiScoreShared;
 					// Raw terminal utility [N] for value-weighted optionality:
 					// opponent-goal reachability minus own-goal danger, normalized later inside the bank.
 					torch::Tensor tOptionalityValueShared;
@@ -2131,15 +2192,116 @@ void GGL::Learner::Start() {
 							torch::Tensor p = torch::searchsorted(sortedD, d).to(torch::kFloat32) / (float)(Nsel * K);
 							float sigma = RS_MAX(1e-3f, config.ppo.herDifficultySigma);
 							torch::Tensor w = torch::exp(-(p - 0.5f).square() / (2.0f * sigma * sigma)).reshape({ Nsel, K });
+
+							torch::Tensor noveltyRank;
+							torch::Tensor utilityRank;
+							if (config.ppo.useCoverageHER) {
+								report["HER/Coverage Bank Fill"] = coverageGoalCount;
+
+								if (config.ppo.herCoverageNoveltyStrength > 0.0f && coverageGoalCount > 0) {
+									torch::Tensor tBankRows = fnCoverageGoalBankRows();
+									if (tBankRows.defined() && tBankRows.numel() > 0) {
+										torch::Tensor tBankPsi = ppo->InferGCRLPsiEmbeddings(tBankRows);
+										int64_t B = tCandPsi.size(0);
+										int64_t bankN = tBankPsi.size(0);
+										int topK = RS_MIN(RS_MAX(1, config.ppo.herCoverageTopK), (int)bankN);
+										torch::Tensor rawNovelty = torch::empty({ B }, torch::TensorOptions().dtype(torch::kFloat32));
+										int64_t chunk = RS_MAX((int64_t)4096, (int64_t)config.ppo.miniBatchSize);
+										for (int64_t start = 0; start < B; start += chunk) {
+											int64_t end = RS_MIN(start + chunk, B);
+											torch::Tensor sims = torch::matmul(
+												tCandPsi.slice(0, start, end),
+												tBankPsi.transpose(0, 1)
+											);
+											torch::Tensor density;
+											if (topK == 1) {
+												density = std::get<0>(sims.max(1));
+											} else {
+												density = std::get<0>(sims.topk(topK, 1, true, true)).mean(1);
+											}
+											// Embeddings are L2-normalized, so cosine similarity is in [-1, 1].
+											// Convert dense/common goals toward 0 novelty and sparse goals toward 1.
+											torch::Tensor novelty = ((1.0f - density) * 0.5f).clamp(0.0f, 1.0f);
+											rawNovelty.slice(0, start, end).copy_(novelty);
+										}
+										noveltyRank = PercentileRank01(rawNovelty);
+										torch::Tensor noveltyBoost = (1.0f + config.ppo.herCoverageNoveltyStrength * noveltyRank)
+											.clamp(1.0f, RS_MAX(1.0f, config.ppo.herCoverageMaxBoost));
+										w = w * noveltyBoost.reshape({ Nsel, K });
+										report["HER/Coverage Novelty Mean"] = noveltyRank.mean().item<float>();
+										report["HER/Coverage Novelty Boost Mean"] = noveltyBoost.mean().item<float>();
+									}
+								}
+
+								if (config.ppo.herCoverageUtilityStrength > 0.0f) {
+									if (!tOptionalityValueShared.defined()) {
+										torch::Tensor gRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+										torch::Tensor aRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
+										torch::Tensor ts = InferGCRLTerminalScoresBatched(ppo, tStates, tActionComps, gRow, aRow, trajN);
+										if (ts.defined()) {
+											tGoalScoreShared = ts.select(1, 0);
+											tAntiScoreShared = ts.select(1, 1);
+											tOptionalityValueShared = tGoalScoreShared - config.ppo.gcrlRewardGateAntiScale * tAntiScoreShared;
+										}
+									}
+
+									if (tOptionalityValueShared.defined()) {
+										torch::Tensor tCandTargetIdx = torch::tensor(candOffsets, torch::TensorOptions().dtype(torch::kLong));
+										torch::Tensor candUtility = tOptionalityValueShared.index_select(0, tCandTargetIdx);
+										utilityRank = PercentileRank01(candUtility);
+										torch::Tensor utilityBoost = (1.0f + config.ppo.herCoverageUtilityStrength * utilityRank)
+											.clamp(1.0f, RS_MAX(1.0f, config.ppo.herCoverageMaxBoost));
+										w = w * utilityBoost.reshape({ Nsel, K });
+										report["HER/Coverage Utility Mean"] = utilityRank.mean().item<float>();
+										report["HER/Coverage Utility Boost Mean"] = utilityBoost.mean().item<float>();
+									}
+								}
+							}
+
 							torch::Tensor chosen = torch::multinomial(w, 1).flatten(); // [Nsel] in [0, K)
 
 							torch::Tensor pSel = p.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).flatten();
 							report["HER/Selected Distance Percentile Mean"] = pSel.mean().item<float>();
+							if (noveltyRank.defined())
+								report["HER/Coverage Selected Novelty"] =
+									noveltyRank.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).mean().item<float>();
+							if (utilityRank.defined())
+								report["HER/Coverage Selected Utility"] =
+									utilityRank.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).mean().item<float>();
 
 							torch::Tensor chosenCpu = chosen.to(torch::kCPU).contiguous();
 							const int64_t* chosenData = chosenCpu.data_ptr<int64_t>();
 							for (int s = 0; s < Nsel; s++)
 								tTarget[candAnchors[s]] = candOffsets[(size_t)s * K + (int)chosenData[s]];
+
+							if (config.ppo.useCoverageHER && config.ppo.herCoverageHarvestResets &&
+								config.ppo.frontierBuffer && combinedTraj.snapshots.size() == (size_t)trajN) {
+								torch::Tensor selectedW = w.gather(1, chosen.unsqueeze(1)).flatten();
+								int topN = RS_MIN(RS_MAX(0, config.ppo.herCoverageResetMaxInsertsPerIter), Nsel);
+								int inserts = 0;
+								if (topN > 0) {
+									auto top = selectedW.topk(topN, 0, true, true);
+									torch::Tensor topIdxCpu = std::get<1>(top).to(torch::kCPU).contiguous();
+									const int64_t* topIdxData = topIdxCpu.data_ptr<int64_t>();
+									for (int q = 0; q < topN; q++) {
+										int s = (int)topIdxData[q];
+										int tt = candOffsets[(size_t)s * K + (int)chosenData[s]];
+										int target = RS_MAX(epStartOf[tt], tt - config.ppo.herCoverageResetBacktrackSteps);
+										int floor = RS_MAX(epStartOf[tt], target - 2 * RS_MAX(1, config.ppo.frontierSnapshotInterval));
+										for (int idx = target; idx >= floor; idx--) {
+											const auto& snap = combinedTraj.snapshots[idx];
+											if (!snap)
+												continue;
+											if (RLGC::FrontierStateBuffer::PassesSanityFilter(*snap)) {
+												config.ppo.frontierBuffer->Insert(*snap);
+												inserts++;
+											}
+											break;
+										}
+									}
+								}
+								report["HER/Coverage Reset Inserts"] = inserts;
+							}
 						}
 
 						// Write back futureGoals / carFutureGoals — verbatim port of the
@@ -2147,6 +2309,27 @@ void GGL::Learner::Start() {
 						combinedTraj.futureGoals.resize((size_t)trajN * 6);
 						combinedTraj.carFutureGoals.resize((size_t)trajN * 6);
 						FList selectedOffsets; selectedOffsets.reserve(trajN);
+						FList coverageRowsToInsert;
+						int coverageRowsSeen = 0;
+						int coverageInsertCap = config.ppo.useCoverageHER ? RS_MAX(0, config.ppo.herCoverageBankInsertCap) : 0;
+						if (coverageInsertCap > 0)
+							coverageRowsToInsert.reserve((size_t)RS_MIN(coverageInsertCap, trajN) * GCRL_GATE_GOAL_DIM);
+						auto fnQueueCoverageGoalRow = [&](const float* row) {
+							if (coverageInsertCap <= 0)
+								return;
+							coverageRowsSeen++;
+							int curRows = (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM);
+							if (curRows < coverageInsertCap) {
+								coverageRowsToInsert.insert(coverageRowsToInsert.end(), row, row + GCRL_GATE_GOAL_DIM);
+							} else {
+								int j = Math::RandInt(0, coverageRowsSeen);
+								if (j < coverageInsertCap) {
+									float* dst = coverageRowsToInsert.data() + (size_t)j * GCRL_GATE_GOAL_DIM;
+									for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++)
+										dst[d] = row[d];
+								}
+							}
+						};
 						for (int t = 0; t < trajN; t++) {
 							int tt = tTarget[t];
 							bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[tt]);
@@ -2164,8 +2347,13 @@ void GGL::Learner::Start() {
 									combinedTraj.carFutureGoals[(size_t)t * 6 + 4] = -combinedTraj.carFutureGoals[(size_t)t * 6 + 4];
 								}
 							}
+							fnQueueCoverageGoalRow(combinedTraj.futureGoals.data() + (size_t)t * GCRL_GATE_GOAL_DIM);
 							selectedOffsets.push_back((float)(tt - t));
 						}
+						for (int i = 0; i < (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM); i++)
+							fnInsertCoverageGoalRow(coverageRowsToInsert.data() + (size_t)i * GCRL_GATE_GOAL_DIM);
+						if (config.ppo.useCoverageHER)
+							report["HER/Coverage Bank Inserted"] = (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM);
 
 						torch::Tensor tOff = torch::tensor(selectedOffsets);
 						report["HER/Selected Offset Mean"] = tOff.mean().item<float>();
@@ -2205,21 +2393,28 @@ void GGL::Learner::Start() {
 						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
 
 						if (needsGCRLRewardGate) {
-							torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
-							torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
-							torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
-								ppo,
-								tStates,
-								tActionComps,
-								tGoalTargetRow,
-								tAntiTargetRow,
-								combinedTraj.Length()
-							);
+							torch::Tensor tGoalScore = tGoalScoreShared;
+							torch::Tensor tAntiScore = tAntiScoreShared;
+							if (!tGoalScore.defined() || !tAntiScore.defined()) {
+								torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+								torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
+								torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
+									ppo,
+									tStates,
+									tActionComps,
+									tGoalTargetRow,
+									tAntiTargetRow,
+									combinedTraj.Length()
+								);
+								if (tTerminalScores.defined()) {
+									tGoalScore = tTerminalScores.select(1, 0);
+									tAntiScore = tTerminalScores.select(1, 1);
+								}
+							}
 
-							if (tTerminalScores.defined()) {
-								torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
-								torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
+							if (tGoalScore.defined() && tAntiScore.defined()) {
 								tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
+								tAntiScoreShared = tAntiScore;
 								tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
 								torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
 								torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
@@ -2861,6 +3056,12 @@ void GGL::Learner::Start() {
 						"Frontier/Reset Fraction Actual",
 						"HER/Selected Offset P50",
 						"HER/Uniform Fraction Actual",
+						"HER/Coverage Bank Fill",
+						"HER/Coverage Novelty Boost Mean",
+						"HER/Coverage Utility Boost Mean",
+						"HER/Coverage Selected Novelty",
+						"HER/Coverage Selected Utility",
+						"HER/Coverage Reset Inserts",
 						"Adaptive/Gate Target Vel",
 						"Adaptive/StrongTouch Floor",
 						"Adaptive/Touch Samples Per Iter",

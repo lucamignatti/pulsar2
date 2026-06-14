@@ -454,13 +454,11 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// Back to 0.3. At 0.65 the from-scratch run e79pvv92 showed GCRL/Final Advantage 0.69
-	// vs GCRL/Reward Advantage 0.33 -- the same 2:1 GCRL-over-reward gradient dominance
-	// that preceded the bgksd0wi collapse, with critics that had barely seen ball touches
-	// steering most of the policy gradient. 0.65 was premised on RESUMING a checkpoint
-	// whose critics were already trained on competent play (ryp4gxwv); re-raise it only
-	// from such a checkpoint, and watch the Final-vs-Reward advantage ratio (~1:1 target).
-	cfg.ppo.gcrlAdvScale = 0.65f;
+	// Intentional 0.65 scale: the stronger GCRL channel has been more useful than the
+	// conservative 0.3 setting in this curriculum. Keep watching Final-vs-Reward advantage
+	// balance; if GCRL/Final Advantage persistently dwarfs GCRL/Reward Advantage, the critics
+	// are again steering most of the policy gradient.
+	cfg.ppo.gcrlAdvScale = 0.5f;
 	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
@@ -514,13 +512,21 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.curriculumAnnealTouchRatioGate = 0.006f;
 	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0002f;
 
-	// ── Self-tuning curriculum (all OFF by default; flip one line to trial each) ──
-	// A: uncertainty-triggered frontier resets. B: difficulty-aware HER goal sampling.
+	// ── Self-tuning curriculum ──
+	// A: uncertainty-triggered frontier resets. B: difficulty/coverage-aware HER goal sampling.
 	// C: adaptive ratcheted-quantile gate target / StrongTouch floor. D: optionality
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
 	cfg.ppo.useFrontierResets = true;          // Feature A
 	cfg.ppo.useDifficultyHER = true;           // Feature B
 	cfg.ppo.herCandidates = 4;                 // Cheaper difficulty-HER candidate set; watch selected percentile/offsets
+	cfg.ppo.useCoverageHER = true;             // Feature B.2: dynamic rare/useful goal coverage for HER + reset harvesting
+	cfg.ppo.herCoverageBankSize = 8192;
+	cfg.ppo.herCoverageCompareSamples = 64;
+	cfg.ppo.herCoverageBankInsertCap = 2048;
+	cfg.ppo.herCoverageNoveltyStrength = 1.0f;
+	cfg.ppo.herCoverageUtilityStrength = 0.75f;
+	cfg.ppo.herCoverageMaxBoost = 3.0f;
+	cfg.ppo.herCoverageResetMaxInsertsPerIter = 512;
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
 	cfg.ppo.useOptionality = false;             // Feature D

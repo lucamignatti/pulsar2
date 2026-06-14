@@ -81,6 +81,13 @@ namespace GGL {
 		struct EMAHistogram* contactBallSpeedHist = nullptr;
 		struct EMAHistogram* contactHitForceHist = nullptr;
 
+		// Coverage-balanced HER: rolling raw HER goal rows (6D ball pos/vel in obs space).
+		// Stored raw instead of as psi embeddings so the live GCRL goal encoder can re-embed
+		// them after each update without semantic drift.
+		RLGC::FList coverageGoalRows;
+		int coverageGoalWriteIdx = 0;
+		int coverageGoalCount = 0;
+
 		// Feature D: rOpt normalizer EMA + burn-in counter (persisted — a restart must not
 		// re-run the burn-in or cold-start the normalizer; the bank/target nets refill/
 		// re-sync instead).
