@@ -424,9 +424,9 @@ namespace GGL {
 		int herCoverageCompareSamples = 64;  // Strided sample from the bank used for density estimates
 		int herCoverageTopK = 4;             // Average top-k cosine similarity to sampled bank rows
 		int herCoverageBankInsertCap = 2048; // Reservoir-sampled selected goals inserted per iteration
-		float herCoverageNoveltyStrength = 1.0f;
+		float herCoverageNoveltyStrength = 1.0f; // Centered exp beta: exp(beta * (rank - 0.5))
 		float herCoverageUtilityStrength = 0.75f;
-		float herCoverageMaxBoost = 3.0f;
+		float herCoverageMaxBoost = 3.0f;        // Clamp centered multiplier to [1/max, max]
 		bool herCoverageHarvestResets = true;
 		int herCoverageResetBacktrackSteps = 30;     // Snapshot before the selected rare-useful goal
 		int herCoverageResetMaxInsertsPerIter = 512; // Cap shared FrontierStateBuffer inserts from coverage HER

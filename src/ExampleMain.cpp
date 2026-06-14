@@ -518,7 +518,7 @@ int main(int argc, char* argv[]) {
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
 	cfg.ppo.useFrontierResets = true;          // Feature A
 	cfg.ppo.useDifficultyHER = true;           // Feature B
-	cfg.ppo.herCandidates = 4;                 // Cheaper difficulty-HER candidate set; watch selected percentile/offsets
+	cfg.ppo.herCandidates = 8;                 // Wider candidate set so coverage-HER has room to select rare/useful goals
 	cfg.ppo.useCoverageHER = true;             // Feature B.2: dynamic rare/useful goal coverage for HER + reset harvesting
 	cfg.ppo.herCoverageBankSize = 8192;
 	cfg.ppo.herCoverageCompareSamples = 64;

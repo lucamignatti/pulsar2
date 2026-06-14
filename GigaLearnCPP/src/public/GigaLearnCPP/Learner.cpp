@@ -2225,10 +2225,13 @@ void GGL::Learner::Start() {
 											rawNovelty.slice(0, start, end).copy_(novelty);
 										}
 										noveltyRank = PercentileRank01(rawNovelty);
-										torch::Tensor noveltyBoost = (1.0f + config.ppo.herCoverageNoveltyStrength * noveltyRank)
-											.clamp(1.0f, RS_MAX(1.0f, config.ppo.herCoverageMaxBoost));
+										float maxCoverageBoost = RS_MAX(1.0f, config.ppo.herCoverageMaxBoost);
+										torch::Tensor noveltyBoost = torch::exp(
+											config.ppo.herCoverageNoveltyStrength * (noveltyRank - 0.5f)
+										).clamp(1.0f / maxCoverageBoost, maxCoverageBoost);
 										w = w * noveltyBoost.reshape({ Nsel, K });
 										report["HER/Coverage Novelty Mean"] = noveltyRank.mean().item<float>();
+										report["HER/Coverage Raw Novelty STD"] = rawNovelty.std(false).item<float>();
 										report["HER/Coverage Novelty Boost Mean"] = noveltyBoost.mean().item<float>();
 									}
 								}
@@ -2249,10 +2252,13 @@ void GGL::Learner::Start() {
 										torch::Tensor tCandTargetIdx = torch::tensor(candOffsets, torch::TensorOptions().dtype(torch::kLong));
 										torch::Tensor candUtility = tOptionalityValueShared.index_select(0, tCandTargetIdx);
 										utilityRank = PercentileRank01(candUtility);
-										torch::Tensor utilityBoost = (1.0f + config.ppo.herCoverageUtilityStrength * utilityRank)
-											.clamp(1.0f, RS_MAX(1.0f, config.ppo.herCoverageMaxBoost));
+										float maxCoverageBoost = RS_MAX(1.0f, config.ppo.herCoverageMaxBoost);
+										torch::Tensor utilityBoost = torch::exp(
+											config.ppo.herCoverageUtilityStrength * (utilityRank - 0.5f)
+										).clamp(1.0f / maxCoverageBoost, maxCoverageBoost);
 										w = w * utilityBoost.reshape({ Nsel, K });
 										report["HER/Coverage Utility Mean"] = utilityRank.mean().item<float>();
+										report["HER/Coverage Raw Utility STD"] = candUtility.std(false).item<float>();
 										report["HER/Coverage Utility Boost Mean"] = utilityBoost.mean().item<float>();
 									}
 								}
@@ -2262,12 +2268,20 @@ void GGL::Learner::Start() {
 
 							torch::Tensor pSel = p.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).flatten();
 							report["HER/Selected Distance Percentile Mean"] = pSel.mean().item<float>();
-							if (noveltyRank.defined())
-								report["HER/Coverage Selected Novelty"] =
-									noveltyRank.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).mean().item<float>();
-							if (utilityRank.defined())
-								report["HER/Coverage Selected Utility"] =
-									utilityRank.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).mean().item<float>();
+							if (noveltyRank.defined()) {
+								float noveltyMean = noveltyRank.mean().item<float>();
+								float selectedNovelty = noveltyRank.reshape({ Nsel, K })
+									.gather(1, chosen.unsqueeze(1)).mean().item<float>();
+								report["HER/Coverage Selected Novelty"] = selectedNovelty;
+								report["HER/Coverage Novelty Selection Lift"] = selectedNovelty - noveltyMean;
+							}
+							if (utilityRank.defined()) {
+								float utilityMean = utilityRank.mean().item<float>();
+								float selectedUtility = utilityRank.reshape({ Nsel, K })
+									.gather(1, chosen.unsqueeze(1)).mean().item<float>();
+								report["HER/Coverage Selected Utility"] = selectedUtility;
+								report["HER/Coverage Utility Selection Lift"] = selectedUtility - utilityMean;
+							}
 
 							torch::Tensor chosenCpu = chosen.to(torch::kCPU).contiguous();
 							const int64_t* chosenData = chosenCpu.data_ptr<int64_t>();
@@ -2301,6 +2315,8 @@ void GGL::Learner::Start() {
 									}
 								}
 								report["HER/Coverage Reset Inserts"] = inserts;
+								report["HER/Coverage Reset Insert Fraction"] =
+									topN > 0 ? (float)inserts / (float)topN : 0.0f;
 							}
 						}
 
@@ -3059,9 +3075,13 @@ void GGL::Learner::Start() {
 						"HER/Coverage Bank Fill",
 						"HER/Coverage Novelty Boost Mean",
 						"HER/Coverage Utility Boost Mean",
+						"HER/Coverage Novelty Selection Lift",
+						"HER/Coverage Utility Selection Lift",
+						"HER/Coverage Raw Utility STD",
 						"HER/Coverage Selected Novelty",
 						"HER/Coverage Selected Utility",
 						"HER/Coverage Reset Inserts",
+						"HER/Coverage Reset Insert Fraction",
 						"Adaptive/Gate Target Vel",
 						"Adaptive/StrongTouch Floor",
 						"Adaptive/Touch Samples Per Iter",
