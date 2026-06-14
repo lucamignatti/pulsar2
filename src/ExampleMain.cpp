@@ -179,6 +179,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 		case 2:  chaseWeight = 4.0f; break;
 		default: chaseWeight = 3.0f; break;
 	}
+	constexpr float BALL_TO_GOAL_WEIGHT = 15.0f;
+	constexpr float BALL_TO_GOAL_RESIDUAL = 0.25f;
+	constexpr float CHASE_RESIDUAL = 0.15f;
 
 	std::vector<WeightedReward> rewards = {
 		// Sparse objective and unavoidable costs stay ungated.
@@ -194,7 +197,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
 		// Every shaped/mechanic incentive is filtered by terminal GCRL progress from the start.
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 15.0f },
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), BALL_TO_GOAL_WEIGHT * BALL_TO_GOAL_RESIDUAL },
 		{ new AerialCommitReward(), 6.0f },
 
 		// Boost
@@ -210,7 +213,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Ground/contact rewards.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
-		{ new VelocityPlayerToBallReward(), chaseWeight },
+		{ new VelocityPlayerToBallReward(), chaseWeight * CHASE_RESIDUAL },
 
 		// Aerial rewards require the ball to be up and/or productive contact.
 		{ new HeightWeightedAerialApproachReward(), 3.0f },
@@ -224,6 +227,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
 		// // GCRL-gated so it only pays when the agent is making terminal progress.
 		// { new EnergyReward(), 1.0f }
+	};
+
+	std::vector<WeightedReward> curriculumRewards = {
+		// Dense bootstrap scaffold. These are the two rewards that keep early policies
+		// entering ball-contact states; the learner anneals this stream down to the gated
+		// residuals above instead of removing the signal entirely.
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), BALL_TO_GOAL_WEIGHT },
+		{ new VelocityPlayerToBallReward(), chaseWeight }
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -277,6 +288,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
+	result.curriculumRewards = curriculumRewards;
 	result.userInfo = resetInfo;
 	result.userInfoDeleter = [](void* ptr) {
 		delete (EnvResetInfo*)ptr;
@@ -437,8 +449,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
-	// Reward shaping is binary now: base rewards are ungated, every shaped reward in
-	// gcrlGatedRewards is gated immediately at full influence. No curriculum/aerial buckets.
+	// Reward shaping stays simple: base rewards are ungated, shaped rewards are gated
+	// immediately, and only the car->ball / ball->goal bootstrap scaffold anneals away.
 	cfg.ppo.useGCRLRewardGate = true;
 	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
 	cfg.ppo.gcrlRewardGateAnnealStart = 0;
@@ -451,9 +463,9 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlAerialRewardGateStartInfluence = 1.0f;
 	cfg.ppo.gcrlAerialRewardGateAnnealStart = 0;
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 0;
-	cfg.ppo.curriculumRewardScale = 0.0f;
-	cfg.ppo.curriculumRewardAnnealStart = 0;
-	cfg.ppo.curriculumRewardAnnealSteps = 0;
+	cfg.ppo.curriculumRewardScale = 1.0f;
+	cfg.ppo.curriculumRewardAnnealStart = -1;
+	cfg.ppo.curriculumRewardAnnealSteps = 2'000'000'000;
 	cfg.ppo.aerialCurriculumRewardScale = 0.0f;
 	cfg.ppo.aerialCurriculumRewardAnnealStart = 0;
 	cfg.ppo.aerialCurriculumRewardAnnealSteps = 0;
