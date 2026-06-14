@@ -20,7 +20,7 @@
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
 
-// ── Self-tuning curriculum shared state ──
+// ── Self-tuning reset/target shared state ──
 // Created in main() before the Learner (EnvCreateFunc runs inside the Learner ctor),
 // raw pointers/globals like `resetInfo`. All inert unless the matching flag is set.
 static RLGC::FrontierStateBuffer* g_FrontierBuffer = nullptr; // Feature A buffer (also fed to PPO config)
@@ -62,7 +62,7 @@ public:
 	}
 };
 
-// ── Aerial curriculum state-setter ──
+// ── Aerial state-setter ──
 // Spawns the ball up in the air and one car positioned to go up and TOUCH it, so the policy
 // actually experiences aerial touches (the existing aerial rewards then reinforce them) instead
 // of having to stumble into one in open play -- the deep-basin reachability problem behind the
@@ -181,19 +181,19 @@ EnvCreateResult EnvCreateFunc(int index) {
 	}
 
 	std::vector<WeightedReward> rewards = {
+		// Sparse objective and unavoidable costs stay ungated.
+		{ new GoalReward(), 275 },
+		{ new DemoedPenalty(), 5.f },
+		{ new TimePenalty(-0.075f), 1.0f }
+	};
 
-		// Ball-goal. 15 (was 5): the negative side of this zero-sum term is the only dense
-		// defensive gradient in the stack -- at 5 it was drowned out by the ~90-weight
-		// offensive rewards and the bot never paid for letting the ball travel at its net.
+	std::vector<WeightedReward> gcrlGatedRewards = {
+		// Every shaped/mechanic incentive is filtered by terminal GCRL progress from the start.
 		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 15.0f },
-
-		// Ungated aerial bootstrap; completed aerial touches/followups remain GCRL-gated.
 		{ new AerialCommitReward(), 6.0f },
 
 		// Boost
 		{ new PickupBoostReward(), 10.f },
-		// 0.05: at 0.2 the max passive income (0.2/step at full boost) beat the time penalty
-		// (0.075/step) and run bgksd0wi converged to boost-camping as its best strategy.
 		{ new SaveBoostReward(), 0.05f },
 
 		// Game events — shot/save callbacks are NULL in Heatseeker (no event tracker),
@@ -202,69 +202,25 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ new ZeroSumReward(new ShotOnFrameReward(), TEAM_SPIRIT, 0.0f), 35.f },
 		{ new ZeroSumReward(new SaveReward(), TEAM_SPIRIT, 0.0f), 20.f },
 		{ new ZeroSumReward(new KickoffOnlyReward(new KickoffTouchReward(3.0f)), 0.0f), 5.0f },
-		{ new GoalReward(), 275 },
 
-		// Getting demoed costs the team a defender for 3 seconds
-		{ new DemoedPenalty(), 5.f },
-
-		// time penalty
-		{ new TimePenalty(-0.075f), 1.0f }
-	};
-
-	std::vector<WeightedReward> gcrlGatedRewards = {
-
-		// Ground/contact rewards are filtered by GCRL terminal progress.
-		// Back to 90 (from 60): the floorless sigmoid gate means ~0.5x expected multiplier,
-		// so 90 x 0.5 ≈ the healthy run g7jf6cwc's effective 90 x 0.6-with-floor.
+		// Ground/contact rewards.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
-
-		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
-		// // GCRL-gated so it only pays when the agent is making terminal progress.
-		// { new EnergyReward(), 1.0f }
-	};
-
-	std::vector<WeightedReward> curriculumRewards = {
-
-		// Temporary chase incentive. NOTE: this group IS multiplied by the GCRL reward gate
-		// (Learner combines it with gcrlGatedRewards before gating) — which is why the gate
-		// influence anneal is now held back by the touch-competence gate: in tkpk0780 the
-		// influence ramp hit 1.0 on its 400M wall clock while the critics were still
-		// touchless, and the only touch-teaching rewards spent 3B steps multiplied by
-		// sigmoid(noise) ≈ 0.5 ± 0.2.
 		{ new VelocityPlayerToBallReward(), chaseWeight },
+		{ new TouchBallReward(), 2.0f },
 
-		// Bottom rung of the touch ladder: StrongTouchReward pays zero below 20kph hit
-		// force, so the first weeks of grazing touches earn nothing from it. This pays for
-		// ANY contact and anneals away with the rest of the curriculum.
-		{ new TouchBallReward(), 2.0f }
-	};
-
-	std::vector<WeightedReward> aerialGCRLGatedRewards = {
-
-		// Aerial rewards use a slower gate anneal so bootstrap signals are not filtered out early.
-		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
-		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
-		// the ball to actually be up and/or productive contact.
-		// 3.0 (was 1.5): going up for a high ball has to compete with the ground chase reward
-		// (weight 6, pays on every ball). This only pays airborne with ball z >= 500, so it
-		// can't be hover-farmed like AirReward was.
+		// Aerial rewards require the ball to be up and/or productive contact.
 		{ new HeightWeightedAerialApproachReward(), 3.0f },
 		{ new UsefulAirTouchReward(), 25.0f },
 		{ new SecondTouchReward(), 12.0f },
 		{ new FlipResetFollowupReward(), 8.0f },
-		{ new UsefulFlickReward(), 8.0f }
-	};
-
-	std::vector<WeightedReward> aerialCurriculumRewards = {
-
-		// Bootstrap rung for real aerial touches: pays only on airborne high-ball contact,
-		// scaled by both time spent airborne and ball height. Unlike AirReward, there is no
-		// per-step hover income; unlike UsefulAirTouchReward, it does not require goalward quality.
+		{ new UsefulFlickReward(), 8.0f },
 		{ new AirTimeTouchReward(), 10.0f },
+		{ new ExponentialAerialBallProgressReward(), 1.0f },
 
-		// Temporary capped bootstrap: go make progress toward high balls while airborne.
-		{ new ExponentialAerialBallProgressReward(), 1.0f }
+		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
+		// // GCRL-gated so it only pays when the agent is making terminal progress.
+		// { new EnergyReward(), 1.0f }
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -305,7 +261,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 				resetInfo, false), f }
 		});
 	} else {
-		// Aerial curriculum: 15% of resets seed an aerial situation so the bot actually gets
+		// Aerial resets: 15% of resets seed an aerial situation so the bot actually gets
 		// aerial-touch reps (high-air-touch ratio has been ~0 -- the basin exists but PPO never
 		// reaches it). difficulty 0.35 = mostly-airborne, achievable touches to start; raise it
 		// as the high-air-touch competence EMA climbs. If this alone cracks aerials, no ERL needed.
@@ -318,9 +274,6 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 	result.gcrlGatedRewards = gcrlGatedRewards;
-	result.curriculumRewards = curriculumRewards;
-	result.aerialGCRLGatedRewards = aerialGCRLGatedRewards;
-	result.aerialCurriculumRewards = aerialCurriculumRewards;
 	result.userInfo = resetInfo;
 	result.userInfoDeleter = [](void* ptr) {
 		delete (EnvResetInfo*)ptr;
@@ -454,13 +407,11 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// Intentional 0.65 scale: the stronger GCRL channel has been more useful than the
-	// conservative 0.3 setting in this curriculum. Keep watching Final-vs-Reward advantage
-	// balance; if GCRL/Final Advantage persistently dwarfs GCRL/Reward Advantage, the critics
-	// are again steering most of the policy gradient.
+	// Fixed from the first iteration: no timestep ramp, so GCRL is a stable training voice
+	// instead of another moving schedule.
 	cfg.ppo.gcrlAdvScale = 0.5f;
-	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
-	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
+	cfg.ppo.gcrlAdvScaleAnnealStart = 0;
+	cfg.ppo.gcrlAdvScaleAnnealSteps = 0;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
 	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
 	// noise. Match goal pursuit strength so last-man defense can veto rebound waiting.
@@ -483,36 +434,30 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
+	// Reward shaping is binary now: base rewards are ungated, every shaped reward in
+	// gcrlGatedRewards is gated immediately at full influence. No curriculum/aerial buckets.
 	cfg.ppo.useGCRLRewardGate = true;
 	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000; // keep early shaping ungated until the critics have ball-touching data
-	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
+	cfg.ppo.gcrlRewardGateAnnealStart = 0;
+	cfg.ppo.gcrlRewardGateAnnealSteps = 0;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 	cfg.ppo.gcrlRewardGateLookahead = 32;
 	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
-	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
-	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
-	cfg.ppo.curriculumRewardScale = 1.0f;
-	cfg.ppo.curriculumRewardAnnealStart = -1;
-	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000;
-	cfg.ppo.aerialCurriculumRewardScale = 1.0f;
-	cfg.ppo.aerialCurriculumRewardAnnealStart = -1;
-	cfg.ppo.aerialCurriculumRewardAnnealSteps = 2'500'000'000;
-	// Competence gates: anneal progress only accumulates while the EMA ratio is at/above
-	// the gate, so the curricula literally cannot expire while the bot still needs them
-	// (rwkkyfej spent 2.3B steps at touch ratio ~0.001 watching its chase reward anneal
-	// away; lengthening the window keeps losing that bet, the gate ends it). Reference
-	// points: blended-competent touch ratio across this mode mix is ~0.007 (good 1v1 run
-	// sat at 0.009-0.0105); 0.0002 high-air touches/step ≈ a few percent of touches being
-	// real aerials. Watch "Curriculum/Touch Ratio EMA" + "Curriculum/High Air Touch Ratio
-	// EMA" against these gates in wandb.
-	cfg.ppo.curriculumAnnealTouchRatioGate = 0.006f;
-	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0002f;
+	cfg.ppo.gcrlAerialRewardGateStartInfluence = 1.0f;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = 0;
+	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 0;
+	cfg.ppo.curriculumRewardScale = 0.0f;
+	cfg.ppo.curriculumRewardAnnealStart = 0;
+	cfg.ppo.curriculumRewardAnnealSteps = 0;
+	cfg.ppo.aerialCurriculumRewardScale = 0.0f;
+	cfg.ppo.aerialCurriculumRewardAnnealStart = 0;
+	cfg.ppo.aerialCurriculumRewardAnnealSteps = 0;
+	cfg.ppo.curriculumAnnealTouchRatioGate = 0.0f;
+	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0f;
 
-	// ── Self-tuning curriculum ──
+	// ── Self-tuning reset/HER features ──
 	// A: uncertainty-triggered frontier resets. B: difficulty/coverage-aware HER goal sampling.
 	// C: adaptive ratcheted-quantile gate target / StrongTouch floor. D: optionality
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
@@ -527,8 +472,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.herCoverageUtilityStrength = 0.75f;
 	cfg.ppo.herCoverageMaxBoost = 3.0f;
 	cfg.ppo.herCoverageResetMaxInsertsPerIter = 512;
-	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
-	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
+	cfg.ppo.useAdaptiveGateTargetVel = false;  // fixed gate target; no moving reward scale
+	cfg.ppo.useAdaptiveStrongTouchFloor = false; // fixed StrongTouch floor
 	cfg.ppo.useOptionality = false;             // Feature D
 	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
@@ -559,8 +504,8 @@ int main(int argc, char* argv[]) {
 
 	cfg.ppo.useSORS = false; // DISABLED
 	cfg.ppo.sorsRewardScale = 0.10f;
-	cfg.ppo.sorsRewardScaleAnnealStart = -1; // Train SORS immediately, but delay reward influence
-	cfg.ppo.sorsRewardScaleAnnealSteps = 100'000'000;
+	cfg.ppo.sorsRewardScaleAnnealStart = 0;
+	cfg.ppo.sorsRewardScaleAnnealSteps = 0;
 	cfg.ppo.sorsRewardClipRange = 1.0f;
 	cfg.ppo.sorsWarmupIters = 8;
 	cfg.ppo.sorsTrainPairs = 4096;
@@ -623,7 +568,7 @@ int main(int argc, char* argv[]) {
 	// CEM_BEST -- re-anchor the live policy onto the single best member's perturbation, a decisive
 	// jump PPO doesn't dilute. With a larger sigma this reaches behaviors PPO is stuck short of,
 	// while optimizing true scoring rather than the shaped proxy. (RANK_GRADIENT = old ES gradient;
-	// CEM_ELITE = top-cemElites mean.) LEFT OFF: run the aerial curriculum first; flip
+	// CEM_ELITE = top-cemElites mean.) Left off while reward/gate simplification is tested.
 	// `enabled = true` if you want selection-ES alongside it. Watch "ES/MeanGoalDiff" + "ES/UpdateNorm".
 	cfg.evolutionStrategy.updateMode = EvolutionStrategyConfig::UpdateMode::CEM_BEST;
 	cfg.evolutionStrategy.cemElites = 256;           // only used by CEM_ELITE

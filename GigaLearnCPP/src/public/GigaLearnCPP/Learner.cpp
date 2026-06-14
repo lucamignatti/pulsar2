@@ -980,15 +980,29 @@ void GGL::Learner::Start() {
 		// Owned exclusively by the collector (main thread in sync mode, collector thread in async).
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
+		bool collectGatedRewards = false;
+		bool collectCurriculumRewards = false;
+		bool collectAerialGatedRewards = false;
+		bool collectAerialCurriculumRewards = false;
+		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
+			collectGatedRewards = collectGatedRewards || !envSet->gcrlGatedRewards[arenaIdx].empty();
+			collectCurriculumRewards = collectCurriculumRewards || !envSet->curriculumRewards[arenaIdx].empty();
+			collectAerialGatedRewards = collectAerialGatedRewards || !envSet->aerialGCRLGatedRewards[arenaIdx].empty();
+			collectAerialCurriculumRewards = collectAerialCurriculumRewards || !envSet->aerialCurriculumRewards[arenaIdx].empty();
+		}
 
 		// Pre-reserve to avoid repeated realloc during episodes.
 		for (auto& traj : trajectories) {
 			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
 			traj.rewards.reserve(maxEpisodeLength);
-			traj.gcrlGatedRewards.reserve(maxEpisodeLength);
-			traj.curriculumRewards.reserve(maxEpisodeLength);
-			traj.aerialGCRLGatedRewards.reserve(maxEpisodeLength);
-			traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
+			if (collectGatedRewards)
+				traj.gcrlGatedRewards.reserve(maxEpisodeLength);
+			if (collectCurriculumRewards)
+				traj.curriculumRewards.reserve(maxEpisodeLength);
+			if (collectAerialGatedRewards)
+				traj.aerialGCRLGatedRewards.reserve(maxEpisodeLength);
+			if (collectAerialCurriculumRewards)
+				traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
 			traj.logProbs.reserve(maxEpisodeLength);
 			traj.actions.reserve(maxEpisodeLength);
 			traj.terminals.reserve(maxEpisodeLength);
@@ -1245,10 +1259,14 @@ void GGL::Learner::Start() {
 				size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
 				combinedTraj.states.reserve(expTs * obsSize);
 				combinedTraj.rewards.reserve(expTs);
-				combinedTraj.gcrlGatedRewards.reserve(expTs);
-				combinedTraj.curriculumRewards.reserve(expTs);
-				combinedTraj.aerialGCRLGatedRewards.reserve(expTs);
-				combinedTraj.aerialCurriculumRewards.reserve(expTs);
+				if (collectGatedRewards)
+					combinedTraj.gcrlGatedRewards.reserve(expTs);
+				if (collectCurriculumRewards)
+					combinedTraj.curriculumRewards.reserve(expTs);
+				if (collectAerialGatedRewards)
+					combinedTraj.aerialGCRLGatedRewards.reserve(expTs);
+				if (collectAerialCurriculumRewards)
+					combinedTraj.aerialCurriculumRewards.reserve(expTs);
 				combinedTraj.logProbs.reserve(expTs);
 				combinedTraj.actions.reserve(expTs);
 				combinedTraj.terminals.reserve(expTs);
@@ -1596,12 +1614,17 @@ void GGL::Learner::Start() {
 					// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
 					int i = 0;
 					for (int newPlayerIdx : newPlayerIndices) {
+						int arenaIdx = playerArenaIdx[newPlayerIdx];
 						trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 						trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-						trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
-						trajectories[newPlayerIdx].curriculumRewards += envSet->state.curriculumRewards[newPlayerIdx];
-						trajectories[newPlayerIdx].aerialGCRLGatedRewards += envSet->state.aerialGCRLGatedRewards[newPlayerIdx];
-						trajectories[newPlayerIdx].aerialCurriculumRewards += envSet->state.aerialCurriculumRewards[newPlayerIdx];
+						if (collectGatedRewards)
+							trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
+						if (collectCurriculumRewards)
+							trajectories[newPlayerIdx].curriculumRewards += envSet->state.curriculumRewards[newPlayerIdx];
+						if (collectAerialGatedRewards)
+							trajectories[newPlayerIdx].aerialGCRLGatedRewards += envSet->state.aerialGCRLGatedRewards[newPlayerIdx];
+						if (collectAerialCurriculumRewards)
+							trajectories[newPlayerIdx].aerialCurriculumRewards += envSet->state.aerialCurriculumRewards[newPlayerIdx];
 						trajectories[newPlayerIdx].logProbs += newLogProbs[i];
 						if (useActionComps) {
 							const float* comp = _curActionComps.data() + newPlayerIdx * 8;
@@ -1609,7 +1632,6 @@ void GGL::Learner::Start() {
 								trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
 						}
 						if (config.ppo.useSORS) {
-							int arenaIdx = playerArenaIdx[newPlayerIdx];
 							int localIdx = playerLocalIdx[newPlayerIdx];
 							const GameState& gs = envSet->state.gameStates[arenaIdx];
 							const Player& player = gs.players[localIdx];
