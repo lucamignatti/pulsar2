@@ -2167,10 +2167,17 @@ void GGL::Learner::Start() {
 				ppo->curGCRLAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
 
 			Timer consumptionTimer = {};
+			double tensorPrepTime = 0.0;
+			double herTime = 0.0;
+			double gcrlGateTime = 0.0;
+			double frontierTime = 0.0;
+			double optionEntropyTime = 0.0;
+			double valueInferTime = 0.0;
 			{ // Process timesteps
 					RG_NO_GRAD;
 
 					// Make and transpose tensors
+					Timer tensorPrepTimer = {};
 					torch::Tensor tStates = torch::tensor(combinedTraj.states).reshape({ -1, obsSize });
 					torch::Tensor tActionMasks = torch::tensor(combinedTraj.actionMasks).reshape({ -1, numActions });
 					torch::Tensor tActions = torch::tensor(combinedTraj.actions);
@@ -2233,6 +2240,7 @@ void GGL::Learner::Start() {
 							epStart = epEnd + 1;
 						}
 					};
+					tensorPrepTime = tensorPrepTimer.Elapsed();
 
 					// ── Feature B: difficulty-aware HER (deferred batched relabel) ──
 					// Relabeling was skipped on the collector when useDifficultyHER is on; do it
@@ -2241,6 +2249,7 @@ void GGL::Learner::Start() {
 					// of the batch distance distribution.
 					if (config.ppo.useGCRL && config.ppo.useDifficultyHER && trajN > 0 && tActionComps.defined()) {
 						RG_NO_GRAD;
+						Timer herTimer = {};
 						fnBuildEpBounds();
 						const float* states = combinedTraj.states.data();
 						int H = config.ppo.gcrlHorizon, minH = config.ppo.gcrlMinHorizon;
@@ -2500,6 +2509,7 @@ void GGL::Learner::Start() {
 						report["HER/Selected Offset P50"] = tOff.quantile(0.5).item<float>();
 						report["HER/Selected Offset P90"] = tOff.quantile(0.9).item<float>();
 						report["HER/Uniform Fraction Actual"] = trajN > 0 ? (float)uniformCount / trajN : 0.0f;
+						herTime += herTimer.Elapsed();
 					}
 
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
@@ -2513,6 +2523,7 @@ void GGL::Learner::Start() {
 						!combinedTraj.actionComps.empty();
 
 					if (hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) {
+						Timer gateTimer = {};
 						torch::Tensor tGatedRewards = hasGatedRewards ?
 							torch::tensor(combinedTraj.gcrlGatedRewards) :
 							torch::zeros_like(tRewards);
@@ -2633,6 +2644,7 @@ void GGL::Learner::Start() {
 						if (hasAerialCurriculumRewards)
 							report["GCRL Aerial Gate/Curriculum Reward Scaled"] = tScaledAerialCurriculumRewards.mean().item<float>();
 						report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
+						gcrlGateTime += gateTimer.Elapsed();
 					}
 
 					// ── Feature A: frontier reset curriculum (consistency scoring) ──
@@ -2647,6 +2659,7 @@ void GGL::Learner::Start() {
 						&& (int)combinedTraj.futureGoals.size() == trajN * 6
 						&& combinedTraj.snapshots.size() == (size_t)trajN) {
 						RG_NO_GRAD;
+						Timer frontierTimer = {};
 						fnBuildEpBounds();
 
 						torch::Tensor tPhi = fnGetSharedPhi();
@@ -2711,6 +2724,7 @@ void GGL::Learner::Start() {
 						uint64_t fbRes = config.ppo.frontierBuffer->fallbackResets.exchange(0, std::memory_order_relaxed);
 						report["Frontier/Fallback Resets"] = (double)fbRes;
 						report["Frontier/Reset Fraction Actual"] = batch.arenaResets > 0 ? (double)fRes / batch.arenaResets : 0.0;
+						frontierTime += frontierTimer.Elapsed();
 					}
 
 					if (config.ppo.useSORS && tActionComps.defined()) {
@@ -2746,6 +2760,7 @@ void GGL::Learner::Start() {
 					// advantage stream). Burn-in injects zero while the normalizer seeds.
 					if ((config.ppo.useOptionality || config.ppo.useOptionEntropy) && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
 						RG_NO_GRAD;
+						Timer optionTimer = {};
 						GCRLOptionality* opt = ppo->optionality;
 
 						// 1. Polyak the frozen scorer toward the live nets
@@ -3024,6 +3039,7 @@ void GGL::Learner::Start() {
 									tRewards = tRewards + injected;
 							}
 						}
+						optionEntropyTime += optionTimer.Elapsed();
 					}
 
 					// States we truncated at (there could be none)
@@ -3036,6 +3052,7 @@ void GGL::Learner::Start() {
 
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
+					Timer valueInferTimer = {};
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
@@ -3063,6 +3080,7 @@ void GGL::Learner::Start() {
 							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 						}
 					}
+					valueInferTime = valueInferTimer.Elapsed();
 
 					// Skip when no episode fully ended this batch (would divide by zero -> inf on the graph)
 					float terminalPortion = (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
@@ -3147,6 +3165,12 @@ void GGL::Learner::Start() {
 				float consumptionTime = consumptionTimer.Elapsed();
 				report["Collection Time"] = batch.collectionTime;
 				report["Consumption Time"] = consumptionTime;
+				report["Tensor Prep Time"] = tensorPrepTime;
+				report["HER Time"] = herTime;
+				report["GCRL Gate Time"] = gcrlGateTime;
+				report["Frontier Time"] = frontierTime;
+				report["Option Entropy Time"] = optionEntropyTime;
+				report["Value Infer Time"] = valueInferTime;
 				report["Collection Steps/Second"] = stepsCollected / batch.collectionTime;
 				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
 				report["Overall Steps/Second"] = stepsCollected / iterationTimer.Elapsed();
@@ -3208,6 +3232,12 @@ void GGL::Learner::Start() {
 						"-Inference Time",
 						"-Env Step Time",
 						"Consumption Time",
+						"-Tensor Prep Time",
+						"-HER Time",
+						"-GCRL Gate Time",
+						"-Frontier Time",
+						"-Option Entropy Time",
+						"-Value Infer Time",
 						"-GAE Time",
 						"-PPO Learn Time",
 						"",

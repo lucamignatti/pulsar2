@@ -17,7 +17,8 @@
 #
 # Stops WITHOUT restarting on:
 #   - exit 0            (clean trainer exit)
-#   - exit 130 / 143    (SIGINT / SIGTERM)
+#   - ../tools/run_trainer.sh --stop
+#   - foreground Ctrl+C / SIGTERM to the wrapper
 #   - MAX_FAST_CRASHES consecutive crashes within FAST_CRASH_SECS of launch
 #     (a crash loop means a real bug or bad checkpoint, not a flake)
 # Anything else (SIGSEGV=139, SIGABRT=134, uncaught exception) restarts after
@@ -35,6 +36,7 @@ DEFAULT_LOG_DIR="$REPO_ROOT/run_logs"
 LOG_DIR="${RUN_TRAINER_LOG_DIR:-$DEFAULT_LOG_DIR}"
 PID_FILE=""
 UNIT_FILE=""
+STOP_FILE=""
 LOG_FILE=""
 MODE="detach"
 BACKGROUND_CHILD=0
@@ -118,6 +120,7 @@ done
 mkdir -p "$LOG_DIR"
 PID_FILE="${PID_FILE:-$LOG_DIR/trainer.pid}"
 UNIT_FILE="${UNIT_FILE:-$LOG_DIR/trainer.unit}"
+STOP_FILE="${STOP_FILE:-$LOG_DIR/trainer.stop}"
 
 is_running() {
 	local pid="$1"
@@ -179,6 +182,8 @@ case "$MODE" in
 		exit 0
 		;;
 	stop)
+		mkdir -p "$LOG_DIR"
+		: > "$STOP_FILE"
 		unit="$(read_unit)"
 		if systemd_unit_active "$unit"; then
 			echo "stopping systemd user unit $unit"
@@ -244,6 +249,7 @@ if [ "$MODE" = "detach" ]; then
 
 	run_id="$(date '+%Y%m%d-%H%M%S')"
 	run_log="$LOG_DIR/train-$run_id.log"
+	rm -f "$STOP_FILE" 2>/dev/null || true
 	ln -sfn "$(basename "$run_log")" "$LOG_DIR/latest.log" 2>/dev/null || true
 
 	if systemd_user_available; then
@@ -256,7 +262,7 @@ if [ "$MODE" = "detach" ]; then
 			--property=StandardOutput=append:"$run_log" \
 			--property=StandardError=append:"$run_log" \
 			--property=KillMode=mixed \
-			--property=OOMPolicy=stop \
+			--property=OOMPolicy=continue \
 			"$SCRIPT_PATH" \
 			--foreground \
 			--background-child \
@@ -313,6 +319,7 @@ interrupted=0
 child_pid=0
 handle_signal() {
 	interrupted=1
+	log "wrapper received stop signal; forwarding SIGTERM to child"
 	if [ "$BACKGROUND_CHILD" -eq 1 ] && [ "$child_pid" -gt 0 ] && kill -0 "$child_pid" 2>/dev/null; then
 		kill -TERM "$child_pid" 2>/dev/null || true
 	fi
@@ -344,7 +351,13 @@ while true; do
 	# The Q-key thread reads the terminal; a crash mid-read can leave it raw.
 	[ -t 0 ] && stty sane 2>/dev/null
 
-	if [ "$interrupted" -eq 1 ] || [ "$code" -eq 130 ] || [ "$code" -eq 143 ]; then
+	stop_requested=0
+	if [ -f "$STOP_FILE" ]; then
+		stop_requested=1
+		rm -f "$STOP_FILE" 2>/dev/null || true
+	fi
+
+	if [ "$interrupted" -eq 1 ] || [ "$stop_requested" -eq 1 ]; then
 		log "stopped by user (exit $code) after ${runtime}s, not restarting"
 		exit "$code"
 	fi
