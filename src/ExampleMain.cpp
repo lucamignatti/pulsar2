@@ -404,9 +404,9 @@ int main(int argc, char* argv[]) {
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 37'500; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 75'000; // Lower this if too much VRAM is being allocated
 	cfg.ppo.overbatching = true;
-	// 4 optimizer steps per batch (one per minibatch) instead of one accumulated step.
+	// 2 optimizer steps per epoch (one per minibatch) instead of one accumulated step.
 	cfg.ppo.stepPerMiniBatch = true;
 	// Hard speed limit: abort the iteration's remaining epochs when the batch-mean KL
 	// exceeds this (SB3-style early stop). Makes minibatch stepping self-limiting.
@@ -438,7 +438,7 @@ int main(int argc, char* argv[]) {
 	// mistakes that caused it. Goals exist now; propagate their credit.
 	cfg.ppo.gaeGamma = 0.995;
 
-	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
+	// With stepPerMiniBatch (4 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
 	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets
 	// the healthy ~0.03/iter update magnitude; maxMeanKL below is the hard backstop.
 	cfg.ppo.policyLR = 1.5e-4;
@@ -539,6 +539,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.optionEntropyKickoffWeight = 0.0f;
 	cfg.ppo.optionEntropyOpenNetWeight = 0.10f;
 	cfg.ppo.optionEntropyOwnNetWeight = 0.10f;
+	cfg.ppo.optBankSize = 1024;                  // Option-entropy bank; cheaper than the 2048 default while retaining breadth.
 	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optDeficitFloorStd = 0.75f;        // Only punish unusually low optionality; no reward above the floor

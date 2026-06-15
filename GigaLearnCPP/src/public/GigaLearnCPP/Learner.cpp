@@ -2261,8 +2261,23 @@ void GGL::Learner::Start() {
 						int Nsel = (int)candAnchors.size();
 						if (Nsel > 0) {
 							torch::Tensor tPhi = fnGetSharedPhi();
+							FList achievedGoalRows((size_t)trajN * GCRL_GATE_GOAL_DIM);
+							for (int tt = 0; tt < trajN; tt++)
+								for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++)
+									achievedGoalRows[(size_t)tt * GCRL_GATE_GOAL_DIM + d] =
+										states[(size_t)tt * obsSize + d];
+							torch::Tensor tAchievedGoals = torch::tensor(achievedGoalRows).reshape({ trajN, GCRL_GATE_GOAL_DIM });
+							torch::Tensor tAchievedPsi = ppo->InferGCRLPsiEmbeddings(tAchievedGoals);
+							torch::Tensor tAchievedPsiFlip;
+							if (hasMirror) {
+								torch::Tensor tAchievedGoalsFlip = tAchievedGoals.clone();
+								tAchievedGoalsFlip.select(1, 0).neg_();
+								tAchievedGoalsFlip.select(1, 3).neg_();
+								tAchievedPsiFlip = ppo->InferGCRLPsiEmbeddings(tAchievedGoalsFlip);
+							}
+
 							std::vector<int> candOffsets((size_t)Nsel * K);
-							FList candGoals((size_t)Nsel * K * 6);
+							std::vector<uint8_t> candFlips(hasMirror ? (size_t)Nsel * K : 0);
 							for (int s = 0; s < Nsel; s++) {
 								int t = candAnchors[s];
 								int lo = t + minH;
@@ -2271,14 +2286,19 @@ void GGL::Learner::Start() {
 									int kt = Math::RandInt(lo, hi + 1);
 									candOffsets[(size_t)s * K + k] = kt;
 									bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[kt]);
-									float* dst = candGoals.data() + ((size_t)s * K + k) * 6;
-									for (int d = 0; d < 6; d++)
-										dst[d] = states[(size_t)kt * obsSize + d];
-									if (flip) { dst[0] = -dst[0]; dst[3] = -dst[3]; }
+									if (hasMirror)
+										candFlips[(size_t)s * K + k] = flip ? 1 : 0;
 								}
 							}
-							torch::Tensor tCandGoals = torch::tensor(candGoals).reshape({ (int64_t)Nsel * K, 6 });
-							torch::Tensor tCandPsi = ppo->InferGCRLPsiEmbeddings(tCandGoals);
+							torch::Tensor tCandTargetIdx = torch::tensor(candOffsets, torch::TensorOptions().dtype(torch::kLong));
+							torch::Tensor tCandPsi = tAchievedPsi.index_select(0, tCandTargetIdx);
+							if (hasMirror) {
+								torch::Tensor tCandPsiFlip = tAchievedPsiFlip.index_select(0, tCandTargetIdx);
+								torch::Tensor flipMask = torch::from_blob(
+									candFlips.data(), { (int64_t)Nsel * K },
+									torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool).unsqueeze(1);
+								tCandPsi = torch::where(flipMask, tCandPsiFlip, tCandPsi);
+							}
 
 							torch::Tensor tAnchorIdx = torch::tensor(candAnchors, torch::TensorOptions().dtype(torch::kLong));
 							torch::Tensor phiSel = tPhi.index_select(0, tAnchorIdx);
@@ -2832,8 +2852,10 @@ void GGL::Learner::Start() {
 						torch::Tensor optionBreadth;
 						torch::Tensor phiOpt = config.ppo.useOptionEntropy ?
 							torch::Tensor() : opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
-						if (config.ppo.useOptionEntropy)
-							optionBreadth = opt->ComputeOptionBreadth(tStates, &phiOpt, &phiReachOnly); // [N] cpu, or {} if bank empty
+						if (config.ppo.useOptionEntropy) {
+							torch::Tensor* reachOnlyOut = config.ppo.useOptionality ? &phiReachOnly : nullptr;
+							optionBreadth = opt->ComputeOptionBreadth(tStates, &phiOpt, reachOnlyOut); // [N] cpu, or {} if bank empty
+						}
 						if (phiOpt.defined()) {
 							double batchPhiMean = phiOpt.mean().item<double>();
 							double batchPhiVar = phiOpt.var(false).item<double>();
