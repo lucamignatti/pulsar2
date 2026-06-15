@@ -74,6 +74,11 @@ namespace GGL {
 		// must be truncated when their controller changes) and switches opponents
 		// mid-episode; longer stints keep opponents consistent and the data pipeline calm.
 		int trainAgainstOldStintBatches = 16;
+		// Preserved old-version handoff tails are drained gradually so they do not form
+		// huge stale mega-batches. Keep the queue bounded too, since each queued timestep
+		// owns obs/action/mask/snapshot data and can otherwise grow until the OS OOMs us.
+		float trainAgainstOldPreservedDrainFraction = 0.5f; // Fraction of ppo.tsPerItr drained per batch
+		int trainAgainstOldMaxPreservedBatches = 4; // Queue cap in multiples of ppo.tsPerItr; <=0 disables the cap
 
 		SkillTrackerConfig skillTracker = {};
 

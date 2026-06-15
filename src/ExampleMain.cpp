@@ -398,6 +398,8 @@ int main(int argc, char* argv[]) {
 	cfg.savePolicyVersions = true;
 	cfg.trainAgainstOldVersions = true;
 	cfg.trainAgainstOldChance = 0.25f;
+	cfg.trainAgainstOldPreservedDrainFraction = 0.5f;
+	cfg.trainAgainstOldMaxPreservedBatches = 4;
 	cfg.tsPerVersion = 25'000'000;
 	cfg.maxOldVersions = 32;
 

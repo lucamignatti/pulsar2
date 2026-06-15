@@ -48,6 +48,19 @@ using namespace RLGC;
 namespace {
 	constexpr int GCRL_GATE_GOAL_DIM = 6;
 
+	template <typename T>
+	void ClearAndLimitCapacity(std::vector<T>& values, size_t reserveElems, size_t maxRetainedElems) {
+		values.clear();
+		if (maxRetainedElems > 0 && values.capacity() > maxRetainedElems) {
+			std::vector<T> trimmed;
+			if (reserveElems > 0)
+				trimmed.reserve(reserveElems);
+			values.swap(trimmed);
+		} else if (reserveElems > 0 && values.capacity() < reserveElems) {
+			values.reserve(reserveElems);
+		}
+	}
+
 	// targetVel is passed in (not read from config) because Feature C can adapt it at
 	// runtime; when useAdaptiveGateTargetVel is off the Learner's member never moves
 	// from the config seed, so the rows are bit-identical to the old behavior.
@@ -990,7 +1003,7 @@ void GGL::Learner::Start() {
 		// Persistent per-player trajectory state — spans episode boundaries across batches.
 		// Owned exclusively by the collector (main thread in sync mode, collector thread in async).
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
-		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
+		int maxEpisodeLength = RS_MAX(1, (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip)));
 		bool collectGatedRewards = false;
 		bool collectCurriculumRewards = false;
 		bool collectAerialGatedRewards = false;
@@ -1002,34 +1015,56 @@ void GGL::Learner::Start() {
 			collectAerialCurriculumRewards = collectAerialCurriculumRewards || !envSet->aerialCurriculumRewards[arenaIdx].empty();
 		}
 
-		// Pre-reserve to avoid repeated realloc during episodes.
+		size_t expectedStepsPerPlayer =
+			numPlayers > 0 ? ((size_t)config.ppo.tsPerItr + (size_t)numPlayers - 1) / (size_t)numPlayers : 0;
+		size_t trajectoryReserveSteps = expectedStepsPerPlayer + 16;
+		if (trajectoryReserveSteps < 16)
+			trajectoryReserveSteps = 16;
+		if (trajectoryReserveSteps > 64)
+			trajectoryReserveSteps = 64;
+		if (trajectoryReserveSteps > (size_t)maxEpisodeLength)
+			trajectoryReserveSteps = (size_t)maxEpisodeLength;
+		size_t maxRetainedTrajectorySteps = trajectoryReserveSteps * 4;
+		if (maxRetainedTrajectorySteps < 128)
+			maxRetainedTrajectorySteps = 128;
+		if (maxRetainedTrajectorySteps > 256)
+			maxRetainedTrajectorySteps = 256;
+		if (maxRetainedTrajectorySteps > (size_t)maxEpisodeLength)
+			maxRetainedTrajectorySteps = (size_t)maxEpisodeLength;
+
+		auto fnLimitTrajectoryStorage = [&](Trajectory& traj, size_t reserveSteps, size_t maxRetainedSteps) {
+			ClearAndLimitCapacity(traj.states, reserveSteps * (size_t)obsSize, maxRetainedSteps * (size_t)obsSize);
+			ClearAndLimitCapacity(traj.nextStates, (size_t)obsSize, (size_t)obsSize * 2);
+			ClearAndLimitCapacity(traj.rewards, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.gcrlGatedRewards, collectGatedRewards ? reserveSteps : 0, collectGatedRewards ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.curriculumRewards, collectCurriculumRewards ? reserveSteps : 0, collectCurriculumRewards ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.aerialGCRLGatedRewards, collectAerialGatedRewards ? reserveSteps : 0, collectAerialGatedRewards ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.aerialCurriculumRewards, collectAerialCurriculumRewards ? reserveSteps : 0, collectAerialCurriculumRewards ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.logProbs, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.explorationWeights, config.ppo.useOptionEntropy ? reserveSteps : 0, config.ppo.useOptionEntropy ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.actionComps, useActionComps ? reserveSteps * 8 : 0, useActionComps ? maxRetainedSteps * 8 : 0);
+			ClearAndLimitCapacity(traj.futureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
+			ClearAndLimitCapacity(traj.carFutureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
+			ClearAndLimitCapacity(traj.sorsSteps, config.ppo.useSORS ? reserveSteps : 0, config.ppo.useSORS ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.actionMasks, reserveSteps * (size_t)numActions, maxRetainedSteps * (size_t)numActions);
+			ClearAndLimitCapacity(traj.terminals, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.actions, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.modeIds, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.mirrored, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(
+				traj.snapshots,
+				(config.ppo.useFrontierResets && config.ppo.frontierBuffer) ? reserveSteps : 0,
+				(config.ppo.useFrontierResets && config.ppo.frontierBuffer) ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(
+				traj.stratumFlags,
+				(config.ppo.useOptionality || config.ppo.useOptionEntropy) ? reserveSteps : 0,
+				(config.ppo.useOptionality || config.ppo.useOptionEntropy) ? maxRetainedSteps : 0);
+		};
+
+		// Keep only a small warm capacity per player. Reserving maxEpisodeLength for
+		// every player costs tens of GB at 5120 games because states are obsSize-wide.
 		for (auto& traj : trajectories) {
-			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
-			traj.rewards.reserve(maxEpisodeLength);
-			if (collectGatedRewards)
-				traj.gcrlGatedRewards.reserve(maxEpisodeLength);
-			if (collectCurriculumRewards)
-				traj.curriculumRewards.reserve(maxEpisodeLength);
-			if (collectAerialGatedRewards)
-				traj.aerialGCRLGatedRewards.reserve(maxEpisodeLength);
-			if (collectAerialCurriculumRewards)
-				traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
-			traj.logProbs.reserve(maxEpisodeLength);
-			if (config.ppo.useOptionEntropy)
-				traj.explorationWeights.reserve(maxEpisodeLength);
-			traj.actions.reserve(maxEpisodeLength);
-			traj.terminals.reserve(maxEpisodeLength);
-			traj.modeIds.reserve(maxEpisodeLength);
-			traj.mirrored.reserve(maxEpisodeLength);
-			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
-			if (useActionComps)
-				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
-			if (config.ppo.useSORS)
-				traj.sorsSteps.reserve(maxEpisodeLength);
-			if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
-				traj.snapshots.reserve(maxEpisodeLength);
-			if (config.ppo.useOptionality || config.ppo.useOptionEntropy)
-				traj.stratumFlags.reserve(maxEpisodeLength);
+			fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 		}
 
 		// Scratch buffers reused across batches to avoid per-call realloc (owned by collector).
@@ -1328,6 +1363,7 @@ void GGL::Learner::Start() {
 			combinedTraj.Clear();
 			{
 				size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
+				fnLimitTrajectoryStorage(combinedTraj, expTs, expTs + expTs / 2);
 				combinedTraj.states.reserve(expTs * obsSize);
 				combinedTraj.rewards.reserve(expTs);
 				if (collectGatedRewards)
@@ -1427,7 +1463,7 @@ void GGL::Learner::Start() {
 			auto fnFinalizeTrajectory = [&](Trajectory& traj) {
 				fnRelabelTrajectory(traj);
 				combinedTraj.Append(traj);
-				traj.Clear();
+				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			};
 
 			// Players being handed to an old version mid-episode: finalize their in-flight
@@ -1461,7 +1497,7 @@ void GGL::Learner::Start() {
 				fnRelabelTrajectory(traj);
 				preservedTrajSteps += traj.Length();
 				preservedTrajs.push_back(std::move(traj));
-				traj.Clear();
+				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			}
 
 			// Drain the preserved queue into this batch, oldest-first (bounds staleness),
@@ -1470,13 +1506,33 @@ void GGL::Learner::Start() {
 			// starved batches of short post-flush fragments, oscillating the composition of
 			// every per-batch metric (gate rewards, avg reward, batch size) in a sawtooth.
 			size_t drainedSteps = 0;
+			size_t droppedPreservedSteps = 0;
+			size_t preservedCapSteps = 0;
 			{
-				size_t drainBudget = (size_t)(config.ppo.tsPerItr / 2);
+				size_t iterSteps = config.ppo.tsPerItr > 0 ? (size_t)config.ppo.tsPerItr : 0;
+				double drainFraction = (double)config.trainAgainstOldPreservedDrainFraction;
+				if (!std::isfinite(drainFraction) || drainFraction < 0)
+					drainFraction = 0;
+				size_t drainBudget = (size_t)((double)iterSteps * drainFraction);
 				while (!preservedTrajs.empty() && drainedSteps < drainBudget) {
 					Trajectory& pres = preservedTrajs.front();
 					drainedSteps += pres.Length();
 					preservedTrajSteps -= pres.Length();
 					combinedTraj.Append(pres);
+					preservedTrajs.pop_front();
+				}
+
+				if (config.trainAgainstOldMaxPreservedBatches > 0 && iterSteps > 0) {
+					size_t capBatches = (size_t)config.trainAgainstOldMaxPreservedBatches;
+					if (capBatches > std::numeric_limits<size_t>::max() / iterSteps)
+						preservedCapSteps = std::numeric_limits<size_t>::max();
+					else
+						preservedCapSteps = iterSteps * capBatches;
+				}
+				while (preservedCapSteps > 0 && preservedTrajSteps > preservedCapSteps && !preservedTrajs.empty()) {
+					size_t dropLen = preservedTrajs.front().Length();
+					preservedTrajSteps -= dropLen;
+					droppedPreservedSteps += dropLen;
 					preservedTrajs.pop_front();
 				}
 			}
@@ -1857,6 +1913,10 @@ void GGL::Learner::Start() {
 				report["Data/Preserved Truncated Timesteps"] = preservedSteps;
 				report["Data/Preserved Queue Timesteps"] = preservedTrajSteps;
 				report["Data/Drained Timesteps"] = drainedSteps;
+				report["Data/Dropped Preserved Timesteps"] = droppedPreservedSteps;
+				report["Data/Preserved Queue Cap"] = preservedCapSteps;
+				report["Data/Trajectory Reserve Steps"] = trajectoryReserveSteps;
+				report["Data/Trajectory Retained Step Cap"] = maxRetainedTrajectorySteps;
 			}
 
 			// Safety net: old-version players' trajectories were finalized as TRUNCATED at the
@@ -1864,7 +1924,7 @@ void GGL::Learner::Start() {
 			// empty. Clearing again guarantees no old-version-era data is ever stitched to
 			// new-policy steps if that invariant is ever broken.
 			for (int oldPlayerIdx : oldPlayerIndices)
-				trajectories[oldPlayerIdx].Clear();
+				fnLimitTrajectoryStorage(trajectories[oldPlayerIdx], trajectoryReserveSteps, maxRetainedTrajectorySteps);
 
 			out.collectionTime = collectionTimer.Elapsed();
 		}; // fnCollectBatch
@@ -3303,6 +3363,15 @@ void GGL::Learner::Start() {
 						"SORS/Pred Window Return",
 						"",
 						"Collected Timesteps",
+						"Data/Consumed Timesteps",
+						"Data/In-Flight Timesteps",
+						"Data/Preserved Truncated Timesteps",
+						"Data/Drained Timesteps",
+						"Data/Preserved Queue Timesteps",
+						"Data/Dropped Preserved Timesteps",
+						"Data/Preserved Queue Cap",
+						"Data/Trajectory Reserve Steps",
+						"Data/Trajectory Retained Step Cap",
 						"Total Timesteps",
 						"Total Iterations"
 					}
