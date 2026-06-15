@@ -213,25 +213,19 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
-		// Ground/contact rewards are filtered by GCRL terminal progress.
-		// Back to 90 (from 60): the floorless sigmoid gate means ~0.5x expected multiplier,
-		// so 90 x 0.5 ≈ the healthy run g7jf6cwc's effective 90 x 0.6-with-floor.
+		// Ground/contact rewards. These live in the legacy gcrlGatedRewards bucket,
+		// but with useGCRLRewardGate=false below they pass through ungated.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
 
 		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
-		// // GCRL-gated so it only pays when the agent is making terminal progress.
+		// // Keep this off for now; it is easy to farm if added ungated.
 		// { new EnergyReward(), 1.0f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
 
-		// Temporary chase incentive. NOTE: this group IS multiplied by the GCRL reward gate
-		// (Learner combines it with gcrlGatedRewards before gating) — which is why the gate
-		// influence anneal is now held back by the touch-competence gate: in tkpk0780 the
-		// influence ramp hit 1.0 on its 400M wall clock while the critics were still
-		// touchless, and the only touch-teaching rewards spent 3B steps multiplied by
-		// sigmoid(noise) ≈ 0.5 ± 0.2.
+		// Temporary chase incentive.
 		{ new VelocityPlayerToBallReward(), chaseWeight },
 
 		// Bottom rung of the touch ladder: StrongTouchReward pays zero below 20kph hit
@@ -242,7 +236,8 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
 
-		// Aerial rewards use a slower gate anneal so bootstrap signals are not filtered out early.
+		// Aerial rewards. These live in the legacy aerialGCRLGatedRewards bucket,
+		// but with useGCRLRewardGate=false below they pass through ungated.
 		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
 		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
 		// the ball to actually be up and/or productive contact.
@@ -485,16 +480,17 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
-	cfg.ppo.useGCRLRewardGate = true;
-	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000; // keep early shaping ungated until the critics have ball-touching data
+	cfg.ppo.useGCRLRewardGate = false;
+	cfg.ppo.gcrlRewardGateInfluence = 0.0f;
+	// Gate knobs are retained for future re-enable, but inactive while useGCRLRewardGate=false.
+	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000;
 	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 	cfg.ppo.gcrlRewardGateLookahead = 32;
-	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
+	cfg.ppo.gcrlAerialRewardGateInfluence = 0.0f;
+	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.0f;
 	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
 	cfg.ppo.curriculumRewardScale = 1.0f;
