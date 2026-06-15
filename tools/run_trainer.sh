@@ -11,9 +11,9 @@
 #   ../tools/run_trainer.sh -- ./OtherBin   # detached custom command
 #
 # Detached mode is intentionally safe to launch from tmux/SSH: the wrapper is
-# started with nohup, stdin is /dev/null, and stdout/stderr go to run_logs.
-# tmux should only tail the log; if tmux or SSH dies, the training process keeps
-# running and the logs stay on disk.
+# started as a transient systemd --user service when available, stdin is
+# /dev/null, and stdout/stderr go to run_logs. tmux should only tail the log; if
+# tmux or SSH dies, the training process keeps running and logs stay on disk.
 #
 # Stops WITHOUT restarting on:
 #   - exit 0            (clean trainer exit)
@@ -28,11 +28,13 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/run_trainer.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DEFAULT_LOG_DIR="$REPO_ROOT/run_logs"
 LOG_DIR="${RUN_TRAINER_LOG_DIR:-$DEFAULT_LOG_DIR}"
 PID_FILE=""
+UNIT_FILE=""
 LOG_FILE=""
 MODE="detach"
 BACKGROUND_CHILD=0
@@ -115,6 +117,7 @@ done
 
 mkdir -p "$LOG_DIR"
 PID_FILE="${PID_FILE:-$LOG_DIR/trainer.pid}"
+UNIT_FILE="${UNIT_FILE:-$LOG_DIR/trainer.unit}"
 
 is_running() {
 	local pid="$1"
@@ -129,8 +132,36 @@ latest_log_path() {
 	fi
 }
 
+read_unit() {
+	[ -f "$UNIT_FILE" ] && cat "$UNIT_FILE" 2>/dev/null || true
+}
+
+systemd_user_available() {
+	[ "${RUN_TRAINER_NO_SYSTEMD:-0}" != "1" ] &&
+		command -v systemd-run >/dev/null 2>&1 &&
+		command -v systemctl >/dev/null 2>&1 &&
+		systemctl --user show-environment >/dev/null 2>&1
+}
+
+systemd_unit_active() {
+	local unit="$1"
+	[ -n "$unit" ] && command -v systemctl >/dev/null 2>&1 &&
+		systemctl --user is-active --quiet "$unit" 2>/dev/null
+}
+
 case "$MODE" in
 	status)
+		unit="$(read_unit)"
+		if systemd_unit_active "$unit"; then
+			echo "running: systemd user unit $unit"
+			systemctl --user status "$unit" --no-pager -l 2>/dev/null | sed -n '1,10p' || true
+			log_path="$(latest_log_path)"
+			[ -n "$log_path" ] && echo "log: $log_path"
+			exit 0
+		elif [ -n "$unit" ]; then
+			rm -f "$UNIT_FILE" 2>/dev/null || true
+		fi
+
 		if [ -f "$PID_FILE" ]; then
 			pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 			if is_running "$pid"; then
@@ -148,6 +179,16 @@ case "$MODE" in
 		exit 0
 		;;
 	stop)
+		unit="$(read_unit)"
+		if systemd_unit_active "$unit"; then
+			echo "stopping systemd user unit $unit"
+			systemctl --user stop "$unit"
+			rm -f "$UNIT_FILE" 2>/dev/null || true
+			exit 0
+		elif [ -n "$unit" ]; then
+			rm -f "$UNIT_FILE" 2>/dev/null || true
+		fi
+
 		if [ ! -f "$PID_FILE" ]; then
 			echo "no pid file at $PID_FILE"
 			exit 1
@@ -182,6 +223,15 @@ case "$MODE" in
 esac
 
 if [ "$MODE" = "detach" ]; then
+	unit="$(read_unit)"
+	if systemd_unit_active "$unit"; then
+		echo "trainer wrapper is already running: systemd user unit $unit"
+		echo "log: $(latest_log_path)"
+		exit 0
+	elif [ -n "$unit" ]; then
+		rm -f "$UNIT_FILE" 2>/dev/null || true
+	fi
+
 	if [ -f "$PID_FILE" ]; then
 		old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 		if is_running "$old_pid"; then
@@ -194,7 +244,37 @@ if [ "$MODE" = "detach" ]; then
 
 	run_id="$(date '+%Y%m%d-%H%M%S')"
 	run_log="$LOG_DIR/train-$run_id.log"
-	nohup "$0" \
+	ln -sfn "$(basename "$run_log")" "$LOG_DIR/latest.log" 2>/dev/null || true
+
+	if systemd_user_available; then
+		unit="gigalearn-trainer-$run_id.service"
+		if systemd-run --user \
+			--unit="$unit" \
+			--collect \
+			--property=WorkingDirectory="$(pwd)" \
+			--property=StandardInput=null \
+			--property=StandardOutput=append:"$run_log" \
+			--property=StandardError=append:"$run_log" \
+			--property=KillMode=mixed \
+			--property=OOMPolicy=stop \
+			"$SCRIPT_PATH" \
+			--foreground \
+			--background-child \
+			--redirected-log \
+			--log-file "$run_log" \
+			--pid-file "$PID_FILE" \
+			-- "${CMD[@]}"; then
+			echo "$unit" > "$UNIT_FILE"
+			echo "started trainer wrapper: systemd user unit $unit"
+			echo "log: $run_log"
+			echo "follow: $0 --follow"
+			echo "stop:   $0 --stop"
+			exit 0
+		fi
+		echo "systemd-run failed; falling back to setsid + nohup" >&2
+	fi
+
+	setsid nohup "$SCRIPT_PATH" \
 		--foreground \
 		--background-child \
 		--redirected-log \
@@ -204,9 +284,8 @@ if [ "$MODE" = "detach" ]; then
 		> "$run_log" 2>&1 < /dev/null &
 	wrapper_pid=$!
 	echo "$wrapper_pid" > "$PID_FILE"
-	ln -sfn "$(basename "$run_log")" "$LOG_DIR/latest.log" 2>/dev/null || true
 
-	echo "started trainer wrapper: pid $wrapper_pid"
+	echo "started trainer wrapper: pid $wrapper_pid (setsid/nohup fallback)"
 	echo "log: $run_log"
 	echo "follow: $0 --follow"
 	echo "stop:   $0 --stop"
