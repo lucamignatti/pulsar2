@@ -1,50 +1,245 @@
 #!/usr/bin/env bash
-# Restart wrapper for GigaLearnBot: relaunches it after a crash, stops on a
-# deliberate exit. Run it from the build directory, exactly where you would
-# run the binary itself:
+# Detached restart wrapper for GigaLearnBot.
 #
-#   ../tools/run_trainer.sh                 # runs ./GigaLearnBot
-#   ../tools/run_trainer.sh ./OtherBin ...  # or any custom command
+# Run from the build directory:
+#
+#   ../tools/run_trainer.sh                 # detached start, logs to ../run_logs
+#   ../tools/run_trainer.sh --follow        # tail the latest detached run log
+#   ../tools/run_trainer.sh --status        # show wrapper/log status
+#   ../tools/run_trainer.sh --stop          # stop wrapper + trainer cleanly by signal
+#   ../tools/run_trainer.sh --foreground    # old terminal-owned restart loop
+#   ../tools/run_trainer.sh -- ./OtherBin   # detached custom command
+#
+# Detached mode is intentionally safe to launch from tmux/SSH: the wrapper is
+# started with nohup, stdin is /dev/null, and stdout/stderr go to run_logs.
+# tmux should only tail the log; if tmux or SSH dies, the training process keeps
+# running and the logs stay on disk.
 #
 # Stops WITHOUT restarting on:
-#   - exit 0            (pressing Q to save+quit)
-#   - exit 130 / 143    (Ctrl+C / SIGTERM)
+#   - exit 0            (clean trainer exit)
+#   - exit 130 / 143    (SIGINT / SIGTERM)
 #   - MAX_FAST_CRASHES consecutive crashes within FAST_CRASH_SECS of launch
 #     (a crash loop means a real bug or bad checkpoint, not a flake)
 # Anything else (SIGSEGV=139, SIGABRT=134, uncaught exception) restarts after
-# RESTART_DELAY_SECS. Checkpoints auto-resume (newest dir in checkpointFolder,
-# saved every tsPerSave=1M steps) and the wandb run ID is stored in the
-# checkpoint json, so a restart resumes the same run with at most ~1M steps lost.
-#
-# To stop training AND the wrapper: press Q (clean save+quit) or Ctrl+C in the
-# terminal. Signaling only the wrapper PID (`kill <wrapper>`) does not reach the
-# trainer: the wrapper waits for the trainer's natural exit, and bash may even
-# swallow a PID-targeted SIGINT entirely if the trainer then dies of something
-# else. Kill the process group instead (`kill -- -<wrapper pid>`).
-#
-# Crash history is appended to restart.log in the current directory.
+# RESTART_DELAY_SECS. Checkpoints auto-resume and the wandb run ID is stored in
+# checkpoint json, so a restart resumes the same run with at most one save
+# interval lost.
 
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DEFAULT_LOG_DIR="$REPO_ROOT/run_logs"
+LOG_DIR="${RUN_TRAINER_LOG_DIR:-$DEFAULT_LOG_DIR}"
+PID_FILE=""
+LOG_FILE=""
+MODE="detach"
+BACKGROUND_CHILD=0
+REDIRECTED_LOG=0
 CMD=("./GigaLearnBot")
-if [ "$#" -gt 0 ]; then CMD=("$@"); fi
 
-LOG_FILE="restart.log"
-RESTART_DELAY_SECS=5
-FAST_CRASH_SECS=120
-MAX_FAST_CRASHES=5
+RESTART_DELAY_SECS="${RESTART_DELAY_SECS:-5}"
+FAST_CRASH_SECS="${FAST_CRASH_SECS:-120}"
+MAX_FAST_CRASHES="${MAX_FAST_CRASHES:-5}"
 
-log() {
-	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
-	echo "[run_trainer] $*" >&2
+usage() {
+	sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# Let segfaults leave a core to debug (systemd-coredump on fedora captures it
-# regardless; this helps on machines without it).
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--detach)
+			MODE="detach"
+			shift
+			;;
+		--foreground)
+			MODE="foreground"
+			shift
+			;;
+		--status)
+			MODE="status"
+			shift
+			;;
+		--stop)
+			MODE="stop"
+			shift
+			;;
+		--follow)
+			MODE="follow"
+			shift
+			;;
+		--log-dir)
+			[ "$#" -ge 2 ] || { echo "--log-dir requires a path" >&2; exit 2; }
+			LOG_DIR="$2"
+			shift 2
+			;;
+		--log-file)
+			[ "$#" -ge 2 ] || { echo "--log-file requires a path" >&2; exit 2; }
+			LOG_FILE="$2"
+			shift 2
+			;;
+		--pid-file)
+			[ "$#" -ge 2 ] || { echo "--pid-file requires a path" >&2; exit 2; }
+			PID_FILE="$2"
+			shift 2
+			;;
+		--background-child)
+			BACKGROUND_CHILD=1
+			shift
+			;;
+		--redirected-log)
+			REDIRECTED_LOG=1
+			shift
+			;;
+		--help|-h)
+			usage
+			exit 0
+			;;
+		--)
+			shift
+			CMD=("$@")
+			break
+			;;
+		-*)
+			echo "unknown option: $1" >&2
+			usage >&2
+			exit 2
+			;;
+		*)
+			CMD=("$@")
+			break
+			;;
+	esac
+done
+
+mkdir -p "$LOG_DIR"
+PID_FILE="${PID_FILE:-$LOG_DIR/trainer.pid}"
+
+is_running() {
+	local pid="$1"
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+latest_log_path() {
+	if [ -L "$LOG_DIR/latest.log" ] || [ -f "$LOG_DIR/latest.log" ]; then
+		printf '%s/latest.log\n' "$LOG_DIR"
+	else
+		ls -t "$LOG_DIR"/train-*.log 2>/dev/null | head -n 1
+	fi
+}
+
+case "$MODE" in
+	status)
+		if [ -f "$PID_FILE" ]; then
+			pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+			if is_running "$pid"; then
+				echo "running: pid $pid"
+				ps -p "$pid" -o pid=,ppid=,stat=,etime=,command= 2>/dev/null || true
+			else
+				echo "not running: stale pid $pid"
+				rm -f "$PID_FILE" 2>/dev/null || true
+			fi
+		else
+			echo "not running: no pid file at $PID_FILE"
+		fi
+		log_path="$(latest_log_path)"
+		[ -n "$log_path" ] && echo "log: $log_path"
+		exit 0
+		;;
+	stop)
+		if [ ! -f "$PID_FILE" ]; then
+			echo "no pid file at $PID_FILE"
+			exit 1
+		fi
+		pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+		if ! is_running "$pid"; then
+			echo "not running: stale pid $pid"
+			rm -f "$PID_FILE" 2>/dev/null || true
+			exit 0
+		fi
+		echo "stopping wrapper pid $pid"
+		kill -TERM "$pid"
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			if ! is_running "$pid"; then
+				echo "stopped"
+				exit 0
+			fi
+			sleep 1
+		done
+		echo "still running after SIGTERM; inspect with: ps -p $pid -o pid,ppid,stat,etime,command"
+		exit 1
+		;;
+	follow)
+		log_path="$(latest_log_path)"
+		if [ -z "$log_path" ]; then
+			echo "no log found in $LOG_DIR" >&2
+			exit 1
+		fi
+		echo "tailing $log_path"
+		exec tail -f "$log_path"
+		;;
+esac
+
+if [ "$MODE" = "detach" ]; then
+	if [ -f "$PID_FILE" ]; then
+		old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+		if is_running "$old_pid"; then
+			echo "trainer wrapper is already running: pid $old_pid"
+			echo "log: $(latest_log_path)"
+			exit 0
+		fi
+		rm -f "$PID_FILE" 2>/dev/null || true
+	fi
+
+	run_id="$(date '+%Y%m%d-%H%M%S')"
+	run_log="$LOG_DIR/train-$run_id.log"
+	nohup "$0" \
+		--foreground \
+		--background-child \
+		--redirected-log \
+		--log-file "$run_log" \
+		--pid-file "$PID_FILE" \
+		-- "${CMD[@]}" \
+		> "$run_log" 2>&1 < /dev/null &
+	wrapper_pid=$!
+	echo "$wrapper_pid" > "$PID_FILE"
+	ln -sfn "$(basename "$run_log")" "$LOG_DIR/latest.log" 2>/dev/null || true
+
+	echo "started trainer wrapper: pid $wrapper_pid"
+	echo "log: $run_log"
+	echo "follow: $0 --follow"
+	echo "stop:   $0 --stop"
+	exit 0
+fi
+
+LOG_FILE="${LOG_FILE:-restart.log}"
+
+log() {
+	local line="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+	if [ "$REDIRECTED_LOG" -eq 1 ]; then
+		echo "$line" >&2
+	else
+		echo "$line" >> "$LOG_FILE"
+		echo "[run_trainer] $*" >&2
+	fi
+}
+
+# Let segfaults leave a core to debug where the platform supports it.
 ulimit -c unlimited 2>/dev/null || true
 
+echo "$$" > "$PID_FILE" 2>/dev/null || true
+
 interrupted=0
-trap 'interrupted=1' INT TERM
+child_pid=0
+handle_signal() {
+	interrupted=1
+	if [ "$BACKGROUND_CHILD" -eq 1 ] && [ "$child_pid" -gt 0 ] && kill -0 "$child_pid" 2>/dev/null; then
+		kill -TERM "$child_pid" 2>/dev/null || true
+	fi
+}
+trap 'handle_signal' INT TERM
+trap 'rm -f "$PID_FILE" 2>/dev/null || true' EXIT
 
 fast_crashes=0
 attempt=0
@@ -54,8 +249,16 @@ while true; do
 	start_ts=$(date +%s)
 	log "launch #$attempt: ${CMD[*]}"
 
-	"${CMD[@]}"
-	code=$?
+	if [ "$BACKGROUND_CHILD" -eq 1 ]; then
+		"${CMD[@]}" &
+		child_pid=$!
+		wait "$child_pid"
+		code=$?
+		child_pid=0
+	else
+		"${CMD[@]}"
+		code=$?
+	fi
 
 	runtime=$(( $(date +%s) - start_ts ))
 
@@ -90,7 +293,7 @@ while true; do
 		fast_crashes=0
 	fi
 
-	log "restarting in ${RESTART_DELAY_SECS}s (Ctrl+C to stop)"
+	log "restarting in ${RESTART_DELAY_SECS}s"
 	sleep "$RESTART_DELAY_SECS" || exit 130
 	if [ "$interrupted" -eq 1 ]; then
 		log "stopped by user during restart delay, not restarting"

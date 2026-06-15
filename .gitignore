@@ -59,6 +59,7 @@ libtorch
 
 /checkpoints
 /wandb
+/run_logs
 
 # more
 .serena/
