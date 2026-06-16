@@ -213,8 +213,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
-		// Ground/contact rewards. These live in the legacy gcrlGatedRewards bucket,
-		// but with useGCRLRewardGate=false below they pass through ungated.
+		// Ground/contact rewards. These are partially filtered by GCRL terminal progress below.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
 
@@ -236,8 +235,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
 
-		// Aerial rewards. These live in the legacy aerialGCRLGatedRewards bucket,
-		// but with useGCRLRewardGate=false below they pass through ungated.
+		// Aerial rewards. These are lightly filtered by GCRL terminal progress below.
 		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
 		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
 		// the ball to actually be up and/or productive contact.
@@ -480,19 +478,20 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoNCEPenalty = 0.01f; // logsumexp penalty inside InfoNCE
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
-	cfg.ppo.useGCRLRewardGate = false;
-	cfg.ppo.gcrlRewardGateInfluence = 0.0f;
-	// Gate knobs are retained for future re-enable, but inactive while useGCRLRewardGate=false.
-	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000;
-	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
+	cfg.ppo.useGCRLRewardGate = true;
+	cfg.ppo.gcrlRewardGateInfluence = 0.4f;
+	// Partial gate: keep GCRL filtering against anti-goal shaping without letting the
+	// signed gate dominate dense mechanics rewards. Progress is competence-gated below.
+	cfg.ppo.gcrlRewardGateAnnealStart = 0;
+	cfg.ppo.gcrlRewardGateAnnealSteps = 350'000'000;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 	cfg.ppo.gcrlRewardGateLookahead = 32;
-	cfg.ppo.gcrlAerialRewardGateInfluence = 0.0f;
-	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.0f;
-	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
-	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
+	cfg.ppo.gcrlAerialRewardGateInfluence = 0.15f;
+	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.15f;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = 0;
+	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 0;
 	cfg.ppo.curriculumRewardScale = 1.0f;
 	cfg.ppo.curriculumRewardAnnealStart = -1;
 	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000;
