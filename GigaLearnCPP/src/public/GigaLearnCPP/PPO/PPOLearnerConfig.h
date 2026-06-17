@@ -342,7 +342,7 @@ namespace GGL {
 		// gate influence ramps (the gate filters rewards by critic-judged terminal progress,
 		// which is noise until the critics have seen ball touches — run tkpk0780 ramped
 		// influence to 1.0 on its wall clock over a touchless world and the touch-teaching
-		// rewards spent ~3B steps multiplied by tanh(noise)). The aerial gate reads the
+		// rewards spent ~3B steps multiplied by sigmoid(noise)). The aerial gate reads the
 		// high air touch ratio (airborne touch, ball z >= 500).
 		float curriculumAnnealTouchRatioGate = 0.0f;
 		float aerialCurriculumAnnealAirTouchRatioGate = 0.0f;
@@ -415,21 +415,6 @@ namespace GGL {
 		// critic's calibration at distance extremes degrades, corrupting the very distance
 		// estimates this sampler depends on. The uniform floor breaks that feedback loop.
 		float herUniformFraction = 0.4f;
-		// Coverage-balanced useful-goal HER: multiply the difficulty-HER candidate weight by
-		// dynamic undercoverage/usefulness boosts in learned psi(goal) space, then optionally
-		// harvest backtracked reset snapshots for the same rare-useful selected goals. This
-		// attacks the achieved-goal feedback loop without hand-labeled aerial/defense bins.
-		bool useCoverageHER = false;
-		int herCoverageBankSize = 8192;       // Rolling raw 6D HER goal rows; re-embedded each iter to avoid stale psi drift
-		int herCoverageCompareSamples = 64;  // Strided sample from the bank used for density estimates
-		int herCoverageTopK = 4;             // Average top-k cosine similarity to sampled bank rows
-		int herCoverageBankInsertCap = 2048; // Reservoir-sampled selected goals inserted per iteration
-		float herCoverageNoveltyStrength = 1.0f; // Centered exp beta: exp(beta * (rank - 0.5))
-		float herCoverageUtilityStrength = 0.75f;
-		float herCoverageMaxBoost = 3.0f;        // Clamp centered multiplier to [1/max, max]
-		bool herCoverageHarvestResets = true;
-		int herCoverageResetBacktrackSteps = 30;     // Snapshot before the selected rare-useful goal
-		int herCoverageResetMaxInsertsPerIter = 512; // Cap shared FrontierStateBuffer inserts from coverage HER
 
 		// ── Adaptive (ratcheted-quantile) targets (Feature C) ──
 		// Replaces two hand-tuned thresholds with quantiles of what the policy actually
@@ -502,23 +487,6 @@ namespace GGL {
 		// two strong critic-derived gradient channels share the miscalibrated-embedding
 		// failure mode and must not both be loud (see Opt/Interlock Active).
 		int optBurnInIters = 20;
-
-		// ── Option-conditioned entropy (uses optionality scorer, no reward shaping) ──
-		// Computes a per-transition exploration weight from the optionality bank's score
-		// breadth. Broad states keep the entropy bonus; sharp/execute states lose it or get
-		// a small entropy penalty. This is deliberately independent from useOptionality.
-		bool useOptionEntropy = false;
-		float optionEntropyBreadthTemp = 1.0f;       // softmax temperature over option-bank scores
-		float optionEntropyMinQualityZ = -0.5f;      // phi_opt z-score where exploration starts opening up
-		float optionEntropyQualitySharpness = 0.5f;  // larger = smoother quality gate
-		float optionEntropyMinWeight = 0.0f;
-		float optionEntropyMaxWeight = 1.0f;
-		float optionEntropyCommitPenalty = 0.01f;    // entropy penalty scale when weight is 0
-		float optionEntropyDefaultWeight = 1.0f;     // used before the option bank has filled
-		int optionEntropyKickoffSteps = 90;          // env steps (~3s at tickSkip=4)
-		float optionEntropyKickoffWeight = 0.0f;
-		float optionEntropyOpenNetWeight = 0.10f;
-		float optionEntropyOwnNetWeight = 0.10f;
 
 		PPOLearnerConfig() {
 			policy = {};

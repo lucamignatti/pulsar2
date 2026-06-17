@@ -16,6 +16,7 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 	saveFolder(saveFolder), maxVersions(maxVersions), tsPerVersion(tsPerVersion), 
 	renderSender(renderSender) {
 
+	bestAnchorFolder = saveFolder.parent_path() / "anchor";
 	skill.config = skillTrackerConfig;
 
 	if (!std::filesystem::exists(saveFolder))
@@ -52,6 +53,8 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 GGL::PolicyVersionManager::~PolicyVersionManager() {
 	for (auto& version : versions)
 		version.models.Free();
+	if (hasBestAnchor)
+		bestAnchor.models.Free();
 	delete skill.envSet;
 }
 
@@ -127,6 +130,8 @@ void GGL::PolicyVersionManager::SaveVersions() {
 			fOut << jStr;
 		}
 	}
+
+	SaveBestAnchor();
 }
 
 void GGL::PolicyVersionManager::LoadVersions(ModelSet modelsTemplate, uint64_t curTimesteps) {
@@ -165,8 +170,15 @@ void GGL::PolicyVersionManager::LoadVersions(ModelSet modelsTemplate, uint64_t c
 	}
 
 	SortVersions();
+	LoadBestAnchor(modelsTemplate, curTimesteps);
 
 	RG_LOG(" > Loaded " << versions.size() << " versions(s)");
+	if (hasBestAnchor) {
+		RG_LOG(" > Loaded best Elo anchor from " << bestAnchorFolder <<
+			" (rating=" << bestAnchorRating <<
+			", mode=" << bestAnchorRatingMode <<
+			", timesteps=" << bestAnchor.timesteps << ")");
+	}
 }
 
 void GGL::PolicyVersionManager::SortVersions() {
@@ -177,9 +189,129 @@ void GGL::PolicyVersionManager::SortVersions() {
 	std::sort(versions.begin(), versions.end(), fnCompareVersions);
 }
 
+int GGL::PolicyVersionManager::GetVersionCandidateCount() const {
+	return (int)versions.size() + (hasBestAnchor ? 1 : 0);
+}
+
+GGL::PolicyVersion& GGL::PolicyVersionManager::GetVersionCandidate(int index) {
+	RG_ASSERT(index >= 0 && index < GetVersionCandidateCount());
+	if (index < versions.size())
+		return versions[index];
+	return bestAnchor;
+}
+
+float GGL::PolicyVersionManager::GetPeakRating(const SkillRating& ratings, std::string* outMode) const {
+	if (ratings.data.empty()) {
+		if (outMode)
+			*outMode = "";
+		return skill.config.initialRating;
+	}
+
+	float peakRating = -std::numeric_limits<float>::infinity();
+	std::string peakMode = "";
+	for (auto& pair : ratings.data) {
+		if (pair.second > peakRating) {
+			peakRating = pair.second;
+			peakMode = pair.first;
+		}
+	}
+
+	if (outMode)
+		*outMode = peakMode;
+	return peakRating;
+}
+
+void GGL::PolicyVersionManager::SaveBestAnchor() {
+	if (!hasBestAnchor)
+		return;
+
+	std::filesystem::remove_all(bestAnchorFolder);
+	std::filesystem::create_directories(bestAnchorFolder);
+	bestAnchor.models.Save(bestAnchorFolder, false);
+
+	auto jsonPath = bestAnchorFolder / "STATS.json";
+	std::ofstream fOut(jsonPath);
+	RG_ASSERT(fOut.good());
+
+	json j = {};
+	j["timesteps"] = bestAnchor.timesteps;
+	j["best_anchor_rating"] = bestAnchorRating;
+	j["best_anchor_rating_mode"] = bestAnchorRatingMode;
+	j["skill_ratings"] = bestAnchor.ratings.ToJSON();
+	fOut << j.dump(4);
+}
+
+void GGL::PolicyVersionManager::LoadBestAnchor(ModelSet modelsTemplate, uint64_t curTimesteps) {
+	if (!std::filesystem::exists(bestAnchorFolder))
+		return;
+
+	auto jsonPath = bestAnchorFolder / "STATS.json";
+	std::ifstream fIn(jsonPath);
+	if (!fIn.good()) {
+		RG_LOG(" > Best Elo anchor folder exists but has no STATS.json, skipping: " << bestAnchorFolder);
+		return;
+	}
+
+	json j = json::parse(fIn);
+	uint64_t anchorTimesteps = j.value("timesteps", (uint64_t)0);
+	if (anchorTimesteps > curTimesteps) {
+		RG_ERR_CLOSE(
+			"Tried to load best Elo anchor that is newer than our current model (" << anchorTimesteps << " > " << curTimesteps << ")!\n" <<
+			"If you deleted checkpoints, either restore the matching latest checkpoint or remove the anchor folder.");
+	}
+
+	if (hasBestAnchor)
+		bestAnchor.models.Free();
+
+	bestAnchor.timesteps = anchorTimesteps;
+	bestAnchor.models = modelsTemplate.CloneAll();
+	bestAnchor.models.Load(bestAnchorFolder, false, false);
+	if (j.contains("skill_ratings"))
+		bestAnchor.ratings.ReadFromJSON(j["skill_ratings"]);
+	else
+		bestAnchor.ratings = {};
+
+	bestAnchorRating = j.value("best_anchor_rating", GetPeakRating(bestAnchor.ratings));
+	bestAnchorRatingMode = j.value("best_anchor_rating_mode", std::string(""));
+	if (bestAnchorRatingMode.empty())
+		bestAnchorRating = GetPeakRating(bestAnchor.ratings, &bestAnchorRatingMode);
+	hasBestAnchor = true;
+}
+
+void GGL::PolicyVersionManager::UpdateBestAnchor(PPOLearner* ppo, Report& report, uint64_t totalTimesteps) {
+	if (!skill.config.enabled || skill.curRatings.data.empty())
+		return;
+
+	std::string peakMode;
+	float peakRating = GetPeakRating(skill.curRatings, &peakMode);
+	report["Rating/Best Anchor"] = hasBestAnchor ? bestAnchorRating : peakRating;
+	report["Rating/Best Anchor Timesteps"] = hasBestAnchor ? (double)bestAnchor.timesteps : (double)totalTimesteps;
+
+	if (hasBestAnchor && peakRating <= bestAnchorRating)
+		return;
+
+	ModelSet anchorModels = ppo->GetPolicyModels().CloneAll();
+	{
+		std::unique_lock lock(versionsMutex);
+		if (hasBestAnchor)
+			bestAnchor.models.Free();
+		bestAnchor.timesteps = totalTimesteps;
+		bestAnchor.models = anchorModels;
+		bestAnchor.ratings = skill.curRatings;
+		bestAnchorRating = peakRating;
+		bestAnchorRatingMode = peakMode;
+		hasBestAnchor = true;
+	}
+
+	RG_LOG(" > Promoted best Elo anchor: " << bestAnchorRatingMode << " = " << bestAnchorRating <<
+		" at " << totalTimesteps << " timesteps");
+	report["Rating/Best Anchor"] = bestAnchorRating;
+	report["Rating/Best Anchor Timesteps"] = (double)bestAnchor.timesteps;
+}
+
 /////////////////////////////////////////////////////////////////////
 
-void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report) {
+void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report, uint64_t totalTimesteps) {
 	RG_NO_GRAD;
 	
 	auto fnUpdateRatings = [this](SkillRating& winner, SkillRating& loser, RLGC::GameState& state) {
@@ -197,14 +329,21 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 	
 	Team newTeam;
 	int oldVersionIndex;
+	bool oldVersionIsBestAnchor;
 	float totalSimTime;
 	if (skill.doContinuation) {
-		RG_ASSERT(skill.prevOldVersionIndex < versions.size());
+		if (skill.prevOldVersionIsBestAnchor) {
+			RG_ASSERT(hasBestAnchor);
+		} else {
+			RG_ASSERT(skill.prevOldVersionIndex < versions.size());
+		}
 		oldVersionIndex = skill.prevOldVersionIndex;
+		oldVersionIsBestAnchor = skill.prevOldVersionIsBestAnchor;
 		newTeam = skill.prevNewTeam;
 		totalSimTime = skill.prevSimTime;
 	} else {
-		oldVersionIndex = Math::RandInt(0, versions.size());
+		oldVersionIndex = Math::RandInt(0, GetVersionCandidateCount());
+		oldVersionIsBestAnchor = oldVersionIndex >= versions.size();
 		newTeam = (Team)Math::RandInt(0, 2);
 		totalSimTime = 0;
 
@@ -212,7 +351,7 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 	}
 	skill.doContinuation = false;
 
-	auto& oldVersion = versions[oldVersionIndex];
+	auto& oldVersion = oldVersionIsBestAnchor ? bestAnchor : versions[oldVersionIndex];
 
 	// Find which players are on which teams
 	std::vector<int>
@@ -318,11 +457,14 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		RG_LOG(" > Forcing continuation (" << skill.curGoals <<  "/" << skill.envSet->arenas.size() << ")");
 		skill.doContinuation = true;
 		skill.prevOldVersionIndex = oldVersionIndex;
+		skill.prevOldVersionIsBestAnchor = oldVersionIsBestAnchor;
 		skill.prevNewTeam = newTeam;
 		skill.prevSimTime = totalSimTime;
 	} else {
 		skill.curGoals = 0;
 	}
+
+	UpdateBestAnchor(ppo, report, totalTimesteps);
 }
 
 void GGL::PolicyVersionManager::OnIteration(struct PPOLearner* ppo, Report& report, int64_t totalTimesteps, int64_t prevTotalTimesteps) {
@@ -333,20 +475,31 @@ void GGL::PolicyVersionManager::OnIteration(struct PPOLearner* ppo, Report& repo
 
 	if (skill.config.enabled) {
 		skill.iterationsSinceRan++;
-		if (skill.iterationsSinceRan >= skill.config.updateInterval && !versions.empty()) {
+		if (skill.iterationsSinceRan >= skill.config.updateInterval && GetVersionCandidateCount() > 0) {
 			skill.iterationsSinceRan = 0;
-			RunSkillMatches(ppo, report);
+			RunSkillMatches(ppo, report, totalTimesteps);
 		}
 	}
 }
 
 void GGL::PolicyVersionManager::AddRunningStatsToJSON(nlohmann::json& json) {
-	if (skill.config.enabled)
+	if (skill.config.enabled) {
 		json["skill_ratings"] = skill.curRatings.ToJSON();
+		if (hasBestAnchor) {
+			json["best_anchor_rating"] = bestAnchorRating;
+			json["best_anchor_rating_mode"] = bestAnchorRatingMode;
+			json["best_anchor_timesteps"] = bestAnchor.timesteps;
+		}
+	}
 }
 
 void GGL::PolicyVersionManager::LoadRunningStatsFromJSON(const nlohmann::json& json) {
-	if (skill.config.enabled)
+	if (skill.config.enabled) {
 		if (json.contains("skill_ratings"))
 			skill.curRatings.ReadFromJSON(json["skill_ratings"]);
+		if (json.contains("best_anchor_rating"))
+			bestAnchorRating = json["best_anchor_rating"];
+		if (json.contains("best_anchor_rating_mode"))
+			bestAnchorRatingMode = json["best_anchor_rating_mode"];
+	}
 }

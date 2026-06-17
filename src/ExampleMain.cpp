@@ -213,18 +213,25 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> gcrlGatedRewards = {
 
-		// Ground/contact rewards. These are partially filtered by GCRL terminal progress below.
+		// Ground/contact rewards are filtered by GCRL terminal progress.
+		// Back to 90 (from 60): the floorless sigmoid gate means ~0.5x expected multiplier,
+		// so 90 x 0.5 ≈ the healthy run g7jf6cwc's effective 90 x 0.6-with-floor.
 		{ new ZeroSumReward(new StrongTouchReward(20, 100,
 			g_UseAdaptiveStrongTouchFloor ? &g_StrongTouchMinVel : nullptr), TEAM_SPIRIT, 0.0f), 90.f },
 
 		// // Small energy reward: encourages speed, boost, flip availability, and forward velocity.
-		// // Keep this off for now; it is easy to farm if added ungated.
+		// // GCRL-gated so it only pays when the agent is making terminal progress.
 		// { new EnergyReward(), 1.0f }
 	};
 
 	std::vector<WeightedReward> curriculumRewards = {
 
-		// Temporary chase incentive.
+		// Temporary chase incentive. NOTE: this group IS multiplied by the GCRL reward gate
+		// (Learner combines it with gcrlGatedRewards before gating) — which is why the gate
+		// influence anneal is now held back by the touch-competence gate: in tkpk0780 the
+		// influence ramp hit 1.0 on its 400M wall clock while the critics were still
+		// touchless, and the only touch-teaching rewards spent 3B steps multiplied by
+		// sigmoid(noise) ≈ 0.5 ± 0.2.
 		{ new VelocityPlayerToBallReward(), chaseWeight },
 
 		// Bottom rung of the touch ladder: StrongTouchReward pays zero below 20kph hit
@@ -235,7 +242,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> aerialGCRLGatedRewards = {
 
-		// Aerial rewards. These are lightly filtered by GCRL terminal progress below.
+		// Aerial rewards use a slower gate anneal so bootstrap signals are not filtered out early.
 		// NOTE: No unconditional AirReward here -- per-step "be airborne" income taught the bots
 		// to hover (80%+ air time, ground-level touch heights). The rewards below all require
 		// the ball to actually be up and/or productive contact.
@@ -367,7 +374,7 @@ int main(int argc, char* argv[]) {
 
 	// Feature D offline harness: `--score-opt <file>` loads the checkpoint, scores the
 	// hand-supplied states in <file> through the frozen optionality scorer, prints
-	// phi_opt per row, and exits. Requires useOptionality or useOptionEntropy (set below).
+	// phi_opt per row, and exits. Requires useOptionality (set below).
 	std::string scoreOptPath;
 	for (int i = 1; i + 1 < argc; i++)
 		if (std::string(argv[i]) == "--score-opt")
@@ -449,17 +456,19 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// Intentional 0.65 scale: the stronger GCRL channel has been more useful than the
-	// conservative 0.3 setting in this curriculum. Keep watching Final-vs-Reward advantage
-	// balance; if GCRL/Final Advantage persistently dwarfs GCRL/Reward Advantage, the critics
-	// are again steering most of the policy gradient.
-	cfg.ppo.gcrlAdvScale = 0.5f;
+	// Back to 0.3. At 0.65 the from-scratch run e79pvv92 showed GCRL/Final Advantage 0.69
+	// vs GCRL/Reward Advantage 0.33 -- the same 2:1 GCRL-over-reward gradient dominance
+	// that preceded the bgksd0wi collapse, with critics that had barely seen ball touches
+	// steering most of the policy gradient. 0.65 was premised on RESUMING a checkpoint
+	// whose critics were already trained on competent play (ryp4gxwv); re-raise it only
+	// from such a checkpoint, and watch the Final-vs-Reward advantage ratio (~1:1 target).
+	cfg.ppo.gcrlAdvScale = 0.65f;
 	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
 	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
-	// noise. Match goal pursuit strength so last-man defense can veto rebound waiting.
-	cfg.ppo.gcrlAntiScale = 1.0f;
+	// noise. Start moderate; raise if defense lags.
+	cfg.ppo.gcrlAntiScale = 0.4f;
 	cfg.ppo.gcrlCarScale = 0.5f;     // car-positioning critic weight in the GCRL advantage
 	// ── Gradient surgery: OFF ──
 	// The magnitude-gated diagnostics settled it: HiMag Conflict ~0.45 (<0.5, i.e. reward and
@@ -479,19 +488,17 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlVarReg = 0.3f;       // embedding variance regularization (anti-collapse)
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 	cfg.ppo.useGCRLRewardGate = true;
-	cfg.ppo.gcrlRewardGateInfluence = 0.4f;
-	// Partial gate: keep GCRL filtering against anti-goal shaping without letting the
-	// signed gate dominate dense mechanics rewards. Progress is competence-gated below.
-	cfg.ppo.gcrlRewardGateAnnealStart = 0;
-	cfg.ppo.gcrlRewardGateAnnealSteps = 350'000'000;
+	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
+	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000; // keep early shaping ungated until the critics have ball-touching data
+	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
 	cfg.ppo.gcrlRewardGateTargetVel = 1200.0f;
 	cfg.ppo.gcrlRewardGateLookahead = 32;
-	cfg.ppo.gcrlAerialRewardGateInfluence = 0.15f;
-	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.15f;
-	cfg.ppo.gcrlAerialRewardGateAnnealStart = 0;
-	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 0;
+	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
+	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
+	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
 	cfg.ppo.curriculumRewardScale = 1.0f;
 	cfg.ppo.curriculumRewardAnnealStart = -1;
 	cfg.ppo.curriculumRewardAnnealSteps = 2'500'000'000;
@@ -509,41 +516,23 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.curriculumAnnealTouchRatioGate = 0.006f;
 	cfg.ppo.aerialCurriculumAnnealAirTouchRatioGate = 0.0002f;
 
-	// ── Self-tuning curriculum ──
-	// A: uncertainty-triggered frontier resets. B: difficulty/coverage-aware HER goal sampling.
+	// ── Self-tuning curriculum (all OFF by default; flip one line to trial each) ──
+	// A: uncertainty-triggered frontier resets. B: difficulty-aware HER goal sampling.
 	// C: adaptive ratcheted-quantile gate target / StrongTouch floor. D: optionality
 	// potential shaping. See PPOLearnerConfig.h for the per-feature knobs and rationale.
 	cfg.ppo.useFrontierResets = true;          // Feature A
 	cfg.ppo.useDifficultyHER = true;           // Feature B
-	cfg.ppo.herCandidates = 8;                 // Wider candidate set so coverage-HER has room to select rare/useful goals
-	cfg.ppo.useCoverageHER = true;             // Feature B.2: dynamic rare/useful goal coverage for HER + reset harvesting
-	cfg.ppo.herCoverageBankSize = 8192;
-	cfg.ppo.herCoverageCompareSamples = 64;
-	cfg.ppo.herCoverageBankInsertCap = 2048;
-	cfg.ppo.herCoverageNoveltyStrength = 1.0f;
-	cfg.ppo.herCoverageUtilityStrength = 0.75f;
-	cfg.ppo.herCoverageMaxBoost = 3.0f;
-	cfg.ppo.herCoverageResetMaxInsertsPerIter = 512;
+	cfg.ppo.herCandidates = 4;                 // Cheaper difficulty-HER candidate set; watch selected percentile/offsets
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
-	cfg.ppo.useOptionality = false;             // Feature D
-	cfg.ppo.useOptionEntropy = true;            // use optionality breadth to suppress/allow entropy, without reward shaping
-	cfg.ppo.optionEntropyCommitPenalty = 0.01f;
-	cfg.ppo.optionEntropyMinQualityZ = -0.5f;
-	cfg.ppo.optionEntropyQualitySharpness = 0.5f;
-	cfg.ppo.optionEntropyBreadthTemp = 1.0f;
-	cfg.ppo.optionEntropyKickoffSteps = 90;
-	cfg.ppo.optionEntropyKickoffWeight = 0.0f;
-	cfg.ppo.optionEntropyOpenNetWeight = 0.10f;
-	cfg.ppo.optionEntropyOwnNetWeight = 0.10f;
-	cfg.ppo.optBankSize = 1024;                  // Option-entropy bank; cheaper than the 2048 default while retaining breadth.
+	cfg.ppo.useOptionality = true;             // Feature D
 	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optDeficitFloorStd = 0.75f;        // Only punish unusually low optionality; no reward above the floor
 	cfg.ppo.optDeficitClip = 3.0f;
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
-	cfg.ppo.optRefineGoals = false;             // Refine the collapse detector without rewarding extra options above the floor
+	cfg.ppo.optRefineGoals = true;             // Refine the collapse detector without rewarding extra options above the floor
 	cfg.ppo.optRefineTopK = 4;
 	cfg.ppo.optRefineSteps = 3;
 	cfg.ppo.optRefineMaxStates = 4096;

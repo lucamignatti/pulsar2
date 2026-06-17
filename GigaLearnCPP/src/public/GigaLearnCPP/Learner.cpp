@@ -14,7 +14,6 @@
 #include <limits>
 #include <deque>
 #include <exception>
-#include <cmath>
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
 #include <c10/hip/HIPCachingAllocator.h>
@@ -211,19 +210,6 @@ namespace {
 				out6[d] = (out6[d] - offset) * invStd;
 			}
 		}
-	}
-
-	torch::Tensor PercentileRank01(torch::Tensor x) {
-		if (!x.defined() || x.numel() <= 0)
-			return {};
-
-		torch::Tensor flat = x.flatten();
-		if (flat.numel() <= 1)
-			return torch::zeros_like(x);
-
-		torch::Tensor sorted = std::get<0>(flat.sort());
-		torch::Tensor ranks = torch::searchsorted(sorted, flat).to(torch::kFloat32) / (float)flat.numel();
-		return ranks.clamp(0.0f, 1.0f).view_as(x);
 	}
 }
 
@@ -492,16 +478,14 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 			j["contact_hit_force_hist"] = contactHitForceHist->ToJSON();
 	}
 
-	// Feature D / option entropy: persist phi_opt stats whenever the optionality scorer
-	// is used. Reward normalizer + burn-in + anneal progress remain reward-only state.
-	if (config.ppo.useOptionality || config.ppo.useOptionEntropy) {
-		j["opt_phi_mean_ema"] = optPhiMeanEMA;
-		j["opt_phi_var_ema"] = optPhiVarEMA;
-		j["opt_phi_stats_iters_done"] = optPhiStatsItersDone;
-	}
+	// Feature D: persist the rOpt normalizer + burn-in + anneal progress (the goal bank
+	// and target nets are deliberately NOT checkpointed — they refill/re-sync on restart).
 	if (config.ppo.useOptionality) {
 		j["opt_reward_mean_ema"] = optRewardMeanEMA;
 		j["opt_reward_var_ema"] = optRewardVarEMA;
+		j["opt_phi_mean_ema"] = optPhiMeanEMA;
+		j["opt_phi_var_ema"] = optPhiVarEMA;
+		j["opt_phi_stats_iters_done"] = optPhiStatsItersDone;
 		j["opt_burn_in_iters_done"] = optBurnInItersDone;
 		if (optWeightAnnealStartTS != UINT64_MAX)
 			j["opt_weight_anneal_start_ts"] = optWeightAnnealStartTS;
@@ -629,8 +613,8 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 }
 
 void GGL::Learner::DebugScoreOptionality(const std::string& path) {
-	if ((!config.ppo.useOptionality && !config.ppo.useOptionEntropy) || !ppo->optionality)
-		RG_ERR_CLOSE("Learner::DebugScoreOptionality(): requires config.ppo.useOptionality or useOptionEntropy");
+	if (!config.ppo.useOptionality || !ppo->optionality)
+		RG_ERR_CLOSE("Learner::DebugScoreOptionality(): requires config.ppo.useOptionality");
 	ppo->optionality->DebugScoreStates(path, obsSize);
 }
 
@@ -931,7 +915,6 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, gcrlGatedRewards, curriculumRewards, aerialGCRLGatedRewards, aerialCurriculumRewards, logProbs;
-			FList explorationWeights;
 			// GCRL: 8-dim action components (per step) and hindsight-relabeled future
 			// ball goals (global / car-local), filled at episode end.
 			FList actionComps, futureGoals, carFutureGoals;
@@ -958,7 +941,6 @@ void GGL::Learner::Start() {
 				aerialGCRLGatedRewards.clear();
 				aerialCurriculumRewards.clear();
 				logProbs.clear();
-				explorationWeights.clear();
 				actionComps.clear();
 				futureGoals.clear();
 				carFutureGoals.clear();
@@ -981,7 +963,6 @@ void GGL::Learner::Start() {
 				aerialGCRLGatedRewards += other.aerialGCRLGatedRewards;
 				aerialCurriculumRewards += other.aerialCurriculumRewards;
 				logProbs += other.logProbs;
-				explorationWeights += other.explorationWeights;
 				actionComps += other.actionComps;
 				futureGoals += other.futureGoals;
 				carFutureGoals += other.carFutureGoals;
@@ -1004,17 +985,6 @@ void GGL::Learner::Start() {
 		// Owned exclusively by the collector (main thread in sync mode, collector thread in async).
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = RS_MAX(1, (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip)));
-		bool collectGatedRewards = false;
-		bool collectCurriculumRewards = false;
-		bool collectAerialGatedRewards = false;
-		bool collectAerialCurriculumRewards = false;
-		for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
-			collectGatedRewards = collectGatedRewards || !envSet->gcrlGatedRewards[arenaIdx].empty();
-			collectCurriculumRewards = collectCurriculumRewards || !envSet->curriculumRewards[arenaIdx].empty();
-			collectAerialGatedRewards = collectAerialGatedRewards || !envSet->aerialGCRLGatedRewards[arenaIdx].empty();
-			collectAerialCurriculumRewards = collectAerialCurriculumRewards || !envSet->aerialCurriculumRewards[arenaIdx].empty();
-		}
-
 		size_t expectedStepsPerPlayer =
 			numPlayers > 0 ? ((size_t)config.ppo.tsPerItr + (size_t)numPlayers - 1) / (size_t)numPlayers : 0;
 		size_t trajectoryReserveSteps = expectedStepsPerPlayer + 16;
@@ -1036,12 +1006,11 @@ void GGL::Learner::Start() {
 			ClearAndLimitCapacity(traj.states, reserveSteps * (size_t)obsSize, maxRetainedSteps * (size_t)obsSize);
 			ClearAndLimitCapacity(traj.nextStates, (size_t)obsSize, (size_t)obsSize * 2);
 			ClearAndLimitCapacity(traj.rewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.gcrlGatedRewards, collectGatedRewards ? reserveSteps : 0, collectGatedRewards ? maxRetainedSteps : 0);
-			ClearAndLimitCapacity(traj.curriculumRewards, collectCurriculumRewards ? reserveSteps : 0, collectCurriculumRewards ? maxRetainedSteps : 0);
-			ClearAndLimitCapacity(traj.aerialGCRLGatedRewards, collectAerialGatedRewards ? reserveSteps : 0, collectAerialGatedRewards ? maxRetainedSteps : 0);
-			ClearAndLimitCapacity(traj.aerialCurriculumRewards, collectAerialCurriculumRewards ? reserveSteps : 0, collectAerialCurriculumRewards ? maxRetainedSteps : 0);
+			ClearAndLimitCapacity(traj.gcrlGatedRewards, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.curriculumRewards, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.aerialGCRLGatedRewards, reserveSteps, maxRetainedSteps);
+			ClearAndLimitCapacity(traj.aerialCurriculumRewards, reserveSteps, maxRetainedSteps);
 			ClearAndLimitCapacity(traj.logProbs, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.explorationWeights, config.ppo.useOptionEntropy ? reserveSteps : 0, config.ppo.useOptionEntropy ? maxRetainedSteps : 0);
 			ClearAndLimitCapacity(traj.actionComps, useActionComps ? reserveSteps * 8 : 0, useActionComps ? maxRetainedSteps * 8 : 0);
 			ClearAndLimitCapacity(traj.futureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
 			ClearAndLimitCapacity(traj.carFutureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
@@ -1057,8 +1026,8 @@ void GGL::Learner::Start() {
 				(config.ppo.useFrontierResets && config.ppo.frontierBuffer) ? maxRetainedSteps : 0);
 			ClearAndLimitCapacity(
 				traj.stratumFlags,
-				(config.ppo.useOptionality || config.ppo.useOptionEntropy) ? reserveSteps : 0,
-				(config.ppo.useOptionality || config.ppo.useOptionEntropy) ? maxRetainedSteps : 0);
+				config.ppo.useOptionality ? reserveSteps : 0,
+				config.ppo.useOptionality ? maxRetainedSteps : 0);
 		};
 
 		// Keep only a small warm capacity per player. Reserving maxEpisodeLength for
@@ -1072,110 +1041,6 @@ void GGL::Learner::Start() {
 		FList _curActionComps;
 		if (useActionComps)
 			_curActionComps.resize(numPlayers * 8);
-
-		auto fnAlignment = [](Vec a, Vec b) {
-			float al = a.Length();
-			float bl = b.Length();
-			if (al < 1e-4f || bl < 1e-4f)
-				return 0.0f;
-			return a.Dot(b) / (al * bl);
-		};
-
-		auto fnOptionEntropySuppressor = [&](int playerIdx, const Trajectory& traj) {
-			if (!config.ppo.useOptionEntropy)
-				return 1.0f;
-
-			float w = 1.0f;
-			int arenaIdx = playerArenaIdx[playerIdx];
-			const GameState& gs = envSet->state.gameStates[arenaIdx];
-			const Player& player = gs.players[playerLocalIdx[playerIdx]];
-
-			if ((int)traj.Length() < config.ppo.optionEntropyKickoffSteps) {
-				bool taggedKickoff = config.ppo.frontierBuffer &&
-					config.ppo.frontierBuffer->GetArenaTag(envSet->arenas[arenaIdx]) == RLGC::FrontierStateBuffer::TAG_KICKOFF;
-				bool centerBall = std::abs(gs.ball.pos.x) < 25.0f && std::abs(gs.ball.pos.y) < 25.0f &&
-					gs.ball.pos.z < 140.0f && gs.ball.vel.Length() < 250.0f;
-				if (taggedKickoff || centerBall)
-					w = RS_MIN(w, config.ppo.optionEntropyKickoffWeight);
-			}
-
-			Vec oppGoal = player.team == Team::BLUE ? CommonValues::ORANGE_GOAL_CENTER : CommonValues::BLUE_GOAL_CENTER;
-			Vec ownGoal = player.team == Team::BLUE ? CommonValues::BLUE_GOAL_CENTER : CommonValues::ORANGE_GOAL_CENTER;
-			Vec ballToOpp = oppGoal - gs.ball.pos;
-			Vec ballToOwn = ownGoal - gs.ball.pos;
-			Vec playerToBall = gs.ball.pos - player.pos;
-
-			float bestOppBallDist = 1e30f;
-			for (const Player& other : gs.players)
-				if (other.team != player.team && !other.isDemoed)
-					bestOppBallDist = RS_MIN(bestOppBallDist, other.pos.Dist(gs.ball.pos));
-
-			float playerBallDist = player.pos.Dist(gs.ball.pos);
-			bool clearOpenNet =
-				ballToOpp.Length() < 3500.0f &&
-				std::abs(gs.ball.pos.x) < 1700.0f &&
-				playerBallDist < 2300.0f &&
-				playerBallDist + 700.0f < bestOppBallDist &&
-				fnAlignment(playerToBall, ballToOpp) > 0.50f;
-			if (clearOpenNet)
-				w = RS_MIN(w, config.ppo.optionEntropyOpenNetWeight);
-
-			float ownNetApproach = gs.ball.vel.Dot(ballToOwn.Normalized());
-			bool ownNetDanger =
-				ballToOwn.Length() < 3200.0f &&
-				(ownNetApproach > 450.0f || std::abs(gs.ball.pos.y) > 3500.0f);
-			if (ownNetDanger)
-				w = RS_MIN(w, config.ppo.optionEntropyOwnNetWeight);
-
-			return RS_CLAMP(w, 0.0f, 1.0f);
-		};
-
-		auto fnInsertCoverageGoalRow = [&](const float* row) {
-			if (!config.ppo.useCoverageHER || config.ppo.herCoverageBankSize <= 0)
-				return;
-
-			const int goalDim = GCRL_GATE_GOAL_DIM;
-			int cap = RS_MAX(1, config.ppo.herCoverageBankSize);
-			if ((int)coverageGoalRows.size() != cap * goalDim) {
-				coverageGoalRows.assign((size_t)cap * goalDim, 0.0f);
-				coverageGoalWriteIdx = 0;
-				coverageGoalCount = 0;
-			}
-
-			float* dst = coverageGoalRows.data() + (size_t)coverageGoalWriteIdx * goalDim;
-			for (int d = 0; d < goalDim; d++)
-				dst[d] = row[d];
-			coverageGoalWriteIdx = (coverageGoalWriteIdx + 1) % cap;
-			coverageGoalCount = RS_MIN(coverageGoalCount + 1, cap);
-		};
-
-		auto fnCoverageGoalBankRows = [&]() -> torch::Tensor {
-			if (!config.ppo.useCoverageHER || coverageGoalCount <= 0 || coverageGoalRows.empty())
-				return {};
-
-			const int goalDim = GCRL_GATE_GOAL_DIM;
-			int sampleCount = RS_MIN(coverageGoalCount, RS_MAX(1, config.ppo.herCoverageCompareSamples));
-			if (sampleCount >= coverageGoalCount) {
-				return torch::from_blob(
-					(void*)coverageGoalRows.data(),
-					{ (int64_t)coverageGoalCount, (int64_t)goalDim },
-					torch::TensorOptions().dtype(torch::kFloat32)).clone();
-			}
-
-			FList sampledRows;
-			sampledRows.resize((size_t)sampleCount * goalDim);
-			for (int i = 0; i < sampleCount; i++) {
-				int srcIdx = (int)((int64_t)i * coverageGoalCount / sampleCount);
-				const float* src = coverageGoalRows.data() + (size_t)srcIdx * goalDim;
-				float* dst = sampledRows.data() + (size_t)i * goalDim;
-				for (int d = 0; d < goalDim; d++)
-					dst[d] = src[d];
-			}
-			return torch::from_blob(
-				(void*)sampledRows.data(),
-				{ (int64_t)sampleCount, (int64_t)goalDim },
-				torch::TensorOptions().dtype(torch::kFloat32)).clone();
-		};
 
 		auto fnBuildSORSWindows = [&](const Trajectory& traj) {
 			std::vector<PPOLearner::SORSWindow> windows;
@@ -1260,6 +1125,7 @@ void GGL::Learner::Start() {
 		int oldStintBatchesLeft = 0;
 		bool oldStintActive = false;
 		uint64_t oldStintVersionTS = 0;
+		bool oldStintUsesBestAnchor = false;
 		Team oldStintTeam = Team::BLUE;
 
 		// Trajectories truncated at an old-version handoff, queued for consumption.
@@ -1290,11 +1156,12 @@ void GGL::Learner::Start() {
 					oldStintBatchesLeft = RS_MAX(1, config.trainAgainstOldStintBatches);
 					oldStintActive =
 						(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
-						&& !versionMgr->versions.empty()
+						&& versionMgr->GetVersionCandidateCount() > 0
 						&& !render;
 					if (oldStintActive) {
-						int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-						oldStintVersionTS = versionMgr->versions[oldVersionIdx].timesteps;
+						int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->GetVersionCandidateCount());
+						oldStintUsesBestAnchor = oldVersionIdx >= versionMgr->versions.size();
+						oldStintVersionTS = versionMgr->GetVersionCandidate(oldVersionIdx).timesteps;
 						oldStintTeam = Team(RocketSim::Math::RandInt(0, 2));
 					}
 				}
@@ -1304,16 +1171,27 @@ void GGL::Learner::Start() {
 					// Re-resolve the stint's version by timesteps each batch: the versions
 					// vector can grow/prune between batches, so a pointer or index cached
 					// from the previous batch would dangle.
-					for (auto& version : versionMgr->versions) {
-						if (version.timesteps == oldStintVersionTS) {
-							oldVersion = &version;
-							break;
+					if (oldStintUsesBestAnchor) {
+						if (versionMgr->hasBestAnchor)
+							oldVersion = &versionMgr->bestAnchor;
+					} else {
+						for (auto& version : versionMgr->versions) {
+							if (version.timesteps == oldStintVersionTS) {
+								oldVersion = &version;
+								break;
+							}
 						}
 					}
-					if (!oldVersion && !versionMgr->versions.empty()) {
+					if (!oldVersion && versionMgr->GetVersionCandidateCount() > 0) {
 						// The stint's version was pruned mid-stint; fall back to the oldest
-						// remaining (versions are sorted by timesteps ascending).
-						oldVersion = &versionMgr->versions.front();
+						// remaining normal version, or the protected anchor if it is all we have.
+						if (!versionMgr->versions.empty()) {
+							oldVersion = &versionMgr->versions.front();
+							oldStintUsesBestAnchor = false;
+						} else {
+							oldVersion = &versionMgr->bestAnchor;
+							oldStintUsesBestAnchor = true;
+						}
 						oldStintVersionTS = oldVersion->timesteps;
 					}
 				}
@@ -1355,8 +1233,7 @@ void GGL::Learner::Start() {
 			// Self-tuning curriculum collector hooks (all dead branches when off)
 			bool doFrontier = config.ppo.useFrontierResets && config.ppo.frontierBuffer && config.ppo.useGCRL;
 			bool doAdaptiveTargets = config.ppo.useAdaptiveGateTargetVel || config.ppo.useAdaptiveStrongTouchFloor;
-			bool doOptionEntropy = config.ppo.useOptionEntropy && config.ppo.useGCRL;
-			bool doOptionalityScoring = (config.ppo.useOptionality || doOptionEntropy) && config.ppo.useGCRL;
+			bool doOptionality = config.ppo.useOptionality && config.ppo.useGCRL;
 
 			// Reset and pre-reserve the combined trajectory.
 			auto& combinedTraj = out.combinedTraj;
@@ -1366,17 +1243,11 @@ void GGL::Learner::Start() {
 				fnLimitTrajectoryStorage(combinedTraj, expTs, expTs + expTs / 2);
 				combinedTraj.states.reserve(expTs * obsSize);
 				combinedTraj.rewards.reserve(expTs);
-				if (collectGatedRewards)
-					combinedTraj.gcrlGatedRewards.reserve(expTs);
-				if (collectCurriculumRewards)
-					combinedTraj.curriculumRewards.reserve(expTs);
-				if (collectAerialGatedRewards)
-					combinedTraj.aerialGCRLGatedRewards.reserve(expTs);
-				if (collectAerialCurriculumRewards)
-					combinedTraj.aerialCurriculumRewards.reserve(expTs);
+				combinedTraj.gcrlGatedRewards.reserve(expTs);
+				combinedTraj.curriculumRewards.reserve(expTs);
+				combinedTraj.aerialGCRLGatedRewards.reserve(expTs);
+				combinedTraj.aerialCurriculumRewards.reserve(expTs);
 				combinedTraj.logProbs.reserve(expTs);
-				if (config.ppo.useOptionEntropy)
-					combinedTraj.explorationWeights.reserve(expTs);
 				combinedTraj.actions.reserve(expTs);
 				combinedTraj.terminals.reserve(expTs);
 				combinedTraj.modeIds.reserve(expTs);
@@ -1392,7 +1263,7 @@ void GGL::Learner::Start() {
 					combinedTraj.sorsSteps.reserve(expTs);
 				if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
 					combinedTraj.snapshots.reserve(expTs);
-				if (doOptionalityScoring)
+				if (config.ppo.useOptionality)
 					combinedTraj.stratumFlags.reserve(expTs);
 			}
 
@@ -1463,6 +1334,7 @@ void GGL::Learner::Start() {
 			auto fnFinalizeTrajectory = [&](Trajectory& traj) {
 				fnRelabelTrajectory(traj);
 				combinedTraj.Append(traj);
+				traj.Clear();
 				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			};
 
@@ -1497,6 +1369,7 @@ void GGL::Learner::Start() {
 				fnRelabelTrajectory(traj);
 				preservedTrajSteps += traj.Length();
 				preservedTrajs.push_back(std::move(traj));
+				traj.Clear();
 				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			}
 
@@ -1511,9 +1384,9 @@ void GGL::Learner::Start() {
 			{
 				size_t iterSteps = config.ppo.tsPerItr > 0 ? (size_t)config.ppo.tsPerItr : 0;
 				double drainFraction = (double)config.trainAgainstOldPreservedDrainFraction;
-				if (!std::isfinite(drainFraction) || drainFraction < 0)
-					drainFraction = 0;
-				size_t drainBudget = (size_t)((double)iterSteps * drainFraction);
+				if (drainFraction < 0.0)
+					drainFraction = 0.0;
+				size_t drainBudget = iterSteps > 0 ? (size_t)((double)iterSteps * drainFraction) : 0;
 				while (!preservedTrajs.empty() && drainedSteps < drainBudget) {
 					Trajectory& pres = preservedTrajs.front();
 					drainedSteps += pres.Length();
@@ -1521,7 +1394,6 @@ void GGL::Learner::Start() {
 					combinedTraj.Append(pres);
 					preservedTrajs.pop_front();
 				}
-
 				if (config.trainAgainstOldMaxPreservedBatches > 0 && iterSteps > 0) {
 					size_t capBatches = (size_t)config.trainAgainstOldMaxPreservedBatches;
 					if (capBatches > std::numeric_limits<size_t>::max() / iterSteps)
@@ -1592,9 +1464,6 @@ void GGL::Learner::Start() {
 							envSet->state.obs.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].states);
 							envSet->state.actionMasks.AppendRow(newPlayerIdx, trajectories[newPlayerIdx].actionMasks);
 							trajectories[newPlayerIdx].modeIds.push_back((int8_t)playerModeIds[newPlayerIdx]);
-							if (doOptionEntropy)
-								trajectories[newPlayerIdx].explorationWeights.push_back(
-									fnOptionEntropySuppressor(newPlayerIdx, trajectories[newPlayerIdx]));
 
 							// Mirror flag must be read here, before StepFirstHalf mutates the game
 							// states, so it matches the state this obs row was built from.
@@ -1746,17 +1615,12 @@ void GGL::Learner::Start() {
 					// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
 					int i = 0;
 					for (int newPlayerIdx : newPlayerIndices) {
-						int arenaIdx = playerArenaIdx[newPlayerIdx];
 						trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 						trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-						if (collectGatedRewards)
-							trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
-						if (collectCurriculumRewards)
-							trajectories[newPlayerIdx].curriculumRewards += envSet->state.curriculumRewards[newPlayerIdx];
-						if (collectAerialGatedRewards)
-							trajectories[newPlayerIdx].aerialGCRLGatedRewards += envSet->state.aerialGCRLGatedRewards[newPlayerIdx];
-						if (collectAerialCurriculumRewards)
-							trajectories[newPlayerIdx].aerialCurriculumRewards += envSet->state.aerialCurriculumRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].gcrlGatedRewards += envSet->state.gcrlGatedRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].curriculumRewards += envSet->state.curriculumRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].aerialGCRLGatedRewards += envSet->state.aerialGCRLGatedRewards[newPlayerIdx];
+						trajectories[newPlayerIdx].aerialCurriculumRewards += envSet->state.aerialCurriculumRewards[newPlayerIdx];
 						trajectories[newPlayerIdx].logProbs += newLogProbs[i];
 						if (useActionComps) {
 							const float* comp = _curActionComps.data() + newPlayerIdx * 8;
@@ -1764,6 +1628,7 @@ void GGL::Learner::Start() {
 								trajectories[newPlayerIdx].actionComps.end(), comp, comp + 8);
 						}
 						if (config.ppo.useSORS) {
+							int arenaIdx = playerArenaIdx[newPlayerIdx];
 							int localIdx = playerLocalIdx[newPlayerIdx];
 							const GameState& gs = envSet->state.gameStates[arenaIdx];
 							const Player& player = gs.players[localIdx];
@@ -1805,7 +1670,7 @@ void GGL::Learner::Start() {
 						// strata (plus the touch mask for Opt/Phi At Touch). Flags describe the
 						// post-step state, one step (~33ms) after the obs row they select — an
 						// acceptable approximation for goal-bank purposes.
-						if (doOptionalityScoring) {
+						if (doOptionality) {
 							int arenaIdx = playerArenaIdx[newPlayerIdx];
 							const GameState& gs = envSet->state.gameStates[arenaIdx];
 							const Player& player = gs.players[playerLocalIdx[newPlayerIdx]];
@@ -1923,8 +1788,10 @@ void GGL::Learner::Start() {
 			// start of this batch and receive no appends during it, so these should already be
 			// empty. Clearing again guarantees no old-version-era data is ever stitched to
 			// new-policy steps if that invariant is ever broken.
-			for (int oldPlayerIdx : oldPlayerIndices)
+			for (int oldPlayerIdx : oldPlayerIndices) {
+				trajectories[oldPlayerIdx].Clear();
 				fnLimitTrajectoryStorage(trajectories[oldPlayerIdx], trajectoryReserveSteps, maxRetainedTrajectorySteps);
+			}
 
 			out.collectionTime = collectionTimer.Elapsed();
 		}; // fnCollectBatch
@@ -2161,7 +2028,7 @@ void GGL::Learner::Start() {
 			// rewards by GCRL terminal progress, and the critics only know anything about
 			// terminal progress once the policy actually touches the ball. On a wall clock
 			// (run tkpk0780) influence hit 1.0 over a touchless world and the curriculum/
-			// gated rewards spent ~3B steps multiplied by tanh(noise) ≈ 0.0 ± 0.4.
+			// gated rewards spent ~3B steps multiplied by sigmoid(noise) ≈ 0.5 ± 0.2.
 			ppo->curGCRLRewardGateInfluence = config.ppo.useGCRLRewardGate ? fnGetGatedAnnealedRange(
 				0.0f,
 				config.ppo.gcrlRewardGateInfluence,
@@ -2227,17 +2094,10 @@ void GGL::Learner::Start() {
 				ppo->curGCRLAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
 
 			Timer consumptionTimer = {};
-			double tensorPrepTime = 0.0;
-			double herTime = 0.0;
-			double gcrlGateTime = 0.0;
-			double frontierTime = 0.0;
-			double optionEntropyTime = 0.0;
-			double valueInferTime = 0.0;
 			{ // Process timesteps
 					RG_NO_GRAD;
 
 					// Make and transpose tensors
-					Timer tensorPrepTimer = {};
 					torch::Tensor tStates = torch::tensor(combinedTraj.states).reshape({ -1, obsSize });
 					torch::Tensor tActionMasks = torch::tensor(combinedTraj.actionMasks).reshape({ -1, numActions });
 					torch::Tensor tActions = torch::tensor(combinedTraj.actions);
@@ -2267,7 +2127,6 @@ void GGL::Learner::Start() {
 					// Per-step goal-critic terminal score [N], shared between the gate block
 					// (which already computes it) and the optionality offensive-stratum filter.
 					torch::Tensor tGoalScoreShared;
-					torch::Tensor tAntiScoreShared;
 					// Raw terminal utility [N] for value-weighted optionality:
 					// opponent-goal reachability minus own-goal danger, normalized later inside the bank.
 					torch::Tensor tOptionalityValueShared;
@@ -2278,11 +2137,6 @@ void GGL::Learner::Start() {
 					// Episode segment end per index (terminals[epEnd] != 0), shared by the
 					// HER pass and the frontier scan. Built only when a feature needs it.
 					int trajN = (int)combinedTraj.Length();
-					torch::Tensor tExplorationWeights;
-					if (config.ppo.useOptionEntropy && combinedTraj.explorationWeights.size() == (size_t)trajN) {
-						tExplorationWeights = torch::tensor(combinedTraj.explorationWeights).clamp(
-							config.ppo.optionEntropyMinWeight, config.ppo.optionEntropyMaxWeight);
-					}
 					std::vector<int> epEndOf, epStartOf;
 					auto fnBuildEpBounds = [&]() {
 						if (!epEndOf.empty() || trajN == 0)
@@ -2300,7 +2154,6 @@ void GGL::Learner::Start() {
 							epStart = epEnd + 1;
 						}
 					};
-					tensorPrepTime = tensorPrepTimer.Elapsed();
 
 					// ── Feature B: difficulty-aware HER (deferred batched relabel) ──
 					// Relabeling was skipped on the collector when useDifficultyHER is on; do it
@@ -2309,7 +2162,6 @@ void GGL::Learner::Start() {
 					// of the batch distance distribution.
 					if (config.ppo.useGCRL && config.ppo.useDifficultyHER && trajN > 0 && tActionComps.defined()) {
 						RG_NO_GRAD;
-						Timer herTimer = {};
 						fnBuildEpBounds();
 						const float* states = combinedTraj.states.data();
 						int H = config.ppo.gcrlHorizon, minH = config.ppo.gcrlMinHorizon;
@@ -2384,132 +2236,15 @@ void GGL::Learner::Start() {
 							torch::Tensor p = torch::searchsorted(sortedD, d).to(torch::kFloat32) / (float)(Nsel * K);
 							float sigma = RS_MAX(1e-3f, config.ppo.herDifficultySigma);
 							torch::Tensor w = torch::exp(-(p - 0.5f).square() / (2.0f * sigma * sigma)).reshape({ Nsel, K });
-
-							torch::Tensor noveltyRank;
-							torch::Tensor utilityRank;
-							if (config.ppo.useCoverageHER) {
-								report["HER/Coverage Bank Fill"] = coverageGoalCount;
-
-								if (config.ppo.herCoverageNoveltyStrength > 0.0f && coverageGoalCount > 0) {
-									torch::Tensor tBankRows = fnCoverageGoalBankRows();
-									if (tBankRows.defined() && tBankRows.numel() > 0) {
-										torch::Tensor tBankPsi = ppo->InferGCRLPsiEmbeddings(tBankRows);
-										int64_t B = tCandPsi.size(0);
-										int64_t bankN = tBankPsi.size(0);
-										int topK = RS_MIN(RS_MAX(1, config.ppo.herCoverageTopK), (int)bankN);
-										torch::Tensor rawNovelty = torch::empty({ B }, torch::TensorOptions().dtype(torch::kFloat32));
-										int64_t chunk = RS_MAX((int64_t)4096, (int64_t)config.ppo.miniBatchSize);
-										for (int64_t start = 0; start < B; start += chunk) {
-											int64_t end = RS_MIN(start + chunk, B);
-											torch::Tensor sims = torch::matmul(
-												tCandPsi.slice(0, start, end),
-												tBankPsi.transpose(0, 1)
-											);
-											torch::Tensor density;
-											if (topK == 1) {
-												density = std::get<0>(sims.max(1));
-											} else {
-												density = std::get<0>(sims.topk(topK, 1, true, true)).mean(1);
-											}
-											// Embeddings are L2-normalized, so cosine similarity is in [-1, 1].
-											// Convert dense/common goals toward 0 novelty and sparse goals toward 1.
-											torch::Tensor novelty = ((1.0f - density) * 0.5f).clamp(0.0f, 1.0f);
-											rawNovelty.slice(0, start, end).copy_(novelty);
-										}
-										noveltyRank = PercentileRank01(rawNovelty);
-										float maxCoverageBoost = RS_MAX(1.0f, config.ppo.herCoverageMaxBoost);
-										torch::Tensor noveltyBoost = torch::exp(
-											config.ppo.herCoverageNoveltyStrength * (noveltyRank - 0.5f)
-										).clamp(1.0f / maxCoverageBoost, maxCoverageBoost);
-										w = w * noveltyBoost.reshape({ Nsel, K });
-										report["HER/Coverage Novelty Mean"] = noveltyRank.mean().item<float>();
-										report["HER/Coverage Raw Novelty STD"] = rawNovelty.std(false).item<float>();
-										report["HER/Coverage Novelty Boost Mean"] = noveltyBoost.mean().item<float>();
-									}
-								}
-
-								if (config.ppo.herCoverageUtilityStrength > 0.0f) {
-									if (!tOptionalityValueShared.defined()) {
-										torch::Tensor gRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
-										torch::Tensor aRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
-										torch::Tensor ts = InferGCRLTerminalScoresBatched(ppo, tStates, tActionComps, gRow, aRow, trajN);
-										if (ts.defined()) {
-											tGoalScoreShared = ts.select(1, 0);
-											tAntiScoreShared = ts.select(1, 1);
-											tOptionalityValueShared = tGoalScoreShared - config.ppo.gcrlRewardGateAntiScale * tAntiScoreShared;
-										}
-									}
-
-									if (tOptionalityValueShared.defined()) {
-										torch::Tensor tCandTargetIdx = torch::tensor(candOffsets, torch::TensorOptions().dtype(torch::kLong));
-										torch::Tensor candUtility = tOptionalityValueShared.index_select(0, tCandTargetIdx);
-										utilityRank = PercentileRank01(candUtility);
-										float maxCoverageBoost = RS_MAX(1.0f, config.ppo.herCoverageMaxBoost);
-										torch::Tensor utilityBoost = torch::exp(
-											config.ppo.herCoverageUtilityStrength * (utilityRank - 0.5f)
-										).clamp(1.0f / maxCoverageBoost, maxCoverageBoost);
-										w = w * utilityBoost.reshape({ Nsel, K });
-										report["HER/Coverage Utility Mean"] = utilityRank.mean().item<float>();
-										report["HER/Coverage Raw Utility STD"] = candUtility.std(false).item<float>();
-										report["HER/Coverage Utility Boost Mean"] = utilityBoost.mean().item<float>();
-									}
-								}
-							}
-
 							torch::Tensor chosen = torch::multinomial(w, 1).flatten(); // [Nsel] in [0, K)
 
 							torch::Tensor pSel = p.reshape({ Nsel, K }).gather(1, chosen.unsqueeze(1)).flatten();
 							report["HER/Selected Distance Percentile Mean"] = pSel.mean().item<float>();
-							if (noveltyRank.defined()) {
-								float noveltyMean = noveltyRank.mean().item<float>();
-								float selectedNovelty = noveltyRank.reshape({ Nsel, K })
-									.gather(1, chosen.unsqueeze(1)).mean().item<float>();
-								report["HER/Coverage Selected Novelty"] = selectedNovelty;
-								report["HER/Coverage Novelty Selection Lift"] = selectedNovelty - noveltyMean;
-							}
-							if (utilityRank.defined()) {
-								float utilityMean = utilityRank.mean().item<float>();
-								float selectedUtility = utilityRank.reshape({ Nsel, K })
-									.gather(1, chosen.unsqueeze(1)).mean().item<float>();
-								report["HER/Coverage Selected Utility"] = selectedUtility;
-								report["HER/Coverage Utility Selection Lift"] = selectedUtility - utilityMean;
-							}
 
 							torch::Tensor chosenCpu = chosen.to(torch::kCPU).contiguous();
 							const int64_t* chosenData = chosenCpu.data_ptr<int64_t>();
 							for (int s = 0; s < Nsel; s++)
 								tTarget[candAnchors[s]] = candOffsets[(size_t)s * K + (int)chosenData[s]];
-
-							if (config.ppo.useCoverageHER && config.ppo.herCoverageHarvestResets &&
-								config.ppo.frontierBuffer && combinedTraj.snapshots.size() == (size_t)trajN) {
-								torch::Tensor selectedW = w.gather(1, chosen.unsqueeze(1)).flatten();
-								int topN = RS_MIN(RS_MAX(0, config.ppo.herCoverageResetMaxInsertsPerIter), Nsel);
-								int inserts = 0;
-								if (topN > 0) {
-									auto top = selectedW.topk(topN, 0, true, true);
-									torch::Tensor topIdxCpu = std::get<1>(top).to(torch::kCPU).contiguous();
-									const int64_t* topIdxData = topIdxCpu.data_ptr<int64_t>();
-									for (int q = 0; q < topN; q++) {
-										int s = (int)topIdxData[q];
-										int tt = candOffsets[(size_t)s * K + (int)chosenData[s]];
-										int target = RS_MAX(epStartOf[tt], tt - config.ppo.herCoverageResetBacktrackSteps);
-										int floor = RS_MAX(epStartOf[tt], target - 2 * RS_MAX(1, config.ppo.frontierSnapshotInterval));
-										for (int idx = target; idx >= floor; idx--) {
-											const auto& snap = combinedTraj.snapshots[idx];
-											if (!snap)
-												continue;
-											if (RLGC::FrontierStateBuffer::PassesSanityFilter(*snap)) {
-												config.ppo.frontierBuffer->Insert(*snap);
-												inserts++;
-											}
-											break;
-										}
-									}
-								}
-								report["HER/Coverage Reset Inserts"] = inserts;
-								report["HER/Coverage Reset Insert Fraction"] =
-									topN > 0 ? (float)inserts / (float)topN : 0.0f;
-							}
 						}
 
 						// Write back futureGoals / carFutureGoals — verbatim port of the
@@ -2517,27 +2252,6 @@ void GGL::Learner::Start() {
 						combinedTraj.futureGoals.resize((size_t)trajN * 6);
 						combinedTraj.carFutureGoals.resize((size_t)trajN * 6);
 						FList selectedOffsets; selectedOffsets.reserve(trajN);
-						FList coverageRowsToInsert;
-						int coverageRowsSeen = 0;
-						int coverageInsertCap = config.ppo.useCoverageHER ? RS_MAX(0, config.ppo.herCoverageBankInsertCap) : 0;
-						if (coverageInsertCap > 0)
-							coverageRowsToInsert.reserve((size_t)RS_MIN(coverageInsertCap, trajN) * GCRL_GATE_GOAL_DIM);
-						auto fnQueueCoverageGoalRow = [&](const float* row) {
-							if (coverageInsertCap <= 0)
-								return;
-							coverageRowsSeen++;
-							int curRows = (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM);
-							if (curRows < coverageInsertCap) {
-								coverageRowsToInsert.insert(coverageRowsToInsert.end(), row, row + GCRL_GATE_GOAL_DIM);
-							} else {
-								int j = Math::RandInt(0, coverageRowsSeen);
-								if (j < coverageInsertCap) {
-									float* dst = coverageRowsToInsert.data() + (size_t)j * GCRL_GATE_GOAL_DIM;
-									for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++)
-										dst[d] = row[d];
-								}
-							}
-						};
 						for (int t = 0; t < trajN; t++) {
 							int tt = tTarget[t];
 							bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[tt]);
@@ -2555,13 +2269,8 @@ void GGL::Learner::Start() {
 									combinedTraj.carFutureGoals[(size_t)t * 6 + 4] = -combinedTraj.carFutureGoals[(size_t)t * 6 + 4];
 								}
 							}
-							fnQueueCoverageGoalRow(combinedTraj.futureGoals.data() + (size_t)t * GCRL_GATE_GOAL_DIM);
 							selectedOffsets.push_back((float)(tt - t));
 						}
-						for (int i = 0; i < (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM); i++)
-							fnInsertCoverageGoalRow(coverageRowsToInsert.data() + (size_t)i * GCRL_GATE_GOAL_DIM);
-						if (config.ppo.useCoverageHER)
-							report["HER/Coverage Bank Inserted"] = (int)(coverageRowsToInsert.size() / GCRL_GATE_GOAL_DIM);
 
 						torch::Tensor tOff = torch::tensor(selectedOffsets);
 						report["HER/Selected Offset Mean"] = tOff.mean().item<float>();
@@ -2569,7 +2278,6 @@ void GGL::Learner::Start() {
 						report["HER/Selected Offset P50"] = tOff.quantile(0.5).item<float>();
 						report["HER/Selected Offset P90"] = tOff.quantile(0.9).item<float>();
 						report["HER/Uniform Fraction Actual"] = trajN > 0 ? (float)uniformCount / trajN : 0.0f;
-						herTime += herTimer.Elapsed();
 					}
 
 					bool hasGatedRewards = !combinedTraj.gcrlGatedRewards.empty();
@@ -2579,11 +2287,10 @@ void GGL::Learner::Start() {
 					bool needsGCRLRewardGate =
 						config.ppo.useGCRLRewardGate &&
 						(ppo->curGCRLRewardGateInfluence > 0 || ppo->curGCRLAerialRewardGateInfluence > 0) &&
-						(hasGatedRewards || hasAerialGatedRewards) &&
+						(hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) &&
 						!combinedTraj.actionComps.empty();
 
-					if (hasGatedRewards || hasCurriculumRewards || hasAerialGatedRewards || hasAerialCurriculumRewards) {
-						Timer gateTimer = {};
+					if (needsGCRLRewardGate) {
 						torch::Tensor tGatedRewards = hasGatedRewards ?
 							torch::tensor(combinedTraj.gcrlGatedRewards) :
 							torch::zeros_like(tRewards);
@@ -2598,113 +2305,95 @@ void GGL::Learner::Start() {
 							torch::zeros_like(tRewards);
 						torch::Tensor tScaledCurriculumRewards = tCurriculumRewards * ppo->curCurriculumRewardScale;
 						torch::Tensor tScaledAerialCurriculumRewards = tAerialCurriculumRewards * ppo->curAerialCurriculumRewardScale;
-						torch::Tensor tAppliedGatedRewards = tGatedRewards;
-						torch::Tensor tAppliedAerialRewards = tAerialGatedRewards;
+						torch::Tensor tNormalRewards = tGatedRewards + tScaledCurriculumRewards;
+						torch::Tensor tAerialRewards = tAerialGatedRewards + tScaledAerialCurriculumRewards;
 						torch::Tensor tBaseRewards = tRewards - tGatedRewards - tCurriculumRewards - tAerialGatedRewards - tAerialCurriculumRewards;
+						torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
+						torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
+						torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
+							ppo,
+							tStates,
+							tActionComps,
+							tGoalTargetRow,
+							tAntiTargetRow,
+							combinedTraj.Length()
+						);
 
-						if (needsGCRLRewardGate) {
-							torch::Tensor tGoalScore = tGoalScoreShared;
-							torch::Tensor tAntiScore = tAntiScoreShared;
-							if (!tGoalScore.defined() || !tAntiScore.defined()) {
-								torch::Tensor tGoalTargetRow = MakeGCRLTerminalTargetRow(false, config, obsStat, (float)adaptiveGateTargetVel);
-								torch::Tensor tAntiTargetRow = MakeGCRLTerminalTargetRow(true, config, obsStat, (float)adaptiveGateTargetVel);
-								torch::Tensor tTerminalScores = InferGCRLTerminalScoresBatched(
-									ppo,
-									tStates,
-									tActionComps,
-									tGoalTargetRow,
-									tAntiTargetRow,
-									combinedTraj.Length()
-								);
-								if (tTerminalScores.defined()) {
-									tGoalScore = tTerminalScores.select(1, 0);
-									tAntiScore = tTerminalScores.select(1, 1);
-								}
+						if (tTerminalScores.defined()) {
+							torch::Tensor tGoalScore = tTerminalScores.select(1, 0);
+							torch::Tensor tAntiScore = tTerminalScores.select(1, 1);
+							tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
+							tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
+							torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
+							torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
+							torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
+
+							int trajLength = combinedTraj.Length();
+							int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+							std::vector<int64_t> futureIdxs(trajLength);
+							for (int epStart = 0; epStart < trajLength;) {
+								int epEnd = epStart;
+								while (epEnd < trajLength - 1 && combinedTraj.terminals[epEnd] == 0)
+									epEnd++;
+								for (int i = epStart; i <= epEnd; i++)
+									futureIdxs[i] = RS_MIN(i + lookahead, epEnd);
+								epStart = epEnd + 1;
 							}
 
-							if (tGoalScore.defined() && tAntiScore.defined()) {
-								tGoalScoreShared = tGoalScore; // reused by the optionality offensive stratum
-								tAntiScoreShared = tAntiScore;
-								tOptionalityValueShared = tGoalScore - config.ppo.gcrlRewardGateAntiScale * tAntiScore;
-								torch::Tensor tNormGoal = (tGoalScore - tGoalScore.mean()) / (tGoalScore.std(false) + 1e-8f);
-								torch::Tensor tNormAnti = (tAntiScore - tAntiScore.mean()) / (tAntiScore.std(false) + 1e-8f);
-								torch::Tensor tTerminalAdv = tNormGoal - config.ppo.gcrlRewardGateAntiScale * tNormAnti;
+							torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+							torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
 
-								int trajLength = combinedTraj.Length();
-								int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
-								std::vector<int64_t> futureIdxs(trajLength);
-								for (int epStart = 0; epStart < trajLength;) {
-									int epEnd = epStart;
-									while (epEnd < trajLength - 1 && combinedTraj.terminals[epEnd] == 0)
-										epEnd++;
-									for (int i = epStart; i <= epEnd; i++)
-										futureIdxs[i] = RS_MIN(i + lookahead, epEnd);
-									epStart = epEnd + 1;
-								}
+							// Normalize the gate delta with slow per-mode EMA stats instead of a
+							// per-batch z-score: the gate's meaning then drifts over ~1/(1-decay)
+							// iterations instead of jumping with each batch's composition, and one
+							// mode's dynamics (e.g. heatseeker ball speeds) can't reprice another's.
+							constexpr double GATE_EMA_DECAY = 0.99;
+							torch::Tensor tNormGateDelta = torch::empty_like(tGateDelta);
+							for (int m = 0; m < numModes; m++) {
+								torch::Tensor mask = (tModeIds == m);
+								torch::Tensor vals = tGateDelta.masked_select(mask);
+								if (vals.numel() == 0)
+									continue;
 
-								torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
-								torch::Tensor tGateDelta = tTerminalAdv.index_select(0, tFutureIdxs) - tTerminalAdv;
+								gateDeltaMeanEMA[m] = GATE_EMA_DECAY * gateDeltaMeanEMA[m] + (1 - GATE_EMA_DECAY) * vals.mean().item<double>();
+								gateDeltaVarEMA[m] = GATE_EMA_DECAY * gateDeltaVarEMA[m] + (1 - GATE_EMA_DECAY) * vals.var(false).item<double>();
 
-								// Normalize the gate delta with slow per-mode EMA stats instead of a
-								// per-batch z-score: the gate's meaning then drifts over ~1/(1-decay)
-								// iterations instead of jumping with each batch's composition, and one
-								// mode's dynamics (e.g. heatseeker ball speeds) can't reprice another's.
-								constexpr double GATE_EMA_DECAY = 0.99;
-								torch::Tensor tNormGateDelta = torch::empty_like(tGateDelta);
+								torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
+								tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+							}
+							tOptionalityProgressDeltaShared = tNormGateDelta;
+
+							torch::Tensor tGate = torch::sigmoid(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
+							torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
+							torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
+							torch::Tensor tAppliedGatedRewards = tNormalRewards * tEffectiveGate;
+							torch::Tensor tAppliedAerialRewards = tAerialRewards * tEffectiveAerialGate;
+							tRewards = tBaseRewards + tAppliedGatedRewards + tAppliedAerialRewards;
+
+							report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
+							report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
+							if (numModes > 1) {
 								for (int m = 0; m < numModes; m++) {
-									torch::Tensor mask = (tModeIds == m);
-									torch::Tensor vals = tGateDelta.masked_select(mask);
-									if (vals.numel() == 0)
-										continue;
-
-									gateDeltaMeanEMA[m] = GATE_EMA_DECAY * gateDeltaMeanEMA[m] + (1 - GATE_EMA_DECAY) * vals.mean().item<double>();
-									gateDeltaVarEMA[m] = GATE_EMA_DECAY * gateDeltaVarEMA[m] + (1 - GATE_EMA_DECAY) * vals.var(false).item<double>();
-
-									torch::Tensor norm = (vals - gateDeltaMeanEMA[m]) / std::sqrt(gateDeltaVarEMA[m] + 1e-8);
-									tNormGateDelta = tNormGateDelta.masked_scatter(mask, norm.to(torch::kFloat32));
+									torch::Tensor modeGate = tEffectiveGate.masked_select(tModeIds == m);
+									if (modeGate.numel() > 0)
+										report["GCRL Gate/Mean/" + modeNames[m]] = modeGate.mean().item<float>();
 								}
-								tOptionalityProgressDeltaShared = tNormGateDelta;
-
-								torch::Tensor tGate = torch::tanh(config.ppo.gcrlRewardGateSharpness * tNormGateDelta);
-								torch::Tensor tEffectiveGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLRewardGateInfluence;
-								torch::Tensor tEffectiveAerialGate = 1.0f + (tGate - 1.0f) * ppo->curGCRLAerialRewardGateInfluence;
-								tAppliedGatedRewards = tGatedRewards * tEffectiveGate;
-								tAppliedAerialRewards = tAerialGatedRewards * tEffectiveAerialGate;
-
-								report["GCRL Gate/Mean"] = tEffectiveGate.mean().item<float>();
-								report["GCRL Gate/STD"] = tEffectiveGate.std(false).item<float>();
-								if (numModes > 1) {
-									for (int m = 0; m < numModes; m++) {
-										torch::Tensor modeGate = tEffectiveGate.masked_select(tModeIds == m);
-										if (modeGate.numel() > 0)
-											report["GCRL Gate/Mean/" + modeNames[m]] = modeGate.mean().item<float>();
-									}
-								}
-								report["GCRL Aerial Gate/Mean"] = tEffectiveAerialGate.mean().item<float>();
-								report["GCRL Aerial Gate/STD"] = tEffectiveAerialGate.std(false).item<float>();
-								report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
-								report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
-								report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
-								report["GCRL Aerial Gate/Aerial Reward Applied"] = tAppliedAerialRewards.mean().item<float>();
 							}
-						}
-
-						tRewards = tBaseRewards + tAppliedGatedRewards + tScaledCurriculumRewards + tScaledAerialCurriculumRewards + tAppliedAerialRewards;
-						report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
-						if (hasGatedRewards)
+							report["GCRL Aerial Gate/Mean"] = tEffectiveAerialGate.mean().item<float>();
+							report["GCRL Aerial Gate/STD"] = tEffectiveAerialGate.std(false).item<float>();
+							report["GCRL Gate/Delta Mean"] = tGateDelta.mean().item<float>();
+							report["GCRL Gate/Delta STD"] = tGateDelta.std(false).item<float>();
+							report["GCRL Gate/Base Reward"] = tBaseRewards.mean().item<float>();
 							report["GCRL Gate/Gated Reward Raw"] = tGatedRewards.mean().item<float>();
-						if (hasCurriculumRewards)
 							report["GCRL Gate/Curriculum Reward Raw"] = tCurriculumRewards.mean().item<float>();
-						if (hasCurriculumRewards)
 							report["GCRL Gate/Curriculum Reward Scaled"] = tScaledCurriculumRewards.mean().item<float>();
-						if (hasAerialGatedRewards)
+							report["GCRL Gate/Gated Reward Applied"] = tAppliedGatedRewards.mean().item<float>();
 							report["GCRL Aerial Gate/Aerial Reward Raw"] = tAerialGatedRewards.mean().item<float>();
-						if (hasAerialCurriculumRewards)
 							report["GCRL Aerial Gate/Curriculum Reward Raw"] = tAerialCurriculumRewards.mean().item<float>();
-						if (hasAerialCurriculumRewards)
 							report["GCRL Aerial Gate/Curriculum Reward Scaled"] = tScaledAerialCurriculumRewards.mean().item<float>();
-						report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
-						gcrlGateTime += gateTimer.Elapsed();
+							report["GCRL Aerial Gate/Aerial Reward Applied"] = tAppliedAerialRewards.mean().item<float>();
+							report["GCRL Gate/Final Reward"] = tRewards.mean().item<float>();
+						}
 					}
 
 					// ── Feature A: frontier reset curriculum (consistency scoring) ──
@@ -2719,7 +2408,6 @@ void GGL::Learner::Start() {
 						&& (int)combinedTraj.futureGoals.size() == trajN * 6
 						&& combinedTraj.snapshots.size() == (size_t)trajN) {
 						RG_NO_GRAD;
-						Timer frontierTimer = {};
 						fnBuildEpBounds();
 
 						torch::Tensor tPhi = fnGetSharedPhi();
@@ -2784,7 +2472,6 @@ void GGL::Learner::Start() {
 						uint64_t fbRes = config.ppo.frontierBuffer->fallbackResets.exchange(0, std::memory_order_relaxed);
 						report["Frontier/Fallback Resets"] = (double)fbRes;
 						report["Frontier/Reset Fraction Actual"] = batch.arenaResets > 0 ? (double)fRes / batch.arenaResets : 0.0;
-						frontierTime += frontierTimer.Elapsed();
 					}
 
 					if (config.ppo.useSORS && tActionComps.defined()) {
@@ -2812,15 +2499,14 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					// ── Optionality scorer consumers: reward shaping and option-conditioned entropy ──
+					// ── Feature D: optionality potential shaping ──
 					// Polyak the frozen scorer, refresh the stratified goal bank, compute
 					// phi_opt over the batch, and inject the masked potential delta into
 					// tRewards — AFTER all multiplicative gating (it is never gated) and
 					// BEFORE GAE (it flows through the normal value/GAE path, not as an
 					// advantage stream). Burn-in injects zero while the normalizer seeds.
-					if ((config.ppo.useOptionality || config.ppo.useOptionEntropy) && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
+					if (config.ppo.useOptionality && config.ppo.useGCRL && ppo->optionality && trajN > 0 && tActionComps.defined()) {
 						RG_NO_GRAD;
-						Timer optionTimer = {};
 						GCRLOptionality* opt = ppo->optionality;
 
 						// 1. Polyak the frozen scorer toward the live nets
@@ -2926,16 +2612,9 @@ void GGL::Learner::Start() {
 						// 3. Refresh the bank (FIFO per stratum) + re-embed under the frozen psi
 						opt->RefreshBank(candRows, candValues, (int64_t)totalIterations, report);
 
-						// 4. phi_opt over the batch; option-entropy also asks for normalized
-						// effective option count from the same bank-score distribution.
+						// 4. phi_opt over the batch
 						torch::Tensor phiReachOnly;
-						torch::Tensor optionBreadth;
-						torch::Tensor phiOpt = config.ppo.useOptionEntropy ?
-							torch::Tensor() : opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
-						if (config.ppo.useOptionEntropy) {
-							torch::Tensor* reachOnlyOut = config.ppo.useOptionality ? &phiReachOnly : nullptr;
-							optionBreadth = opt->ComputeOptionBreadth(tStates, &phiOpt, reachOnlyOut); // [N] cpu, or {} if bank empty
-						}
+						torch::Tensor phiOpt = opt->ComputePhiOpt(tStates, &phiReachOnly); // [N] cpu, or {} if bank empty
 						if (phiOpt.defined()) {
 							double batchPhiMean = phiOpt.mean().item<double>();
 							double batchPhiVar = phiOpt.var(false).item<double>();
@@ -2984,122 +2663,99 @@ void GGL::Learner::Start() {
 								}
 							}
 
-							if (config.ppo.useOptionEntropy && optionBreadth.defined()) {
-								torch::Tensor suppressor = tExplorationWeights.defined() ?
-									tExplorationWeights : torch::full_like(optionBreadth, config.ppo.optionEntropyDefaultWeight);
-								torch::Tensor phiZ = (phiOpt - (float)optPhiMeanEMA) / (float)phiStdEMA;
-								float qualitySharpness = RS_MAX(1e-6f, config.ppo.optionEntropyQualitySharpness);
-								torch::Tensor qualityGate = torch::sigmoid(
-									(phiZ - config.ppo.optionEntropyMinQualityZ) / qualitySharpness);
-								tExplorationWeights = (suppressor * optionBreadth * qualityGate).clamp(
-									config.ppo.optionEntropyMinWeight,
-									config.ppo.optionEntropyMaxWeight);
+							// 5. One-sided option-collapse penalty + running normalizer.
+							torch::Tensor rOptRaw = -optDeficit;
 
-								report["Option Entropy/Breadth Mean"] = optionBreadth.mean().item<float>();
-								report["Option Entropy/Breadth Std"] = optionBreadth.std(false).item<float>();
-								report["Option Entropy/Quality Gate Mean"] = qualityGate.mean().item<float>();
-								report["Option Entropy/Suppressor Mean"] = suppressor.mean().item<float>();
-								report["Option Entropy/Weight Mean Pre-PPO"] = tExplorationWeights.mean().item<float>();
-								report["Option Entropy/Low Weight Fraction"] =
-									(tExplorationWeights < 0.25f).to(torch::kFloat32).mean().item<float>();
-							}
+							if (config.ppo.optCommitReliefScale > 0.0f) {
+								torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
+								if (!optProgressDelta.defined() && optValue.defined()) {
+									fnBuildEpBounds();
+									int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
+									std::vector<int64_t> futureIdxs(trajN);
+									for (int t = 0; t < trajN; t++)
+										futureIdxs[t] = RS_MIN(t + lookahead, epEndOf[t]);
 
-							if (config.ppo.useOptionality) {
-								// 5. One-sided option-collapse penalty + running normalizer.
-								torch::Tensor rOptRaw = -optDeficit;
-
-								if (config.ppo.optCommitReliefScale > 0.0f) {
-									torch::Tensor optProgressDelta = tOptionalityProgressDeltaShared;
-									if (!optProgressDelta.defined() && optValue.defined()) {
-										fnBuildEpBounds();
-										int lookahead = RS_MAX(1, config.ppo.gcrlRewardGateLookahead);
-										std::vector<int64_t> futureIdxs(trajN);
-										for (int t = 0; t < trajN; t++)
-											futureIdxs[t] = RS_MIN(t + lookahead, epEndOf[t]);
-
-										torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
-										torch::Tensor rawDelta = optValue.index_select(0, tFutureIdxs) - optValue;
-										optProgressDelta = torch::empty_like(rawDelta);
-										for (int m = 0; m < numModes; m++) {
-											torch::Tensor mask = (tModeIds == m);
-											torch::Tensor vals = rawDelta.masked_select(mask);
-											if (vals.numel() == 0)
-												continue;
-											torch::Tensor norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
-											optProgressDelta = optProgressDelta.masked_scatter(mask, norm.to(torch::kFloat32));
-										}
-									}
-
-									if (optProgressDelta.defined()) {
-										float reliefScale = RS_CLAMP(config.ppo.optCommitReliefScale, 0.0f, 1.0f);
-										float sharpness = RS_MAX(1e-6f, config.ppo.optCommitReliefSharpness);
-										torch::Tensor lossMask = rOptRaw < 0.0f;
-										torch::Tensor positiveProgress = optProgressDelta > 0.0f;
-										torch::Tensor reliefGate = torch::where(
-											positiveProgress,
-											torch::sigmoid(sharpness * optProgressDelta),
-											torch::zeros_like(optProgressDelta)
-										);
-										torch::Tensor relief = reliefGate * reliefScale;
-										torch::Tensor rOptBeforeRelief = rOptRaw;
-										rOptRaw = torch::where(lossMask, rOptRaw * (1.0f - relief), rOptRaw);
-
-										torch::Tensor lossF = lossMask.to(torch::kFloat32);
-										float lossCount = lossF.sum().item<float>();
-										report["Opt Commit/GCRL Delta Mean"] = optProgressDelta.mean().item<float>();
-										report["Opt Commit/Loss Fraction"] = lossF.mean().item<float>();
-										report["Opt Commit/Relief Mean"] =
-											lossCount > 0 ? (relief * lossF).sum().item<float>() / lossCount : 0.0f;
-										float rawLoss = (-rOptBeforeRelief).masked_select(lossMask).sum().item<float>();
-										float relievedLoss = (-rOptRaw).masked_select(lossMask).sum().item<float>();
-										report["Opt Commit/Relieved Loss Share"] =
-											rawLoss > 1e-8f ? (rawLoss - relievedLoss) / rawLoss : 0.0f;
+									torch::Tensor tFutureIdxs = torch::tensor(futureIdxs, torch::TensorOptions().dtype(torch::kLong));
+									torch::Tensor rawDelta = optValue.index_select(0, tFutureIdxs) - optValue;
+									optProgressDelta = torch::empty_like(rawDelta);
+									for (int m = 0; m < numModes; m++) {
+										torch::Tensor mask = (tModeIds == m);
+										torch::Tensor vals = rawDelta.masked_select(mask);
+										if (vals.numel() == 0)
+											continue;
+										torch::Tensor norm = (vals - vals.mean()) / (vals.std(false) + 1e-8f);
+										optProgressDelta = optProgressDelta.masked_scatter(mask, norm.to(torch::kFloat32));
 									}
 								}
 
-								double batchMean = rOptRaw.mean().item<double>();
-								double batchVar = rOptRaw.var(false).item<double>();
-								constexpr double OPT_NORM_DECAY = 0.999;
-								optRewardMeanEMA = OPT_NORM_DECAY * optRewardMeanEMA + (1 - OPT_NORM_DECAY) * batchMean;
-								optRewardVarEMA = OPT_NORM_DECAY * optRewardVarEMA + (1 - OPT_NORM_DECAY) * batchVar;
-								double normStd = std::sqrt(optRewardVarEMA + 1e-8);
+								if (optProgressDelta.defined()) {
+									float reliefScale = RS_CLAMP(config.ppo.optCommitReliefScale, 0.0f, 1.0f);
+									float sharpness = RS_MAX(1e-6f, config.ppo.optCommitReliefSharpness);
+									torch::Tensor lossMask = rOptRaw < 0.0f;
+									torch::Tensor positiveProgress = optProgressDelta > 0.0f;
+									torch::Tensor reliefGate = torch::where(
+										positiveProgress,
+										torch::sigmoid(sharpness * optProgressDelta),
+										torch::zeros_like(optProgressDelta)
+									);
+									torch::Tensor relief = reliefGate * reliefScale;
+									torch::Tensor rOptBeforeRelief = rOptRaw;
+									rOptRaw = torch::where(lossMask, rOptRaw * (1.0f - relief), rOptRaw);
 
-								// 6. Weight schedule + interlock
-								float effectiveOptWeight = fnGetGatedAnnealedRange(
-									config.ppo.optWeight, config.ppo.optWeightFinal,
-									-1, config.ppo.optAnnealSteps,
-									optWeightAnnealStartTS, optWeightAnnealProgressTS,
-									config.ppo.curriculumAnnealTouchRatioGate, touchRatioEMA);
-								bool interlock = ppo->curGCRLAdvScale >= 0.5f;
-								if (interlock)
-									effectiveOptWeight *= 0.5f;
-								report["Opt/Interlock Active"] = interlock ? 1.0 : 0.0;
-
-								bool burnIn = optBurnInItersDone < config.ppo.optBurnInIters;
-								optBurnInItersDone++;
-
-								torch::Tensor injected = rOptRaw * (effectiveOptWeight / (float)normStd);
-								report["Opt/Reward Std (pre-norm)"] = (float)std::sqrt(RS_MAX(batchVar, 0.0));
-								report["Opt/Effective Weight"] = burnIn ? 0.0f : effectiveOptWeight;
-								report["Opt/Reward Mean"] = burnIn ? 0.0f : injected.mean().item<float>();
-								float meanAbsTotal = tRewards.abs().mean().item<float>();
-								report["Opt/Reward Share"] = (!burnIn && meanAbsTotal > 1e-8f)
-									? injected.abs().mean().item<float>() / meanAbsTotal : 0.0f;
-
-								// Hover monitor: Pearson(rOpt, curriculum reward — dominant term is the chase reward)
-								if (combinedTraj.curriculumRewards.size() == (size_t)trajN) {
-									torch::Tensor tChase = torch::tensor(combinedTraj.curriculumRewards);
-									torch::Tensor a = rOptRaw - rOptRaw.mean();
-									torch::Tensor b = tChase - tChase.mean();
-									float denom = (a.norm() * b.norm()).item<float>();
-									report["Opt/Corr With Chase"] = denom > 1e-8f ? (a * b).sum().item<float>() / denom : 0.0f;
+									torch::Tensor lossF = lossMask.to(torch::kFloat32);
+									float lossCount = lossF.sum().item<float>();
+									report["Opt Commit/GCRL Delta Mean"] = optProgressDelta.mean().item<float>();
+									report["Opt Commit/Loss Fraction"] = lossF.mean().item<float>();
+									report["Opt Commit/Relief Mean"] =
+										lossCount > 0 ? (relief * lossF).sum().item<float>() / lossCount : 0.0f;
+									float rawLoss = (-rOptBeforeRelief).masked_select(lossMask).sum().item<float>();
+									float relievedLoss = (-rOptRaw).masked_select(lossMask).sum().item<float>();
+									report["Opt Commit/Relieved Loss Share"] =
+										rawLoss > 1e-8f ? (rawLoss - relievedLoss) / rawLoss : 0.0f;
 								}
-
-								if (!burnIn)
-									tRewards = tRewards + injected;
 							}
+
+							double batchMean = rOptRaw.mean().item<double>();
+							double batchVar = rOptRaw.var(false).item<double>();
+							constexpr double OPT_NORM_DECAY = 0.999;
+							optRewardMeanEMA = OPT_NORM_DECAY * optRewardMeanEMA + (1 - OPT_NORM_DECAY) * batchMean;
+							optRewardVarEMA = OPT_NORM_DECAY * optRewardVarEMA + (1 - OPT_NORM_DECAY) * batchVar;
+							double normStd = std::sqrt(optRewardVarEMA + 1e-8);
+
+							// 6. Weight schedule + interlock
+							float effectiveOptWeight = fnGetGatedAnnealedRange(
+								config.ppo.optWeight, config.ppo.optWeightFinal,
+								-1, config.ppo.optAnnealSteps,
+								optWeightAnnealStartTS, optWeightAnnealProgressTS,
+								config.ppo.curriculumAnnealTouchRatioGate, touchRatioEMA);
+							bool interlock = ppo->curGCRLAdvScale >= 0.5f;
+							if (interlock)
+								effectiveOptWeight *= 0.5f;
+							report["Opt/Interlock Active"] = interlock ? 1.0 : 0.0;
+
+							bool burnIn = optBurnInItersDone < config.ppo.optBurnInIters;
+							optBurnInItersDone++;
+
+							torch::Tensor injected = rOptRaw * (effectiveOptWeight / (float)normStd);
+							report["Opt/Reward Std (pre-norm)"] = (float)std::sqrt(RS_MAX(batchVar, 0.0));
+							report["Opt/Effective Weight"] = burnIn ? 0.0f : effectiveOptWeight;
+							report["Opt/Reward Mean"] = burnIn ? 0.0f : injected.mean().item<float>();
+							float meanAbsTotal = tRewards.abs().mean().item<float>();
+							report["Opt/Reward Share"] = (!burnIn && meanAbsTotal > 1e-8f)
+								? injected.abs().mean().item<float>() / meanAbsTotal : 0.0f;
+
+							// Hover monitor: Pearson(rOpt, curriculum reward — dominant term is the chase reward)
+							if (combinedTraj.curriculumRewards.size() == (size_t)trajN) {
+								torch::Tensor tChase = torch::tensor(combinedTraj.curriculumRewards);
+								torch::Tensor a = rOptRaw - rOptRaw.mean();
+								torch::Tensor b = tChase - tChase.mean();
+								float denom = (a.norm() * b.norm()).item<float>();
+								report["Opt/Corr With Chase"] = denom > 1e-8f ? (a * b).sum().item<float>() / denom : 0.0f;
+							}
+
+							if (!burnIn)
+								tRewards = tRewards + injected;
 						}
-						optionEntropyTime += optionTimer.Elapsed();
 					}
 
 					// States we truncated at (there could be none)
@@ -3112,7 +2768,6 @@ void GGL::Learner::Start() {
 
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
-					Timer valueInferTimer = {};
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
@@ -3140,7 +2795,6 @@ void GGL::Learner::Start() {
 							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device), true)).cpu();
 						}
 					}
-					valueInferTime = valueInferTimer.Elapsed();
 
 					// Skip when no episode fully ended this batch (would divide by zero -> inf on the graph)
 					float terminalPortion = (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
@@ -3190,10 +2844,6 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
-					if (tExplorationWeights.defined())
-						experience.data.explorationWeights = tExplorationWeights;
-					else
-						experience.data.explorationWeights = torch::Tensor();
 					if (numModes > 1)
 						experience.data.modeIds = tModeIds;
 
@@ -3225,12 +2875,6 @@ void GGL::Learner::Start() {
 				float consumptionTime = consumptionTimer.Elapsed();
 				report["Collection Time"] = batch.collectionTime;
 				report["Consumption Time"] = consumptionTime;
-				report["Tensor Prep Time"] = tensorPrepTime;
-				report["HER Time"] = herTime;
-				report["GCRL Gate Time"] = gcrlGateTime;
-				report["Frontier Time"] = frontierTime;
-				report["Option Entropy Time"] = optionEntropyTime;
-				report["Value Infer Time"] = valueInferTime;
 				report["Collection Steps/Second"] = stepsCollected / batch.collectionTime;
 				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
 				report["Overall Steps/Second"] = stepsCollected / iterationTimer.Elapsed();
@@ -3292,12 +2936,6 @@ void GGL::Learner::Start() {
 						"-Inference Time",
 						"-Env Step Time",
 						"Consumption Time",
-						"-Tensor Prep Time",
-						"-HER Time",
-						"-GCRL Gate Time",
-						"-Frontier Time",
-						"-Option Entropy Time",
-						"-Value Infer Time",
 						"-GAE Time",
 						"-PPO Learn Time",
 						"",
@@ -3318,16 +2956,6 @@ void GGL::Learner::Start() {
 						"Frontier/Reset Fraction Actual",
 						"HER/Selected Offset P50",
 						"HER/Uniform Fraction Actual",
-						"HER/Coverage Bank Fill",
-						"HER/Coverage Novelty Boost Mean",
-						"HER/Coverage Utility Boost Mean",
-						"HER/Coverage Novelty Selection Lift",
-						"HER/Coverage Utility Selection Lift",
-						"HER/Coverage Raw Utility STD",
-						"HER/Coverage Selected Novelty",
-						"HER/Coverage Selected Utility",
-						"HER/Coverage Reset Inserts",
-						"HER/Coverage Reset Insert Fraction",
 						"Adaptive/Gate Target Vel",
 						"Adaptive/StrongTouch Floor",
 						"Adaptive/Touch Samples Per Iter",

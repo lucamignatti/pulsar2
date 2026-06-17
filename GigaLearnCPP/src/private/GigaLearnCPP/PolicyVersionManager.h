@@ -6,6 +6,7 @@
 #include <GigaLearnCPP/Util/RenderSender.h>
 
 #include <nlohmann/json.hpp>
+#include <limits>
 #include <shared_mutex>
 
 namespace GGL {
@@ -62,8 +63,14 @@ namespace GGL {
 		std::vector<PolicyVersion> versions;
 		mutable std::shared_mutex versionsMutex; // shared: collectors reading; unique: OnIteration mutating
 		std::filesystem::path saveFolder;
+		std::filesystem::path bestAnchorFolder;
 		int maxVersions;
 		uint64_t tsPerVersion;
+
+		PolicyVersion bestAnchor = {};
+		bool hasBestAnchor = false;
+		float bestAnchorRating = -std::numeric_limits<float>::infinity();
+		std::string bestAnchorRatingMode = "";
 
 		//////////////////
 
@@ -75,6 +82,7 @@ namespace GGL {
 
 			bool doContinuation = false;
 			int prevOldVersionIndex;
+			bool prevOldVersionIsBestAnchor = false;
 			Team prevNewTeam;
 			float prevSimTime;
 
@@ -95,10 +103,16 @@ namespace GGL {
 
 		void SaveVersions();
 		void LoadVersions(ModelSet modelsTemplate, uint64_t curTimesteps);
+		void SaveBestAnchor();
+		void LoadBestAnchor(ModelSet modelsTemplate, uint64_t curTimesteps);
 
 		void SortVersions();
+		int GetVersionCandidateCount() const;
+		PolicyVersion& GetVersionCandidate(int index);
+		float GetPeakRating(const SkillRating& ratings, std::string* outMode = NULL) const;
+		void UpdateBestAnchor(struct PPOLearner* ppo, Report& report, uint64_t totalTimesteps);
 
-		void RunSkillMatches(struct PPOLearner* ppo, Report& report);
+		void RunSkillMatches(struct PPOLearner* ppo, Report& report, uint64_t totalTimesteps);
 
 		void OnIteration(struct PPOLearner* ppo, Report& report, int64_t totalTimesteps, int64_t prevTotalTimesteps);
 

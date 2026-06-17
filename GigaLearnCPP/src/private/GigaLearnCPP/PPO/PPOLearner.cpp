@@ -34,11 +34,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		RG_ERR_CLOSE("PPOLearner: useGCRLRewardGate requires useGCRL");
 
 	// The self-tuning curriculum features all score with the GCRL embedding nets
-	if ((config.useFrontierResets || config.useDifficultyHER || config.useCoverageHER || config.useOptionality || config.useOptionEntropy) && !config.useGCRL)
-		RG_ERR_CLOSE("PPOLearner: useFrontierResets/useDifficultyHER/useCoverageHER/useOptionality/useOptionEntropy require useGCRL");
-
-	if (config.useCoverageHER && !config.useDifficultyHER)
-		RG_ERR_CLOSE("PPOLearner: useCoverageHER requires useDifficultyHER");
+	if ((config.useFrontierResets || config.useDifficultyHER || config.useOptionality) && !config.useGCRL)
+		RG_ERR_CLOSE("PPOLearner: useFrontierResets/useDifficultyHER/useOptionality require useGCRL");
 
 	// ENSEMBLE is a planned fallback (extra phi/psi heads) — error instead of silently
 	// no-opping if it's ever selected before being implemented.
@@ -73,10 +70,10 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		models.Add(makeGCRLCritic("anti_critic"));
 		models.Add(makeGCRLCritic("car_critic"));
 
-		// Optionality shaping / option-conditioned entropy: self-test the math, then build
-		// the frozen scorer as a copy of the freshly-made goal critic. After a checkpoint
-		// load the Learner re-syncs it via PolyakUpdate-from-loaded-weights (see Learner::Load).
-		if (config.useOptionality || config.useOptionEntropy) {
+		// Optionality shaping (Feature D): self-test the math, then build the frozen
+		// scorer as a copy of the freshly-made goal critic. After a checkpoint load the
+		// Learner re-syncs it via PolyakUpdate-from-loaded-weights (see Learner::Load).
+		if (config.useOptionality) {
 			GCRLOptionality::RunSelfTests();
 			optionality = new GCRLOptionality(
 				config, featureDim,
@@ -207,7 +204,7 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 }
 
 torch::Tensor GGL::PPOLearner::InferGCRLTerminalScores(torch::Tensor obs, torch::Tensor actionComps, torch::Tensor goalTargets, torch::Tensor antiTargets) {
-	if (!config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
+	if (!config.useGCRLRewardGate || !config.useGCRL || !models["goal_critic"] || !models["anti_critic"])
 		return {};
 
 	torch::NoGradGuard noGrad;
@@ -396,7 +393,7 @@ void GGL::PPOLearner::TrainSORS(Report& report) {
 	report["SORS/Pred Window Return"] = avgPredReturn.Get();
 }
 
-torch::Tensor ComputeEntropyRows(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
+torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
 	// Compute log probs and entropy
 	auto entropy = -(probs.log() * probs).sum(-1);
 
@@ -410,11 +407,7 @@ torch::Tensor ComputeEntropyRows(torch::Tensor probs, torch::Tensor actionMasks,
 		entropy /= logf(actionMasks.size(-1));
 	}
 
-	return entropy;
-}
-
-torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
-	return ComputeEntropyRows(probs, actionMasks, maskEntropy).mean();
+	return entropy.mean();
 }
 
 float GGL::PPOLearner::GetEntropyScale() const {
@@ -444,8 +437,7 @@ namespace {
 	// to the host once per batch (each .item<float>() in the hot loop is a full GPU sync).
 	// Slots that don't apply to a minibatch stay NaN; AvgTracker::Add ignores NaN.
 	enum MetricSlot : int {
-		M_ENTROPY, M_OPTION_EXPLORE_ENTROPY, M_OPTION_ENTROPY_WEIGHT, M_OPTION_ENTROPY_COEFF,
-		M_DIVERGENCE, M_POLICY_LOSS, M_REL_ENTROPY_LOSS, M_CRITIC_LOSS,
+		M_ENTROPY, M_DIVERGENCE, M_POLICY_LOSS, M_REL_ENTROPY_LOSS, M_CRITIC_LOSS,
 		M_GUIDING_LOSS, M_RATIO, M_CLIP,
 		M_INFONCE, M_INFONCE_GOAL, M_INFONCE_ANTI, M_INFONCE_CAR,
 		M_INFONCE_RAW, M_INFONCE_REG1, M_INFONCE_REG2,
@@ -517,7 +509,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
 			auto batchAdvantages = batch.advantages;
-			auto batchExplorationWeights = batch.explorationWeights;
 			auto batchModeIds = batch.modeIds;
 			auto batchActionComps = batch.actionComps;
 			auto batchFutureGoals = batch.futureGoals;
@@ -538,9 +529,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto advantages = batchAdvantages.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true);
-				torch::Tensor explorationWeights;
-				if (batchExplorationWeights.defined())
-					explorationWeights = batchExplorationWeights.slice(0, start, stop).to(device, RG_H2D_NONBLOCKING(device), true).clamp(0.0f, 1.0f);
 
 				torch::Tensor modeIds;
 				if (batchModeIds.defined())
@@ -659,7 +647,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					mbSlots[M_GCRL_FINAL_ADV] = advantages.abs().mean();
 				}
 
-				torch::Tensor probs, logProbs, entropy, entropyObjective, ratio, clipped, policyLoss, ppoLoss;
+				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy (from the shared features)
@@ -669,25 +657,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						probs = torch::softmax(logits + (-1e10f) * maskBool.logical_not(), -1)
 							.view({ -1, m_policy->config.numOutputs }).clamp(1e-11f, 1);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
-						torch::Tensor entropyRows = ComputeEntropyRows(probs, actionMasks, config.maskEntropy);
-						entropy = entropyRows.mean();
+						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						mbSlots[M_ENTROPY] = entropy.detach();
-						const float entropyScale = GetEntropyScale();
-						if (explorationWeights.defined()) {
-							torch::Tensor w = explorationWeights.view_as(entropyRows);
-							torch::Tensor entropyCoeff =
-								entropyScale * w - config.optionEntropyCommitPenalty * (1.0f - w);
-							entropyObjective = (entropyRows * entropyCoeff).mean();
-							mbSlots[M_OPTION_ENTROPY_WEIGHT] = w.mean().detach();
-							mbSlots[M_OPTION_ENTROPY_COEFF] = entropyCoeff.mean().detach();
-							torch::Tensor denom = w.sum().clamp_min(1e-6f);
-							mbSlots[M_OPTION_EXPLORE_ENTROPY] = ((entropyRows * w).sum() / denom).detach();
-						} else {
-							entropyObjective = entropy * entropyScale;
-						}
 					}
 
 					logProbs = logProbs.view_as(oldProbs);
+					const float entropyScale = GetEntropyScale();
 
 					// Compute PPO loss
 					// (log-ratio clamped at +-15: e^15 is already ~1e6x past the clip range, and
@@ -703,9 +678,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						ratio * advantages, clipped * advantages
 					).mean();
 					mbSlots[M_POLICY_LOSS] = policyLoss.detach();
-					mbSlots[M_REL_ENTROPY_LOSS] = entropyObjective.detach() / policyLoss.detach();
+					mbSlots[M_REL_ENTROPY_LOSS] = (entropy.detach() * entropyScale) / policyLoss.detach();
 
-					ppoLoss = (policyLoss - entropyObjective) * batchSizeRatio;
+					ppoLoss = (policyLoss - entropy * entropyScale) * batchSizeRatio;
 
 					// NOTE: The adaptive entropy controller is updated once per batch (after the
 					// host metric sync), not here per-minibatch.
@@ -872,10 +847,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// Adaptive entropy controller, once per batch from the batch-mean entropy.
 				// (Was per-minibatch; with the old accumulate-then-step config there was one
 				// minibatch per batch anyway, so the effective cadence is unchanged.)
-				float controllerEntropy = (config.useOptionEntropy && !std::isnan(m[M_OPTION_EXPLORE_ENTROPY])) ?
-					m[M_OPTION_EXPLORE_ENTROPY] : m[M_ENTROPY];
-				if (config.adaptiveEntropy && trainPolicy && !std::isnan(controllerEntropy)) {
-					curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - controllerEntropy);
+				if (config.adaptiveEntropy && trainPolicy && !std::isnan(m[M_ENTROPY])) {
+					curEntropyScale += config.adaptiveEntropyLR * (config.targetEntropy - m[M_ENTROPY]);
 					curEntropyScale = std::clamp(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
 				}
 
@@ -933,11 +906,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	report["Entropy Scale"] = GetEntropyScale();
 	if (config.adaptiveEntropy)
 		report["Target Entropy"] = config.targetEntropy;
-	if (config.useOptionEntropy) {
-		report["Option Entropy/Explore Entropy"] = avg[M_OPTION_EXPLORE_ENTROPY].Get();
-		report["Option Entropy/Weight Mean"] = avg[M_OPTION_ENTROPY_WEIGHT].Get();
-		report["Option Entropy/Coeff Mean"] = avg[M_OPTION_ENTROPY_COEFF].Get();
-	}
 	report["Mean KL Divergence"] = avg[M_DIVERGENCE].Get();
 	if (!isFirstIteration) {
 		// These metrics give bad data on the first iteration, which will mess up graph scaling
