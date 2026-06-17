@@ -126,6 +126,197 @@ namespace RLGC {
 		}
 	};
 
+	// Port of Rolv-Arild/Necto training/reward.py at b030656 ("Add Nexto Changes for v3").
+	// The reward already applies team-spirit and opponent-punish redistribution internally.
+	class NextoReward : public Reward {
+	public:
+		float teamSpirit;
+		float goalW, goalDistW, goalSpeedBonusW, goalDistBonusW;
+		float demoW, distW, alignW, boostGainW, boostLoseW;
+		float touchGrassW, touchHeightW, touchAccelW, opponentPunishW;
+
+		GameState lastState;
+		bool hasLastState = false;
+		float lastStateQuality = 0;
+		std::vector<float> lastPlayerQualities;
+		std::vector<float> rewards;
+
+		NextoReward(
+			float teamSpirit = 0.3f,
+			float goalW = 10,
+			float goalDistW = 10,
+			float goalSpeedBonusW = 2.5f,
+			float goalDistBonusW = 2.5f,
+			float demoW = 10,
+			float distW = 0.5f,
+			float alignW = 0.5f,
+			float boostGainW = 1,
+			float boostLoseW = 0,
+			float touchGrassW = 0.005f,
+			float touchHeightW = 1,
+			float touchAccelW = 0.5f,
+			float opponentPunishW = 1
+		) :
+			teamSpirit(teamSpirit), goalW(goalW), goalDistW(goalDistW),
+			goalSpeedBonusW(goalSpeedBonusW), goalDistBonusW(goalDistBonusW),
+			demoW(demoW), distW(distW), alignW(alignW), boostGainW(boostGainW),
+			boostLoseW(boostLoseW), touchGrassW(touchGrassW),
+			touchHeightW(touchHeightW), touchAccelW(touchAccelW),
+			opponentPunishW(opponentPunishW) {}
+
+		virtual void Reset(const GameState& initialState) override {
+			lastState = initialState;
+			hasLastState = true;
+			auto qualities = GetStateQualities(initialState);
+			lastStateQuality = qualities.first;
+			lastPlayerQualities = std::move(qualities.second);
+			rewards.assign(initialState.players.size(), 0);
+		}
+
+		virtual void PreStep(const GameState& state) override {
+			if (!hasLastState || lastState.players.size() != state.players.size()) {
+				Reset(state);
+				return;
+			}
+
+			auto qualities = GetStateQualities(state);
+			float stateQuality = qualities.first;
+			const std::vector<float>& playerQualities = qualities.second;
+			std::vector<float> playerRewards(state.players.size(), 0);
+
+			for (int i = 0; i < (int)state.players.size(); i++) {
+				const Player& player = state.players[i];
+				const Player& last = lastState.players[i];
+
+				float carHeight = player.pos.z / CommonValues::CEILING_Z;
+				float ballHeight = state.ball.pos.z / CommonValues::CEILING_Z;
+
+				if (player.ballTouchedStep) {
+					float heightFactor = 0.5f * (carHeight + ballHeight);
+					playerRewards[i] += touchHeightW * (player.isOnGround ? 1.0f : 2.0f) * heightFactor;
+					playerRewards[i] += touchAccelW * (1 - heightFactor) *
+						(state.ball.vel - lastState.ball.vel).Length() / CommonValues::CAR_MAX_SPEED;
+				}
+
+				float boost = RS_CLAMP(player.boost / 100.0f, 0.0f, 1.0f);
+				float lastBoost = RS_CLAMP(last.boost / 100.0f, 0.0f, 1.0f);
+				float boostDiff = sqrtf(boost) - sqrtf(lastBoost);
+				if (boostDiff >= 0) {
+					playerRewards[i] += boostGainW * boostDiff;
+				} else if (carHeight < CommonValues::GOAL_HEIGHT / CommonValues::CEILING_Z) {
+					playerRewards[i] += boostLoseW * boostDiff * (1 - carHeight);
+				}
+
+				if (player.isOnGround)
+					playerRewards[i] -= touchGrassW;
+
+				if (player.isDemoed && !last.isDemoed)
+					playerRewards[i] -= demoW / 2;
+				if (player.eventState.demo)
+					playerRewards[i] += demoW / 2;
+			}
+
+			for (int i = 0; i < (int)state.players.size(); i++) {
+				float qualityDelta = playerQualities[i] - lastPlayerQualities[i];
+				float stateDelta = stateQuality - lastStateQuality;
+				playerRewards[i] += qualityDelta + (state.players[i].team == Team::BLUE ? stateDelta : -stateDelta);
+			}
+
+			lastStateQuality = stateQuality;
+			lastPlayerQualities = playerQualities;
+
+			if (state.goalScored) {
+				Team scoredTeam = state.ball.pos.y > 0 ? Team::BLUE : Team::ORANGE;
+				float goalSpeed = lastState.ball.vel.Length();
+				for (int i = 0; i < (int)state.players.size(); i++) {
+					const Player& player = state.players[i];
+					if (player.team == scoredTeam) {
+						playerRewards[i] = goalW + goalDistBonusW * goalSpeed / CommonValues::BALL_MAX_SPEED;
+					} else {
+						float dist = (player.pos - lastState.ball.pos).Length();
+						playerRewards[i] = -goalDistBonusW * (1 - expf(-dist / CommonValues::CAR_MAX_SPEED));
+					}
+				}
+			}
+
+			ApplyTeamRedistribution(state, playerRewards);
+			rewards = std::move(playerRewards);
+			lastState = state;
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return player.index >= 0 && player.index < (int)rewards.size() ? rewards[player.index] : 0;
+		}
+
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			if (rewards.size() != state.players.size())
+				return std::vector<float>(state.players.size(), 0);
+			return rewards;
+		}
+
+	private:
+		static Vec BlueGoal() {
+			return (CommonValues::BLUE_GOAL_BACK + CommonValues::BLUE_GOAL_CENTER) / 2;
+		}
+
+		static Vec OrangeGoal() {
+			return (CommonValues::ORANGE_GOAL_BACK + CommonValues::ORANGE_GOAL_CENTER) / 2;
+		}
+
+		static float CosineSimilarity(const Vec& a, const Vec& b) {
+			float denom = a.Length() * b.Length();
+			return denom > 1e-6f ? a.Dot(b) / denom : 0;
+		}
+
+		std::pair<float, std::vector<float>> GetStateQualities(const GameState& state) const {
+			Vec ballPos = state.ball.pos;
+			float stateQuality = 0.5f * goalDistW *
+				(expf(-(OrangeGoal() - ballPos).Length() / CommonValues::CAR_MAX_SPEED) -
+				 expf(-(BlueGoal() - ballPos).Length() / CommonValues::CAR_MAX_SPEED));
+
+			std::vector<float> playerQualities(state.players.size(), 0);
+			for (int i = 0; i < (int)state.players.size(); i++) {
+				const Player& player = state.players[i];
+				Vec pos = player.pos;
+				float alignment = 0.5f * (
+					CosineSimilarity(ballPos - pos, CommonValues::ORANGE_GOAL_BACK - pos) -
+					CosineSimilarity(ballPos - pos, CommonValues::BLUE_GOAL_BACK - pos)
+				);
+				if (player.team == Team::ORANGE)
+					alignment *= -1;
+
+				float liuDist = expf(-(ballPos - pos).Length() / 1410.0f);
+				playerQualities[i] = distW * liuDist + alignW * alignment;
+			}
+
+			return { stateQuality / 2, playerQualities };
+		}
+
+		void ApplyTeamRedistribution(const GameState& state, std::vector<float>& playerRewards) const {
+			float blueSum = 0, orangeSum = 0;
+			int blueCount = 0, orangeCount = 0;
+			for (int i = 0; i < (int)state.players.size(); i++) {
+				if (state.players[i].team == Team::BLUE) {
+					blueSum += playerRewards[i];
+					blueCount++;
+				} else {
+					orangeSum += playerRewards[i];
+					orangeCount++;
+				}
+			}
+
+			float blueMean = blueCount > 0 ? blueSum / blueCount : 0;
+			float orangeMean = orangeCount > 0 ? orangeSum / orangeCount : 0;
+			for (int i = 0; i < (int)state.players.size(); i++) {
+				float ownMean = state.players[i].team == Team::BLUE ? blueMean : orangeMean;
+				float oppMean = state.players[i].team == Team::BLUE ? orangeMean : blueMean;
+				playerRewards[i] = (1 - teamSpirit) * playerRewards[i] + teamSpirit * ownMean - opponentPunishW * oppMean;
+				if (!std::isfinite(playerRewards[i]))
+					playerRewards[i] = 0;
+			}
+		}
+	};
+
 	class SpeedReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {
