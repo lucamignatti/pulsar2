@@ -525,14 +525,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.herCandidates = 4;                 // Cheaper difficulty-HER candidate set; watch selected percentile/offsets
 	cfg.ppo.useAdaptiveGateTargetVel = true;   // Feature C.1
 	cfg.ppo.useAdaptiveStrongTouchFloor = true;// Feature C.2
-	cfg.ppo.useOptionality = true;             // Feature D
+	cfg.ppo.useOptionality = false;            // Feature D
 	cfg.ppo.optCommitReliefScale = 0.75f;      // Do not punish option loss as hard when GCRL terminal prospects improve
 	cfg.ppo.optCommitReliefSharpness = 1.0f;
 	cfg.ppo.optDeficitFloorStd = 0.75f;        // Only punish unusually low optionality; no reward above the floor
 	cfg.ppo.optDeficitClip = 3.0f;
 	cfg.ppo.optValueWeight = 1.0f;             // Value-weighted optionality: reachable AND terminal-useful futures
 	cfg.ppo.optValueClip = 3.0f;
-	cfg.ppo.optRefineGoals = true;             // Refine the collapse detector without rewarding extra options above the floor
+	cfg.ppo.optRefineGoals = false;            // Refine the collapse detector without rewarding extra options above the floor
 	cfg.ppo.optRefineTopK = 4;
 	cfg.ppo.optRefineSteps = 3;
 	cfg.ppo.optRefineMaxStates = 4096;
