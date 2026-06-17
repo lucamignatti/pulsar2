@@ -47,19 +47,6 @@ using namespace RLGC;
 namespace {
 	constexpr int GCRL_GATE_GOAL_DIM = 6;
 
-	template <typename T>
-	void ClearAndLimitCapacity(std::vector<T>& values, size_t reserveElems, size_t maxRetainedElems) {
-		values.clear();
-		if (maxRetainedElems > 0 && values.capacity() > maxRetainedElems) {
-			std::vector<T> trimmed;
-			if (reserveElems > 0)
-				trimmed.reserve(reserveElems);
-			values.swap(trimmed);
-		} else if (reserveElems > 0 && values.capacity() < reserveElems) {
-			values.reserve(reserveElems);
-		}
-	}
-
 	// targetVel is passed in (not read from config) because Feature C can adapt it at
 	// runtime; when useAdaptiveGateTargetVel is off the Learner's member never moves
 	// from the config seed, so the rows are bit-identical to the old behavior.
@@ -984,56 +971,30 @@ void GGL::Learner::Start() {
 		// Persistent per-player trajectory state — spans episode boundaries across batches.
 		// Owned exclusively by the collector (main thread in sync mode, collector thread in async).
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
-		int maxEpisodeLength = RS_MAX(1, (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip)));
-		size_t expectedStepsPerPlayer =
-			numPlayers > 0 ? ((size_t)config.ppo.tsPerItr + (size_t)numPlayers - 1) / (size_t)numPlayers : 0;
-		size_t trajectoryReserveSteps = expectedStepsPerPlayer + 16;
-		if (trajectoryReserveSteps < 16)
-			trajectoryReserveSteps = 16;
-		if (trajectoryReserveSteps > 64)
-			trajectoryReserveSteps = 64;
-		if (trajectoryReserveSteps > (size_t)maxEpisodeLength)
-			trajectoryReserveSteps = (size_t)maxEpisodeLength;
-		size_t maxRetainedTrajectorySteps = trajectoryReserveSteps * 4;
-		if (maxRetainedTrajectorySteps < 128)
-			maxRetainedTrajectorySteps = 128;
-		if (maxRetainedTrajectorySteps > 256)
-			maxRetainedTrajectorySteps = 256;
-		if (maxRetainedTrajectorySteps > (size_t)maxEpisodeLength)
-			maxRetainedTrajectorySteps = (size_t)maxEpisodeLength;
+		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
 
-		auto fnLimitTrajectoryStorage = [&](Trajectory& traj, size_t reserveSteps, size_t maxRetainedSteps) {
-			ClearAndLimitCapacity(traj.states, reserveSteps * (size_t)obsSize, maxRetainedSteps * (size_t)obsSize);
-			ClearAndLimitCapacity(traj.nextStates, (size_t)obsSize, (size_t)obsSize * 2);
-			ClearAndLimitCapacity(traj.rewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.gcrlGatedRewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.curriculumRewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.aerialGCRLGatedRewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.aerialCurriculumRewards, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.logProbs, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.actionComps, useActionComps ? reserveSteps * 8 : 0, useActionComps ? maxRetainedSteps * 8 : 0);
-			ClearAndLimitCapacity(traj.futureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
-			ClearAndLimitCapacity(traj.carFutureGoals, config.ppo.useGCRL ? reserveSteps * 6 : 0, config.ppo.useGCRL ? maxRetainedSteps * 6 : 0);
-			ClearAndLimitCapacity(traj.sorsSteps, config.ppo.useSORS ? reserveSteps : 0, config.ppo.useSORS ? maxRetainedSteps : 0);
-			ClearAndLimitCapacity(traj.actionMasks, reserveSteps * (size_t)numActions, maxRetainedSteps * (size_t)numActions);
-			ClearAndLimitCapacity(traj.terminals, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.actions, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.modeIds, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(traj.mirrored, reserveSteps, maxRetainedSteps);
-			ClearAndLimitCapacity(
-				traj.snapshots,
-				(config.ppo.useFrontierResets && config.ppo.frontierBuffer) ? reserveSteps : 0,
-				(config.ppo.useFrontierResets && config.ppo.frontierBuffer) ? maxRetainedSteps : 0);
-			ClearAndLimitCapacity(
-				traj.stratumFlags,
-				config.ppo.useOptionality ? reserveSteps : 0,
-				config.ppo.useOptionality ? maxRetainedSteps : 0);
-		};
-
-		// Keep only a small warm capacity per player. Reserving maxEpisodeLength for
-		// every player costs tens of GB at 5120 games because states are obsSize-wide.
+		// Pre-reserve to avoid repeated realloc during episodes.
 		for (auto& traj : trajectories) {
-			fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
+			traj.states.reserve((size_t)maxEpisodeLength * obsSize);
+			traj.rewards.reserve(maxEpisodeLength);
+			traj.gcrlGatedRewards.reserve(maxEpisodeLength);
+			traj.curriculumRewards.reserve(maxEpisodeLength);
+			traj.aerialGCRLGatedRewards.reserve(maxEpisodeLength);
+			traj.aerialCurriculumRewards.reserve(maxEpisodeLength);
+			traj.logProbs.reserve(maxEpisodeLength);
+			traj.actions.reserve(maxEpisodeLength);
+			traj.terminals.reserve(maxEpisodeLength);
+			traj.modeIds.reserve(maxEpisodeLength);
+			traj.mirrored.reserve(maxEpisodeLength);
+			traj.actionMasks.reserve((size_t)maxEpisodeLength * numActions);
+			if (useActionComps)
+				traj.actionComps.reserve((size_t)maxEpisodeLength * 8);
+			if (config.ppo.useSORS)
+				traj.sorsSteps.reserve(maxEpisodeLength);
+			if (config.ppo.useFrontierResets && config.ppo.frontierBuffer)
+				traj.snapshots.reserve(maxEpisodeLength);
+			if (config.ppo.useOptionality)
+				traj.stratumFlags.reserve(maxEpisodeLength);
 		}
 
 		// Scratch buffers reused across batches to avoid per-call realloc (owned by collector).
@@ -1125,7 +1086,6 @@ void GGL::Learner::Start() {
 		int oldStintBatchesLeft = 0;
 		bool oldStintActive = false;
 		uint64_t oldStintVersionTS = 0;
-		bool oldStintUsesBestAnchor = false;
 		Team oldStintTeam = Team::BLUE;
 
 		// Trajectories truncated at an old-version handoff, queued for consumption.
@@ -1156,12 +1116,11 @@ void GGL::Learner::Start() {
 					oldStintBatchesLeft = RS_MAX(1, config.trainAgainstOldStintBatches);
 					oldStintActive =
 						(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
-						&& versionMgr->GetVersionCandidateCount() > 0
+						&& !versionMgr->versions.empty()
 						&& !render;
 					if (oldStintActive) {
-						int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->GetVersionCandidateCount());
-						oldStintUsesBestAnchor = oldVersionIdx >= versionMgr->versions.size();
-						oldStintVersionTS = versionMgr->GetVersionCandidate(oldVersionIdx).timesteps;
+						int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
+						oldStintVersionTS = versionMgr->versions[oldVersionIdx].timesteps;
 						oldStintTeam = Team(RocketSim::Math::RandInt(0, 2));
 					}
 				}
@@ -1171,27 +1130,16 @@ void GGL::Learner::Start() {
 					// Re-resolve the stint's version by timesteps each batch: the versions
 					// vector can grow/prune between batches, so a pointer or index cached
 					// from the previous batch would dangle.
-					if (oldStintUsesBestAnchor) {
-						if (versionMgr->hasBestAnchor)
-							oldVersion = &versionMgr->bestAnchor;
-					} else {
-						for (auto& version : versionMgr->versions) {
-							if (version.timesteps == oldStintVersionTS) {
-								oldVersion = &version;
-								break;
-							}
+					for (auto& version : versionMgr->versions) {
+						if (version.timesteps == oldStintVersionTS) {
+							oldVersion = &version;
+							break;
 						}
 					}
-					if (!oldVersion && versionMgr->GetVersionCandidateCount() > 0) {
+					if (!oldVersion && !versionMgr->versions.empty()) {
 						// The stint's version was pruned mid-stint; fall back to the oldest
-						// remaining normal version, or the protected anchor if it is all we have.
-						if (!versionMgr->versions.empty()) {
-							oldVersion = &versionMgr->versions.front();
-							oldStintUsesBestAnchor = false;
-						} else {
-							oldVersion = &versionMgr->bestAnchor;
-							oldStintUsesBestAnchor = true;
-						}
+						// remaining (versions are sorted by timesteps ascending).
+						oldVersion = &versionMgr->versions.front();
 						oldStintVersionTS = oldVersion->timesteps;
 					}
 				}
@@ -1240,7 +1188,6 @@ void GGL::Learner::Start() {
 			combinedTraj.Clear();
 			{
 				size_t expTs = config.ppo.tsPerItr + config.ppo.tsPerItr / 4;
-				fnLimitTrajectoryStorage(combinedTraj, expTs, expTs + expTs / 2);
 				combinedTraj.states.reserve(expTs * obsSize);
 				combinedTraj.rewards.reserve(expTs);
 				combinedTraj.gcrlGatedRewards.reserve(expTs);
@@ -1335,7 +1282,6 @@ void GGL::Learner::Start() {
 				fnRelabelTrajectory(traj);
 				combinedTraj.Append(traj);
 				traj.Clear();
-				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			};
 
 			// Players being handed to an old version mid-episode: finalize their in-flight
@@ -1370,7 +1316,6 @@ void GGL::Learner::Start() {
 				preservedTrajSteps += traj.Length();
 				preservedTrajs.push_back(std::move(traj));
 				traj.Clear();
-				fnLimitTrajectoryStorage(traj, trajectoryReserveSteps, maxRetainedTrajectorySteps);
 			}
 
 			// Drain the preserved queue into this batch, oldest-first (bounds staleness),
@@ -1379,32 +1324,13 @@ void GGL::Learner::Start() {
 			// starved batches of short post-flush fragments, oscillating the composition of
 			// every per-batch metric (gate rewards, avg reward, batch size) in a sawtooth.
 			size_t drainedSteps = 0;
-			size_t droppedPreservedSteps = 0;
-			size_t preservedCapSteps = 0;
 			{
-				size_t iterSteps = config.ppo.tsPerItr > 0 ? (size_t)config.ppo.tsPerItr : 0;
-				double drainFraction = (double)config.trainAgainstOldPreservedDrainFraction;
-				if (drainFraction < 0.0)
-					drainFraction = 0.0;
-				size_t drainBudget = iterSteps > 0 ? (size_t)((double)iterSteps * drainFraction) : 0;
+				size_t drainBudget = (size_t)(config.ppo.tsPerItr / 2);
 				while (!preservedTrajs.empty() && drainedSteps < drainBudget) {
 					Trajectory& pres = preservedTrajs.front();
 					drainedSteps += pres.Length();
 					preservedTrajSteps -= pres.Length();
 					combinedTraj.Append(pres);
-					preservedTrajs.pop_front();
-				}
-				if (config.trainAgainstOldMaxPreservedBatches > 0 && iterSteps > 0) {
-					size_t capBatches = (size_t)config.trainAgainstOldMaxPreservedBatches;
-					if (capBatches > std::numeric_limits<size_t>::max() / iterSteps)
-						preservedCapSteps = std::numeric_limits<size_t>::max();
-					else
-						preservedCapSteps = iterSteps * capBatches;
-				}
-				while (preservedCapSteps > 0 && preservedTrajSteps > preservedCapSteps && !preservedTrajs.empty()) {
-					size_t dropLen = preservedTrajs.front().Length();
-					preservedTrajSteps -= dropLen;
-					droppedPreservedSteps += dropLen;
 					preservedTrajs.pop_front();
 				}
 			}
@@ -1778,20 +1704,14 @@ void GGL::Learner::Start() {
 				report["Data/Preserved Truncated Timesteps"] = preservedSteps;
 				report["Data/Preserved Queue Timesteps"] = preservedTrajSteps;
 				report["Data/Drained Timesteps"] = drainedSteps;
-				report["Data/Dropped Preserved Timesteps"] = droppedPreservedSteps;
-				report["Data/Preserved Queue Cap"] = preservedCapSteps;
-				report["Data/Trajectory Reserve Steps"] = trajectoryReserveSteps;
-				report["Data/Trajectory Retained Step Cap"] = maxRetainedTrajectorySteps;
 			}
 
 			// Safety net: old-version players' trajectories were finalized as TRUNCATED at the
 			// start of this batch and receive no appends during it, so these should already be
 			// empty. Clearing again guarantees no old-version-era data is ever stitched to
 			// new-policy steps if that invariant is ever broken.
-			for (int oldPlayerIdx : oldPlayerIndices) {
+			for (int oldPlayerIdx : oldPlayerIndices)
 				trajectories[oldPlayerIdx].Clear();
-				fnLimitTrajectoryStorage(trajectories[oldPlayerIdx], trajectoryReserveSteps, maxRetainedTrajectorySteps);
-			}
 
 			out.collectionTime = collectionTimer.Elapsed();
 		}; // fnCollectBatch
@@ -2187,23 +2107,8 @@ void GGL::Learner::Start() {
 						int Nsel = (int)candAnchors.size();
 						if (Nsel > 0) {
 							torch::Tensor tPhi = fnGetSharedPhi();
-							FList achievedGoalRows((size_t)trajN * GCRL_GATE_GOAL_DIM);
-							for (int tt = 0; tt < trajN; tt++)
-								for (int d = 0; d < GCRL_GATE_GOAL_DIM; d++)
-									achievedGoalRows[(size_t)tt * GCRL_GATE_GOAL_DIM + d] =
-										states[(size_t)tt * obsSize + d];
-							torch::Tensor tAchievedGoals = torch::tensor(achievedGoalRows).reshape({ trajN, GCRL_GATE_GOAL_DIM });
-							torch::Tensor tAchievedPsi = ppo->InferGCRLPsiEmbeddings(tAchievedGoals);
-							torch::Tensor tAchievedPsiFlip;
-							if (hasMirror) {
-								torch::Tensor tAchievedGoalsFlip = tAchievedGoals.clone();
-								tAchievedGoalsFlip.select(1, 0).neg_();
-								tAchievedGoalsFlip.select(1, 3).neg_();
-								tAchievedPsiFlip = ppo->InferGCRLPsiEmbeddings(tAchievedGoalsFlip);
-							}
-
 							std::vector<int> candOffsets((size_t)Nsel * K);
-							std::vector<uint8_t> candFlips(hasMirror ? (size_t)Nsel * K : 0);
+							FList candGoals((size_t)Nsel * K * 6);
 							for (int s = 0; s < Nsel; s++) {
 								int t = candAnchors[s];
 								int lo = t + minH;
@@ -2212,19 +2117,14 @@ void GGL::Learner::Start() {
 									int kt = Math::RandInt(lo, hi + 1);
 									candOffsets[(size_t)s * K + k] = kt;
 									bool flip = hasMirror && (combinedTraj.mirrored[t] != combinedTraj.mirrored[kt]);
-									if (hasMirror)
-										candFlips[(size_t)s * K + k] = flip ? 1 : 0;
+									float* dst = candGoals.data() + ((size_t)s * K + k) * 6;
+									for (int d = 0; d < 6; d++)
+										dst[d] = states[(size_t)kt * obsSize + d];
+									if (flip) { dst[0] = -dst[0]; dst[3] = -dst[3]; }
 								}
 							}
-							torch::Tensor tCandTargetIdx = torch::tensor(candOffsets, torch::TensorOptions().dtype(torch::kLong));
-							torch::Tensor tCandPsi = tAchievedPsi.index_select(0, tCandTargetIdx);
-							if (hasMirror) {
-								torch::Tensor tCandPsiFlip = tAchievedPsiFlip.index_select(0, tCandTargetIdx);
-								torch::Tensor flipMask = torch::from_blob(
-									candFlips.data(), { (int64_t)Nsel * K },
-									torch::TensorOptions().dtype(torch::kUInt8)).to(torch::kBool).unsqueeze(1);
-								tCandPsi = torch::where(flipMask, tCandPsiFlip, tCandPsi);
-							}
+							torch::Tensor tCandGoals = torch::tensor(candGoals).reshape({ (int64_t)Nsel * K, 6 });
+							torch::Tensor tCandPsi = ppo->InferGCRLPsiEmbeddings(tCandGoals);
 
 							torch::Tensor tAnchorIdx = torch::tensor(candAnchors, torch::TensorOptions().dtype(torch::kLong));
 							torch::Tensor phiSel = tPhi.index_select(0, tAnchorIdx);
@@ -2991,15 +2891,6 @@ void GGL::Learner::Start() {
 						"SORS/Pred Window Return",
 						"",
 						"Collected Timesteps",
-						"Data/Consumed Timesteps",
-						"Data/In-Flight Timesteps",
-						"Data/Preserved Truncated Timesteps",
-						"Data/Drained Timesteps",
-						"Data/Preserved Queue Timesteps",
-						"Data/Dropped Preserved Timesteps",
-						"Data/Preserved Queue Cap",
-						"Data/Trajectory Reserve Steps",
-						"Data/Trajectory Retained Step Cap",
 						"Total Timesteps",
 						"Total Iterations"
 					}

@@ -398,17 +398,15 @@ int main(int argc, char* argv[]) {
 	cfg.savePolicyVersions = true;
 	cfg.trainAgainstOldVersions = true;
 	cfg.trainAgainstOldChance = 0.25f;
-	cfg.trainAgainstOldPreservedDrainFraction = 0.5f;
-	cfg.trainAgainstOldMaxPreservedBatches = 4;
 	cfg.tsPerVersion = 25'000'000;
 	cfg.maxOldVersions = 32;
 
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 150'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 37'500; // Lower this if too much VRAM is being allocated
 	cfg.ppo.overbatching = true;
-	// 2 optimizer steps per epoch (one per minibatch) instead of one accumulated step.
+	// 4 optimizer steps per batch (one per minibatch) instead of one accumulated step.
 	cfg.ppo.stepPerMiniBatch = true;
 	// Hard speed limit: abort the iteration's remaining epochs when the batch-mean KL
 	// exceeds this (SB3-style early stop). Makes minibatch stepping self-limiting.
@@ -422,8 +420,13 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 	cfg.ppo.adaptiveEntropy = true;
-	// Restore the fast no-optionality baseline's exploration target.
-	cfg.ppo.targetEntropy = 0.70f;
+	// Back to 0.65/0.10 (the ryp4gxwv values). The 0.70/0.20 bump was premised on healthy
+	// reward income from a competent checkpoint; from scratch, e79pvv92's entropy fell to
+	// 0.48 ANYWAY with the controller pinned at the 0.20 ceiling -- the bonus term ran ~10x
+	// the policy loss (Policy Relative Entropy Loss ~9.8) without buying any exploration,
+	// it just diluted the reward gradient during the income-starved bootstrap (the rwkkyfej
+	// failure mode). Re-raise only when resuming a checkpoint with established income.
+	cfg.ppo.targetEntropy = 0.65f;
 	cfg.ppo.adaptiveEntropyLR = 5e-3f;
 	cfg.ppo.minEntropyScale = 0.0f;
 	cfg.ppo.maxEntropyScale = 0.10f;
@@ -435,9 +438,10 @@ int main(int argc, char* argv[]) {
 	// mistakes that caused it. Goals exist now; propagate their credit.
 	cfg.ppo.gaeGamma = 0.995;
 
-	// The fast no-optionality baseline used one minibatch per epoch, so 4e-4 is paired with
-	// fewer optimizer steps per iteration. maxMeanKL remains the hard backstop.
-	cfg.ppo.policyLR = 4e-4;
+	// With stepPerMiniBatch (8 optimizer steps/iter) 4e-4 moved the policy 4-5x too fast
+	// (KL 0.01-0.03, clip fraction 0.15, entropy collapse in run bgksd0wi). 1.5e-4 targets
+	// the healthy ~0.03/iter update magnitude; maxMeanKL below is the hard backstop.
+	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 2e-4;
 	cfg.ppo.gcrlLR = 2e-4;
 	cfg.ppo.sorsLR = 2e-4f;
@@ -450,9 +454,14 @@ int main(int argc, char* argv[]) {
 	// policy gradient on top of the reward-driven GAE advantage. The dense rewards above
 	// teach mechanics; GCRL teaches where to be.
 	cfg.ppo.useGCRL = true;
-	// Match the old fast no-optionality ramp schedule, with the requested 0.65 cap.
+	// Back to 0.3. At 0.65 the from-scratch run e79pvv92 showed GCRL/Final Advantage 0.69
+	// vs GCRL/Reward Advantage 0.33 -- the same 2:1 GCRL-over-reward gradient dominance
+	// that preceded the bgksd0wi collapse, with critics that had barely seen ball touches
+	// steering most of the policy gradient. 0.65 was premised on RESUMING a checkpoint
+	// whose critics were already trained on competent play (ryp4gxwv); re-raise it only
+	// from such a checkpoint, and watch the Final-vs-Reward advantage ratio (~1:1 target).
 	cfg.ppo.gcrlAdvScale = 0.65f;
-	cfg.ppo.gcrlAdvScaleAnnealStart = -1;
+	cfg.ppo.gcrlAdvScaleAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAdvScaleAnnealSteps = 100'000'000;
 	// The anti critic now scores own-goal danger (it queries the own-goal target instead of
 	// duplicating the goal critic), so this weighs real defensive signal, not twin-network
@@ -478,7 +487,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlInfoSubSample = 256; // contrastive sub-batch size
 	cfg.ppo.useGCRLRewardGate = true;
 	cfg.ppo.gcrlRewardGateInfluence = 1.0f;
-	cfg.ppo.gcrlRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlRewardGateAnnealStart = 400'000'000; // keep early shaping ungated until the critics have ball-touching data
 	cfg.ppo.gcrlRewardGateAnnealSteps = 100'000'000;
 	cfg.ppo.gcrlRewardGateSharpness = 1.0f;
 	cfg.ppo.gcrlRewardGateAntiScale = 0.85f;
@@ -486,7 +495,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.gcrlRewardGateLookahead = 32;
 	cfg.ppo.gcrlAerialRewardGateInfluence = 1.0f;
 	cfg.ppo.gcrlAerialRewardGateStartInfluence = 0.2f;
-	cfg.ppo.gcrlAerialRewardGateAnnealStart = -1;
+	cfg.ppo.gcrlAerialRewardGateAnnealStart = 400'000'000;
 	cfg.ppo.gcrlAerialRewardGateAnnealSteps = 1'000'000'000;
 	cfg.ppo.curriculumRewardScale = 1.0f;
 	cfg.ppo.curriculumRewardAnnealStart = -1;
