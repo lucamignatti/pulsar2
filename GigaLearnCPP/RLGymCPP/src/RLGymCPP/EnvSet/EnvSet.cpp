@@ -48,45 +48,42 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 	RG_ASSERT(config.tickSkip > 0);
 	RG_ASSERT(config.actionDelay >= 0 && config.actionDelay <= config.tickSkip);
 
-	arenas.resize(config.numArenas);
-	eventTrackers.resize(config.numArenas);
-	eventCallbackInfos.resize(config.numArenas);
-	userInfos.resize(config.numArenas);
-	rewards.resize(config.numArenas);
-	terminalConditions.resize(config.numArenas);
-	obsBuilders.resize(config.numArenas);
-	actionParsers.resize(config.numArenas);
-	stateSetters.resize(config.numArenas);
-
+	std::mutex appendMutex = {};
 	auto fnCreateArenas = [&](int idx) {
 		auto createResult = config.envCreateFn(idx);
 		auto arena = createResult.arena;
 
-		arenas[idx] = arena;
+		{
+			std::lock_guard<std::mutex> lk(appendMutex);
 
-		auto userInfo = new CallbackUserInfo();
-		userInfo->arena = arena;
-		userInfo->arenaIdx = idx;
-		userInfo->envSet = this;
-		eventCallbackInfos[idx] = userInfo;
-		arena->SetCarBumpCallback(_BumpCallback, userInfo);
+			arenas.push_back(arena);
 
-		if (arena->gameMode != GameMode::HEATSEEKER) {
-			GameEventTracker* tracker = new GameEventTracker({});
-			eventTrackers[idx] = tracker;
+			auto userInfo = new CallbackUserInfo();
+			userInfo->arena = arena;
+			userInfo->arenaIdx = (int)arenas.size() - 1;
+			userInfo->envSet = this;
+			eventCallbackInfos.push_back(userInfo);
+			arena->SetCarBumpCallback(_BumpCallback, userInfo);
 
-			tracker->SetShotCallback(_ShotEventCallback, userInfo);
-			tracker->SetGoalCallback(_GoalEventCallback, userInfo);
-			tracker->SetSaveCallback(_SaveEventCallback, userInfo);
+			if (arena->gameMode != GameMode::HEATSEEKER) {
+				GameEventTracker* tracker = new GameEventTracker({});
+				eventTrackers.push_back(tracker);
+
+				tracker->SetShotCallback(_ShotEventCallback, userInfo);
+				tracker->SetGoalCallback(_GoalEventCallback, userInfo);
+				tracker->SetSaveCallback(_SaveEventCallback, userInfo);
+			} else {
+				eventTrackers.push_back(NULL);
+			}
+
+			userInfos.push_back(createResult.userInfo);
+
+			rewards.push_back(createResult.rewards);
+			terminalConditions.push_back(createResult.terminalConditions);
+			obsBuilders.push_back(createResult.obsBuilder);
+			actionParsers.push_back(createResult.actionParser);
+			stateSetters.push_back(createResult.stateSetter);
 		}
-
-		userInfos[idx] = createResult.userInfo;
-
-		rewards[idx] = createResult.rewards;
-		terminalConditions[idx] = createResult.terminalConditions;
-		obsBuilders[idx] = createResult.obsBuilder;
-		actionParsers[idx] = createResult.actionParser;
-		stateSetters[idx] = createResult.stateSetter;
 	};
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 
