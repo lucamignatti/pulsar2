@@ -3,6 +3,7 @@ cmake_minimum_required (VERSION 3.8)
 project("GigaLearnCPP")
 
 include_directories("${PROJECT_SOURCE_DIR}/src/")
+option(USE_ROCM "Build against ROCm/HIP LibTorch while using Torch's CUDA-facing C++ API" OFF)
 
 # Make sure CMake finds libtorch if its in this directory
 if (EXISTS "${PROJECT_SOURCE_DIR}/libtorch/")
@@ -17,7 +18,7 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # Add all headers and code files
-file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
+file(GLOB_RECURSE FILES_SRC CONFIGURE_DEPENDS "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
 
 add_library(GigaLearnCPP SHARED ${FILES_SRC})
 target_compile_definitions(GigaLearnCPP PRIVATE -DWITHIN_GGL)
@@ -27,9 +28,14 @@ target_include_directories(GigaLearnCPP PRIVATE "src/private")
 # Include libtorch
 target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
-if (TORCH_CUDA_LIBRARIES)
-	message("Enabling CUDA support...")
-	target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
+if (TORCH_CUDA_LIBRARIES OR USE_ROCM)
+	if (USE_ROCM)
+		message("Enabling ROCm/HIP support through Torch CUDA API...")
+		target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT -DUSE_ROCM)
+	else()
+		message("Enabling CUDA support...")
+		target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
+	endif()
 endif()
 
 # Set C++ version to 20

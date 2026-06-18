@@ -142,7 +142,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
 
-	bool addLayerNorm = true;
+	bool addLayerNorm = false;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;

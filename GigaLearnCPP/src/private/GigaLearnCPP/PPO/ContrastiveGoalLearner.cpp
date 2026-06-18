@@ -17,7 +17,7 @@ namespace GGL {
 		result.layerSizes = { 256, 256, reprSize };
 		result.activationType = ModelActivationType::LEAKY_RELU;
 		result.optimType = ModelOptimType::MUON;
-		result.addLayerNorm = true;
+		result.addLayerNorm = false;
 		result.addOutputLayer = false;
 		result.numInputs = inputSize;
 		result.numOutputs = reprSize;
