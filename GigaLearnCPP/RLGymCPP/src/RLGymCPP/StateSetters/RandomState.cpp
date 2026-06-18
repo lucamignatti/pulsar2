@@ -1,5 +1,6 @@
 #include "RandomState.h"
 #include "../Math.h"
+#include "../Util/CrashDebug.h"
 
 using RocketSim::Math::RandFloat;
 using RLGC::Math::RandVec;
@@ -9,9 +10,17 @@ Vec RandNormVec() {
 }
 
 void RLGC::RandomState::ResetArena(Arena* arena) {
+	RG_CRASH_LOG(
+		"RandomState::ResetArena begin arena=" << arena <<
+		" randBallSpeed=" << randBallSpeed <<
+		" randCarSpeed=" << randCarSpeed <<
+		" carsOnGround=" << carsOnGround <<
+		" cars=" << arena->_cars.size()
+	);
 	
 	// Reset boost pads and everything
 	arena->ResetToRandomKickoff();
+	RG_CRASH_LOG("RandomState::ResetArena after ResetToRandomKickoff arena=" << arena << " tick=" << arena->tickCount);
 
 	constexpr float
 		X_MAX = 3500,
@@ -30,9 +39,16 @@ void RLGC::RandomState::ResetArena(Arena* arena) {
 			bs.vel = RandNormVec() * RandFloat(0, 4000);
 			bs.angVel = Math::RandVec(Vec(-4, -4, -4), Vec(4, 4, 4));
 		}
+		RG_CRASH_LOG(
+			"RandomState ball arena=" << arena <<
+			" pos=(" << bs.pos.x << "," << bs.pos.y << "," << bs.pos.z << ")" <<
+			" vel=(" << bs.vel.x << "," << bs.vel.y << "," << bs.vel.z << ")" <<
+			" ang=(" << bs.angVel.x << "," << bs.angVel.y << "," << bs.angVel.z << ")"
+		);
 		arena->ball->SetState(bs);
 	}
 
+	int carIdx = 0;
 	for (Car* car : arena->_cars) { // Randomize cars
 		CarState cs = {};
 		cs.pos = Math::RandVec(Vec(-X_MAX, -Y_MAX, CAR_Z_MIN), Vec(X_MAX, Y_MAX, Z_MAX));
@@ -57,6 +73,18 @@ void RLGC::RandomState::ResetArena(Arena* arena) {
 
 		cs.boost = RandFloat(0, 100);
 
+		RG_CRASH_LOG(
+			"RandomState car arena=" << arena <<
+			" carIdx=" << carIdx <<
+			" car=" << car <<
+			" onGround=" << onGround <<
+			" pos=(" << cs.pos.x << "," << cs.pos.y << "," << cs.pos.z << ")" <<
+			" vel=(" << cs.vel.x << "," << cs.vel.y << "," << cs.vel.z << ")" <<
+			" ang=(" << cs.angVel.x << "," << cs.angVel.y << "," << cs.angVel.z << ")" <<
+			" boost=" << cs.boost
+		);
 		car->SetState(cs);
+		carIdx++;
 	}
+	RG_CRASH_LOG("RandomState::ResetArena end arena=" << arena);
 }
