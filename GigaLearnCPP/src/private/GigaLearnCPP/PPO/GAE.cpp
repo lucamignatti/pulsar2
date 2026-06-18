@@ -63,7 +63,7 @@ void GGL::GAE::Compute(
 			totalRew += abs(curReward);
 		}
 
-		float nextValPred;
+		float nextValPred = 0;
 		if (terminal == RLGC::TerminalType::TRUNCATED) {
 			// We've encountered a truncation
 			// Pull the next truncated value
@@ -74,9 +74,12 @@ void GGL::GAE::Compute(
 			if (truncCount >= numTruncs)
 				RG_ERR_CLOSE("GAE encountered too many truncated terminals, not enough val preds (max: " << numTruncs << ")")
 
-			nextValPred = _truncValPreds[truncCount];
+			nextValPred = _truncValPreds[numTruncs - truncCount - 1];
 			truncCount++;
-		} else {
+		} else if (!done) {
+			if (step + 1 >= numReturns)
+				RG_ERR_CLOSE("GAE encountered a non-terminal final step");
+
 			nextValPred = _valPreds[step + 1];
 		}
 
