@@ -19,8 +19,10 @@ GGL::ExperienceTensors GGL::ExperienceBuffer::_GetSamples(const int64_t* indices
 
 	auto* toItr = result.begin();
 	auto* fromItr = data.begin();
-	for (; toItr != result.end(); toItr++, fromItr++)
-		*toItr = torch::index_select(*fromItr, 0, tIndices);
+	for (; toItr != result.end(); toItr++, fromItr++) {
+		if (fromItr->defined())
+			*toItr = torch::index_select(*fromItr, 0, tIndices);
+	}
 
 	return result;
 }

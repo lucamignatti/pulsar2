@@ -5,6 +5,46 @@
 
 namespace GGL {
 
+	struct ContrastiveGoalConfig {
+		bool enabled = false;
+
+		float lambdaStart = 0.f;
+		float lambda = 0.65f;
+		uint64_t lambdaAnnealSteps = 200'000'000;
+		float sigmaFloor = 1e-4f;
+		float sigmaMin = 1e-6f;
+
+		int representationSize = 64;
+		int criticEpochs = 1;
+		int64_t criticMiniBatchSize = 8192;
+		float criticLR = 3e-4f;
+
+		float targetSpeed = 1500.f;
+		float nearGoalDistance = 1e-4f;
+		float minCommandSupportFraction = 0.05f;
+		float minCommandActionRange = 1e-3f;
+		int failedGateDisableIters = 3;
+
+		int immediateMin = 1;
+		int immediateMax = 4;
+		int shortMin = 5;
+		int shortMax = 15;
+		int mediumMin = 16;
+		int mediumMax = 45;
+		int longMin = 46;
+		int longMax = 90;
+
+		float immediateWeight = 0.20f;
+		float shortWeight = 0.35f;
+		float mediumWeight = 0.30f;
+		float longWeight = 0.15f;
+
+		float posScaleX = 4096.f;
+		float posScaleY = 6000.f;
+		float posScaleZ = 2044.f;
+		float velScale = 6000.f;
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
 
@@ -51,6 +91,8 @@ namespace GGL {
 		float gaeLambda = 0.95f;
 		float gaeGamma = 0.99f;
 		float rewardClipRange = 10; // Clip range for normalized rewards, set 0 to disable
+
+		ContrastiveGoalConfig contrastiveGoal;
 
 		bool useGuidingPolicy = false;
 		std::filesystem::path guidingPolicyPath = "guiding_policy/"; // Path of the guiding policy model(s)

@@ -8,6 +8,7 @@
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
+#include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
@@ -35,7 +36,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	result.stateSetter = new KickoffState();
+	result.stateSetter = new CombinedState({
+		{ new KickoffState(), 0.10f },
+		{ new RandomState(true, false, true), 0.40f },
+		{ new RandomState(true, true, true), 0.20f },
+		{ new RandomState(true, true, false), 0.30f }
+	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 
@@ -117,6 +123,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.layerSizes = { 256, 256 };
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
+
+	cfg.ppo.contrastiveGoal.enabled = true;
+	cfg.ppo.contrastiveGoal.lambdaStart = 0.f;
+	cfg.ppo.contrastiveGoal.lambda = 0.65f;
+	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
+	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
+	cfg.ppo.contrastiveGoal.criticEpochs = 1;
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 8192;
 
 	auto optim = ModelOptimType::ADAM;
 	cfg.ppo.policy.optimType = optim;

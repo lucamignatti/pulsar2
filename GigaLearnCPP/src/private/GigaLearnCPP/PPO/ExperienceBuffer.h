@@ -5,12 +5,14 @@ namespace GGL {
 
 	struct ExperienceTensors {
 		torch::Tensor
-			states, actions, logProbs, targetValues, actionMasks, advantages;
+			states, actions, logProbs, targetValues, actionMasks, advantages,
+			oldActionProbs, commandedGoals, achievedGoals, actionControls,
+			segmentIds, segmentSteps, crlAdvantages;
 
 		auto begin() { return &states; }
-		auto end() { return &advantages + 1; }
+		auto end() { return &crlAdvantages + 1; }
 		auto begin() const { return &states; }
-		auto end() const { return &advantages + 1; }
+		auto end() const { return &crlAdvantages + 1; }
 	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/experience_buffer.py

@@ -17,8 +17,68 @@
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 #include "Util/AvgTracker.h"
+#include <RLGymCPP/ActionParsers/DefaultAction.h>
+#include <RLGymCPP/CommonValues.h>
+#include <RLGymCPP/Gamestates/StateUtil.h>
 
 using namespace RLGC;
+
+static void AppendNormalizedGoal(FList& out, const Vec& pos, const Vec& vel, const GGL::ContrastiveGoalConfig& cfg) {
+	out += pos.x / cfg.posScaleX;
+	out += pos.y / cfg.posScaleY;
+	out += pos.z / cfg.posScaleZ;
+	out += vel.x / cfg.velScale;
+	out += vel.y / cfg.velScale;
+	out += vel.z / cfg.velScale;
+}
+
+static void AppendAchievedGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
+	PhysState ball = InvertPhys(state.ball, player.team == Team::ORANGE);
+	AppendNormalizedGoal(out, ball.pos, ball.vel, cfg);
+}
+
+static void AppendCommandedGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
+	PhysState ball = InvertPhys(state.ball, player.team == Team::ORANGE);
+
+	Vec targetPos = {};
+	targetPos.x = RS_CLAMP(
+		ball.pos.x,
+		-CommonValues::GOAL_WIDTH_FROM_CENTER + CommonValues::BALL_RADIUS,
+		CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS
+	);
+	targetPos.y = CommonValues::BACK_NET_Y;
+	targetPos.z = RS_CLAMP(
+		ball.pos.z,
+		CommonValues::BALL_RADIUS,
+		CommonValues::GOAL_HEIGHT - CommonValues::BALL_RADIUS
+	);
+
+	Vec direction = targetPos - ball.pos;
+	if (direction.Length() < 1e-3f)
+		direction = Vec(0, 1, 0);
+	else
+		direction = direction.Normalized();
+
+	Vec targetVel = direction * cfg.targetSpeed;
+	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
+}
+
+static int GetArenaIdxForPlayer(const EnvSet& envSet, int playerIdx) {
+	for (int arenaIdx = 0; arenaIdx < envSet.state.arenaPlayerStartIdx.size(); arenaIdx++) {
+		int start = envSet.state.arenaPlayerStartIdx[arenaIdx];
+		int stop = (arenaIdx + 1 < envSet.state.arenaPlayerStartIdx.size()) ?
+			envSet.state.arenaPlayerStartIdx[arenaIdx + 1] : envSet.state.numPlayers;
+		if (playerIdx >= start && playerIdx < stop)
+			return arenaIdx;
+	}
+	RG_ERR_CLOSE("Could not find arena for player index " << playerIdx);
+	return -1;
+}
+
+static void AppendActionControl(FList& out, const Action& action) {
+	for (int i = 0; i < Action::ELEM_AMOUNT; i++)
+		out += action[i];
+}
 
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
@@ -111,6 +171,18 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		ppo = new PPOLearner(obsSize, numActions, config.ppo, device);
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
+	}
+
+	if (config.ppo.contrastiveGoal.enabled) {
+		DefaultAction* defaultAction = dynamic_cast<DefaultAction*>(envSet->actionParsers[0]);
+		if (!defaultAction)
+			RG_ERR_CLOSE("Contrastive scoring auxiliary requires DefaultAction so decoded controller vectors are available");
+
+		FList controls;
+		for (const Action& action : defaultAction->actions)
+			AppendActionControl(controls, action);
+
+		ppo->SetDiscreteActionControls(torch::tensor(controls).reshape({ numActions, (int)Action::ELEM_AMOUNT }));
 	}
 
 	if (config.renderMode) {
@@ -480,10 +552,12 @@ void GGL::Learner::Start() {
 		int numPlayers = envSet->state.numPlayers;
 
 		struct Trajectory {
-			FList states, nextStates, rewards, logProbs;
+			FList states, nextStates, rewards, logProbs, oldActionProbs;
+			FList commandedGoals, achievedGoals, actionControls;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
+			std::vector<int64_t> segmentIds, segmentSteps;
 
 			void Clear() {
 				*this = Trajectory();
@@ -494,9 +568,15 @@ void GGL::Learner::Start() {
 				nextStates += other.nextStates;
 				rewards += other.rewards;
 				logProbs += other.logProbs;
+				oldActionProbs += other.oldActionProbs;
+				commandedGoals += other.commandedGoals;
+				achievedGoals += other.achievedGoals;
+				actionControls += other.actionControls;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
+				segmentIds += other.segmentIds;
+				segmentSteps += other.segmentSteps;
 			}
 
 			size_t Length() const {
@@ -505,6 +585,12 @@ void GGL::Learner::Start() {
 		};
 
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
+		std::vector<int64_t> curSegmentIds(numPlayers);
+		std::vector<int64_t> curSegmentSteps(numPlayers, 0);
+		int64_t nextSegmentId = 1;
+		for (int i = 0; i < numPlayers; i++)
+			curSegmentIds[i] = nextSegmentId++;
+
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
 
 		while (true) {
@@ -603,7 +689,7 @@ void GGL::Learner::Start() {
 							}
 						}
 
-						torch::Tensor tActions, tLogProbs;
+						torch::Tensor tActions, tLogProbs, tActionProbs;
 						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
@@ -611,6 +697,17 @@ void GGL::Learner::Start() {
 							for (int newPlayerIdx : newPlayerIndices) {
 								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
 								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
+
+								if (config.ppo.contrastiveGoal.enabled) {
+									int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+									int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
+									const GameState& state = envSet->state.gameStates[arenaIdx];
+									const Player& player = state.players[localPlayerIdx];
+
+									AppendCommandedGoal(trajectories[newPlayerIdx].commandedGoals, state, player, config.ppo.contrastiveGoal);
+									trajectories[newPlayerIdx].segmentIds.push_back(curSegmentIds[newPlayerIdx]);
+									trajectories[newPlayerIdx].segmentSteps.push_back(curSegmentSteps[newPlayerIdx]);
+								}
 							}
 						}
 
@@ -624,20 +721,22 @@ void GGL::Learner::Start() {
 							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 
-							torch::Tensor tNewActions;
+							torch::Tensor tNewActions, tNewActionProbs;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, NULL, &tNewActionProbs);
 							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
 							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
+							tActionProbs = tNewActionProbs.cpu();
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs);
+							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, NULL, &tActionProbs);
 							tActions = tActions.cpu();
+							tActionProbs = tActionProbs.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
 
@@ -645,6 +744,25 @@ void GGL::Learner::Start() {
 						FList newLogProbs;
 						if (tLogProbs.defined() && !render)
 							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);	
+
+						FList newActionProbs;
+						if (tActionProbs.defined() && !render && config.ppo.contrastiveGoal.enabled)
+							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs);
+
+						if (!render && config.ppo.contrastiveGoal.enabled) {
+							int i = 0;
+							for (int newPlayerIdx : newPlayerIndices) {
+								for (int actionIdx = 0; actionIdx < numActions; actionIdx++)
+									trajectories[newPlayerIdx].oldActionProbs += newActionProbs[i * numActions + actionIdx];
+
+								int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+								DefaultAction* defaultAction = dynamic_cast<DefaultAction*>(envSet->actionParsers[arenaIdx]);
+								if (!defaultAction)
+									RG_ERR_CLOSE("Contrastive scoring auxiliary requires DefaultAction for every arena");
+								AppendActionControl(trajectories[newPlayerIdx].actionControls, defaultAction->actions[curActions[newPlayerIdx]]);
+								i++;
+							}
+						}
 
 						stepTimer.Reset();
 						envSet->Sync(); // Make sure the first half is done
@@ -683,6 +801,14 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
+
+							if (config.ppo.contrastiveGoal.enabled) {
+								int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+								int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
+								const GameState& state = envSet->state.gameStates[arenaIdx];
+								const Player& player = state.players[localPlayerIdx];
+								AppendAchievedGoal(trajectories[newPlayerIdx].achievedGoals, state, player, config.ppo.contrastiveGoal);
+							}
 							i++;
 						}
 
@@ -718,6 +844,10 @@ void GGL::Learner::Start() {
 
 								combinedTraj.Append(traj);
 								traj.Clear();
+								curSegmentIds[newPlayerIdx] = nextSegmentId++;
+								curSegmentSteps[newPlayerIdx] = 0;
+							} else {
+								curSegmentSteps[newPlayerIdx]++;
 							}
 						}
 					}
@@ -738,6 +868,15 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
+					torch::Tensor tOldActionProbs, tCommandedGoals, tAchievedGoals, tActionControls, tSegmentIds, tSegmentSteps;
+					if (config.ppo.contrastiveGoal.enabled) {
+						tOldActionProbs = torch::tensor(combinedTraj.oldActionProbs).reshape({ -1, numActions });
+						tCommandedGoals = torch::tensor(combinedTraj.commandedGoals).reshape({ -1, 6 });
+						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
+						tActionControls = torch::tensor(combinedTraj.actionControls).reshape({ -1, (int)Action::ELEM_AMOUNT });
+						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
+						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
+					}
 
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
@@ -811,6 +950,14 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (config.ppo.contrastiveGoal.enabled) {
+						experience.data.oldActionProbs = tOldActionProbs;
+						experience.data.commandedGoals = tCommandedGoals;
+						experience.data.achievedGoals = tAchievedGoals;
+						experience.data.actionControls = tActionControls;
+						experience.data.segmentIds = tSegmentIds;
+						experience.data.segmentSteps = tSegmentSteps;
+					}
 				}
 
 				// Free CUDA cache
@@ -821,7 +968,7 @@ void GGL::Learner::Start() {
 
 				// Learn
 				Timer learnTimer = {};
-				ppo->Learn(experience, report, isFirstIteration);
+				ppo->Learn(experience, report, isFirstIteration, totalTimesteps);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
 
 				// Set metrics

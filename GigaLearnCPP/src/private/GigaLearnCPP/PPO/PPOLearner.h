@@ -1,5 +1,6 @@
 #pragma once
-#include "ExperienceBuffer.h";
+#include "ExperienceBuffer.h"
+#include "ContrastiveGoalLearner.h"
 #include <GigaLearnCPP/Util/Report.h>
 #include <GigaLearnCPP/Util/Timer.h>
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
@@ -20,9 +21,15 @@ namespace GGL {
 	public:
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
+		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
 
 		PPOLearnerConfig config;
 		torch::Device device;
+		int obsSize;
+		int numActions;
+		torch::Tensor discreteActionControls;
+		bool contrastiveCriticReady = false;
+		int contrastiveGateFailures = 0;
 
 		PPOLearner(
 			int obsSize, int numActions,
@@ -38,8 +45,9 @@ namespace GGL {
 		);
 		
 		// If models is null, this->models will be used
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor* outActionProbs = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
+		void SetDiscreteActionControls(torch::Tensor controls);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		static torch::Tensor InferPolicyProbsFromModels(
@@ -52,10 +60,11 @@ namespace GGL {
 			ModelSet& models, 
 			torch::Tensor obs, torch::Tensor actionMasks, 
 			bool deterministic, float temperature, bool halfPrec,
-			torch::Tensor* outActions, torch::Tensor* outLogProbs
+			torch::Tensor* outActions, torch::Tensor* outLogProbs,
+			torch::Tensor* outActionProbs = NULL
 		);
 
-		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
+		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);
 
 		void TransferLearn(
 			ModelSet& oldModels, 
