@@ -380,7 +380,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 
 	// Reset all obs builders initially
 	for (int i = 0; i < envSet->arenas.size(); i++)
-		oldObsBuilders[i]->Reset(envSet->state.gameStates[0]);
+		oldObsBuilders[i]->Reset(envSet->state.gameStates[i]);
 
 	std::vector<ActionParser*> oldActionParsers = {};
 	for (int i = 0; i < envSet->arenas.size(); i++)
@@ -550,6 +550,8 @@ void GGL::Learner::Start() {
 
 	if (render)
 		RG_LOG("\t(Render mode enabled)");
+	if (!render && config.ppo.deterministic)
+		RG_ERR_CLOSE("Learner::Start(): PPO deterministic mode cannot be used for training because sampled action log-probs are required.");
 
 	try {
 		bool saveQueued;
@@ -678,7 +680,7 @@ void GGL::Learner::Start() {
 
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too
-							int numSamples = RS_MAX(envSet->state.numPlayers, config.maxObsSamples);
+							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 							for (int i = 0; i < numSamples; i++) {
 								int idx = Math::RandInt(0, envSet->state.numPlayers);
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
@@ -758,6 +760,9 @@ void GGL::Learner::Start() {
 						if (tActionProbs.defined() && !render && config.ppo.contrastiveGoal.enabled)
 							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs);
 
+						stepTimer.Reset();
+						envSet->Sync(); // Make sure the first half is done
+
 						if (!render && config.ppo.contrastiveGoal.enabled) {
 							int i = 0;
 							for (int newPlayerIdx : newPlayerIndices) {
@@ -773,8 +778,6 @@ void GGL::Learner::Start() {
 							}
 						}
 
-						stepTimer.Reset();
-						envSet->Sync(); // Make sure the first half is done
 						envSet->StepSecondHalf(curActions, false);
 						envStepTime += stepTimer.Elapsed();
 
@@ -792,7 +795,7 @@ void GGL::Learner::Start() {
 							std::unordered_map<std::string, AvgTracker> avgRewards = {};
 							for (int i = 0; i < numSamples; i++) {
 								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
-								auto& prevRewards = envSet->state.lastRewards[i];
+								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
 
 								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
 									std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();

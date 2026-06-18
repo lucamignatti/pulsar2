@@ -57,7 +57,7 @@ namespace RLGC {
 		}
 
 		const auto& GetBoostPadTimers(bool inverted) const {
-			return inverted ? boostPadTimers : boostPadTimersInv;
+			return inverted ? boostPadTimersInv : boostPadTimers;
 		}
 
 		// Called before updating to reset the per-step state
