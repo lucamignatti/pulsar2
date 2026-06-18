@@ -2,6 +2,35 @@
 
 #include <GigaLearnCPP/Util/Models.h>
 #include <GigaLearnCPP/PPO/PPOLearner.h>
+#include <torch/cuda.h>
+#if defined(__APPLE__) && __has_include(<torch/mps.h>)
+#include <torch/mps.h>
+#define RG_MPS_SUPPORT
+#endif
+
+static torch::Device ResolveInferDevice(bool useGPU) {
+	if (!useGPU)
+		return torch::Device(torch::kCPU);
+
+#ifdef __APPLE__
+#ifdef RG_MPS_SUPPORT
+	if (torch::mps::is_available())
+		return torch::Device(torch::kMPS);
+#endif
+	if (torch::cuda::is_available())
+		return torch::Device(torch::kCUDA);
+#else
+	if (torch::cuda::is_available())
+		return torch::Device(torch::kCUDA);
+#ifdef RG_MPS_SUPPORT
+	if (torch::mps::is_available())
+		return torch::Device(torch::kMPS);
+#endif
+#endif
+
+	RG_ERR_CLOSE("InferUnit: useGPU was requested but neither MPS nor CUDA is available to libtorch.");
+	return torch::Device(torch::kCPU);
+}
 
 GGL::InferUnit::InferUnit(
 	RLGC::ObsBuilder* obsBuilder, int obsSize, RLGC::ActionParser* actionParser,
@@ -10,12 +39,13 @@ GGL::InferUnit::InferUnit(
 	obsBuilder(obsBuilder), obsSize(obsSize), actionParser(actionParser), useGPU(useGPU) {
 
 	this->models = new ModelSet();
+	auto device = ResolveInferDevice(useGPU);
 
 	try {
 		PPOLearner::MakeModels(
 			false, obsSize, actionParser->GetActionAmount(),
 			sharedHeadConfig, policyConfig, {},
-			useGPU ? torch::kCUDA : torch::kCPU,
+			device,
 			*this->models
 		);
 	} catch (std::exception& e) {
@@ -59,7 +89,7 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 	try {
 		RG_NO_GRAD;
 
-		auto device = useGPU ? torch::kCUDA : torch::kCPU;
+		auto device = ResolveInferDevice(useGPU);
 
 		auto tObs = torch::tensor(allObs).reshape({(int64_t)players.size(), obsSize});
 		auto tActionMasks = torch::tensor(allActionMasks).reshape({(int64_t)players.size(), this->actionParser->GetActionAmount()});

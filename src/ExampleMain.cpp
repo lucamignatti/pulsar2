@@ -87,7 +87,7 @@ int main(int argc, char* argv[]) {
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
 
-	cfg.deviceType = LearnerDeviceType::GPU_CUDA;
+	cfg.deviceType = LearnerDeviceType::AUTO;
 
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
@@ -147,8 +147,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+	cfg.sendMetrics = false; // Send metrics
+	cfg.renderMode = true; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
 
 	cfg.skillTracker.enabled = true;

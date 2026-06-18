@@ -7,7 +7,8 @@ namespace GGL {
 	enum class LearnerDeviceType {
 		AUTO,
 		CPU,
-		GPU_CUDA
+		GPU_CUDA,
+		GPU_MPS
 	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
@@ -36,7 +37,7 @@ namespace GGL {
 
 		int64_t randomSeed = -1; // Set to -1 to use the current time
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
-		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto will use your CUDA GPU if available
+		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto uses MPS on macOS if available, otherwise CUDA, otherwise CPU
 
 		// Standardize the obs values (doesn't seem to help much from my testing)
 		bool standardizeObs = false;

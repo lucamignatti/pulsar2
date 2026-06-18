@@ -4,6 +4,10 @@
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
 
 #include <torch/cuda.h>
+#if defined(__APPLE__) && __has_include(<torch/mps.h>)
+#include <torch/mps.h>
+#define RG_MPS_SUPPORT
+#endif
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
 
@@ -84,6 +88,89 @@ static void AppendActionControl(FList& out, const Action& action) {
 		out += action[i];
 }
 
+static bool CanMoveTensorToDevice(at::Device device) {
+	try {
+		torch::Tensor t = torch::tensor(0);
+		t = t.to(device);
+		t = t.cpu();
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+static bool IsMPSAvailable() {
+#ifdef RG_MPS_SUPPORT
+	return torch::mps::is_available();
+#else
+	return false;
+#endif
+}
+
+static at::Device UseCudaDevice() {
+	RG_LOG("\tUsing CUDA GPU device...");
+
+	bool deviceTestFailed = !CanMoveTensorToDevice(at::Device(at::kCUDA));
+	if (!torch::cuda::is_available() || deviceTestFailed)
+		RG_ERR_CLOSE(
+			"Learner::Learner(): Can't use CUDA GPU because " <<
+			(torch::cuda::is_available() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
+			"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
+		)
+
+	return at::Device(at::kCUDA);
+}
+
+static at::Device UseMPSDevice() {
+#ifdef RG_MPS_SUPPORT
+	RG_LOG("\tUsing MPS GPU device...");
+
+	bool deviceTestFailed = !CanMoveTensorToDevice(at::Device(at::kMPS));
+	if (!torch::mps::is_available() || deviceTestFailed)
+		RG_ERR_CLOSE(
+			"Learner::Learner(): Can't use MPS GPU because " <<
+			(torch::mps::is_available() ? "libtorch cannot access the GPU" : "MPS is not available to libtorch") << ".\n" <<
+			"Make sure your libtorch comes with MPS support and that you are running on a supported macOS device."
+		)
+
+	return at::Device(at::kMPS);
+#else
+	RG_ERR_CLOSE(
+		"Learner::Learner(): Can't use MPS GPU because this build of libtorch does not provide torch/mps.h.\n" <<
+		"Use a macOS libtorch build with MPS support or choose AUTO/CPU/CUDA."
+	)
+	return at::Device(at::kCPU);
+#endif
+}
+
+static at::Device ResolveLearnerDevice(GGL::LearnerDeviceType deviceType) {
+	if (deviceType == GGL::LearnerDeviceType::CPU) {
+		RG_LOG("\tUsing CPU device...");
+		return at::Device(at::kCPU);
+	}
+
+	if (deviceType == GGL::LearnerDeviceType::GPU_CUDA)
+		return UseCudaDevice();
+
+	if (deviceType == GGL::LearnerDeviceType::GPU_MPS)
+		return UseMPSDevice();
+
+#ifdef __APPLE__
+	if (IsMPSAvailable())
+		return UseMPSDevice();
+	if (torch::cuda::is_available())
+		return UseCudaDevice();
+#else
+	if (torch::cuda::is_available())
+		return UseCudaDevice();
+	if (IsMPSAvailable())
+		return UseMPSDevice();
+#endif
+
+	RG_LOG("\tUsing CPU device...");
+	return at::Device(at::kCPU);
+}
+
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
 {
@@ -108,35 +195,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	torch::manual_seed(config.randomSeed);
 
-	at::Device device = at::Device(at::kCPU);
-	if (
-		config.deviceType == LearnerDeviceType::GPU_CUDA || 
-		(config.deviceType == LearnerDeviceType::AUTO && torch::cuda::is_available())
-		) {
-		RG_LOG("\tUsing CUDA GPU device...");
-
-		// Test out moving a tensor to GPU and back to make sure the device is working
-		torch::Tensor t;
-		bool deviceTestFailed = false;
-		try {
-			t = torch::tensor(0);
-			t = t.to(at::Device(at::kCUDA));
-			t = t.cpu();
-		} catch (...) {
-			deviceTestFailed = true;
-		}
-
-		if (!torch::cuda::is_available() || deviceTestFailed)
-			RG_ERR_CLOSE(
-				"Learner::Learner(): Can't use CUDA GPU because " <<
-				(torch::cuda::is_available() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
-				"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
-			)
-		device = at::Device(at::kCUDA);
-	} else {
-		RG_LOG("\tUsing CPU device...");
-		device = at::Device(at::kCPU);
-	}
+	at::Device device = ResolveLearnerDevice(config.deviceType);
 
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
 		RG_LOG("\tInitializing RocketSim...");
