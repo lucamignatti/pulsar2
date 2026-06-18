@@ -149,6 +149,16 @@ int main(int argc, char* argv[]) {
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
+	cfg.ppo.deterministic = cfg.renderMode;
+
+	cfg.skillTracker.enabled = true;
+	cfg.skillTracker.numArenas = 16;
+	cfg.skillTracker.simTime = 45;
+	cfg.skillTracker.maxSimTime = 240;
+	cfg.skillTracker.updateInterval = 16;
+	cfg.skillTracker.ratingInc = 5;
+	cfg.skillTracker.initialRating = 0;
+	cfg.skillTracker.deterministic = false;
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
