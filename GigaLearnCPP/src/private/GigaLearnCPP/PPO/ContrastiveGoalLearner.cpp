@@ -15,6 +15,8 @@ namespace GGL {
 	static ModelConfig MakeEncoderConfig(int inputSize, int reprSize) {
 		ModelConfig result = PartialModelConfig{};
 		result.layerSizes = { 256, 256, reprSize };
+		result.activationType = ModelActivationType::LEAKY_RELU;
+		result.optimType = ModelOptimType::MUON;
 		result.addLayerNorm = true;
 		result.addOutputLayer = false;
 		result.numInputs = inputSize;

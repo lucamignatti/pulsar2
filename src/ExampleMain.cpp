@@ -82,7 +82,7 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 int main(int argc, char* argv[]) {
 	// Initialize RocketSim with collision meshes
 	// Change this path to point to your meshes!
-	RocketSim::Init("C:\\Users\\admin\\source\\repos\\RLArenaCollisionDumper\\collision_meshes");
+	RocketSim::Init("collision_meshes");
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
@@ -93,16 +93,16 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 256;
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
-	cfg.randomSeed = 123;
+	cfg.randomSeed = 67;
 
-	int tsPerItr = 50'000;
+	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 50'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target with CRL all-action scoring enabled
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -130,14 +130,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 8192;
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 4096; // InfoNCE logits scale quadratically with this
 
-	auto optim = ModelOptimType::ADAM;
+	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
 
-	auto activation = ModelActivationType::RELU;
+	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
