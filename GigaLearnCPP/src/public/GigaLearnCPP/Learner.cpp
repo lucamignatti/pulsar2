@@ -343,6 +343,11 @@ void GGL::Learner::Load() {
 void GGL::Learner::StartQuitKeyThread(bool& quitPressed, std::thread& outThread) {
 	quitPressed = false;
 
+	if (!KeyPressDetector::HasTerminalInput()) {
+		RG_LOG("No interactive stdin; Q-to-save key listener disabled. Use the runner stop command or SIGTERM to stop.");
+		return;
+	}
+
 	RG_LOG("Press 'Q' to save and quit!");
 	outThread = std::thread(
 		[&] {
