@@ -3,7 +3,7 @@
 #include "../BasicTypes/Action.h"
 #include "../TerminalConditions/TerminalCondition.h"
 #include "../Rewards/Reward.h"
-#include "../OBSBuilders/OBSBuilder.h"
+#include "../ObsBuilders/ObsBuilder.h"
 #include "../ActionParsers/ActionParser.h"
 #include "../StateSetters/StateSetter.h"
 #include "../ThreadPool.h"

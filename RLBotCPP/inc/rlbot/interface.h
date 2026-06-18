@@ -20,6 +20,10 @@
 #define DLLNAME "libRLBotInterface.so" 
 #endif
 
+#if defined(OS_UNIX) && defined(__APPLE__)
+#define DLLNAME "libRLBotInterface.dylib"
+#endif
+
 namespace rlbot {
 struct ByteBuffer {
   void *ptr;
