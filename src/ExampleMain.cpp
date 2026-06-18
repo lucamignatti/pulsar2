@@ -14,8 +14,28 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
+	// These are ok rewards that will produce a scoring bot in ~100m steps
 	std::vector<WeightedReward> rewards = {
-		{ new NextoReward(), 1.f }
+
+		// Movement
+		{ new AirReward(), 0.25f },
+
+		// Player-ball
+		{ new FaceBallReward(), 0.25f },
+		{ new VelocityPlayerToBallReward(), 4.f },
+		{ new StrongTouchReward(20, 100), 60 },
+
+		// Ball-goal
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+
+		// Boost
+		{ new PickupBoostReward(), 10.f },
+		{ new SaveBoostReward(), 0.2f },
+
+		// Game events
+		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
+		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
+		{ new GoalReward(), 150 }
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
