@@ -4,7 +4,6 @@
 
 namespace GGL {
 	namespace KeyPressDetector {
-		bool HasTerminalInput();
 		char GetPressedChar();
 	}
 }

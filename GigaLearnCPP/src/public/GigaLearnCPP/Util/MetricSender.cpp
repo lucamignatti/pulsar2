@@ -2,35 +2,8 @@
 
 #include "Timer.h"
 
-#include <filesystem>
-#include <vector>
-
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#elif defined(__linux__)
-#include <unistd.h>
-#endif
-
 namespace py = pybind11;
 using namespace GGL;
-
-static std::filesystem::path GetExecutableDir() {
-#ifdef __APPLE__
-	uint32_t size = 0;
-	_NSGetExecutablePath(nullptr, &size);
-	std::vector<char> buffer(size);
-	if (_NSGetExecutablePath(buffer.data(), &size) == 0)
-		return std::filesystem::canonical(buffer.data()).parent_path();
-#elif defined(__linux__)
-	std::vector<char> buffer(4096);
-	ssize_t len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
-	if (len > 0) {
-		buffer[len] = '\0';
-		return std::filesystem::canonical(buffer.data()).parent_path();
-	}
-#endif
-	return std::filesystem::current_path();
-}
 
 GGL::MetricSender::MetricSender(std::string _projectName, std::string _groupName, std::string _runName, std::string runID) :
 	projectName(_projectName), groupName(_groupName), runName(_runName) {
@@ -38,16 +11,6 @@ GGL::MetricSender::MetricSender(std::string _projectName, std::string _groupName
 	RG_LOG("Initializing MetricSender...");
 
 	try {
-		auto sys = py::module::import("sys");
-		auto sysPath = sys.attr("path");
-		auto exeDir = GetExecutableDir();
-		auto exeDirStr = exeDir.string();
-		auto scriptsDirStr = (exeDir / "python_scripts").string();
-
-		// Make helper modules importable regardless of the shell's current working directory.
-		sysPath.attr("insert")(0, exeDirStr);
-		sysPath.attr("insert")(0, scriptsDirStr);
-
 		pyMod = py::module::import("python_scripts.metric_receiver");
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("MetricSender: Failed to import metrics receiver, exception: " << e.what());
@@ -73,19 +36,8 @@ void GGL::MetricSender::Send(const Report& report) {
 
 	try {
 		pyMod.attr("add_metrics")(reportDict);
-		consecutiveSendFailures = 0;
 	} catch (std::exception& e) {
-		// A transient wandb/network error shouldn't kill a long training run.
-		// Drop this report and only give up after repeated consecutive failures.
-		consecutiveSendFailures++;
-		if (consecutiveSendFailures >= MAX_CONSECUTIVE_SEND_FAILURES)
-			RG_ERR_CLOSE(
-				"MetricSender: Failed to add metrics " << consecutiveSendFailures << " times in a row, giving up.\n" <<
-				"Last exception: " << e.what());
-
-		RG_LOG(
-			"WARNING: MetricSender failed to add metrics (" << consecutiveSendFailures << "/" << MAX_CONSECUTIVE_SEND_FAILURES <<
-			" consecutive failures), this report will be dropped. Exception: " << e.what());
+		RG_ERR_CLOSE("MetricSender: Failed to add metrics, exception: " << e.what());
 	}
 }
 

@@ -3,7 +3,7 @@
 #include "../BasicTypes/Action.h"
 #include "../TerminalConditions/TerminalCondition.h"
 #include "../Rewards/Reward.h"
-#include "../ObsBuilders/ObsBuilder.h"
+#include "../OBSBuilders/OBSBuilder.h"
 #include "../ActionParsers/ActionParser.h"
 #include "../StateSetters/StateSetter.h"
 #include "../ThreadPool.h"
@@ -14,17 +14,12 @@ namespace RLGC {
 	struct EnvCreateResult {
 		Arena* arena;
 		std::vector<WeightedReward> rewards;
-		std::vector<WeightedReward> gcrlGatedRewards;
-		std::vector<WeightedReward> curriculumRewards;
-		std::vector<WeightedReward> aerialGCRLGatedRewards;
-		std::vector<WeightedReward> aerialCurriculumRewards;
 		std::vector<TerminalCondition*> terminalConditions;
 		ObsBuilder* obsBuilder;
 		ActionParser* actionParser;
 		StateSetter* stateSetter;
 
 		void* userInfo; // Optional userinfo pointer if you want to track some data per-env
-		void (*userInfoDeleter)(void*) = nullptr;
 	};
 	typedef std::function<EnvCreateResult(int index)> EnvCreateFn;
 
@@ -44,15 +39,7 @@ namespace RLGC {
 		DimList2<float> obs;
 		DimList2<uint8_t> actionMasks;
 		std::vector<float> rewards;
-		std::vector<float> gcrlGatedRewards;
-		std::vector<float> curriculumRewards;
-		std::vector<float> aerialGCRLGatedRewards;
-		std::vector<float> aerialCurriculumRewards;
 		std::vector<std::vector<float>> lastRewards; // Only from the first arena
-		std::vector<std::vector<float>> lastGCRLGatedRewards;
-		std::vector<std::vector<float>> lastCurriculumRewards;
-		std::vector<std::vector<float>> lastAerialGCRLGatedRewards;
-		std::vector<std::vector<float>> lastAerialCurriculumRewards;
 		std::vector<uint8_t> terminals;
 
 		std::vector<int> arenaPlayerStartIdx = {};
@@ -67,15 +54,7 @@ namespace RLGC {
 			gameStates.resize(arenas.size());
 			prevGameStates.resize(arenas.size());
 			rewards.resize(numPlayers);
-			gcrlGatedRewards.resize(numPlayers);
-			curriculumRewards.resize(numPlayers);
-			aerialGCRLGatedRewards.resize(numPlayers);
-			aerialCurriculumRewards.resize(numPlayers);
 			lastRewards.resize(arenas.size());
-			lastGCRLGatedRewards.resize(arenas.size());
-			lastCurriculumRewards.resize(arenas.size());
-			lastAerialGCRLGatedRewards.resize(arenas.size());
-			lastAerialCurriculumRewards.resize(arenas.size());
 			terminals.resize(arenas.size());
 		}
 	};
@@ -93,7 +72,6 @@ namespace RLGC {
 
 		std::vector<CallbackUserInfo*> eventCallbackInfos;
 		std::vector<void*> userInfos;
-		std::vector<void (*)(void*)> userInfoDeleters;
 
 		EnvSetConfig config;
 
@@ -101,16 +79,10 @@ namespace RLGC {
 		int numActions;
 
 		std::vector<std::vector<WeightedReward>> rewards;
-		std::vector<std::vector<WeightedReward>> gcrlGatedRewards;
-		std::vector<std::vector<WeightedReward>> curriculumRewards;
-		std::vector<std::vector<WeightedReward>> aerialGCRLGatedRewards;
-		std::vector<std::vector<WeightedReward>> aerialCurriculumRewards;
 		std::vector<std::vector<TerminalCondition*>> terminalConditions;
 		std::vector<ObsBuilder*> obsBuilders;
 		std::vector<ActionParser*> actionParsers;
 		std::vector<StateSetter*> stateSetters;
-		std::vector<FList> obsBuildBuffers;
-		std::vector<std::vector<uint8_t>> actionMaskBuildBuffers;
 
 		EnvState state = {};
 
@@ -119,45 +91,13 @@ namespace RLGC {
 		RG_NO_COPY(EnvSet);
 
 		~EnvSet() {
-			auto deleteRewardGroup = [](std::vector<WeightedReward>& rewardGroup) {
-				for (auto& weightedReward : rewardGroup)
-					delete weightedReward.reward;
-				rewardGroup.clear();
-			};
-
-			for (auto& rewardGroup : rewards)
-				deleteRewardGroup(rewardGroup);
-			for (auto& rewardGroup : gcrlGatedRewards)
-				deleteRewardGroup(rewardGroup);
-			for (auto& rewardGroup : curriculumRewards)
-				deleteRewardGroup(rewardGroup);
-			for (auto& rewardGroup : aerialGCRLGatedRewards)
-				deleteRewardGroup(rewardGroup);
-			for (auto& rewardGroup : aerialCurriculumRewards)
-				deleteRewardGroup(rewardGroup);
-
-			for (auto& conditions : terminalConditions)
-				for (auto& condition : conditions)
-					delete condition;
-
-			for (auto& obsBuilder : obsBuilders)
-				delete obsBuilder;
-			for (auto& actionParser : actionParsers)
-				delete actionParser;
-			for (auto& stateSetter : stateSetters)
-				delete stateSetter;
+			for (Arena* arena : arenas)
+				delete arena;
 
 			for (auto& eventTracker : eventTrackers)
 				delete eventTracker;
 			for (auto& eventCallbackInfo : eventCallbackInfos)
 				delete eventCallbackInfo;
-
-			for (int i = 0; i < userInfos.size(); i++)
-				if (userInfoDeleters[i])
-					userInfoDeleters[i](userInfos[i]);
-
-			for (Arena* arena : arenas)
-				delete arena;
 		}
 
 		////////////////////

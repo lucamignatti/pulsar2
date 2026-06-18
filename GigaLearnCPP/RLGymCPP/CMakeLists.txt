@@ -11,10 +11,6 @@ target_include_directories(RLGymCPP PUBLIC "src/")
 set_target_properties(RLGymCPP PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(RLGymCPP PROPERTIES CXX_STANDARD 20)
 
-if(NOT MSVC)
-    target_compile_options(RLGymCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
-endif()
-
 # Include RocketSim
 add_subdirectory("RocketSim")
 target_link_libraries(RLGymCPP RocketSim)

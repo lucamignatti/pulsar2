@@ -1,6 +1,5 @@
 #pragma once
 #include "ActionParser.h"
-#include "../Gamestates/StateUtil.h"
 
 namespace RLGC {
 
@@ -14,7 +13,7 @@ namespace RLGC {
 		DefaultAction();
 
 		virtual Action ParseAction(int index, const Player& player, const GameState& state) override {
-			return MirrorActionX(actions[index], ShouldMirrorXForPlayer(player));
+			return actions[index];
 		}
 
 		virtual int GetActionAmount() override {
@@ -22,6 +21,5 @@ namespace RLGC {
 		}
 
 		virtual std::vector<uint8_t> GetActionMask(const Player& player, const GameState& state) override;
-		virtual void GetActionMaskInto(std::vector<uint8_t>& result, const Player& player, const GameState& state) override;
 	};
 }

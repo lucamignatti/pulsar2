@@ -3,15 +3,17 @@
 void GGL::GAE::Compute(
 	torch::Tensor rews, torch::Tensor terminals, torch::Tensor valPreds, torch::Tensor truncValPreds,
 	torch::Tensor& outAdvantages, torch::Tensor& outTargetValues, torch::Tensor& outReturns, float& outRewClipPortion,
-	float gamma, float lambda, const FList& returnStds, const int8_t* modeIds, float clipRange
+	float gamma, float lambda, float returnStd, float clipRange
 ) {
-	RG_ASSERT(!returnStds.empty());
 
 	bool hasTruncValPreds = truncValPreds.defined();
 
 	float prevLambda = 0;
 	int numReturns = rews.size(0);
+	outAdvantages = torch::zeros(numReturns);
+	outReturns = torch::zeros(numReturns);
 	float prevRet = 0;
+	int truncCount = 0;
 
 	float totalRew = 0, totalClippedRew = 0;
 
@@ -36,20 +38,14 @@ void GGL::GAE::Compute(
 		_truncValPreds = NULL;
 		numTruncs = 0;
 	}
-	// Walk truncation preds in reverse (they were appended forward) to match the backward GAE pass.
-	int truncCount = numTruncs - 1;
 
-	outAdvantages = torch::zeros(numReturns);
-	outReturns = torch::zeros(numReturns);
-	auto _outReturns = outReturns.data_ptr<float>();
-	auto _outAdvantages = outAdvantages.data_ptr<float>();
+	auto _outReturns = std::vector<float>(numReturns, 0);
+	auto _outAdvantages = std::vector<float>(numReturns, 0);
 
 	for (int step = numReturns - 1; step >= 0; step--) {
 		uint8_t terminal = _terminals[step];
 		float done = terminal == RLGC::TerminalType::NORMAL;
 		float trunc = terminal == RLGC::TerminalType::TRUNCATED;
-
-		float returnStd = returnStds[modeIds ? modeIds[step] : 0];
 
 		float curReward;
 		if (returnStd != 0) {
@@ -75,15 +71,13 @@ void GGL::GAE::Compute(
 			if (!hasTruncValPreds)
 				RG_ERR_CLOSE("GAE encountered a truncated terminal, but has no truncated val pred");
 
-			if (truncCount < 0)
+			if (truncCount >= numTruncs)
 				RG_ERR_CLOSE("GAE encountered too many truncated terminals, not enough val preds (max: " << numTruncs << ")")
 
 			nextValPred = _truncValPreds[truncCount];
-			truncCount--;
+			truncCount++;
 		} else {
-			// Guard against OOB at the last step: (1-done) is 0 for NORMAL terminals so the
-			// value is multiplied away, but the read itself would be UB without the check.
-			nextValPred = (step + 1 < numReturns) ? _valPreds[step + 1] : 0.0f;
+			nextValPred = _valPreds[step + 1];
 		}
 
 		float predReturn = curReward + gamma * nextValPred * (1 - done);
@@ -98,9 +92,11 @@ void GGL::GAE::Compute(
 	}
 	
 	if (hasTruncValPreds)
-		if (truncCount != -1)
-			RG_ERR_CLOSE("GAE didn't receive expected truncation count (consumed " << (numTruncs - 1 - truncCount) << "/" << numTruncs << ")");
+		if (truncCount != truncValPreds.size(0))
+			RG_ERR_CLOSE("GAE didn't receive expected truncation count (only " << truncCount << "/" << truncValPreds.size(0) << ")");
 
+	outReturns = torch::tensor(_outReturns);
+	outAdvantages = torch::tensor(_outAdvantages);
 	outTargetValues = valPreds.slice(0, 0, numReturns) + outAdvantages;
 	outRewClipPortion = (totalRew - totalClippedRew) / RS_MAX(totalRew, 1e-7f);
 }

@@ -58,12 +58,6 @@ namespace RLGC {
 			return std::vector<T>(startItr, startItr + size[1]);
 		}
 
-		// Appends a row directly into dest without allocating a temporary vector.
-		void AppendRow(size_t idx0, std::vector<T>& dest) const {
-			const T* rowStart = data.data() + (idx0 * size[1]);
-			dest.insert(dest.end(), rowStart, rowStart + size[1]);
-		}
-
 		void Add(const std::vector<T>& newRow) {
 			RG_ASSERT(size[1] == newRow.size());
 			size[0]++;

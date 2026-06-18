@@ -25,34 +25,14 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 		RLGC::EnvSetConfig skillEnvSetConfig = envSetConfig;
 		skillEnvSetConfig.numArenas = skill.config.numArenas;
 		skill.envSet = new RLGC::EnvSet(skillEnvSetConfig);
-		auto deleteRewardGroup = [](std::vector<RLGC::WeightedReward>& rewardGroup) {
-			for (auto& weightedReward : rewardGroup)
-				delete weightedReward.reward;
-			rewardGroup.clear();
-		};
 		for (int i = 0; i < skill.envSet->arenas.size(); i++) {
-			deleteRewardGroup(skill.envSet->rewards[i]);
-			deleteRewardGroup(skill.envSet->gcrlGatedRewards[i]);
-			deleteRewardGroup(skill.envSet->curriculumRewards[i]);
-			deleteRewardGroup(skill.envSet->aerialGCRLGatedRewards[i]);
-			deleteRewardGroup(skill.envSet->aerialCurriculumRewards[i]);
-
-			delete skill.envSet->stateSetters[i];
-			skill.envSet->stateSetters[i] = new RLGC::FuzzedKickoffState();
-
-			for (auto& condition : skill.envSet->terminalConditions[i])
-				delete condition;
+			skill.envSet->rewards[i].clear();
+			skill.envSet->stateSetters[i] = { new RLGC::FuzzedKickoffState() };
 			skill.envSet->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
 		}
 	} else {
 		skill.envSet = NULL;
 	}
-}
-
-GGL::PolicyVersionManager::~PolicyVersionManager() {
-	for (auto& version : versions)
-		version.models.Free();
-	delete skill.envSet;
 }
 
 GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone, uint64_t timesteps) {
@@ -67,28 +47,18 @@ GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone
 
 	newVersion.ratings = skill.curRatings;
 
-	{
-		std::unique_lock lock(versionsMutex);
-		versions.push_back(newVersion);
+	versions.push_back(newVersion);
 
-		SortVersions();
+	SortVersions();
 
-		// Remove old versions
-		while (versions.size() > maxVersions) {
-			auto& toRemove = versions[0];
-			toRemove.models.Free();
-			versions.erase(versions.begin());
-		}
-
-		// Sorting means the new version isn't necessarily at the back, so find it by timesteps
-		for (auto& version : versions)
-			if (version.timesteps == timesteps)
-				return version;
+	// Remove old versions
+	while (versions.size() > maxVersions) {
+		auto& toRemove = versions[0];
+		toRemove.models.Free();
+		versions.erase(versions.begin());
 	}
 
-	RG_ERR_CLOSE(
-		"PolicyVersionManager::AddVersion(): Newly added version (at " << timesteps << " timesteps) was immediately pruned, " <<
-		"it must be older than all " << maxVersions << " existing versions");
+	return versions.back();
 }
 
 void GGL::PolicyVersionManager::SaveVersions() {
@@ -102,9 +72,13 @@ void GGL::PolicyVersionManager::SaveVersions() {
 		for (auto& version : versions)
 			matchesVersion |= (savedTimesteps == version.timesteps);
 
-		// Get rid of saved versions we no longer track
-		if (!matchesVersion)
+		if (matchesVersion) {
+			// We want to keep this
+			allSavedTimesteps.insert(savedTimesteps);
+		} else {
+			// Get rid of it
 			std::filesystem::remove_all(saveFolder / std::to_string(savedTimesteps));
+		}
 	}
 
 	for (auto& version : versions) {
@@ -259,11 +233,11 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		torch::Tensor _tLogProbs;
 
 		PPOLearner::InferActionsFromModels(
-			ppo->models, tNewStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), tNewActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), 
+			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true), 
 			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, 
 			&tNewActions, &_tLogProbs);
 		PPOLearner::InferActionsFromModels(
-			oldVersion.models, tOldStates.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), tOldActionMasks.to(ppo->device, RG_H2D_NONBLOCKING(ppo->device)), 
+			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true), 
 			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
 			&tOldActions, &_tLogProbs);
 
@@ -303,7 +277,7 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		float delta = pair.second - prevRating;
 
 		std::stringstream ratingLine;
-		ratingLine << pair.first << " = " << pair.second;
+		ratingLine << " > " << pair.first << " = " << prevRating;
 		if (delta != 0)
 			ratingLine << " (" << (delta >= 0 ? '+' : '-') << abs(delta) << ")";
 

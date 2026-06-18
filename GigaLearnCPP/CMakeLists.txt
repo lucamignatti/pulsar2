@@ -17,9 +17,7 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # Add all headers and code files
-# CONFIGURE_DEPENDS makes CMake re-glob on every build, so newly added source files are picked
-# up automatically without a manual reconfigure (otherwise new .cpp files silently fail to link).
-file(GLOB_RECURSE FILES_SRC CONFIGURE_DEPENDS "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
+file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/.h" "libsrc/.hpp")
 
 add_library(GigaLearnCPP SHARED ${FILES_SRC})
 target_compile_definitions(GigaLearnCPP PRIVATE -DWITHIN_GGL)
@@ -29,7 +27,7 @@ target_include_directories(GigaLearnCPP PRIVATE "src/private")
 # Include libtorch
 target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
-if (NOT APPLE)
+if (TORCH_CUDA_LIBRARIES)
 	message("Enabling CUDA support...")
 	target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
 endif()
@@ -37,11 +35,6 @@ endif()
 # Set C++ version to 20
 set_target_properties(GigaLearnCPP PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnCPP PROPERTIES CXX_STANDARD 20)
-
-if(NOT MSVC)
-    # -fno-finite-math-only restores correct NaN/Inf semantics for nlohmann/json (serialises float infinity).
-    target_compile_options(GigaLearnCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
-endif()
 
 # Include RLGymCPP
 add_subdirectory(RLGymCPP)
@@ -51,22 +44,18 @@ target_link_libraries(GigaLearnCPP PUBLIC RLGymCPP)
 target_include_directories(GigaLearnCPP PUBLIC "${PROJECT_SOURCE_DIR}/libsrc/json")
 
 # Include python
-# Use CMake's modern FindPython package exclusively so the interpreter, headers,
-# and library all come from the same Python installation/virtualenv. Mixing this
-# with the legacy FindPythonLibs module can link against a different Python than
-# Python_EXECUTABLE, which breaks embedded Python extension imports on macOS/Linux.
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
-target_include_directories(GigaLearnCPP PUBLIC ${Python_INCLUDE_DIRS})
-target_link_libraries(GigaLearnCPP PUBLIC Python::Python)
+find_package(Python COMPONENTS Interpreter Development)
+find_package(PythonLibs REQUIRED)
+include_directories(${PYTHON_INCLUDE_DIRS})
+target_link_libraries(GigaLearnCPP PUBLIC ${PYTHON_LIBRARIES})
 message("Found Python:")
-message("Python_LIBRARIES: ${Python_LIBRARIES}")
-message("Python_INCLUDE_DIRS: ${Python_INCLUDE_DIRS}")
+message("PYTHON_LIBRARIES: ${PYTHON_LIBRARIES}")
+message("PYTHON_INCLUDE_DIRS: ${PYTHON_INCLUDE_DIRS}")
 message("Python_RUNTIME_LIBRARY_DIRS: ${Python_RUNTIME_LIBRARY_DIRS}")
 message("Python_EXECUTABLE: ${Python_EXECUTABLE}")
 add_definitions(-DPY_EXEC_PATH="${Python_EXECUTABLE}") # Give C++ access to the executable path
 
 # Include pybind11
-set(PYBIND11_FINDPYTHON ON)
 add_subdirectory(pybind11)
 target_link_libraries(GigaLearnCPP PUBLIC pybind11::embed)
 

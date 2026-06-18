@@ -2,14 +2,12 @@
 #include <RLGymCPP/BasicTypes/Lists.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
-#include "EvolutionStrategyConfig.h"
 
 namespace GGL {
 	enum class LearnerDeviceType {
 		AUTO,
 		CPU,
-		GPU_CUDA,
-		GPU_MPS
+		GPU_CUDA
 	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
@@ -23,14 +21,14 @@ namespace GGL {
 		// If renderMode, this is the scaling of time for the game
 		// 1.0 = Run the game at real time
 		// 2.0 = Run the game twice as fast as real time
-		float renderTimeScale = 1.0f;
+		float renderTimeScale = 1.0f; 
 
 		PPOLearnerConfig ppo = {};
 
 		// Checkpoints are saved here as timestep-numbered subfolders
 		//	e.g. a checkpoint at 20,000 steps will save to a subfolder called "20000"
 		// Set empty to disable saving
-		std::filesystem::path checkpointFolder = "checkpoints";
+		std::filesystem::path checkpointFolder = "checkpoints"; 
 
 		// Save every timestep
 		// Set to zero to just use timestepsPerIteration
@@ -68,15 +66,7 @@ namespace GGL {
 
 		bool trainAgainstOldVersions = false;
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
-		// How many consecutive iterations an old-version assignment (or the absence of one)
-		// persists before being re-rolled. Re-rolling every iteration interrupts half the
-		// population's in-flight episodes every ~1/chance iterations (their trajectories
-		// must be truncated when their controller changes) and switches opponents
-		// mid-episode; longer stints keep opponents consistent and the data pipeline calm.
-		int trainAgainstOldStintBatches = 16;
 
 		SkillTrackerConfig skillTracker = {};
-
-		EvolutionStrategyConfig evolutionStrategy = {};
 	};
 }

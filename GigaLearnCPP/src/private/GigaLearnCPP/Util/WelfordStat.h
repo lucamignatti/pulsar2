@@ -11,18 +11,15 @@ namespace GGL {
 
 		WelfordStat() {};
 
-		void Increment(float sample) {
-			double delta = (double)sample - runningMean;
-			double deltaN = delta / (count + 1);
-
-			runningMean += deltaN;
-			runningVariance += delta * deltaN * count;
-			count++;
-		}
-
 		void Increment(const FList& samples) {
-			for (float sample : samples)
-				Increment(sample);
+			for (float sample : samples) {
+				double delta = (double)sample - runningMean;
+				double deltaN = delta / (count + 1);
+
+				runningMean += deltaN;
+				runningVariance += delta * deltaN * count;
+				count++;
+			}
 		}
 
 		void Reset() {
@@ -115,41 +112,9 @@ namespace GGL {
 		}
 
 		void ReadFromJSON(const nlohmann::json& json) {
-			runningMeans = Utils::MakeVecFromJSON<double>(json["means"]);
-			runningVariances = Utils::MakeVecFromJSON<double>(json["vars"]);
+			runningMeans = Utils::MakeVecFromJSON<double>(json["mean"]);
+			runningVariances = Utils::MakeVecFromJSON<double>(json["var"]);
 			count = json["count"];
 		}
 	};
-
-	// ── Shared obs standardization ───────────────────────────────────────────
-	// Single source of truth used by both the PPO collection loop and the ES rollouts, so
-	// members and baseline always see obs normalized exactly the way the policy was trained.
-
-	// Compute per-dim (offset, invStd) from running stats, with the same clamping the trainer uses.
-	inline void ComputeObsNorm(
-		BatchedWelfordStat* stat, float minSTD, float maxMeanRange,
-		std::vector<float>& outOffset, std::vector<float>& outInvStd) {
-
-		const std::vector<double>& meanVec = stat->GetMean();
-		std::vector<double> stdVec = stat->GetSTD();
-		int w = stat->width;
-		outOffset.resize(w);
-		outInvStd.resize(w);
-		for (int j = 0; j < w; j++) {
-			outOffset[j] = RS_CLAMP((float)meanVec[j], -maxMeanRange, maxMeanRange);
-			outInvStd[j] = 1.0f / RS_MAX((float)stdVec[j], minSTD);
-		}
-	}
-
-	// Apply a precomputed (offset, invStd) normalization in-place to a row-major [rows, width] obs buffer.
-	inline void ApplyObsNorm(
-		float* obsData, int rows, int width,
-		const std::vector<float>& offset, const std::vector<float>& invStd) {
-
-		for (int i = 0; i < rows; i++) {
-			float* row = obsData + (size_t)i * width;
-			for (int j = 0; j < width; j++)
-				row[j] = (row[j] - offset[j]) * invStd[j];
-		}
-	}
 }

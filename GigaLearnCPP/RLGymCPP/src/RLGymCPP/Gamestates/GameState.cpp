@@ -1,12 +1,12 @@
 #include "GameState.h"
 
 #include "../Math.h"
-#include <mutex>
 
 using namespace RLGC;
 
 static int boostPadIndexMap[CommonValues::BOOST_LOCATIONS_AMOUNT] = {};
-static std::once_flag boostPadIndexMapOnce;
+static bool boostPadIndexMapBuilt = false;
+static std::mutex boostPadIndexMapMutex = {};
 void _BuildBoostPadIndexMap(Arena* arena) {
 	constexpr const char* ERROR_PREFIX = "_BuildBoostPadIndexMap(): ";
 #ifdef RG_VERBOSE
@@ -46,6 +46,7 @@ void _BuildBoostPadIndexMap(Arena* arena) {
 #ifdef RG_VERBOSE
 	RG_LOG(" > Done");
 #endif
+	boostPadIndexMapBuilt = true;
 }
 
 void RLGC::GameState::ResetBeforeStep() {
@@ -77,7 +78,15 @@ void RLGC::GameState::UpdateFromArena(Arena* arena, const std::vector<Action>& a
 		carItr++;
 	}
 
-	std::call_once(boostPadIndexMapOnce, _BuildBoostPadIndexMap, arena);
+	if (!boostPadIndexMapBuilt) {
+		boostPadIndexMapMutex.lock();
+		// Check again? This seems stupid but also makes sense to me
+		//	Without this, we could lock as the index map is building, then go build again
+		//	I would like to keep the mutex inside the if statement so it is only checked a few times
+		if (!boostPadIndexMapBuilt) 
+			_BuildBoostPadIndexMap(arena);
+		boostPadIndexMapMutex.unlock();
+	}
 
 	int numBoostPads = arena->_boostPads.size();
 	boostPads.resize(numBoostPads);

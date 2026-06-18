@@ -25,11 +25,11 @@ namespace RLGC {
 			child->PreStep(state);
 		}
 
-		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {
 			return child->GetReward(player, state, isFinal);
 		}
 
-		virtual std::string GetName() override {
+		virtual std::string GetName() {
 			return child->GetName();
 		}
 	};

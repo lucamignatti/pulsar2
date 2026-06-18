@@ -75,7 +75,7 @@ RLGC::DefaultAction::DefaultAction() {
 		if (i < numGroundActions)
 			groundMask[i] = true;
 
-		if (i >= numGroundActions && !action.jump)
+		if (i > numGroundActions && !action.jump)
 			airMask[i] = true;
 
 		// Add additional yaw-only actions to air mask
@@ -89,13 +89,7 @@ RLGC::DefaultAction::DefaultAction() {
 }
 
 std::vector<uint8_t> RLGC::DefaultAction::GetActionMask(const Player& player, const GameState& state) {
-	std::vector<uint8_t> result;
-	GetActionMaskInto(result, player, state);
-	return result;
-}
-
-void RLGC::DefaultAction::GetActionMaskInto(std::vector<uint8_t>& result, const Player& player, const GameState& state) {
-	result.assign(actions.size(), false);
+	auto result = std::vector<uint8_t>(actions.size(), false);
 
 	auto fnApplyMask = [&](const std::vector<uint8_t>& mask, bool add) {
 		if (add) {
@@ -119,4 +113,6 @@ void RLGC::DefaultAction::GetActionMaskInto(std::vector<uint8_t>& result, const 
 	bool isTurtled = player.worldContact.hasContact && player.worldContact.contactNormal.z > 0.9f;
 	if (player.HasFlipOrJump() || isTurtled)
 		fnApplyMask(jumpMask, true);
+
+	return result;
 }

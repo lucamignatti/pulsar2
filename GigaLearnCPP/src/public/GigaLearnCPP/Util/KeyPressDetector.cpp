@@ -2,11 +2,6 @@
 
 #ifdef _MSC_VER
 #include <conio.h>
-#include <io.h>
-
-bool GGL::KeyPressDetector::HasTerminalInput() {
-	return _isatty(_fileno(stdin));
-}
 
 char GGL::KeyPressDetector::GetPressedChar() {
 	return _getch();
@@ -15,10 +10,6 @@ char GGL::KeyPressDetector::GetPressedChar() {
 #else
 #include <unistd.h>
 #include <termios.h>
-
-bool GGL::KeyPressDetector::HasTerminalInput() {
-	return isatty(STDIN_FILENO);
-}
 
 char GGL::KeyPressDetector::GetPressedChar() {
 	// https://stackoverflow.com/questions/421860/capture-characters-from-standard-input-without-waiting-for-enter-to-be-pressed

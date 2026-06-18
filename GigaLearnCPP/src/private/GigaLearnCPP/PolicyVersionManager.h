@@ -6,7 +6,6 @@
 #include <GigaLearnCPP/Util/RenderSender.h>
 
 #include <nlohmann/json.hpp>
-#include <shared_mutex>
 
 namespace GGL {
 
@@ -60,7 +59,6 @@ namespace GGL {
 
 	struct PolicyVersionManager {
 		std::vector<PolicyVersion> versions;
-		mutable std::shared_mutex versionsMutex; // shared: collectors reading; unique: OnIteration mutating
 		std::filesystem::path saveFolder;
 		int maxVersions;
 		uint64_t tsPerVersion;
@@ -105,10 +103,6 @@ namespace GGL {
 		void AddRunningStatsToJSON(nlohmann::json& json);
 		void LoadRunningStatsFromJSON(const nlohmann::json& json);
 
-		// Each stored PolicyVersion owns a cloned ModelSet (AddVersion -> CloneAll), and the
-		// skill tracker owns a new'd EnvSet. ModelSet has no destructor, so without this every
-		// version's cloned models + the skill EnvSet leaked on teardown. Defined in the .cpp
-		// where RLGC::EnvSet is a complete type.
-		~PolicyVersionManager();
+		// TODO: Add deconstructor
 	};
 }

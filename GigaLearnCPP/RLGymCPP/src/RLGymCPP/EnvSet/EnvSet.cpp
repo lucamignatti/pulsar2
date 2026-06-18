@@ -53,14 +53,13 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 		auto createResult = config.envCreateFn(idx);
 		auto arena = createResult.arena;
 
+		appendMutex.lock();
 		{
-			std::lock_guard<std::mutex> lk(appendMutex);
-
 			arenas.push_back(arena);
 
 			auto userInfo = new CallbackUserInfo();
 			userInfo->arena = arena;
-			userInfo->arenaIdx = (int)arenas.size() - 1; // index in push_back order, not job-creation order
+			userInfo->arenaIdx = idx;
 			userInfo->envSet = this;
 			eventCallbackInfos.push_back(userInfo);
 			arena->SetCarBumpCallback(_BumpCallback, userInfo);
@@ -74,22 +73,18 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 				tracker->SetSaveCallback(_SaveEventCallback, userInfo);
 			} else {
 				eventTrackers.push_back(NULL);
-				// NOTE: no second eventCallbackInfos push here — one entry per arena is correct
+				eventCallbackInfos.push_back(NULL);
 			}
 
-				userInfos.push_back(createResult.userInfo);
-				userInfoDeleters.push_back(createResult.userInfoDeleter);
+			userInfos.push_back(createResult.userInfo);
 
-				rewards.push_back(createResult.rewards);
-			gcrlGatedRewards.push_back(createResult.gcrlGatedRewards);
-			curriculumRewards.push_back(createResult.curriculumRewards);
-			aerialGCRLGatedRewards.push_back(createResult.aerialGCRLGatedRewards);
-			aerialCurriculumRewards.push_back(createResult.aerialCurriculumRewards);
+			rewards.push_back(createResult.rewards);
 			terminalConditions.push_back(createResult.terminalConditions);
 			obsBuilders.push_back(createResult.obsBuilder);
 			actionParsers.push_back(createResult.actionParser);
 			stateSetters.push_back(createResult.stateSetter);
 		}
+		appendMutex.unlock();
 	};
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 
@@ -104,14 +99,7 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 		obsSize = obsBuilders[0]->BuildObs(testState.players[0], testState).size();
 		state.obs = DimList2<float>(state.numPlayers, obsSize);
 
-		numActions = actionParsers[0]->GetActionAmount();
-		state.actionMasks = DimList2<uint8_t>(state.numPlayers, numActions);
-		obsBuildBuffers.resize(state.numPlayers);
-		actionMaskBuildBuffers.resize(state.numPlayers);
-		for (auto& obsBuffer : obsBuildBuffers)
-			obsBuffer.reserve(obsSize);
-		for (auto& maskBuffer : actionMaskBuildBuffers)
-			maskBuffer.reserve(numActions);
+		state.actionMasks = DimList2<uint8_t>(state.numPlayers, actionParsers[0]->GetActionAmount());
 	}
 
 	// Reset all arenas initially
@@ -203,98 +191,63 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 		{
 			for (auto& weighted : rewards[arenaIdx])
 				weighted.reward->PreStep(gs);
-			for (auto& weighted : gcrlGatedRewards[arenaIdx])
-				weighted.reward->PreStep(gs);
-			for (auto& weighted : curriculumRewards[arenaIdx])
-				weighted.reward->PreStep(gs);
-			for (auto& weighted : aerialGCRLGatedRewards[arenaIdx])
-				weighted.reward->PreStep(gs);
-			for (auto& weighted : aerialCurriculumRewards[arenaIdx])
-				weighted.reward->PreStep(gs);
 		}
 
 		// Update rewards
 		{
-			FList baseRewards = FList(gs.players.size(), 0);
-			FList gatedRewards = FList(gs.players.size(), 0);
-			FList curriculumRewardsOut = FList(gs.players.size(), 0);
-			FList aerialGatedRewards = FList(gs.players.size(), 0);
-			FList aerialCurriculumRewardsOut = FList(gs.players.size(), 0);
+			FList allRewards = FList(gs.players.size(), 0);
+			for (int rewardIdx = 0; rewardIdx < rewards[arenaIdx].size(); rewardIdx++) {
+				auto& weightedReward = rewards[arenaIdx][rewardIdx];
+				FList output = weightedReward.reward->GetAllRewards(gs, terminalType);
+				for (int i = 0; i < gs.players.size(); i++)
+					allRewards[i] += output[i] * weightedReward.weight;
 
-			auto fnGetPlayerSampleIndex = [&](const FList& output) {
-				if (config.shuffleRewardSampling)
-					return Math::RandInt(0, output.size());
-
-				int playerSampleIndex = 0;
-				int lowestID = gs.players[0].carId;
-				for (int i = 1; i < gs.players.size(); i++) {
-					auto id = gs.players[i].carId;
-					if (id < lowestID) {
-						lowestID = id;
-						playerSampleIndex = i;
+				// Save the reward
+				if (config.saveRewards) {
+					int playerSampleIndex;
+					if (config.shuffleRewardSampling) {
+						playerSampleIndex = Math::RandInt(0, output.size());
+					} else {
+						// Find player with the lowest id
+						playerSampleIndex = 0;
+						int lowestID = gs.players[0].carId;
+						for (int i = 1; i < gs.players.size(); i++) {
+							auto id = gs.players[i].carId;
+							if (id < lowestID) {
+								lowestID = id;
+								playerSampleIndex = i;
+							}
+						}
 					}
+					// We will only take the reward from a random player
+					float rewardToSave = output[playerSampleIndex];
+						
+					// If zero-sum, use the inner reward
+					if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
+						rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
+
+					// If needed, initialize last rewards
+					if (state.lastRewards[arenaIdx].empty())
+						state.lastRewards[arenaIdx].resize(rewards[arenaIdx].size());
+
+					state.lastRewards[arenaIdx][rewardIdx] = rewardToSave;
 				}
-				return playerSampleIndex;
-			};
-
-			auto fnUpdateRewardGroup = [&](std::vector<WeightedReward>& rewardGroup, FList& outRewards, std::vector<float>& lastRewards) {
-				for (int rewardIdx = 0; rewardIdx < rewardGroup.size(); rewardIdx++) {
-					auto& weightedReward = rewardGroup[rewardIdx];
-					FList output = weightedReward.reward->GetAllRewards(gs, terminalType);
-					for (int i = 0; i < gs.players.size(); i++)
-						outRewards[i] += output[i] * weightedReward.weight;
-
-					if (config.saveRewards) {
-						int playerSampleIndex = fnGetPlayerSampleIndex(output);
-						float rewardToSave = output[playerSampleIndex];
-
-						if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
-							rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
-
-						if (lastRewards.empty())
-							lastRewards.resize(rewardGroup.size());
-
-						lastRewards[rewardIdx] = rewardToSave;
-					}
-				}
-			};
-
-			fnUpdateRewardGroup(rewards[arenaIdx], baseRewards, state.lastRewards[arenaIdx]);
-			fnUpdateRewardGroup(gcrlGatedRewards[arenaIdx], gatedRewards, state.lastGCRLGatedRewards[arenaIdx]);
-			fnUpdateRewardGroup(curriculumRewards[arenaIdx], curriculumRewardsOut, state.lastCurriculumRewards[arenaIdx]);
-			fnUpdateRewardGroup(aerialGCRLGatedRewards[arenaIdx], aerialGatedRewards, state.lastAerialGCRLGatedRewards[arenaIdx]);
-			fnUpdateRewardGroup(aerialCurriculumRewards[arenaIdx], aerialCurriculumRewardsOut, state.lastAerialCurriculumRewards[arenaIdx]);
+			}
 
 			for (int i = 0; i < gs.players.size(); i++)
-				state.rewards[playerStartIdx + i] = baseRewards[i] + gatedRewards[i] + curriculumRewardsOut[i] + aerialGatedRewards[i] + aerialCurriculumRewardsOut[i];
-			for (int i = 0; i < gs.players.size(); i++)
-				state.gcrlGatedRewards[playerStartIdx + i] = gatedRewards[i];
-			for (int i = 0; i < gs.players.size(); i++)
-				state.curriculumRewards[playerStartIdx + i] = curriculumRewardsOut[i];
-			for (int i = 0; i < gs.players.size(); i++)
-				state.aerialGCRLGatedRewards[playerStartIdx + i] = aerialGatedRewards[i];
-			for (int i = 0; i < gs.players.size(); i++)
-				state.aerialCurriculumRewards[playerStartIdx + i] = aerialCurriculumRewardsOut[i];
+				state.rewards[playerStartIdx + i] = allRewards[i];
 		}
 
 		// Update observations
 		{
-			for (int i = 0; i < gs.players.size(); i++) {
-				int playerIdx = playerStartIdx + i;
-				auto& obsBuffer = obsBuildBuffers[playerIdx];
-				obsBuilders[arenaIdx]->BuildObsInto(obsBuffer, gs.players[i], gs);
-				state.obs.Set(playerIdx, obsBuffer);
-			}
+			for (int i = 0; i < gs.players.size(); i++)
+				state.obs.Set(playerStartIdx + i, obsBuilders[arenaIdx]->BuildObs(gs.players[i], gs));
 		}
 
 		// Update action masks
 		{
-			for (int i = 0; i < gs.players.size(); i++) {
-				int playerIdx = playerStartIdx + i;
-				auto& maskBuffer = actionMaskBuildBuffers[playerIdx];
-				actionParsers[arenaIdx]->GetActionMaskInto(maskBuffer, gs.players[i], gs);
-				state.actionMasks.Set(playerIdx, maskBuffer);
-			}
+			for (int i = 0; i < gs.players.size(); i++)
+				state.actionMasks.Set(playerStartIdx + i, actionParsers[arenaIdx]->GetActionMask(gs.players[i], gs));
 		}
 	};
 
@@ -304,8 +257,9 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 void RLGC::EnvSet::ResetArena(int index) {
 	stateSetters[index]->ResetArena(arenas[index]);
 	GameState newState = GameState(arenas[index]);
-	newState.userInfo = userInfos[index];
 	state.gameStates[index] = newState;
+
+	newState.userInfo = userInfos[index];
 
 	// Update event tracker
 	if (eventTrackers[index])
@@ -317,28 +271,17 @@ void RLGC::EnvSet::ResetArena(int index) {
 		cond->Reset(newState);
 	for (auto& weightedReward : rewards[index])
 		weightedReward.reward->Reset(newState);
-	for (auto& weightedReward : gcrlGatedRewards[index])
-		weightedReward.reward->Reset(newState);
-	for (auto& weightedReward : curriculumRewards[index])
-		weightedReward.reward->Reset(newState);
-	for (auto& weightedReward : aerialGCRLGatedRewards[index])
-		weightedReward.reward->Reset(newState);
-	for (auto& weightedReward : aerialCurriculumRewards[index])
-		weightedReward.reward->Reset(newState);
 
 	int playerStartIdx = state.arenaPlayerStartIdx[index];
 	for (int i = 0; i < newState.players.size(); i++) {
-		int playerIdx = playerStartIdx + i;
 
 		// Update obs
-		auto& obsBuffer = obsBuildBuffers[playerIdx];
-		obsBuilders[index]->BuildObsInto(obsBuffer, newState.players[i], newState);
-		state.obs.Set(playerIdx, obsBuffer);
+		auto obs = obsBuilders[index]->BuildObs(newState.players[i], newState);
+		state.obs.Set(playerStartIdx + i, obs);
 
 		// Update action mask
-		auto& maskBuffer = actionMaskBuildBuffers[playerIdx];
-		actionParsers[index]->GetActionMaskInto(maskBuffer, newState.players[i], newState);
-		state.actionMasks.Set(playerIdx, maskBuffer);
+		auto actionMask = actionParsers[index]->GetActionMask(newState.players[i], newState);
+		state.actionMasks.Set(playerStartIdx + i, actionMask);
 	}
 
 	// Remove previous state

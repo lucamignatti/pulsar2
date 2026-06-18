@@ -8,8 +8,6 @@ namespace RLGC {
 	// TODO: Only designed for discrete actions currently 
 	class ActionParser {
 	public:
-		virtual ~ActionParser() = default;
-
 		virtual Action ParseAction(int actionIdx, const Player& player, const GameState& state) = 0;
 		virtual int GetActionAmount() = 0;
 
@@ -17,10 +15,6 @@ namespace RLGC {
 		// Not using std::vector<bool> because it has major issues (see https://isocpp.org/blog/2012/11/on-vectorbool)
 		virtual std::vector<uint8_t> GetActionMask(const Player& player, const GameState& state) {
 			return std::vector<uint8_t>(GetActionAmount(), true);
-		}
-
-		virtual void GetActionMaskInto(std::vector<uint8_t>& output, const Player& player, const GameState& state) {
-			output = GetActionMask(player, state);
 		}
 	};
 }

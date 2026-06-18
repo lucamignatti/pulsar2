@@ -32,20 +32,18 @@ namespace GGL {
 			gradMag = sqrtf(gradMag);
 
 			// Normalize the gradients by dividing them by the update magnitude
-			if (gradMag > 0) {
-				for (auto& group : this->param_groups()) {
-					for (auto& param : group.params()) {
-						if (!param.grad().defined())
-							continue;
+			for (auto& group : this->param_groups()) {
+				for (auto& param : group.params()) {
+					if (!param.grad().defined())
+						continue;
 
-						auto& gradSlice = param.mutable_grad();
-						gradSlice /= gradMag;
-					}
+					auto& gradSlice = param.mutable_grad();
+					gradSlice /= gradMag;
 				}
 			}
 
-			// Let SGD do the step with our new gradients (no closure — it was already evaluated above)
-			return SGD::step();
+			// Let SGD do the step with our new gradients
+			return SGD::step(closure);
 		}
 	};
 }

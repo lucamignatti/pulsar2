@@ -10,9 +10,7 @@
 #include <torch/optim/adagrad.h>
 #include <torch/optim/rmsprop.h>
 #include <torch/optim/sgd.h>
-#include <torch/cuda.h>
 
-#include "Muon.h"
 #include "MagSGD.h"
 
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
@@ -49,8 +47,6 @@ namespace GGL {
 			return new torch::optim::Adagrad(parameters, lr);
 		case ModelOptimType::RMSPROP:
 			return new torch::optim::RMSprop(parameters, lr);
-		case ModelOptimType::MUON:
-			return new Muon(parameters, MuonOptions(lr));
 		case ModelOptimType::MAGSGD:
 			return new MagSGD(parameters, lr);
 		}
@@ -74,9 +70,6 @@ namespace GGL {
 			case ModelOptimType::RMSPROP:
 				static_cast<torch::optim::RMSpropOptions&>(group.options()).lr(lr);
 				break;
-			case ModelOptimType::MUON:
-				static_cast<MuonOptions&>(group.options()).lr(lr);
-				break;
 			case ModelOptimType::MAGSGD:
 				static_cast<MagSGDOptions&>(group.options()).lr(lr);
 				break;
@@ -88,35 +81,6 @@ namespace GGL {
 
 	//////////////////////////
 
-	// Drop-in LayerNorm composed from primitive ops, so autograd derives the backward from
-	// simple, well-tested kernels. The fused native_layer_norm_backward was the prime
-	// suspect for ROCm's recurring non-finite policy/critic gradients: losses were finite,
-	// every input was clamped, and the LayerNorm-free GCRL towers never produced a single
-	// bad gradient while the LN-bearing policy/critic did constantly.
-	// Parameter names/order/shapes match torch::nn::LayerNorm, so checkpoints interchange.
-	struct ManualLayerNormImpl : torch::nn::Cloneable<ManualLayerNormImpl> {
-		int64_t size;
-		double eps;
-		torch::Tensor weight, bias;
-
-		ManualLayerNormImpl(int64_t size = 1, double eps = 1e-5) : size(size), eps(eps) {
-			reset();
-		}
-
-		void reset() override {
-			weight = register_parameter("weight", torch::ones({ size }));
-			bias = register_parameter("bias", torch::zeros({ size }));
-		}
-
-		torch::Tensor forward(torch::Tensor x) {
-			auto mean = x.mean(-1, true);
-			auto centered = x - mean;
-			auto var = centered.square().mean(-1, true);
-			return centered / (var + eps).sqrt() * weight + bias;
-		}
-	};
-	TORCH_MODULE(ManualLayerNorm);
-
 	class Model : public torch::nn::Module {
 	public:
 		const char* modelName;
@@ -125,10 +89,7 @@ namespace GGL {
 		bool _seqHalfOutdated = true;
 		ModelConfig config;
 
-		torch::optim::Optimizer* optim = nullptr;
-
-		// Optimizer steps skipped due to non-finite gradients (per model, see StepOptim)
-		uint64_t nanGradSkips = 0;
+		torch::optim::Optimizer* optim;
 
 		Model() : config(PartialModelConfig{}), device({}), modelName(NULL) {} // Uninitialized init
 
@@ -177,9 +138,7 @@ namespace GGL {
 			auto fromParams = this->parameters();
 			auto toParams = clone->parameters();
 			for (int i = 0; i < fromParams.size(); i++)
-				toParams[i].copy_(fromParams[i], false);
-			if (device.is_cuda())
-				torch::cuda::synchronize(device.index());
+				toParams[i].copy_(fromParams[i], true);
 			return clone;
 		}
 
@@ -194,85 +153,20 @@ namespace GGL {
 			return total;
 		}
 
-		// MakeOptimizer() new's the optimizer; the optimizer also holds copies of this
-		// model's parameter tensor handles, so a leaked optim pins the model's full weight
-		// storage alive even after the modules are destroyed. Cloned models (policy versions,
-		// the optionality target nets) are deleted via ModelSet::Free()/delete every version
-		// rotation, so failing to free optim here leaked a full model's worth of weights on
-		// every prune -- unbounded growth over a training run.
-		virtual ~Model() { delete optim; }
-	};
-
-	// ── Quasimetric GCRL critic ──────────────────────────────────────────────
-	// L2-normalized phi(state-features, action) and psi(goal) embeddings, scored by
-	// cosine similarity / tau. Trained with a symmetric InfoNCE contrastive loss over
-	// hindsight-relabeled future goals. Three of these (goal/anti/car) produce the
-	// "game sense" advantage that is blended into the policy gradient alongside the
-	// reward-driven GAE advantage. This is a port of the Python QCritic architecture.
-	class QuasimetricCritic : public Model {
-	public:
-		torch::nn::Sequential phi_net, psi_net;
-		float tau;
-		float var_reg;
-		float infonce_penalty;
-		int action_dim;
-		int repr_dim;
-
-		// hiddenSizes defines the phi/psi tower hidden layers; the output is always repr_dim
-		// (phi and psi MUST share it for the cosine metric to be valid). obs_dim/action_dim/
-		// goal_dim are structural (shared-head width / Action::ELEM_AMOUNT / ball pos+vel).
-		QuasimetricCritic(
-			const char* modelName,
-			int obs_dim, int action_dim, int goal_dim,
-			const std::vector<int>& hiddenSizes, int repr_dim,
-			ModelActivationType activation, bool addLayerNorm,
-			float tau, float var_reg, float infonce_penalty,
-			ModelOptimType optimType,
-			torch::Device device
-		);
-
-		// Single-tower embeddings (both L2-normalized). Split out so batched inference
-		// passes (gate scoring, HER candidate scoring, frontier consistency, optionality)
-		// can run one tower without paying for the other; embed() composes them.
-		torch::Tensor embed_phi(torch::Tensor obs, torch::Tensor actions);
-		torch::Tensor embed_psi(torch::Tensor goals);
-		std::pair<torch::Tensor, torch::Tensor> embed(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
-		torch::Tensor forward(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
-		torch::Tensor score_q(torch::Tensor obs, torch::Tensor actions, torch::Tensor goals);
-		// outRaw/outReg1/outReg2 optionally receive the detached loss components
-		// (contrastive term, logsumexp penalty, variance regularizer) for reporting.
-		torch::Tensor infonce_loss(
-			torch::Tensor obs, torch::Tensor actions, torch::Tensor goals,
-			float tau_override = -1,
-			torch::Tensor sampleWeights = {},
-			torch::Tensor* outRaw = nullptr, torch::Tensor* outReg1 = nullptr, torch::Tensor* outReg2 = nullptr
-		);
-
-		virtual void Save(std::filesystem::path folder, bool saveOptim = true) override;
-		virtual void Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim = true) override;
-	};
-
-	class SORSRewardModel : public Model {
-	public:
-		int obs_dim, action_dim;
-
-		SORSRewardModel(
-			const char* modelName,
-			int obs_dim, int action_dim,
-			PartialModelConfig config,
-			torch::Device device
-		);
-
-		torch::Tensor Forward(torch::Tensor obs, torch::Tensor actions, bool halfPrec = false);
+		virtual ~Model() = default;
 	};
 
 	class ModelSet {
 	public:
 		std::map<std::string, Model*> map = {};
 
-		Model* operator[](const std::string& name) {
+		Model* operator[](const std::string& name) { 
 			auto itr = map.find(name);
-			return (itr != map.end()) ? itr->second : nullptr;
+			if (itr == map.end()) {
+				return NULL;
+			} else {
+				return map[name];
+			}
 		};
 
 		void Add(Model* model) {
@@ -296,7 +190,7 @@ namespace GGL {
 				model->Load(folder, allowNotExist, loadOptims);
 		}
 
-		class ModelIterator : public std::iterator<std::forward_iterator_tag, Model*> {
+		class ModelIterator : public std::iterator<std::forward_iterator_tag, typename Model*> {
 		public:
 			using MapItr = std::map<std::string, Model*>::iterator;
 			MapItr _mapItr;
@@ -308,7 +202,7 @@ namespace GGL {
 			bool operator==(const ModelIterator& other) const { return _mapItr == other._mapItr; }
 			bool operator!=(const ModelIterator& other) const { return _mapItr != other._mapItr; }
 
-			Model*& operator*() const { return _mapItr->second; }
+			typename Model*& operator*() const { return _mapItr->second; }
 		};
 
 		ModelIterator begin() {
@@ -324,35 +218,6 @@ namespace GGL {
 			for (Model*& model : clone)
 				model = model->MakeClone();
 			return clone;
-		}
-
-		// Copy weights from src into this set's matching models (by name). Both sets must have the same models.
-		void CopyParamsFrom(const ModelSet& src) {
-			RG_NO_GRAD;
-			bool anyCuda = false;
-			c10::DeviceIndex deviceIndex = 0;
-			for (Model* dst : *this) {
-				auto it = src.map.find(dst->modelName);
-				RG_ASSERT(it != src.map.end());
-				Model* srcModel = it->second;
-				RG_ASSERT(srcModel);
-				auto srcParams = srcModel->parameters();
-				auto dstParams = dst->parameters();
-				RG_ASSERT(srcParams.size() == dstParams.size());
-				for (int i = 0; i < (int)srcParams.size(); i++)
-					dstParams[i].copy_(srcParams[i], false);
-				dst->_seqHalfOutdated = true;
-				if (dst->device.is_cuda()) {
-					anyCuda = true;
-					deviceIndex = dst->device.index();
-				}
-			}
-			// Single device sync after all copies (was once per model -> several redundant
-			// full-device syncs per iteration). The copies are enqueued on the calling
-			// (main) thread's stream; one sync guarantees they all complete before the
-			// collector reads the updated weights on its own stream.
-			if (anyCuda)
-				torch::cuda::synchronize(deviceIndex);
 		}
 
 		void Free() {
