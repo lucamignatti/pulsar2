@@ -1,0 +1,3 @@
+[2026-06-14 22:51:11] launch #1: /bin/sh -c echo dry-run-ok
+dry-run-ok
+[2026-06-14 22:51:11] clean exit after 0s, not restarting
