@@ -12,3 +12,8 @@ add_library(RocketSim ${FILES_ROCKETSIM} ${FILES_BULLET})
 
 set_target_properties(RocketSim PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(RocketSim PROPERTIES CXX_STANDARD 20)
+
+if(NOT MSVC)
+    # -ffast-math omitted: Bullet3 may rely on IEEE NaN/Inf semantics in contact detection.
+    target_compile_options(RocketSim PRIVATE -march=native -funroll-loops)
+endif()
