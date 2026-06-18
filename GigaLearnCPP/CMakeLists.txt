@@ -3,7 +3,6 @@ cmake_minimum_required (VERSION 3.8)
 project("GigaLearnCPP")
 
 include_directories("${PROJECT_SOURCE_DIR}/src/")
-option(USE_ROCM "Build against ROCm/HIP LibTorch while using Torch's CUDA-facing C++ API" OFF)
 
 # Make sure CMake finds libtorch if its in this directory
 if (EXISTS "${PROJECT_SOURCE_DIR}/libtorch/")
@@ -28,19 +27,19 @@ target_include_directories(GigaLearnCPP PRIVATE "src/private")
 # Include libtorch
 target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
-if (TORCH_CUDA_LIBRARIES OR USE_ROCM)
-	if (USE_ROCM)
-		message("Enabling ROCm/HIP support through Torch CUDA API...")
-		target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT -DUSE_ROCM)
-	else()
-		message("Enabling CUDA support...")
-		target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
-	endif()
+if (NOT APPLE)
+	message("Enabling CUDA support...")
+	target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
 endif()
 
 # Set C++ version to 20
 set_target_properties(GigaLearnCPP PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnCPP PROPERTIES CXX_STANDARD 20)
+
+if(NOT MSVC)
+    # -fno-finite-math-only restores correct NaN/Inf semantics for nlohmann/json (serialises float infinity).
+    target_compile_options(GigaLearnCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+endif()
 
 # Include RLGymCPP
 add_subdirectory(RLGymCPP)
