@@ -140,8 +140,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = false; // Send metrics
-	cfg.renderMode = true; // Don't render
+	cfg.sendMetrics = true; // Send metrics
+	cfg.renderMode = false; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
 
 	cfg.skillTracker.enabled = true;
