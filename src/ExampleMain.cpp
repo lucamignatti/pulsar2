@@ -7,8 +7,6 @@
 #include <RLGymCPP/ObsBuilders/DefaultObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
-#include <RLGymCPP/StateSetters/RandomState.h>
-#include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
@@ -36,12 +34,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	result.stateSetter = new CombinedState({
-		{ new KickoffState(), 0.10f },
-		{ new RandomState(true, false, true), 0.40f },
-		{ new RandomState(true, true, true), 0.20f },
-		{ new RandomState(true, true, false), 0.30f }
-	});
+	result.stateSetter = new KickoffState();
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 

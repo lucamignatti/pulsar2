@@ -386,10 +386,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
 			auto batchAdvantages = batch.advantages;
+			int64_t actualBatchSize = batchObs.size(0);
 
-			auto fnRunMinibatch = [&](int start, int stop) {
+			auto fnRunMinibatch = [&](int64_t start, int64_t stop) {
 
-				float batchSizeRatio = (stop - start) / (float)config.batchSize;
+				float batchSizeRatio = (stop - start) / (float)actualBatchSize;
 
 				// Send everything to the device and enforce correct shapes
 				auto acts = batchActs.slice(0, start, stop).to(device, true, true);
@@ -485,11 +486,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			
 			if (device.is_cpu()) {
 				// Just run one minibatch
-				fnRunMinibatch(0, config.batchSize);
+				fnRunMinibatch(0, actualBatchSize);
 			} else {
-				for (int mbs = 0; mbs < config.batchSize; mbs += config.miniBatchSize) {
-					int start = mbs;
-					int stop = start + config.miniBatchSize;
+				for (int64_t mbs = 0; mbs < actualBatchSize; mbs += config.miniBatchSize) {
+					int64_t start = mbs;
+					int64_t stop = std::min<int64_t>(start + config.miniBatchSize, actualBatchSize);
 					fnRunMinibatch(start, stop);
 				}
 			}
