@@ -256,9 +256,8 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 void RLGC::EnvSet::ResetArena(int index) {
 	stateSetters[index]->ResetArena(arenas[index]);
 	GameState newState = GameState(arenas[index]);
-	state.gameStates[index] = newState;
-
 	newState.userInfo = userInfos[index];
+	state.gameStates[index] = newState;
 
 	// Update event tracker
 	if (eventTrackers[index])
