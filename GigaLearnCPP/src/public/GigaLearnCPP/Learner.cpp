@@ -24,7 +24,6 @@
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 #include <RLGymCPP/CommonValues.h>
 #include <RLGymCPP/Gamestates/StateUtil.h>
-#include <RLGymCPP/Util/CrashDebug.h>
 
 using namespace RLGC;
 
@@ -544,17 +543,6 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 void GGL::Learner::Start() {
 
 	bool render = config.renderMode;
-	RG_CRASH_LOG(
-		"Learner::Start begin render=" << render <<
-		" totalTimesteps=" << totalTimesteps <<
-		" totalIterations=" << totalIterations <<
-		" obsSize=" << obsSize <<
-		" numActions=" << numActions <<
-		" tsPerItr=" << config.ppo.tsPerItr <<
-		" miniBatchSize=" << config.ppo.miniBatchSize <<
-		" deterministic=" << config.ppo.deterministic <<
-		" contrastiveGoal=" << config.ppo.contrastiveGoal.enabled
-	);
 
 	RG_LOG("Learner::Start():");
 	RG_LOG("\tObs size: " << obsSize);
@@ -620,11 +608,6 @@ void GGL::Learner::Start() {
 			Report report = {};
 
 			bool isFirstIteration = (totalTimesteps == 0);
-			RG_CRASH_LOG(
-				"Learner iteration begin totalIterations=" << totalIterations <<
-				" totalTimesteps=" << totalTimesteps <<
-				" isFirstIteration=" << isFirstIteration
-			);
 
 			// TODO: Old version switching messes up the gameplay potentially
 			GGL::PolicyVersion* oldVersion = NULL;
@@ -636,7 +619,6 @@ void GGL::Learner::Start() {
 				newPlayerIndices.push_back(i);
 
 			if (config.trainAgainstOldVersions) {
-				RG_CRASH_LOG("Learner old-version selection begin versions=" << (versionMgr ? versionMgr->versions.size() : 0));
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
 				bool shouldTrainAgainstOld =
 					(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
@@ -670,15 +652,9 @@ void GGL::Learner::Start() {
 					tNewPlayerIndices = torch::tensor(newPlayerIndices);
 					tOldPlayerIndices = torch::tensor(oldPlayerIndices);
 				}
-				RG_CRASH_LOG(
-					"Learner old-version selection end oldVersion=" << (oldVersion != NULL) <<
-					" newPlayers=" << newPlayerIndices.size() <<
-					" oldPlayers=" << oldPlayerIndices.size()
-				);
 			}
 
 			int numRealPlayers = oldVersion ? newPlayerIndices.size() : envSet->state.numPlayers;
-			RG_CRASH_LOG("Learner numRealPlayers=" << numRealPlayers << " envPlayers=" << envSet->state.numPlayers);
 
 			int stepsCollected = 0;
 			{ // Generate experience
@@ -694,27 +670,16 @@ void GGL::Learner::Start() {
 					float envStepTime = 0;
 
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
-						RG_CRASH_LOG(
-							"Collect step begin iter=" << totalIterations <<
-							" step=" << step <<
-							" combinedLen=" << combinedTraj.Length() <<
-							" stepsCollected=" << stepsCollected
-						);
 						Timer stepTimer = {};
-						RG_CRASH_LOG("Collect reset begin step=" << step);
 						envSet->Reset();
-						RG_CRASH_LOG("Collect reset end step=" << step);
 						envStepTime += stepTimer.Elapsed();
 
-						RG_CRASH_LOG("Collect obs finite check begin step=" << step << " obsVals=" << envSet->state.obs.data.size());
 						for (float f : envSet->state.obs.data)
 							if (isnan(f) || isinf(f))
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
-						RG_CRASH_LOG("Collect obs finite check end step=" << step);
 
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too
-							RG_CRASH_LOG("Collect obs stat begin step=" << step);
 							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 							for (int i = 0; i < numSamples; i++) {
 								int idx = Math::RandInt(0, envSet->state.numPlayers);
@@ -733,17 +698,13 @@ void GGL::Learner::Start() {
 									obsVal = (obsVal - mean[j]) / std[j];
 								}
 							}
-							RG_CRASH_LOG("Collect obs stat end step=" << step << " samples=" << numSamples);
 						}
 
 						torch::Tensor tActions, tLogProbs, tActionProbs;
-						RG_CRASH_LOG("Collect tensorize obs/masks begin step=" << step);
 						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
-						RG_CRASH_LOG("Collect tensorize obs/masks end step=" << step << " statesN=" << tStates.size(0) << " masksN=" << tActionMasks.size(0));
 
 						if (!render) {
-							RG_CRASH_LOG("Collect append pre-action trajectory begin step=" << step << " newPlayers=" << newPlayerIndices.size());
 							for (int newPlayerIdx : newPlayerIndices) {
 								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
 								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
@@ -759,15 +720,11 @@ void GGL::Learner::Start() {
 									trajectories[newPlayerIdx].segmentSteps.push_back(curSegmentSteps[newPlayerIdx]);
 								}
 							}
-							RG_CRASH_LOG("Collect append pre-action trajectory end step=" << step);
 						}
 
-						RG_CRASH_LOG("Collect StepFirstHalf call begin step=" << step);
 						envSet->StepFirstHalf(true);
-						RG_CRASH_LOG("Collect StepFirstHalf call returned step=" << step);
 
 						Timer inferTimer = {};
-						RG_CRASH_LOG("Collect inference begin step=" << step << " oldVersion=" << (oldVersion != NULL));
 
 						if (oldVersion) {
 							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
@@ -792,10 +749,8 @@ void GGL::Learner::Start() {
 							tActions = tActions.cpu();
 							tActionProbs = tActionProbs.cpu();
 						}
-						RG_CRASH_LOG("Collect inference end step=" << step << " actionsDefined=" << tActions.defined());
 						inferTime += inferTimer.Elapsed();
 
-						RG_CRASH_LOG("Collect actions to vector begin step=" << step);
 						auto curActions = TENSOR_TO_VEC<int>(tActions);
 						FList newLogProbs;
 						if (tLogProbs.defined() && !render)
@@ -804,20 +759,11 @@ void GGL::Learner::Start() {
 						FList newActionProbs;
 						if (tActionProbs.defined() && !render && config.ppo.contrastiveGoal.enabled)
 							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs.flatten());
-						RG_CRASH_LOG(
-							"Collect actions to vector end step=" << step <<
-							" curActions=" << curActions.size() <<
-							" logProbs=" << newLogProbs.size() <<
-							" actionProbs=" << newActionProbs.size()
-						);
 
 						stepTimer.Reset();
-						RG_CRASH_LOG("Collect sync begin step=" << step);
 						envSet->Sync(); // Make sure the first half is done
-						RG_CRASH_LOG("Collect sync end step=" << step);
 
 						if (!render && config.ppo.contrastiveGoal.enabled) {
-							RG_CRASH_LOG("Collect CRL action data begin step=" << step);
 							size_t expectedActionProbs = (size_t)newPlayerIndices.size() * numActions;
 							if (newActionProbs.size() != expectedActionProbs)
 								RG_ERR_CLOSE(
@@ -836,12 +782,6 @@ void GGL::Learner::Start() {
 								if (newPlayerIdx < 0 || newPlayerIdx >= numPlayers)
 									RG_ERR_CLOSE("Contrastive scoring auxiliary newPlayerIdx out of range: " << newPlayerIdx << "/" << numPlayers);
 
-								RG_CRASH_LOG(
-									"Collect CRL action data player begin step=" << step <<
-									" packedPlayer=" << i <<
-									" flatPlayer=" << newPlayerIdx <<
-									" action=" << curActions[newPlayerIdx]
-								);
 								for (int actionIdx = 0; actionIdx < numActions; actionIdx++)
 									trajectories[newPlayerIdx].oldActionProbs += newActionProbs[i * numActions + actionIdx];
 
@@ -856,36 +796,23 @@ void GGL::Learner::Start() {
 										" actionCount=" << defaultAction->actions.size()
 									);
 								AppendActionControl(trajectories[newPlayerIdx].actionControls, defaultAction->actions[curActions[newPlayerIdx]]);
-								RG_CRASH_LOG(
-									"Collect CRL action data player end step=" << step <<
-									" packedPlayer=" << i <<
-									" flatPlayer=" << newPlayerIdx
-								);
 								i++;
 							}
-							RG_CRASH_LOG("Collect CRL action data end step=" << step);
 						}
 
-						RG_CRASH_LOG("Collect StepSecondHalf begin step=" << step);
 						envSet->StepSecondHalf(curActions, false);
-						RG_CRASH_LOG("Collect StepSecondHalf end step=" << step);
 						envStepTime += stepTimer.Elapsed();
 
-						RG_CRASH_LOG("Collect stepCallback begin step=" << step);
 						if (stepCallback)
 							stepCallback(this, envSet->state.gameStates, report);
-						RG_CRASH_LOG("Collect stepCallback end step=" << step);
 
 						if (render) {
-							RG_CRASH_LOG("Collect render send begin step=" << step);
 							renderSender->Send(envSet->state.gameStates[0]);
-							RG_CRASH_LOG("Collect render send end step=" << step);
 							continue;
 						}
 
 						// Calc average rewards
 						if (config.addRewardsToMetrics && (Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
-							RG_CRASH_LOG("Collect reward metrics begin step=" << step);
 							int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
 							std::unordered_map<std::string, AvgTracker> avgRewards = {};
 							for (int i = 0; i < numSamples; i++) {
@@ -900,11 +827,9 @@ void GGL::Learner::Start() {
 
 							for (auto& pair : avgRewards)
 								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
-							RG_CRASH_LOG("Collect reward metrics end step=" << step << " samples=" << numSamples);
 						}
 
 						// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
-						RG_CRASH_LOG("Collect append post-step trajectory begin step=" << step);
 						int i = 0;
 						for (int newPlayerIdx : newPlayerIndices) {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
@@ -920,9 +845,7 @@ void GGL::Learner::Start() {
 							}
 							i++;
 						}
-						RG_CRASH_LOG("Collect append post-step trajectory end step=" << step);
 
-						RG_CRASH_LOG("Collect terminals build begin step=" << step);
 						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
 							uint8_t terminalType = envSet->state.terminals[idx];
@@ -934,9 +857,7 @@ void GGL::Learner::Start() {
 							for (int i = 0; i < playersInArena; i++)
 								curTerminals[playerStartIdx + i] = terminalType;
 						}
-						RG_CRASH_LOG("Collect terminals build end step=" << step);
 
-						RG_CRASH_LOG("Collect terminal trajectory handling begin step=" << step);
 						for (int newPlayerIdx : newPlayerIndices) {
 							int8_t terminalType = curTerminals[newPlayerIdx];
 							auto& traj = trajectories[newPlayerIdx];
@@ -963,28 +884,18 @@ void GGL::Learner::Start() {
 								curSegmentSteps[newPlayerIdx]++;
 							}
 						}
-						RG_CRASH_LOG("Collect terminal trajectory handling end step=" << step << " combinedLen=" << combinedTraj.Length());
-						RG_CRASH_LOG(
-							"Collect step end iter=" << totalIterations <<
-							" step=" << step <<
-							" combinedLen=" << combinedTraj.Length() <<
-							" stepsCollectedNext=" << (stepsCollected + numRealPlayers)
-						);
 					}
 
 					report["Inference Time"] = inferTime;
 					report["Env Step Time"] = envStepTime;
 				}
 				float collectionTime = collectionTimer.Elapsed();
-				RG_CRASH_LOG("Collection finished combinedLen=" << combinedTraj.Length() << " stepsCollected=" << stepsCollected << " collectionTime=" << collectionTime);
 
 				Timer consumptionTimer = {};
 				{ // Process timesteps
 					RG_NO_GRAD;
-					RG_CRASH_LOG("Process timesteps begin length=" << combinedTraj.Length());
 
 					// Make and transpose tensors
-					RG_CRASH_LOG("Process tensor build begin");
 					torch::Tensor tStates = torch::tensor(combinedTraj.states).reshape({ -1, obsSize });
 					torch::Tensor tActionMasks = torch::tensor(combinedTraj.actionMasks).reshape({ -1, numActions });
 					torch::Tensor tActions = torch::tensor(combinedTraj.actions);
@@ -1000,20 +911,17 @@ void GGL::Learner::Start() {
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
 					}
-					RG_CRASH_LOG("Process tensor build end states=" << tStates.size(0) << " actions=" << tActions.size(0) << " rewards=" << tRewards.size(0));
 
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
 					if (!combinedTraj.nextStates.empty())
 						tNextTruncStates = torch::tensor(combinedTraj.nextStates).reshape({ -1, obsSize });
-					RG_CRASH_LOG("Process trunc tensor done defined=" << tNextTruncStates.defined());
 
 					report["Average Step Reward"] = tRewards.mean().item<float>();
 					report["Collected Timesteps"] = stepsCollected;
 					
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
-					RG_CRASH_LOG("Value inference begin deviceIsCPU=" << ppo->device.is_cpu());
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
@@ -1041,7 +949,6 @@ void GGL::Learner::Start() {
 							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
 						}
 					}
-					RG_CRASH_LOG("Value inference end valPreds=" << tValPreds.size(0));
 
 					report["Episode Length"] = 1.f / (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
 
@@ -1049,13 +956,11 @@ void GGL::Learner::Start() {
 					// Run GAE
 					torch::Tensor tAdvantages, tTargetVals, tReturns;
 					float rewClipPortion;
-					RG_CRASH_LOG("GAE begin rewards=" << tRewards.size(0) << " terminals=" << tTerminals.size(0));
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
 						tAdvantages, tTargetVals, tReturns, rewClipPortion,
 						config.ppo.gaeGamma, config.ppo.gaeLambda, returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange
 					);
-					RG_CRASH_LOG("GAE end advantages=" << tAdvantages.size(0) << " returns=" << tReturns.size(0));
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
 
@@ -1079,7 +984,6 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
-					RG_CRASH_LOG("Experience assigned base tensors");
 					if (config.ppo.contrastiveGoal.enabled) {
 						experience.data.oldActionProbs = tOldActionProbs;
 						experience.data.commandedGoals = tCommandedGoals;
@@ -1088,23 +992,17 @@ void GGL::Learner::Start() {
 						experience.data.segmentIds = tSegmentIds;
 						experience.data.segmentSteps = tSegmentSteps;
 					}
-					RG_CRASH_LOG("Experience assigned optional tensors");
 				}
 
 				// Free CUDA cache
 #ifdef RG_CUDA_SUPPORT
-				if (ppo->device.is_cuda()) {
-					RG_CRASH_LOG("CUDA emptyCache begin");
+				if (ppo->device.is_cuda())
 					c10::cuda::CUDACachingAllocator::emptyCache();
-					RG_CRASH_LOG("CUDA emptyCache end");
-				}
 #endif
 
 				// Learn
 				Timer learnTimer = {};
-				RG_CRASH_LOG("PPO Learn begin");
 				ppo->Learn(experience, report, isFirstIteration, totalTimesteps);
-				RG_CRASH_LOG("PPO Learn end");
 				report["PPO Learn Time"] = learnTimer.Elapsed();
 
 				// Set metrics
@@ -1120,11 +1018,9 @@ void GGL::Learner::Start() {
 				report["Total Timesteps"] = totalTimesteps;
 				totalIterations++;
 				report["Total Iterations"] = totalIterations;
-				RG_CRASH_LOG("Learner iteration counters updated totalIterations=" << totalIterations << " totalTimesteps=" << totalTimesteps);
 
 				if (versionMgr)
 					versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
-				RG_CRASH_LOG("Version manager iteration done");
 
 				if (saveQueued) {
 					if (!config.checkpointFolder.empty())
@@ -1140,11 +1036,9 @@ void GGL::Learner::Start() {
 				}
 
 				report.Finish();
-				RG_CRASH_LOG("Report finish done");
 
 				if (metricSender)
 					metricSender->Send(report);
-				RG_CRASH_LOG("Metric send done");
 
 				report.Display(
 					{
@@ -1173,7 +1067,6 @@ void GGL::Learner::Start() {
 						"Total Iterations"
 					}
 				);
-				RG_CRASH_LOG("Learner iteration end totalIterations=" << totalIterations << " totalTimesteps=" << totalTimesteps);
 			}
 		}
 		

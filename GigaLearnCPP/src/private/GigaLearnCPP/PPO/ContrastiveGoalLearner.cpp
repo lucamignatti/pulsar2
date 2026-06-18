@@ -189,13 +189,13 @@ namespace GGL {
 					positiveIndices[i] = samples[start + i].positiveIdx;
 				}
 
-				Tensor tAnchorIndices = torch::tensor(anchorIndices, TensorOptions().dtype(kLong).device(data.states.device()));
-				Tensor tPositiveIndices = torch::tensor(positiveIndices, TensorOptions().dtype(kLong).device(data.states.device()));
+				Tensor tAnchorIndices = torch::tensor(anchorIndices, TensorOptions().dtype(kLong));
+				Tensor tPositiveIndices = torch::tensor(positiveIndices, TensorOptions().dtype(kLong));
 
-				Tensor states = data.states.index_select(0, tAnchorIndices);
-				Tensor actionControls = data.actionControls.index_select(0, tAnchorIndices);
-				Tensor positiveGoals = data.achievedGoals.index_select(0, tPositiveIndices);
-				Tensor anchorSegments = data.segmentIds.index_select(0, tAnchorIndices);
+				Tensor states = data.states.index_select(0, tAnchorIndices.to(data.states.device())).to(device);
+				Tensor actionControls = data.actionControls.index_select(0, tAnchorIndices.to(data.actionControls.device())).to(device);
+				Tensor positiveGoals = data.achievedGoals.index_select(0, tPositiveIndices.to(data.achievedGoals.device())).to(device);
+				Tensor anchorSegments = data.segmentIds.index_select(0, tAnchorIndices.to(data.segmentIds.device())).to(device);
 
 				Tensor sa = EncodeStateAction(states, actionControls);
 				Tensor g = EncodeGoal(positiveGoals);

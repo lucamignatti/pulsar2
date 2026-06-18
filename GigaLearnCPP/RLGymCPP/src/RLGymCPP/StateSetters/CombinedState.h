@@ -3,7 +3,6 @@
 #include "StateSetter.h"
 
 #include "../Math.h"
-#include "../Util/CrashDebug.h"
 
 namespace RLGC {
 	// Combine state setters with weights
@@ -34,13 +33,10 @@ namespace RLGC {
 
 		void ResetArena(Arena* arena) override {
 			float f = RocketSim::Math::RandFloat(0, totalWeight);
-			RG_CRASH_LOG("CombinedState::ResetArena begin arena=" << arena << " draw=" << f << " totalWeight=" << totalWeight);
 
 			for (int i = 0; i < setters.size(); i++) {
 				if (f <= cumulativeWeights[i]) {
-					RG_CRASH_LOG("CombinedState::ResetArena selected index=" << i << " setterPtr=" << setters[i]);
 					setters[i]->ResetArena(arena);
-					RG_CRASH_LOG("CombinedState::ResetArena end arena=" << arena << " index=" << i);
 					return;
 				}
 			}
