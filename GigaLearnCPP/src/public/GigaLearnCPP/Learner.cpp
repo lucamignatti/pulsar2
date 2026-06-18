@@ -803,7 +803,7 @@ void GGL::Learner::Start() {
 
 						FList newActionProbs;
 						if (tActionProbs.defined() && !render && config.ppo.contrastiveGoal.enabled)
-							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs);
+							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs.flatten());
 						RG_CRASH_LOG(
 							"Collect actions to vector end step=" << step <<
 							" curActions=" << curActions.size() <<
@@ -818,8 +818,30 @@ void GGL::Learner::Start() {
 
 						if (!render && config.ppo.contrastiveGoal.enabled) {
 							RG_CRASH_LOG("Collect CRL action data begin step=" << step);
+							size_t expectedActionProbs = (size_t)newPlayerIndices.size() * numActions;
+							if (newActionProbs.size() != expectedActionProbs)
+								RG_ERR_CLOSE(
+									"Contrastive scoring auxiliary action-prob size mismatch: got " <<
+									newActionProbs.size() << ", expected " << expectedActionProbs <<
+									" (" << newPlayerIndices.size() << " players * " << numActions << " actions)"
+								);
+							if (curActions.size() != (size_t)numPlayers)
+								RG_ERR_CLOSE(
+									"Contrastive scoring auxiliary action size mismatch: got " <<
+									curActions.size() << ", expected " << numPlayers
+								);
+
 							int i = 0;
 							for (int newPlayerIdx : newPlayerIndices) {
+								if (newPlayerIdx < 0 || newPlayerIdx >= numPlayers)
+									RG_ERR_CLOSE("Contrastive scoring auxiliary newPlayerIdx out of range: " << newPlayerIdx << "/" << numPlayers);
+
+								RG_CRASH_LOG(
+									"Collect CRL action data player begin step=" << step <<
+									" packedPlayer=" << i <<
+									" flatPlayer=" << newPlayerIdx <<
+									" action=" << curActions[newPlayerIdx]
+								);
 								for (int actionIdx = 0; actionIdx < numActions; actionIdx++)
 									trajectories[newPlayerIdx].oldActionProbs += newActionProbs[i * numActions + actionIdx];
 
@@ -827,7 +849,18 @@ void GGL::Learner::Start() {
 								DefaultAction* defaultAction = dynamic_cast<DefaultAction*>(envSet->actionParsers[arenaIdx]);
 								if (!defaultAction)
 									RG_ERR_CLOSE("Contrastive scoring auxiliary requires DefaultAction for every arena");
+								if (curActions[newPlayerIdx] < 0 || curActions[newPlayerIdx] >= defaultAction->actions.size())
+									RG_ERR_CLOSE(
+										"Contrastive scoring auxiliary action index out of range: player=" << newPlayerIdx <<
+										" action=" << curActions[newPlayerIdx] <<
+										" actionCount=" << defaultAction->actions.size()
+									);
 								AppendActionControl(trajectories[newPlayerIdx].actionControls, defaultAction->actions[curActions[newPlayerIdx]]);
+								RG_CRASH_LOG(
+									"Collect CRL action data player end step=" << step <<
+									" packedPlayer=" << i <<
+									" flatPlayer=" << newPlayerIdx
+								);
 								i++;
 							}
 							RG_CRASH_LOG("Collect CRL action data end step=" << step);
