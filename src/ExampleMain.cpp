@@ -139,7 +139,7 @@ int main(int argc, char* argv[]) {
 
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.lambdaStart = 0.f;
-	cfg.ppo.contrastiveGoal.lambda = 0.65f;
+	cfg.ppo.contrastiveGoal.lambda = 0.f;
 	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
