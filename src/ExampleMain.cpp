@@ -149,6 +149,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
+	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
 	cfg.ppo.contrastiveGoal.targetSpeed = 1500.f;
 	cfg.ppo.contrastiveGoal.targetSpeedJitter = 500.f;
 

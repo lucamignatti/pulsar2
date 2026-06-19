@@ -17,6 +17,7 @@ namespace GGL {
 		int representationSize = 64;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
+		int64_t policyScoreBatchSize = 4096;
 		float criticLR = 3e-4f;
 		float logsumexpPenaltyCoeff = 0.1f;
 

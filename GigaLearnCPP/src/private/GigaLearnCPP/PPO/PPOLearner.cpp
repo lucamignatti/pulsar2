@@ -170,6 +170,26 @@ static torch::Tensor OneHotActions(torch::Tensor actions, int64_t numActions) {
 	return result.scatter_(1, actions.unsqueeze(1), 1.f);
 }
 
+static torch::Tensor ScoreGCRLChunks(GGL::ContrastiveGoalLearner* learner, torch::Tensor states, torch::Tensor actions, torch::Tensor goals, int64_t numActions, int64_t chunkSize) {
+	std::vector<torch::Tensor> chunks;
+	int64_t n = states.size(0);
+	if (chunkSize <= 0)
+		chunkSize = n;
+
+	chunks.reserve((n + chunkSize - 1) / chunkSize);
+	for (int64_t start = 0; start < n; start += chunkSize) {
+		int64_t stop = RS_MIN(start + chunkSize, n);
+		torch::Tensor actionRepresentations = OneHotActions(actions.slice(0, start, stop), numActions);
+		chunks.push_back(learner->Score(
+			states.slice(0, start, stop),
+			actionRepresentations,
+			goals.slice(0, start, stop)
+		));
+	}
+
+	return torch::cat(chunks, 0);
+}
+
 static float GetAnnealedContrastiveLambda(const GGL::ContrastiveGoalConfig& cfg, uint64_t totalTimesteps) {
 	if (cfg.lambdaAnnealSteps == 0)
 		return cfg.lambda;
@@ -199,8 +219,14 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	torch::Tensor states = experience.data.states.to(device);
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
 	torch::Tensor commandedGoals = experience.data.commandedGoals.to(device);
-	torch::Tensor actionRepresentations = OneHotActions(actions, learner->numActions);
-	torch::Tensor gcrlScores = learner->contrastiveGoalLearner->Score(states, actionRepresentations, commandedGoals);
+	torch::Tensor gcrlScores = ScoreGCRLChunks(
+		learner->contrastiveGoalLearner,
+		states,
+		actions,
+		commandedGoals,
+		learner->numActions,
+		cfg.policyScoreBatchSize
+	);
 
 	experience.data.crlAdvantages = gcrlScores.detach().to(experience.data.advantages.device());
 
