@@ -19,6 +19,7 @@ namespace GGL {
 		float realizedMedium = 0;
 		float realizedLong = 0;
 		int64_t anchorsUsed = 0;
+		int64_t trainSamplesUsed = 0;
 	};
 
 	class ContrastiveGoalLearner {

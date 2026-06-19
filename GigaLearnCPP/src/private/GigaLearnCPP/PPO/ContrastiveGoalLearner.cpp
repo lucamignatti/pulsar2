@@ -1,6 +1,8 @@
 #include "ContrastiveGoalLearner.h"
 
 #include <torch/nn/modules/loss.h>
+#include <cmath>
+#include <unordered_set>
 
 using namespace torch;
 
@@ -9,8 +11,24 @@ namespace GGL {
 	struct PositiveSample {
 		int64_t anchorIdx;
 		int64_t positiveIdx;
+		int64_t segmentId;
+		int64_t goalKey;
 		int bucket;
 	};
+
+	static int64_t MakeGoalKey(const Tensor& achievedGoalsCPU, int64_t goalIdx, const ContrastiveGoalConfig& config) {
+		Tensor goal = achievedGoalsCPU[goalIdx];
+		auto accessor = goal.accessor<float, 1>();
+		float binSize = RS_MAX(config.nearGoalDistance, 1e-6f);
+
+		uint64_t hash = 1469598103934665603ull;
+		for (int i = 0; i < 6; i++) {
+			int64_t quantized = std::llround(accessor[i] / binSize);
+			hash ^= (uint64_t)quantized;
+			hash *= 1099511628211ull;
+		}
+		return (int64_t)hash;
+	}
 
 	static ModelConfig MakeEncoderConfig(int inputSize, int reprSize) {
 		ModelConfig result = PartialModelConfig{};
@@ -79,6 +97,7 @@ namespace GGL {
 
 	static std::vector<PositiveSample> BuildPositiveSamples(ExperienceTensors& data, const ContrastiveGoalConfig& config, std::default_random_engine& rng, ContrastiveGoalStats& stats) {
 		Tensor segmentIdsCPU = data.segmentIds.to(kCPU).to(kLong);
+		Tensor achievedGoalsCPU = data.achievedGoals.to(kCPU).to(kFloat);
 		int64_t n = segmentIdsCPU.size(0);
 		auto segmentAccessor = segmentIdsCPU.accessor<int64_t, 1>();
 
@@ -97,7 +116,8 @@ namespace GGL {
 				if (!TryPickBucketFuture(anchorPos, indices.size(), config, rng, futureOffset, bucket))
 					continue;
 
-				result.push_back({ indices[anchorPos], indices[anchorPos + futureOffset], bucket });
+				int64_t positiveIdx = indices[anchorPos + futureOffset];
+				result.push_back({ indices[anchorPos], positiveIdx, kv.first, MakeGoalKey(achievedGoalsCPU, positiveIdx, config), bucket });
 				switch (bucket) {
 				case 0: stats.realizedImmediate++; break;
 				case 1: stats.realizedShort++; break;
@@ -116,6 +136,28 @@ namespace GGL {
 		}
 
 		return result;
+	}
+
+	static std::vector<PositiveSample> TakeDiverseBatch(const std::vector<PositiveSample>& samples, int64_t& cursor, int64_t maxBatchSize) {
+		std::vector<PositiveSample> batch;
+		batch.reserve(maxBatchSize);
+
+		std::unordered_set<int64_t> usedSegments;
+		std::unordered_set<int64_t> usedGoals;
+		usedSegments.reserve(maxBatchSize);
+		usedGoals.reserve(maxBatchSize);
+
+		while (cursor < (int64_t)samples.size() && (int64_t)batch.size() < maxBatchSize) {
+			const PositiveSample& sample = samples[cursor++];
+			if (usedSegments.count(sample.segmentId) || usedGoals.count(sample.goalKey))
+				continue;
+
+			usedSegments.insert(sample.segmentId);
+			usedGoals.insert(sample.goalKey);
+			batch.push_back(sample);
+		}
+
+		return batch;
 	}
 
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionControlSize, const ContrastiveGoalConfig& config, torch::Device device) :
@@ -178,16 +220,19 @@ namespace GGL {
 		for (int epoch = 0; epoch < config.criticEpochs; epoch++) {
 			std::shuffle(samples.begin(), samples.end(), rng);
 
-			for (int64_t start = 0; start < (int64_t)samples.size(); start += miniBatchSize) {
-				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, samples.size() - start);
+			int64_t cursor = 0;
+			while (cursor < (int64_t)samples.size()) {
+				std::vector<PositiveSample> batchSamples = TakeDiverseBatch(samples, cursor, miniBatchSize);
+				int64_t curBatchSize = batchSamples.size();
 				if (curBatchSize <= 1)
 					continue;
 
 				std::vector<int64_t> anchorIndices(curBatchSize), positiveIndices(curBatchSize);
 				for (int64_t i = 0; i < curBatchSize; i++) {
-					anchorIndices[i] = samples[start + i].anchorIdx;
-					positiveIndices[i] = samples[start + i].positiveIdx;
+					anchorIndices[i] = batchSamples[i].anchorIdx;
+					positiveIndices[i] = batchSamples[i].positiveIdx;
 				}
+				stats.trainSamplesUsed += curBatchSize;
 
 				Tensor tAnchorIndices = torch::tensor(anchorIndices, TensorOptions().dtype(kLong));
 				Tensor tPositiveIndices = torch::tensor(positiveIndices, TensorOptions().dtype(kLong));

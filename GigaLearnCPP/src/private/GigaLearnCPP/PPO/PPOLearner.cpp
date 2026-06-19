@@ -219,6 +219,40 @@ static CommandSupportStats EstimateCommandSupport(torch::Tensor commandedGoals, 
 	return result;
 }
 
+static torch::Tensor ProjectGoalsToAchievedSupport(torch::Tensor commandedGoals, torch::Tensor achievedGoals, int64_t maxSamples, int64_t chunkSize, GGL::Report& report) {
+	RG_NO_GRAD;
+
+	int64_t n = commandedGoals.size(0);
+	int64_t supportCount = achievedGoals.size(0);
+	if (n == 0 || supportCount == 0 || maxSamples <= 0)
+		return commandedGoals;
+	if (chunkSize <= 0)
+		chunkSize = n;
+
+	int64_t sampleCount = RS_MIN(supportCount, maxSamples);
+	torch::Tensor supportIndices = torch::randperm(supportCount, torch::TensorOptions().dtype(torch::kLong).device(achievedGoals.device())).slice(0, 0, sampleCount);
+	torch::Tensor supportGoals = achievedGoals.index_select(0, supportIndices);
+
+	std::vector<torch::Tensor> chunks;
+	chunks.reserve((n + chunkSize - 1) / chunkSize);
+	double totalProjectionDistance = 0;
+
+	for (int64_t start = 0; start < n; start += chunkSize) {
+		int64_t stop = RS_MIN(start + chunkSize, n);
+		torch::Tensor cmdChunk = commandedGoals.slice(0, start, stop);
+		auto nearest = torch::cdist(cmdChunk, supportGoals, 2).min(1);
+		torch::Tensor nearestDistances = std::get<0>(nearest);
+		torch::Tensor nearestIndices = std::get<1>(nearest);
+
+		chunks.push_back(supportGoals.index_select(0, nearestIndices));
+		totalProjectionDistance += nearestDistances.sum().detach().cpu().item<float>();
+	}
+
+	report["Command Projection Distance"] = totalProjectionDistance / RS_MAX(n, (int64_t)1);
+	report["Command Projection Support Samples"] = sampleCount;
+	return torch::cat(chunks, 0);
+}
+
 void GGL::PPOLearner::SetDiscreteActionControls(torch::Tensor controls) {
 	discreteActionControls = controls.to(device).to(torch::kFloat32);
 	if (config.contrastiveGoal.enabled && (discreteActionControls.size(0) != numActions || discreteActionControls.size(1) != 8))
@@ -259,7 +293,22 @@ static void PrepareContrastivePolicyAdvantages(GGL::PPOLearner* learner, GGL::Ex
 	torch::Tensor commandedGoals = experience.data.commandedGoals.to(device);
 	torch::Tensor achievedGoals = experience.data.achievedGoals.to(device);
 
-	torch::Tensor qAll = GatherQChunks(learner->contrastiveGoalLearner, states, learner->discreteActionControls, commandedGoals, 4096);
+	CommandSupportStats support = EstimateCommandSupport(commandedGoals, achievedGoals, 2048);
+	float supportFraction = support.supportFraction;
+	report["Command Support Fraction"] = support.supportFraction;
+	report["Joint Support Distance to g_cmd"] = support.jointDistance;
+	report["Position Support Distance to g_cmd"] = support.positionDistance;
+	report["Velocity Support Distance to g_cmd"] = support.velocityDistance;
+
+	torch::Tensor scoringGoals = commandedGoals;
+	if (cfg.projectCommandToAchievedSupport) {
+		scoringGoals = ProjectGoalsToAchievedSupport(commandedGoals, achievedGoals, cfg.commandSupportSamples, cfg.commandProjectionChunkSize, report);
+		report["CRL Projected Command Goals"] = 1;
+	} else {
+		report["CRL Projected Command Goals"] = 0;
+	}
+
+	torch::Tensor qAll = GatherQChunks(learner->contrastiveGoalLearner, states, learner->discreteActionControls, scoringGoals, 4096);
 	torch::Tensor qExecuted = qAll.gather(1, actions.unsqueeze(1)).flatten();
 	torch::Tensor vCrl = (oldActionProbs * qAll).sum(1);
 	torch::Tensor aCrl = qExecuted - vCrl;
@@ -290,13 +339,6 @@ static void PrepareContrastivePolicyAdvantages(GGL::PPOLearner* learner, GGL::Ex
 		report["Action-Score Range at Achieved Goals"] = TensorMean(std::get<0>(qAchieved.max(1)) - std::get<0>(qAchieved.min(1)));
 		report["Action-Shuffle Drop at Achieved Goals"] = TensorMean(qAchievedExecuted - qAchieved.mean(1));
 	}
-
-	CommandSupportStats support = EstimateCommandSupport(commandedGoals, achievedGoals, 2048);
-	float supportFraction = support.supportFraction;
-	report["Command Support Fraction"] = support.supportFraction;
-	report["Joint Support Distance to g_cmd"] = support.jointDistance;
-	report["Position Support Distance to g_cmd"] = support.positionDistance;
-	report["Velocity Support Distance to g_cmd"] = support.velocityDistance;
 
 	float lambdaEffective = GetAnnealedContrastiveLambda(cfg, totalTimesteps);
 	bool varianceGate = crlStd >= cfg.sigmaMin;
@@ -354,6 +396,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Horizon Medium Realized"] = crlTrainStats.realizedMedium;
 		report["Horizon Long Realized"] = crlTrainStats.realizedLong;
 		report["CRL Anchors Used"] = crlTrainStats.anchorsUsed;
+		report["CRL Train Samples Used"] = crlTrainStats.trainSamplesUsed;
 	}
 
 	{
