@@ -21,8 +21,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	if (config.contrastiveGoal.enabled) {
-		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, 8, config.contrastiveGoal, device);
-		RG_LOG("Contrastive scoring auxiliary enabled with separate critic encoders");
+		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device);
+		RG_LOG("GCRL scoring auxiliary enabled with separate critic encoders");
 	}
 
 	// Print param counts
@@ -164,99 +164,10 @@ static float TensorMean(torch::Tensor t) {
 	return t.mean().detach().cpu().item<float>();
 }
 
-static torch::Tensor GatherQChunks(GGL::ContrastiveGoalLearner* learner, torch::Tensor states, torch::Tensor actionControls, torch::Tensor goals, int64_t chunkSize) {
-	std::vector<torch::Tensor> chunks;
-	int64_t n = states.size(0);
-	for (int64_t start = 0; start < n; start += chunkSize) {
-		int64_t stop = RS_MIN(start + chunkSize, n);
-		chunks.push_back(learner->ScoreAllActions(
-			states.slice(0, start, stop),
-			actionControls,
-			goals.slice(0, start, stop)
-		));
-	}
-	return torch::cat(chunks, 0);
-}
-
-struct CommandSupportStats {
-	float supportFraction = 0;
-	float jointDistance = 0;
-	float positionDistance = 0;
-	float velocityDistance = 0;
-};
-
-static CommandSupportStats EstimateCommandSupport(torch::Tensor commandedGoals, torch::Tensor achievedGoals, int64_t maxSamples) {
-	RG_NO_GRAD;
-
-	CommandSupportStats result;
-	int64_t n = commandedGoals.size(0);
-	if (n < 4)
-		return result;
-
-	int64_t sampleCount = RS_MIN(n, maxSamples);
-	torch::Tensor sampleIndices = torch::randperm(n, torch::TensorOptions().dtype(torch::kLong).device(commandedGoals.device())).slice(0, 0, sampleCount);
-	torch::Tensor cmd = commandedGoals.index_select(0, sampleIndices);
-	torch::Tensor achieved = achievedGoals.index_select(0, sampleIndices);
-
-	torch::Tensor achievedDists = torch::cdist(achieved, achieved, 2);
-	torch::Tensor diag = torch::eye(sampleCount, torch::TensorOptions().dtype(torch::kBool).device(commandedGoals.device()));
-	achievedDists = achievedDists.masked_fill(diag, 1e9);
-	torch::Tensor achievedNN = std::get<0>(achievedDists.min(1));
-	float threshold = achievedNN.mean().item<float>() + 2.f * achievedNN.std(false).item<float>();
-	if (threshold <= 0 || !std::isfinite(threshold))
-		return result;
-
-	torch::Tensor cmdDists = torch::cdist(cmd, achieved, 2);
-	auto nearest = cmdDists.min(1);
-	torch::Tensor cmdNN = std::get<0>(nearest);
-	torch::Tensor nearestIndices = std::get<1>(nearest);
-	torch::Tensor nearestAchieved = achieved.index_select(0, nearestIndices);
-
-	result.supportFraction = cmdNN.le(threshold).to(torch::kFloat32).mean().item<float>();
-	result.jointDistance = cmdNN.mean().item<float>();
-	result.positionDistance = torch::norm(cmd.slice(1, 0, 3) - nearestAchieved.slice(1, 0, 3), 2, 1).mean().item<float>();
-	result.velocityDistance = torch::norm(cmd.slice(1, 3, 6) - nearestAchieved.slice(1, 3, 6), 2, 1).mean().item<float>();
-	return result;
-}
-
-static torch::Tensor ProjectGoalsToAchievedSupport(torch::Tensor commandedGoals, torch::Tensor achievedGoals, int64_t maxSamples, int64_t chunkSize, GGL::Report& report) {
-	RG_NO_GRAD;
-
-	int64_t n = commandedGoals.size(0);
-	int64_t supportCount = achievedGoals.size(0);
-	if (n == 0 || supportCount == 0 || maxSamples <= 0)
-		return commandedGoals;
-	if (chunkSize <= 0)
-		chunkSize = n;
-
-	int64_t sampleCount = RS_MIN(supportCount, maxSamples);
-	torch::Tensor supportIndices = torch::randperm(supportCount, torch::TensorOptions().dtype(torch::kLong).device(achievedGoals.device())).slice(0, 0, sampleCount);
-	torch::Tensor supportGoals = achievedGoals.index_select(0, supportIndices);
-
-	std::vector<torch::Tensor> chunks;
-	chunks.reserve((n + chunkSize - 1) / chunkSize);
-	double totalProjectionDistance = 0;
-
-	for (int64_t start = 0; start < n; start += chunkSize) {
-		int64_t stop = RS_MIN(start + chunkSize, n);
-		torch::Tensor cmdChunk = commandedGoals.slice(0, start, stop);
-		auto nearest = torch::cdist(cmdChunk, supportGoals, 2).min(1);
-		torch::Tensor nearestDistances = std::get<0>(nearest);
-		torch::Tensor nearestIndices = std::get<1>(nearest);
-
-		chunks.push_back(supportGoals.index_select(0, nearestIndices));
-		totalProjectionDistance += nearestDistances.sum().detach().cpu().item<float>();
-	}
-
-	report["Command Projection Distance"] = totalProjectionDistance / RS_MAX(n, (int64_t)1);
-	report["Command Projection Support Samples"] = sampleCount;
-	return torch::cat(chunks, 0);
-}
-
-void GGL::PPOLearner::SetDiscreteActionControls(torch::Tensor controls) {
-	discreteActionControls = controls.to(device).to(torch::kFloat32);
-	if (config.contrastiveGoal.enabled && (discreteActionControls.size(0) != numActions || discreteActionControls.size(1) != 8))
-		RG_ERR_CLOSE("Contrastive scoring auxiliary expected action controls shaped [numActions, 8], got " << discreteActionControls.sizes());
+static torch::Tensor OneHotActions(torch::Tensor actions, int64_t numActions) {
+	actions = actions.to(torch::kLong);
+	torch::Tensor result = torch::zeros({ actions.size(0), numActions }, torch::TensorOptions().dtype(torch::kFloat32).device(actions.device()));
+	return result.scatter_(1, actions.unsqueeze(1), 1.f);
 }
 
 static float GetAnnealedContrastiveLambda(const GGL::ContrastiveGoalConfig& cfg, uint64_t totalTimesteps) {
@@ -267,90 +178,48 @@ static float GetAnnealedContrastiveLambda(const GGL::ContrastiveGoalConfig& cfg,
 	return cfg.lambdaStart + (cfg.lambda - cfg.lambdaStart) * progress;
 }
 
-static void PrepareContrastivePolicyAdvantages(GGL::PPOLearner* learner, GGL::ExperienceBuffer& experience, GGL::Report& report, uint64_t totalTimesteps) {
+static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::ExperienceBuffer& experience, GGL::Report& report, uint64_t totalTimesteps) {
 	if (!learner->config.contrastiveGoal.enabled)
 		return;
 
 	if (!learner->contrastiveGoalLearner)
-		RG_ERR_CLOSE("Contrastive goal config is enabled but no contrastive learner exists");
-	if (!learner->discreteActionControls.defined())
-		RG_ERR_CLOSE("Contrastive goal config is enabled but decoded discrete action controls were not registered");
-	if (!experience.data.oldActionProbs.defined() || !experience.data.commandedGoals.defined() || !experience.data.achievedGoals.defined())
-		RG_ERR_CLOSE("Contrastive goal config is enabled but rollout CRL tensors are missing");
+		RG_ERR_CLOSE("GCRL config is enabled but no contrastive learner exists");
+	if (!experience.data.actions.defined() || !experience.data.commandedGoals.defined())
+		RG_ERR_CLOSE("GCRL config is enabled but rollout goal/action tensors are missing");
 
 	RG_NO_GRAD;
 
 	auto device = learner->device;
 	auto& cfg = learner->config.contrastiveGoal;
 
-	torch::Tensor nextoAdvRaw = experience.data.advantages.to(device);
-	report["Nexto Advantage Mean"] = TensorMean(nextoAdvRaw);
-	report["Nexto Advantage Std"] = TensorStd(nextoAdvRaw);
+	torch::Tensor baseAdvRaw = experience.data.advantages.to(device);
+	report["PPO Advantage Mean"] = TensorMean(baseAdvRaw);
+	report["PPO Advantage Std"] = TensorStd(baseAdvRaw);
 
 	torch::Tensor states = experience.data.states.to(device);
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
-	torch::Tensor oldActionProbs = experience.data.oldActionProbs.to(device);
 	torch::Tensor commandedGoals = experience.data.commandedGoals.to(device);
-	torch::Tensor achievedGoals = experience.data.achievedGoals.to(device);
+	torch::Tensor actionRepresentations = OneHotActions(actions, learner->numActions);
+	torch::Tensor gcrlScores = learner->contrastiveGoalLearner->Score(states, actionRepresentations, commandedGoals);
 
-	CommandSupportStats support = EstimateCommandSupport(commandedGoals, achievedGoals, 2048);
-	float supportFraction = support.supportFraction;
-	report["Command Support Fraction"] = support.supportFraction;
-	report["Joint Support Distance to g_cmd"] = support.jointDistance;
-	report["Position Support Distance to g_cmd"] = support.positionDistance;
-	report["Velocity Support Distance to g_cmd"] = support.velocityDistance;
+	experience.data.crlAdvantages = gcrlScores.detach().to(experience.data.advantages.device());
 
-	torch::Tensor scoringGoals = commandedGoals;
-	if (cfg.projectCommandToAchievedSupport) {
-		scoringGoals = ProjectGoalsToAchievedSupport(commandedGoals, achievedGoals, cfg.commandSupportSamples, cfg.commandProjectionChunkSize, report);
-		report["CRL Projected Command Goals"] = 1;
-	} else {
-		report["CRL Projected Command Goals"] = 0;
-	}
-
-	torch::Tensor qAll = GatherQChunks(learner->contrastiveGoalLearner, states, learner->discreteActionControls, scoringGoals, 4096);
-	torch::Tensor qExecuted = qAll.gather(1, actions.unsqueeze(1)).flatten();
-	torch::Tensor vCrl = (oldActionProbs * qAll).sum(1);
-	torch::Tensor aCrl = qExecuted - vCrl;
-
-	experience.data.crlAdvantages = aCrl.detach().to(experience.data.advantages.device());
-
-	float crlMean = TensorMean(aCrl);
-	float crlStd = TensorStd(aCrl);
-	report["CRL Advantage Mean"] = crlMean;
-	report["CRL Advantage Std"] = crlStd;
-
-	torch::Tensor actionRange = std::get<0>(qAll.max(1)) - std::get<0>(qAll.min(1));
-	float commandActionRange = TensorMean(actionRange);
-	float commandShuffleDrop = TensorMean(qExecuted - qAll.mean(1));
-	report["Action-Score Range at g_cmd"] = commandActionRange;
-	report["Action-Shuffle Drop at g_cmd"] = commandShuffleDrop;
-
-	int64_t sensSampleCount = std::min<int64_t>(states.size(0), 2048);
-	if (sensSampleCount > 0) {
-		torch::Tensor sensIndices = torch::randperm(states.size(0), torch::TensorOptions().dtype(torch::kLong).device(device)).slice(0, 0, sensSampleCount);
-		torch::Tensor qAchieved = learner->contrastiveGoalLearner->ScoreAllActions(
-			states.index_select(0, sensIndices),
-			learner->discreteActionControls,
-			achievedGoals.index_select(0, sensIndices)
-		);
-		torch::Tensor achievedActions = actions.index_select(0, sensIndices);
-		torch::Tensor qAchievedExecuted = qAchieved.gather(1, achievedActions.unsqueeze(1)).flatten();
-		report["Action-Score Range at Achieved Goals"] = TensorMean(std::get<0>(qAchieved.max(1)) - std::get<0>(qAchieved.min(1)));
-		report["Action-Shuffle Drop at Achieved Goals"] = TensorMean(qAchievedExecuted - qAchieved.mean(1));
-	}
+	float gcrlMean = TensorMean(gcrlScores);
+	float gcrlStd = TensorStd(gcrlScores);
+	report["GCRL Score Mean"] = gcrlMean;
+	report["GCRL Score Std"] = gcrlStd;
+	report["CRL Advantage Mean"] = gcrlMean;
+	report["CRL Advantage Std"] = gcrlStd;
 
 	float lambdaEffective = GetAnnealedContrastiveLambda(cfg, totalTimesteps);
-	bool varianceGate = crlStd >= cfg.sigmaMin;
-	bool actionGate = commandActionRange >= cfg.minCommandActionRange;
-	bool supportGate = supportFraction >= cfg.minCommandSupportFraction;
+	bool varianceGate = gcrlStd >= cfg.sigmaMin;
 
-	torch::Tensor nextoNorm = NormalizeAdvantage(nextoAdvRaw, cfg.sigmaFloor);
-	torch::Tensor crlNorm = torch::zeros_like(nextoNorm);
-	if (crlStd >= cfg.sigmaMin)
-		crlNorm = NormalizeAdvantage(aCrl, cfg.sigmaFloor);
+	torch::Tensor baseNorm = NormalizeAdvantage(baseAdvRaw, cfg.sigmaFloor);
+	torch::Tensor gcrlNorm = torch::zeros_like(baseNorm);
+	if (varianceGate)
+		gcrlNorm = NormalizeAdvantage(gcrlScores, cfg.sigmaFloor);
 
-	torch::Tensor policyAdvantage = nextoNorm + lambdaEffective * torch::clamp(crlNorm, -3, 3);
+	torch::Tensor policyAdvantage = baseNorm + lambdaEffective * torch::clamp(gcrlNorm, -3, 3);
 	experience.data.advantages = policyAdvantage.detach().to(experience.data.advantages.device());
 
 	report["A Policy Mean"] = TensorMean(policyAdvantage);
@@ -360,8 +229,6 @@ static void PrepareContrastivePolicyAdvantages(GGL::PPOLearner* learner, GGL::Ex
 	report["CRL Lambda Effective"] = lambdaEffective;
 	report["CRL Lambda Anneal Progress"] = cfg.lambdaAnnealSteps == 0 ? 1 : RS_CLAMP(totalTimesteps / (float)cfg.lambdaAnnealSteps, 0.f, 1.f);
 	report["CRL Variance Gate"] = varianceGate ? 1 : 0;
-	report["CRL Action Gate"] = actionGate ? 1 : 0;
-	report["CRL Support Gate"] = supportGate ? 1 : 0;
 }
 
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps) {
@@ -378,25 +245,25 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgClip;
 
 	if (config.contrastiveGoal.enabled) {
-		PrepareContrastivePolicyAdvantages(this, experience, report, totalTimesteps);
-
 		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng);
-		if (crlTrainStats.anchorsUsed > 0)
-			contrastiveCriticReady = true;
 
 		report["CRL Critic Loss"] = crlTrainStats.loss;
+		report["GCRL Row Loss"] = crlTrainStats.rowLoss;
+		report["GCRL Column Loss"] = crlTrainStats.columnLoss;
 		report["CRL Positive Logit"] = crlTrainStats.positiveLogitMean;
 		report["CRL Negative Logit"] = crlTrainStats.negativeLogitMean;
 		report["CRL State-Action Embedding Norm"] = crlTrainStats.stateActionEmbeddingNorm;
 		report["CRL Goal Embedding Norm"] = crlTrainStats.goalEmbeddingNorm;
-		report["Duplicate-Negative Mask Rate"] = crlTrainStats.duplicateNegativeMaskRate;
-		report["Eligible-Future Mask Rate"] = crlTrainStats.eligibleFutureMaskRate;
+		report["GCRL Categorical Accuracy"] = crlTrainStats.categoricalAccuracy;
+		report["GCRL LogSumExp"] = crlTrainStats.logsumexpMean;
 		report["Horizon Immediate Realized"] = crlTrainStats.realizedImmediate;
 		report["Horizon Short Realized"] = crlTrainStats.realizedShort;
 		report["Horizon Medium Realized"] = crlTrainStats.realizedMedium;
 		report["Horizon Long Realized"] = crlTrainStats.realizedLong;
 		report["CRL Anchors Used"] = crlTrainStats.anchorsUsed;
 		report["CRL Train Samples Used"] = crlTrainStats.trainSamplesUsed;
+
+		PrepareGCRLPolicyAdvantages(this, experience, report, totalTimesteps);
 	}
 
 	{
@@ -644,11 +511,7 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 
 	models.Load(folderPath, true, true);
 	if (contrastiveGoalLearner) {
-		bool hasSavedContrastiveCritic =
-			std::filesystem::exists(contrastiveGoalLearner->stateActionEncoder.GetSavePath(folderPath)) &&
-			std::filesystem::exists(contrastiveGoalLearner->goalEncoder.GetSavePath(folderPath));
 		contrastiveGoalLearner->Load(folderPath, true, true);
-		contrastiveCriticReady = hasSavedContrastiveCritic;
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);

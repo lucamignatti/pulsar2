@@ -15,6 +15,7 @@ namespace GGL {
 	enum class ModelActivationType {
 		RELU,
 		LEAKY_RELU,
+		SWISH,
 		SIGMOID,
 		TANH
 	};

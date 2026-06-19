@@ -25,7 +25,6 @@
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 #include "Util/AvgTracker.h"
-#include <RLGymCPP/ActionParsers/DefaultAction.h>
 #include <RLGymCPP/CommonValues.h>
 #include <RLGymCPP/Gamestates/StateUtil.h>
 
@@ -48,18 +47,14 @@ static void AppendAchievedGoal(FList& out, const GameState& state, const Player&
 static void AppendCommandedGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
 	PhysState ball = InvertPhys(state.ball, player.team == Team::ORANGE);
 
+	float targetXRange = CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS;
+	float minTargetZ = CommonValues::BALL_RADIUS;
+	float maxTargetZ = CommonValues::GOAL_HEIGHT - CommonValues::BALL_RADIUS;
+
 	Vec targetPos = {};
-	targetPos.x = RS_CLAMP(
-		ball.pos.x,
-		-CommonValues::GOAL_WIDTH_FROM_CENTER + CommonValues::BALL_RADIUS,
-		CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS
-	);
+	targetPos.x = RocketSim::Math::RandFloat(-targetXRange, targetXRange);
 	targetPos.y = CommonValues::BACK_NET_Y;
-	targetPos.z = RS_CLAMP(
-		ball.pos.z,
-		CommonValues::BALL_RADIUS,
-		CommonValues::GOAL_HEIGHT - CommonValues::BALL_RADIUS
-	);
+	targetPos.z = RocketSim::Math::RandFloat(minTargetZ, maxTargetZ);
 
 	Vec direction = targetPos - ball.pos;
 	if (direction.Length() < 1e-3f)
@@ -67,7 +62,9 @@ static void AppendCommandedGoal(FList& out, const GameState& state, const Player
 	else
 		direction = direction.Normalized();
 
-	Vec targetVel = direction * cfg.targetSpeed;
+	float minSpeed = RS_MAX(0.f, cfg.targetSpeed - cfg.targetSpeedJitter);
+	float maxSpeed = RS_MAX(minSpeed, cfg.targetSpeed + cfg.targetSpeedJitter);
+	Vec targetVel = direction * RocketSim::Math::RandFloat(minSpeed, maxSpeed);
 	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
 }
 
@@ -81,11 +78,6 @@ static int GetArenaIdxForPlayer(const EnvSet& envSet, int playerIdx) {
 	}
 	RG_ERR_CLOSE("Could not find arena for player index " << playerIdx);
 	return -1;
-}
-
-static void AppendActionControl(FList& out, const Action& action) {
-	for (int i = 0; i < Action::ELEM_AMOUNT; i++)
-		out += action[i];
 }
 
 static bool CanMoveTensorToDevice(at::Device device) {
@@ -234,18 +226,6 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		ppo = new PPOLearner(obsSize, numActions, config.ppo, device);
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
-	}
-
-	if (config.ppo.contrastiveGoal.enabled) {
-		DefaultAction* defaultAction = dynamic_cast<DefaultAction*>(envSet->actionParsers[0]);
-		if (!defaultAction)
-			RG_ERR_CLOSE("Contrastive scoring auxiliary requires DefaultAction so decoded controller vectors are available");
-
-		FList controls;
-		for (const Action& action : defaultAction->actions)
-			AppendActionControl(controls, action);
-
-		ppo->SetDiscreteActionControls(torch::tensor(controls).reshape({ numActions, (int)Action::ELEM_AMOUNT }));
 	}
 
 	if (config.renderMode) {
@@ -622,8 +602,8 @@ void GGL::Learner::Start() {
 		int numPlayers = envSet->state.numPlayers;
 
 		struct Trajectory {
-			FList states, nextStates, rewards, logProbs, oldActionProbs;
-			FList commandedGoals, achievedGoals, actionControls;
+			FList states, nextStates, rewards, logProbs;
+			FList commandedGoals, achievedGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
@@ -638,10 +618,8 @@ void GGL::Learner::Start() {
 				nextStates += other.nextStates;
 				rewards += other.rewards;
 				logProbs += other.logProbs;
-				oldActionProbs += other.oldActionProbs;
 				commandedGoals += other.commandedGoals;
 				achievedGoals += other.achievedGoals;
-				actionControls += other.actionControls;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -759,7 +737,7 @@ void GGL::Learner::Start() {
 							}
 						}
 
-						torch::Tensor tActions, tLogProbs, tActionProbs;
+						torch::Tensor tActions, tLogProbs;
 						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
@@ -791,22 +769,20 @@ void GGL::Learner::Start() {
 							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 
-							torch::Tensor tNewActions, tNewActionProbs;
+							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, NULL, &tNewActionProbs);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
 							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
 							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
-							tActionProbs = tNewActionProbs.cpu();
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, NULL, &tActionProbs);
+							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs);
 							tActions = tActions.cpu();
-							tActionProbs = tActionProbs.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
 
@@ -815,49 +791,8 @@ void GGL::Learner::Start() {
 						if (tLogProbs.defined() && !render)
 							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);	
 
-						FList newActionProbs;
-						if (tActionProbs.defined() && !render && config.ppo.contrastiveGoal.enabled)
-							newActionProbs = TENSOR_TO_VEC<float>(tActionProbs.flatten());
-
 						stepTimer.Reset();
 						envSet->Sync(); // Make sure the first half is done
-
-						if (!render && config.ppo.contrastiveGoal.enabled) {
-							size_t expectedActionProbs = (size_t)newPlayerIndices.size() * numActions;
-							if (newActionProbs.size() != expectedActionProbs)
-								RG_ERR_CLOSE(
-									"Contrastive scoring auxiliary action-prob size mismatch: got " <<
-									newActionProbs.size() << ", expected " << expectedActionProbs <<
-									" (" << newPlayerIndices.size() << " players * " << numActions << " actions)"
-								);
-							if (curActions.size() != (size_t)numPlayers)
-								RG_ERR_CLOSE(
-									"Contrastive scoring auxiliary action size mismatch: got " <<
-									curActions.size() << ", expected " << numPlayers
-								);
-
-							int i = 0;
-							for (int newPlayerIdx : newPlayerIndices) {
-								if (newPlayerIdx < 0 || newPlayerIdx >= numPlayers)
-									RG_ERR_CLOSE("Contrastive scoring auxiliary newPlayerIdx out of range: " << newPlayerIdx << "/" << numPlayers);
-
-								for (int actionIdx = 0; actionIdx < numActions; actionIdx++)
-									trajectories[newPlayerIdx].oldActionProbs += newActionProbs[i * numActions + actionIdx];
-
-								int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
-								DefaultAction* defaultAction = dynamic_cast<DefaultAction*>(envSet->actionParsers[arenaIdx]);
-								if (!defaultAction)
-									RG_ERR_CLOSE("Contrastive scoring auxiliary requires DefaultAction for every arena");
-								if (curActions[newPlayerIdx] < 0 || curActions[newPlayerIdx] >= defaultAction->actions.size())
-									RG_ERR_CLOSE(
-										"Contrastive scoring auxiliary action index out of range: player=" << newPlayerIdx <<
-										" action=" << curActions[newPlayerIdx] <<
-										" actionCount=" << defaultAction->actions.size()
-									);
-								AppendActionControl(trajectories[newPlayerIdx].actionControls, defaultAction->actions[curActions[newPlayerIdx]]);
-								i++;
-							}
-						}
 
 						envSet->StepSecondHalf(curActions, false);
 						envStepTime += stepTimer.Elapsed();
@@ -961,12 +896,10 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tOldActionProbs, tCommandedGoals, tAchievedGoals, tActionControls, tSegmentIds, tSegmentSteps;
+					torch::Tensor tCommandedGoals, tAchievedGoals, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
-						tOldActionProbs = torch::tensor(combinedTraj.oldActionProbs).reshape({ -1, numActions });
 						tCommandedGoals = torch::tensor(combinedTraj.commandedGoals).reshape({ -1, 6 });
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
-						tActionControls = torch::tensor(combinedTraj.actionControls).reshape({ -1, (int)Action::ELEM_AMOUNT });
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
 					}
@@ -1044,10 +977,8 @@ void GGL::Learner::Start() {
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
 					if (config.ppo.contrastiveGoal.enabled) {
-						experience.data.oldActionProbs = tOldActionProbs;
 						experience.data.commandedGoals = tCommandedGoals;
 						experience.data.achievedGoals = tAchievedGoals;
-						experience.data.actionControls = tActionControls;
 						experience.data.segmentIds = tSegmentIds;
 						experience.data.segmentSteps = tSegmentSteps;
 					}

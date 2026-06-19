@@ -6,7 +6,7 @@ namespace GGL {
 	struct ExperienceTensors {
 		torch::Tensor
 			states, actions, logProbs, targetValues, actionMasks, advantages,
-			oldActionProbs, commandedGoals, achievedGoals, actionControls,
+			commandedGoals, achievedGoals,
 			segmentIds, segmentSteps, crlAdvantages;
 
 		auto begin() { return &states; }

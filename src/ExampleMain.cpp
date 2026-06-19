@@ -14,28 +14,33 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	// These are ok rewards that will produce a scoring bot in ~100m steps
+	constexpr float TEAM_SPIRIT = 0.6f;
+	constexpr float OPPONENT_PUNISH = 1.f;
+	auto teamMixed = [](Reward* reward) {
+		return new ZeroSumReward(reward, TEAM_SPIRIT, OPPONENT_PUNISH);
+	};
+
 	std::vector<WeightedReward> rewards = {
 
-		// Movement
-		{ new AirReward(), 0.25f },
+		// Ball-goal shaping
+		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
 
-		// Player-ball
-		{ new FaceBallReward(), 0.25f },
-		{ new VelocityPlayerToBallReward(), 4.f },
-		{ new StrongTouchReward(20, 100), 60 },
+		// Goals
+		{ teamMixed(new TeamGoalReward()), 12.5f },
+		{ teamMixed(new GoalSpeedBonusReward()), 1.25f },
+		{ teamMixed(new ConcedeDistanceReward()), 1.25f },
 
-		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+		// Touches
+		{ teamMixed(new TouchHeightReward()), 1.f },
+		{ teamMixed(new FlipResetReward()), 5.f },
 
 		// Boost
-		{ new PickupBoostReward(), 10.f },
-		{ new SaveBoostReward(), 0.2f },
+		{ teamMixed(new BoostGainReward()), 0.7f },
+		{ teamMixed(new BoostLoseReward()), 0.4f },
 
-		// Game events
-		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
-		{ new GoalReward(), 150 }
+		// Demos
+		{ teamMixed(new DemoReward()), 2.5f },
+		{ teamMixed(new DemoedPenalty()), 2.5f }
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -44,7 +49,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 1;
+	int playersPerTeam = 3;
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -105,8 +110,8 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 5120;
+	// 3v3 has 3x as many cars per arena as 1v1, so keep total simulated cars near the old setup.
+	cfg.numGames = 1700;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -115,7 +120,7 @@ int main(int argc, char* argv[]) {
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target with CRL all-action scoring enabled
+	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -143,7 +148,9 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 4096; // InfoNCE logits scale quadratically with this
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
+	cfg.ppo.contrastiveGoal.targetSpeed = 1500.f;
+	cfg.ppo.contrastiveGoal.targetSpeedJitter = 500.f;
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;

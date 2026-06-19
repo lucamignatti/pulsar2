@@ -16,17 +16,12 @@ namespace GGL {
 
 		int representationSize = 64;
 		int criticEpochs = 1;
-		int64_t criticMiniBatchSize = 8192;
+		int64_t criticMiniBatchSize = 256;
 		float criticLR = 3e-4f;
+		float logsumexpPenaltyCoeff = 0.1f;
 
 		float targetSpeed = 1500.f;
-		float nearGoalDistance = 1e-4f;
-		bool projectCommandToAchievedSupport = true;
-		int64_t commandSupportSamples = 2048;
-		int64_t commandProjectionChunkSize = 4096;
-		float minCommandSupportFraction = 0.05f;
-		float minCommandActionRange = 1e-3f;
-		int failedGateDisableIters = 3;
+		float targetSpeedJitter = 500.f;
 
 		int immediateMin = 1;
 		int immediateMax = 4;

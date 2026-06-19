@@ -1,8 +1,7 @@
 #include "ContrastiveGoalLearner.h"
 
 #include <torch/nn/modules/loss.h>
-#include <cmath>
-#include <unordered_set>
+#include <unordered_map>
 
 using namespace torch;
 
@@ -11,31 +10,15 @@ namespace GGL {
 	struct PositiveSample {
 		int64_t anchorIdx;
 		int64_t positiveIdx;
-		int64_t segmentId;
-		int64_t goalKey;
 		int bucket;
 	};
 
-	static int64_t MakeGoalKey(const Tensor& achievedGoalsCPU, int64_t goalIdx, const ContrastiveGoalConfig& config) {
-		Tensor goal = achievedGoalsCPU[goalIdx];
-		auto accessor = goal.accessor<float, 1>();
-		float binSize = RS_MAX(config.nearGoalDistance, 1e-6f);
-
-		uint64_t hash = 1469598103934665603ull;
-		for (int i = 0; i < 6; i++) {
-			int64_t quantized = std::llround(accessor[i] / binSize);
-			hash ^= (uint64_t)quantized;
-			hash *= 1099511628211ull;
-		}
-		return (int64_t)hash;
-	}
-
 	static ModelConfig MakeEncoderConfig(int inputSize, int reprSize) {
 		ModelConfig result = PartialModelConfig{};
-		result.layerSizes = { 256, 256, reprSize };
-		result.activationType = ModelActivationType::LEAKY_RELU;
-		result.optimType = ModelOptimType::MUON;
-		result.addLayerNorm = false;
+		result.layerSizes = { 1024, 1024, 1024, 1024, reprSize };
+		result.activationType = ModelActivationType::SWISH;
+		result.optimType = ModelOptimType::ADAM;
+		result.addLayerNorm = true;
 		result.addOutputLayer = false;
 		result.numInputs = inputSize;
 		result.numOutputs = reprSize;
@@ -97,7 +80,6 @@ namespace GGL {
 
 	static std::vector<PositiveSample> BuildPositiveSamples(ExperienceTensors& data, const ContrastiveGoalConfig& config, std::default_random_engine& rng, ContrastiveGoalStats& stats) {
 		Tensor segmentIdsCPU = data.segmentIds.to(kCPU).to(kLong);
-		Tensor achievedGoalsCPU = data.achievedGoals.to(kCPU).to(kFloat);
 		int64_t n = segmentIdsCPU.size(0);
 		auto segmentAccessor = segmentIdsCPU.accessor<int64_t, 1>();
 
@@ -116,8 +98,7 @@ namespace GGL {
 				if (!TryPickBucketFuture(anchorPos, indices.size(), config, rng, futureOffset, bucket))
 					continue;
 
-				int64_t positiveIdx = indices[anchorPos + futureOffset];
-				result.push_back({ indices[anchorPos], positiveIdx, kv.first, MakeGoalKey(achievedGoalsCPU, positiveIdx, config), bucket });
+				result.push_back({ indices[anchorPos], indices[anchorPos + futureOffset], bucket });
 				switch (bucket) {
 				case 0: stats.realizedImmediate++; break;
 				case 1: stats.realizedShort++; break;
@@ -138,99 +119,70 @@ namespace GGL {
 		return result;
 	}
 
-	static std::vector<PositiveSample> TakeDiverseBatch(const std::vector<PositiveSample>& samples, int64_t& cursor, int64_t maxBatchSize) {
-		std::vector<PositiveSample> batch;
-		batch.reserve(maxBatchSize);
-
-		std::unordered_set<int64_t> usedSegments;
-		std::unordered_set<int64_t> usedGoals;
-		usedSegments.reserve(maxBatchSize);
-		usedGoals.reserve(maxBatchSize);
-
-		while (cursor < (int64_t)samples.size() && (int64_t)batch.size() < maxBatchSize) {
-			const PositiveSample& sample = samples[cursor++];
-			if (usedSegments.count(sample.segmentId) || usedGoals.count(sample.goalKey))
-				continue;
-
-			usedSegments.insert(sample.segmentId);
-			usedGoals.insert(sample.goalKey);
-			batch.push_back(sample);
-		}
-
-		return batch;
-	}
-
-	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionControlSize, const ContrastiveGoalConfig& config, torch::Device device) :
-		stateActionEncoder("crl_sa", MakeEncoderConfig(obsSize + actionControlSize, config.representationSize), device),
-		goalEncoder("crl_goal", MakeEncoderConfig(6, config.representationSize), device),
-		config(config), device(device), obsSize(obsSize), actionControlSize(actionControlSize) {
+	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device) :
+		stateActionEncoder("gcrl_sa", MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
+		goalEncoder("gcrl_goal", MakeEncoderConfig(6, config.representationSize), device),
+		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize) {
 		SetLearningRate(config.criticLR);
 	}
 
-	Tensor ContrastiveGoalLearner::EncodeStateAction(Tensor states, Tensor actionControls) {
-		return stateActionEncoder.Forward(torch::cat({ states, actionControls }, -1), false);
+	Tensor ContrastiveGoalLearner::EncodeStateAction(Tensor states, Tensor actionRepresentations) {
+		return stateActionEncoder.Forward(torch::cat({ states, actionRepresentations }, -1), false);
 	}
 
 	Tensor ContrastiveGoalLearner::EncodeGoal(Tensor goals) {
 		return goalEncoder.Forward(goals, false);
 	}
 
-	Tensor ContrastiveGoalLearner::Score(Tensor states, Tensor actionControls, Tensor goals) {
-		Tensor sa = EncodeStateAction(states, actionControls);
+	Tensor ContrastiveGoalLearner::Score(Tensor states, Tensor actionRepresentations, Tensor goals) {
+		Tensor sa = EncodeStateAction(states, actionRepresentations);
 		Tensor g = EncodeGoal(goals);
 		return -torch::norm(sa - g, 2, -1);
-	}
-
-	Tensor ContrastiveGoalLearner::ScoreAllActions(Tensor states, Tensor allActionControls, Tensor goals) {
-		int64_t batchSize = states.size(0);
-		int64_t numActions = allActionControls.size(0);
-
-		Tensor stateExpanded = states.unsqueeze(1).expand({ batchSize, numActions, states.size(1) }).reshape({ batchSize * numActions, states.size(1) });
-		Tensor actionExpanded = allActionControls.unsqueeze(0).expand({ batchSize, numActions, allActionControls.size(1) }).reshape({ batchSize * numActions, allActionControls.size(1) });
-		Tensor goalExpanded = goals.unsqueeze(1).expand({ batchSize, numActions, goals.size(1) }).reshape({ batchSize * numActions, goals.size(1) });
-
-		return Score(stateExpanded, actionExpanded, goalExpanded).reshape({ batchSize, numActions });
 	}
 
 	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
 		ContrastiveGoalStats stats;
 
-		if (!data.segmentIds.defined() || data.segmentIds.size(0) == 0)
+		if (
+			!data.states.defined() ||
+			!data.actions.defined() ||
+			!data.achievedGoals.defined() ||
+			!data.segmentIds.defined() ||
+			data.segmentIds.size(0) == 0
+		)
 			return stats;
 
 		std::vector<PositiveSample> samples = BuildPositiveSamples(data, config, rng, stats);
 		if (samples.empty())
 			return stats;
 
-		std::shuffle(samples.begin(), samples.end(), rng);
-
 		int64_t miniBatchSize = config.criticMiniBatchSize;
 		if (miniBatchSize <= 0)
 			miniBatchSize = samples.size();
 
 		float totalLoss = 0;
+		float totalRowLoss = 0;
+		float totalColumnLoss = 0;
 		float totalPositiveLogit = 0;
 		float totalNegativeLogit = 0;
 		float totalSANorm = 0;
 		float totalGoalNorm = 0;
-		float totalDuplicateMaskRate = 0;
-		float totalFutureMaskRate = 0;
+		float totalAccuracy = 0;
+		float totalLogsumexp = 0;
 		int64_t batches = 0;
 
 		for (int epoch = 0; epoch < config.criticEpochs; epoch++) {
 			std::shuffle(samples.begin(), samples.end(), rng);
 
-			int64_t cursor = 0;
-			while (cursor < (int64_t)samples.size()) {
-				std::vector<PositiveSample> batchSamples = TakeDiverseBatch(samples, cursor, miniBatchSize);
-				int64_t curBatchSize = batchSamples.size();
+			for (int64_t start = 0; start < (int64_t)samples.size(); start += miniBatchSize) {
+				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, samples.size() - start);
 				if (curBatchSize <= 1)
 					continue;
 
 				std::vector<int64_t> anchorIndices(curBatchSize), positiveIndices(curBatchSize);
 				for (int64_t i = 0; i < curBatchSize; i++) {
-					anchorIndices[i] = batchSamples[i].anchorIdx;
-					positiveIndices[i] = batchSamples[i].positiveIdx;
+					anchorIndices[i] = samples[start + i].anchorIdx;
+					positiveIndices[i] = samples[start + i].positiveIdx;
 				}
 				stats.trainSamplesUsed += curBatchSize;
 
@@ -238,27 +190,26 @@ namespace GGL {
 				Tensor tPositiveIndices = torch::tensor(positiveIndices, TensorOptions().dtype(kLong));
 
 				Tensor states = data.states.index_select(0, tAnchorIndices.to(data.states.device())).to(device);
-				Tensor actionControls = data.actionControls.index_select(0, tAnchorIndices.to(data.actionControls.device())).to(device);
+				Tensor actions = data.actions.index_select(0, tAnchorIndices.to(data.actions.device())).to(device).to(kLong);
+				Tensor actionRepresentations = torch::zeros(
+					{ curBatchSize, actionRepresentationSize },
+					TensorOptions().dtype(kFloat32).device(device)
+				).scatter_(1, actions.unsqueeze(1), 1.f);
 				Tensor positiveGoals = data.achievedGoals.index_select(0, tPositiveIndices.to(data.achievedGoals.device())).to(device);
-				Tensor anchorSegments = data.segmentIds.index_select(0, tAnchorIndices.to(data.segmentIds.device())).to(device);
 
-				Tensor sa = EncodeStateAction(states, actionControls);
+				Tensor sa = EncodeStateAction(states, actionRepresentations);
 				Tensor g = EncodeGoal(positiveGoals);
 
 				Tensor logits = -torch::cdist(sa, g, 2);
 				Tensor labels = torch::arange(curBatchSize, TensorOptions().dtype(kLong).device(device));
-
-				Tensor sameSegment = anchorSegments.unsqueeze(1).eq(anchorSegments.unsqueeze(0));
 				Tensor diag = torch::eye(curBatchSize, TensorOptions().dtype(kBool).device(device));
-				Tensor duplicateGoals = torch::cdist(positiveGoals, positiveGoals, 2).lt(config.nearGoalDistance);
-				Tensor invalidNegatives = (sameSegment | duplicateGoals) & ~diag;
 
-				stats.eligibleFutureMaskRate += invalidNegatives.to(kFloat).mean().item<float>();
-				stats.duplicateNegativeMaskRate += (duplicateGoals & ~diag).to(kFloat).mean().item<float>();
-
-				logits = logits.masked_fill(invalidNegatives, -1e9);
-
-				Tensor loss = torch::nn::CrossEntropyLoss()(logits, labels);
+				Tensor rowLoss = torch::nn::CrossEntropyLoss()(logits, labels);
+				Tensor columnLoss = torch::nn::CrossEntropyLoss()(logits.transpose(0, 1), labels);
+				Tensor logsumexpRows = torch::logsumexp(logits, 1);
+				Tensor logsumexpColumns = torch::logsumexp(logits, 0);
+				Tensor logsumexpPenalty = config.logsumexpPenaltyCoeff * 0.5f * (logsumexpRows.pow(2).mean() + logsumexpColumns.pow(2).mean());
+				Tensor loss = 0.5f * (rowLoss + columnLoss) + logsumexpPenalty;
 
 				stateActionEncoder.optim->zero_grad();
 				goalEncoder.optim->zero_grad();
@@ -267,29 +218,34 @@ namespace GGL {
 				goalEncoder.StepOptim();
 
 				Tensor positiveLogits = logits.diag();
-				Tensor negativeMask = ~diag & ~invalidNegatives;
-				Tensor negativeLogits = logits.masked_select(negativeMask);
+				Tensor negativeLogits = logits.masked_select(~diag);
+				Tensor rowCorrect = logits.argmax(1).eq(labels);
+				Tensor columnCorrect = logits.argmax(0).eq(labels);
 
 				totalLoss += loss.item<float>();
+				totalRowLoss += rowLoss.item<float>();
+				totalColumnLoss += columnLoss.item<float>();
 				totalPositiveLogit += positiveLogits.mean().item<float>();
 				if (negativeLogits.numel() > 0)
 					totalNegativeLogit += negativeLogits.mean().item<float>();
 				totalSANorm += sa.norm(2, -1).mean().item<float>();
 				totalGoalNorm += g.norm(2, -1).mean().item<float>();
-				totalDuplicateMaskRate += (duplicateGoals & ~diag).to(kFloat).mean().item<float>();
-				totalFutureMaskRate += invalidNegatives.to(kFloat).mean().item<float>();
+				totalAccuracy += 0.5f * (rowCorrect.to(kFloat).mean().item<float>() + columnCorrect.to(kFloat).mean().item<float>());
+				totalLogsumexp += 0.5f * (logsumexpRows.mean().item<float>() + logsumexpColumns.mean().item<float>());
 				batches++;
 			}
 		}
 
 		if (batches > 0) {
 			stats.loss = totalLoss / batches;
+			stats.rowLoss = totalRowLoss / batches;
+			stats.columnLoss = totalColumnLoss / batches;
 			stats.positiveLogitMean = totalPositiveLogit / batches;
 			stats.negativeLogitMean = totalNegativeLogit / batches;
 			stats.stateActionEmbeddingNorm = totalSANorm / batches;
 			stats.goalEmbeddingNorm = totalGoalNorm / batches;
-			stats.duplicateNegativeMaskRate = totalDuplicateMaskRate / batches;
-			stats.eligibleFutureMaskRate = totalFutureMaskRate / batches;
+			stats.categoricalAccuracy = totalAccuracy / batches;
+			stats.logsumexpMean = totalLogsumexp / batches;
 		}
 
 		return stats;

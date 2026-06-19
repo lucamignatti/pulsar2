@@ -27,6 +27,9 @@ namespace GGL {
 		case ModelActivationType::LEAKY_RELU:
 			seq->push_back(torch::nn::LeakyReLU());
 			return;
+		case ModelActivationType::SWISH:
+			seq->push_back(torch::nn::SiLU());
+			return;
 		case ModelActivationType::SIGMOID:
 			seq->push_back(torch::nn::Sigmoid());
 			return;

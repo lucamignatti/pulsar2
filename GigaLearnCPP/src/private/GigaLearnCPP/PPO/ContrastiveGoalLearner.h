@@ -8,12 +8,14 @@ namespace GGL {
 
 	struct ContrastiveGoalStats {
 		float loss = 0;
+		float rowLoss = 0;
+		float columnLoss = 0;
 		float positiveLogitMean = 0;
 		float negativeLogitMean = 0;
 		float stateActionEmbeddingNorm = 0;
 		float goalEmbeddingNorm = 0;
-		float duplicateNegativeMaskRate = 0;
-		float eligibleFutureMaskRate = 0;
+		float categoricalAccuracy = 0;
+		float logsumexpMean = 0;
 		float realizedImmediate = 0;
 		float realizedShort = 0;
 		float realizedMedium = 0;
@@ -29,14 +31,13 @@ namespace GGL {
 		ContrastiveGoalConfig config;
 		torch::Device device;
 		int obsSize;
-		int actionControlSize;
+		int actionRepresentationSize;
 
-		ContrastiveGoalLearner(int obsSize, int actionControlSize, const ContrastiveGoalConfig& config, torch::Device device);
+		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device);
 
-		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionControls);
+		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionRepresentations);
 		torch::Tensor EncodeGoal(torch::Tensor goals);
-		torch::Tensor Score(torch::Tensor states, torch::Tensor actionControls, torch::Tensor goals);
-		torch::Tensor ScoreAllActions(torch::Tensor states, torch::Tensor allActionControls, torch::Tensor goals);
+		torch::Tensor Score(torch::Tensor states, torch::Tensor actionRepresentations, torch::Tensor goals);
 
 		ContrastiveGoalStats Train(ExperienceTensors& data, std::default_random_engine& rng);
 

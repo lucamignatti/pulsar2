@@ -27,9 +27,6 @@ namespace GGL {
 		torch::Device device;
 		int obsSize;
 		int numActions;
-		torch::Tensor discreteActionControls;
-		bool contrastiveCriticReady = false;
-		int contrastiveGateFailures = 0;
 
 		PPOLearner(
 			int obsSize, int numActions,
@@ -47,7 +44,6 @@ namespace GGL {
 		// If models is null, this->models will be used
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor* outActionProbs = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
-		void SetDiscreteActionControls(torch::Tensor controls);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		static torch::Tensor InferPolicyProbsFromModels(
