@@ -58,7 +58,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 3;
+	int playersPerTeam = 1; // 1v1 bootstrap test (mirrors the proven ryp4gxwv recipe)
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -119,8 +119,9 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// 3v3 has 3x as many cars per arena as 1v1, so keep total simulated cars near the old setup.
-	cfg.numGames = 1700;
+	// Bootstrap-debug run is 1v1 (see playersPerTeam below); keep total simulated
+	// cars (~10k) near the 3v3 setup so iteration time stays comparable.
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -131,9 +132,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.batchSize = tsPerItr;
 	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target
 
-	// Using 2 epochs seems pretty optimal when comparing time training to skill
-	// Perhaps 1 or 3 is better for you, test and find out!
-	cfg.ppo.epochs = 1;
+	// 2 epochs (the value this comment has always recommended). epochs=1 gave the
+	// policy only a single gradient step per iteration's data AND made Mean KL a
+	// meaningless ~0 (ratio==1 by construction, so reported KL was just float
+	// noise), hiding whether the policy was actually moving.
+	cfg.ppo.epochs = 2;
 
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
@@ -151,7 +154,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	cfg.ppo.contrastiveGoal.enabled = true;
+	// GCRL advantage blend OFF for the bootstrap. From a cold policy the one-step
+	// contrastive advantage is ~0 (taken score ~= baseline far from the ball) and
+	// the variance gate (sigmaMin 1e-6) never closes, so the blend only injected
+	// ~0.65x unit-std noise into the policy gradient. Re-enable once the bot plays.
+	cfg.ppo.contrastiveGoal.enabled = false;
 	cfg.ppo.contrastiveGoal.lambdaStart = 0.f;
 	cfg.ppo.contrastiveGoal.lambda = 0.65f;
 	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
