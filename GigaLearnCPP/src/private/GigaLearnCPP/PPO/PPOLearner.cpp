@@ -42,6 +42,12 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	}
 }
 
+GGL::PPOLearner::~PPOLearner() {
+	models.Free();
+	guidingPolicyModels.Free();
+	delete contrastiveGoalLearner;
+}
+
 void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
 	int obsSize, int numActions, 
@@ -142,7 +148,12 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 		// Account for action masking in entropy
 		// We will effectively narrow the entropy to the scope of the valid actions
 		// This way states with more masked actions don't just have inherently lower entropy
-		entropy /= actionMasks.to(torch::kFloat32).sum(-1).log();
+		auto validActionCounts = actionMasks.to(torch::kFloat32).sum(-1);
+		entropy = torch::where(
+			validActionCounts > 1,
+			entropy / validActionCounts.log(),
+			torch::zeros_like(entropy)
+		);
 	} else {
 		entropy /= logf(actionMasks.size(-1));
 	}

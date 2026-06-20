@@ -59,6 +59,13 @@ GGL::InferUnit::InferUnit(
 	}
 }
 
+GGL::InferUnit::~InferUnit() {
+	if (models) {
+		models->Free();
+		delete models;
+	}
+}
+
 RLGC::Action GGL::InferUnit::InferAction(const RLGC::Player& player, const RLGC::GameState& state, bool deterministic, float temperature) {
 	return BatchInferActions({ player }, { state }, deterministic, temperature)[0];
 }

@@ -3,6 +3,7 @@
 #include "rlbot/interface.h"
 
 #include <cstdlib>
+#include <cstring>
 
 namespace rlbot {
 template <typename type> class FlatbufferContainer {
@@ -14,50 +15,69 @@ private:
 public:
   FlatbufferContainer(ByteBuffer buffer) {
     size = buffer.size;
-    data = (char *)malloc(size);
-    memcpy(data, buffer.ptr, size);
+    data = size > 0 ? (char *)malloc(size) : nullptr;
+    if (size > 0)
+      memcpy(data, buffer.ptr, size);
 
-    flatbuffer = flatbuffers::GetRoot<type>(data);
+    flatbuffer = data ? flatbuffers::GetRoot<type>(data) : nullptr;
   }
 
   ~FlatbufferContainer() { free(data); }
 
   FlatbufferContainer(const FlatbufferContainer &flatbuffercontainer) {
     size = flatbuffercontainer.size;
-    data = (char *)malloc(size);
-    memcpy(data, flatbuffercontainer.data, size);
+    data = size > 0 ? (char *)malloc(size) : nullptr;
+    if (size > 0)
+      memcpy(data, flatbuffercontainer.data, size);
 
-    flatbuffer = flatbuffers::GetRoot<type>(data);
+    flatbuffer = data ? flatbuffers::GetRoot<type>(data) : nullptr;
   }
 
   FlatbufferContainer(FlatbufferContainer &&flatbuffercontainer) {
     size = flatbuffercontainer.size;
     data = flatbuffercontainer.data;
 
-    flatbuffer = flatbuffers::GetRoot<type>(data);
+    flatbuffer = data ? flatbuffers::GetRoot<type>(data) : nullptr;
 
     flatbuffercontainer.data = nullptr;
     flatbuffercontainer.size = 0;
+    flatbuffercontainer.flatbuffer = nullptr;
   }
 
-  FlatbufferContainer<type>
+  FlatbufferContainer<type> &
   operator=(const FlatbufferContainer &flatbuffercontainer) {
-    size = flatbuffercontainer.size;
-    data = (char *)malloc(size);
-    memcpy(data, flatbuffercontainer.data, size);
+    if (this == &flatbuffercontainer)
+      return *this;
 
-    flatbuffer = flatbuffers::GetRoot<type>(data);
+    free(data);
+
+    size = flatbuffercontainer.size;
+    data = size > 0 ? (char *)malloc(size) : nullptr;
+    if (size > 0)
+      memcpy(data, flatbuffercontainer.data, size);
+
+    flatbuffer = data ? flatbuffers::GetRoot<type>(data) : nullptr;
+
+    return *this;
   }
 
-  FlatbufferContainer<type>
+  FlatbufferContainer<type> &
   operator=(FlatbufferContainer &&flatbuffercontainer) {
+    if (this == &flatbuffercontainer)
+      return *this;
+
+    free(data);
+
     size = flatbuffercontainer.size;
     data = flatbuffercontainer.data;
 
-    flatbuffer = flatbuffers::GetRoot<type>(data);
+    flatbuffer = data ? flatbuffers::GetRoot<type>(data) : nullptr;
 
     flatbuffercontainer.data = nullptr;
     flatbuffercontainer.size = 0;
+    flatbuffercontainer.flatbuffer = nullptr;
+
+    return *this;
   }
 
   const type *getRoot() const { return flatbuffer; }

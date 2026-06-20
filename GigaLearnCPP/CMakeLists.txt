@@ -77,8 +77,8 @@ if (MSVC)
 endif (MSVC)
 
 # Make our python files copy over to our build dir
-configure_file("./python_scripts/metric_receiver.py" "../python_scripts/metric_receiver.py" COPY)
-configure_file("./python_scripts/render_receiver.py" "../python_scripts/render_receiver.py" COPY)
+configure_file("./python_scripts/metric_receiver.py" "../python_scripts/metric_receiver.py" COPYONLY)
+configure_file("./python_scripts/render_receiver.py" "../python_scripts/render_receiver.py" COPYONLY)
 
 # MSVC sometimes won't link to the libtorch DLLs unless you do this
 # This is also from https://pytorch.org/cppdocs/installing.html#minimal-example

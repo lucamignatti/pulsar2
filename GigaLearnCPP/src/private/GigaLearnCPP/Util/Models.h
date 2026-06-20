@@ -100,7 +100,7 @@ namespace GGL {
 
 		torch::optim::Optimizer* optim;
 
-		Model() : config(PartialModelConfig{}), device({}), modelName(NULL) {} // Uninitialized init
+		Model() : config(PartialModelConfig{}), device({}), modelName(NULL), optim(NULL) {} // Uninitialized init
 
 		Model(
 			const char* modelName,
@@ -162,7 +162,9 @@ namespace GGL {
 			return total;
 		}
 
-		virtual ~Model() = default;
+		virtual ~Model() {
+			delete optim;
+		}
 	};
 
 	class ModelSet {

@@ -32,6 +32,7 @@ namespace GGL {
 			int obsSize, int numActions,
 			PPOLearnerConfig config, torch::Device device
 		);
+		~PPOLearner();
 
 		static void MakeModels(
 			bool makeCritic, 

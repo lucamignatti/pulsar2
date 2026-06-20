@@ -35,7 +35,7 @@ def render_state(state_json_str):
         if 'state' in j:
             send_data_to_rsvis(j['state'], j['gamemode'])
         else:
-            send_data_to_rsvis(j)
+            send_data_to_rsvis(j, j.get('gamemode', 'soccar'))
     except Exception as err:
         print("Exception while sending data:")
         traceback.print_exc()

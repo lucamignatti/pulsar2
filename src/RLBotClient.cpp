@@ -21,7 +21,6 @@ RLBotBot::RLBotBot(int _index, int _team, std::string _name, const RLBotParams& 
 }
 
 RLBotBot::~RLBotBot() {
-	delete g_RLBotParams.inferUnit;
 }
 
 Vec ToVec(const rlbot::flat::Vector3* rlbotVec) {

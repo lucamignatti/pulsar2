@@ -23,8 +23,11 @@ std::vector<std::string> split(std::string string, char seperator) {
 }
 
 bool isNumber(std::string string) {
+  if (string.empty())
+    return false;
+
   for (int i = 0; i < string.length(); i++) {
-    if (!std::isdigit(string[i]))
+    if (!std::isdigit(static_cast<unsigned char>(string[i])))
       return false;
   }
 
@@ -49,6 +52,11 @@ void Server::Run(uint16_t port, std::function<void(Message)> callback) {
     Message m;
 
     if (params[0] == "add") {
+      if (params.size() < 5) {
+        std::cerr << "Invalid tcp message!" << std::endl;
+        continue;
+      }
+
       m.command = Command::Add;
 
       if (isNumber(params[2])) {
@@ -68,6 +76,11 @@ void Server::Run(uint16_t port, std::function<void(Message)> callback) {
       m.name = params[1];
       m.dll_dir = params[4];
     } else if (params[0] == "remove") {
+      if (params.size() < 2) {
+        std::cerr << "Invalid tcp message!" << std::endl;
+        continue;
+      }
+
       m.command = Command::Remove;
 
       if (isNumber(params[1])) {
