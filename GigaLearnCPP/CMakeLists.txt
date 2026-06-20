@@ -44,6 +44,7 @@ function(ggl_prepare_rocm_torch_dependencies)
 	if (NOT TARGET hip::amdhip64)
 		find_package(hip CONFIG QUIET)
 	endif()
+	find_package(hiprtc CONFIG QUIET)
 
 	if (NOT TARGET hip::amdhip64)
 		find_library(GGL_AMDHIP64_LIBRARY
@@ -57,6 +58,22 @@ function(ggl_prepare_rocm_torch_dependencies)
 			add_library(hip::amdhip64 SHARED IMPORTED GLOBAL)
 			set_target_properties(hip::amdhip64 PROPERTIES
 				IMPORTED_LOCATION "${GGL_AMDHIP64_LIBRARY}"
+			)
+		endif()
+	endif()
+
+	if (NOT TARGET hiprtc::hiprtc)
+		find_library(GGL_HIPRTC_LIBRARY
+			NAMES hiprtc
+			HINTS ${GGL_ROCM_PREFIXES}
+			PATH_SUFFIXES lib lib64
+		)
+
+		if (GGL_HIPRTC_LIBRARY)
+			message("Found libhiprtc without a CMake target, creating hiprtc::hiprtc fallback: ${GGL_HIPRTC_LIBRARY}")
+			add_library(hiprtc::hiprtc SHARED IMPORTED GLOBAL)
+			set_target_properties(hiprtc::hiprtc PROPERTIES
+				IMPORTED_LOCATION "${GGL_HIPRTC_LIBRARY}"
 			)
 		endif()
 	endif()
