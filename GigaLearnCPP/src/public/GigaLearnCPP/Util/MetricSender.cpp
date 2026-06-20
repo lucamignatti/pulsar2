@@ -57,6 +57,11 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 	if (key.rfind("Rewards/", 0) == 0)
 		return true;
 
+	// Skill-tracker Elo is logged under dynamic "Rating/<gamemode>" keys
+	// (PolicyVersionManager). Without this it's computed but silently dropped.
+	if (key.rfind("Rating/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 
