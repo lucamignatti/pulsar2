@@ -46,16 +46,38 @@ static void AppendAchievedGoal(FList& out, const GameState& state, const Player&
 }
 
 static void AppendScoringGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
+	// Canonical frame: the player's attacking goal is always at +y.
 	PhysState ball = InvertPhys(state.ball, player.team == Team::ORANGE);
 
 	float targetXRange = CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS;
 	float minTargetZ = CommonValues::BALL_RADIUS;
 	float maxTargetZ = CommonValues::GOAL_HEIGHT - CommonValues::BALL_RADIUS;
 
+	// (2A) Least-resistance score point: lead the ball along its own velocity,
+	// then clamp into the goal mouth. A ball already flying at the far post leads
+	// to the far post (where it would cross), not the perpendicular-nearest
+	// point. The lead is scaled by how much the velocity points at the goal (so
+	// a ball moving away/sideways doesn't over-lead) and capped, and it vanishes
+	// as the ball slows — degrading continuously to the closest mouth point with
+	// no piecewise switch.
+	Vec goalCenter = Vec(0, CommonValues::BACK_WALL_Y, CommonValues::GOAL_HEIGHT * 0.5f);
+	Vec toGoal = goalCenter - ball.pos;
+	Vec dirToGoal = (toGoal.Length() > 1e-3f) ? toGoal.Normalized() : Vec(0, 1, 0);
+
+	float speed = ball.vel.Length();
+	float align = (speed > 1e-3f) ? (ball.vel / speed).Dot(dirToGoal) : 0.f;
+	float leadScale = RS_CLAMP(align, 0.f, 1.f);
+	Vec lead = ball.vel * (cfg.scoringGoalLeadTime * leadScale);
+	float leadLen = lead.Length();
+	if (cfg.scoringGoalMaxLead > 0 && leadLen > cfg.scoringGoalMaxLead)
+		lead = lead * (cfg.scoringGoalMaxLead / leadLen);
+
+	Vec anchor = ball.pos + lead;
+
 	Vec targetPos = {};
-	targetPos.x = RS_CLAMP(ball.pos.x, -targetXRange, targetXRange);
-	targetPos.y = CommonValues::BACK_NET_Y;
-	targetPos.z = RS_CLAMP(ball.pos.z, minTargetZ, maxTargetZ);
+	targetPos.x = RS_CLAMP(anchor.x, -targetXRange, targetXRange);
+	targetPos.y = CommonValues::BACK_WALL_Y;
+	targetPos.z = RS_CLAMP(anchor.z, minTargetZ, maxTargetZ);
 
 	Vec direction = targetPos - ball.pos;
 	if (direction.Length() < 1e-3f)
@@ -626,6 +648,7 @@ void GGL::Learner::Start() {
 			FList states, nextStates, rewards, logProbs;
 			FList achievedGoals, herGoals, scoringGoals;
 			std::vector<uint8_t> actionMasks;
+			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
 			std::vector<int64_t> segmentIds, segmentSteps;
@@ -642,6 +665,7 @@ void GGL::Learner::Start() {
 				achievedGoals += other.achievedGoals;
 				herGoals += other.herGoals;
 				scoringGoals += other.scoringGoals;
+				gcrlTrainMask += other.gcrlTrainMask;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -752,9 +776,27 @@ void GGL::Learner::Start() {
 					int minOffset = RS_MAX(1, config.ppo.contrastiveGoal.herMinOffset);
 					int maxOffsetCfg = RS_MAX(minOffset, config.ppo.contrastiveGoal.herMaxOffset);
 					float shortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.herShortBiasPower);
+					float goalwardBias = RS_CLAMP(config.ppo.contrastiveGoal.herGoalwardBias, 0.f, 1.f);
 
 					if ((int)traj.achievedGoals.size() != n * 6)
 						RG_ERR_CLOSE("GCRL HER relabeling expected " << n << " achieved goal rows, got " << (traj.achievedGoals.size() / 6));
+
+					// (2B) Admit this match to contrastive training only if the ball
+					// actually moved during it; a dead kickoff->timeout match would just
+					// reteach the degenerate stationary-ball manifold. achievedGoals hold
+					// the ball's canonical (pos, vel) normalized by posScale*/velScale, so
+					// compare the normalized speed against the configured threshold.
+					float moveThreshNorm = config.ppo.contrastiveGoal.gcrlMinBallMoveSpeed / RS_MAX(1e-6f, config.ppo.contrastiveGoal.velScale);
+					float moveThreshNormSq = moveThreshNorm * moveThreshNorm;
+					bool ballMoved = false;
+					for (int t = 0; t < n && !ballMoved; t++) {
+						float vx = traj.achievedGoals[(size_t)t * 6 + 3];
+						float vy = traj.achievedGoals[(size_t)t * 6 + 4];
+						float vz = traj.achievedGoals[(size_t)t * 6 + 5];
+						if (vx * vx + vy * vy + vz * vz >= moveThreshNormSq)
+							ballMoved = true;
+					}
+					traj.gcrlTrainMask.assign((size_t)n, ballMoved ? 1 : 0);
 
 					traj.herGoals.resize((size_t)n * 6);
 					for (int t = 0; t < n; t++) {
@@ -764,10 +806,27 @@ void GGL::Learner::Start() {
 						if (remaining > 0) {
 							int maxOffset = RS_MIN(maxOffsetCfg, remaining);
 							if (maxOffset >= minOffset) {
-								float u = RocketSim::Math::RandFloat();
-								float biased = powf(u, shortBiasPower);
-								int span = maxOffset - minOffset + 1;
-								selectedOffset = minOffset + RS_MIN(span - 1, (int)floorf(biased * span));
+								if (goalwardBias > 0.f && RocketSim::Math::RandFloat() < goalwardBias) {
+									// (2C) Target the most-goalward (max canonical +y) achieved
+									// state within the offset window, so real near-net states
+									// populate the goal space and the (2A) scoring goal is
+									// in-distribution. Still a true achieved state (valid positive).
+									int bestOffset = minOffset;
+									float bestY = traj.achievedGoals[(size_t)(t + minOffset) * 6 + 1];
+									for (int o = minOffset + 1; o <= maxOffset; o++) {
+										float y = traj.achievedGoals[(size_t)(t + o) * 6 + 1];
+										if (y > bestY) {
+											bestY = y;
+											bestOffset = o;
+										}
+									}
+									selectedOffset = bestOffset;
+								} else {
+									float u = RocketSim::Math::RandFloat();
+									float biased = powf(u, shortBiasPower);
+									int span = maxOffset - minOffset + 1;
+									selectedOffset = minOffset + RS_MIN(span - 1, (int)floorf(biased * span));
+								}
 							} else {
 								selectedOffset = remaining;
 							}
@@ -990,20 +1049,22 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tAchievedGoals, tHERGoals, tScoringGoals, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
+						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
 
 						int64_t expRows = tStates.size(0);
-						if (tAchievedGoals.size(0) != expRows || tHERGoals.size(0) != expRows || tScoringGoals.size(0) != expRows || tSegmentIds.size(0) != expRows)
+						if (tAchievedGoals.size(0) != expRows || tHERGoals.size(0) != expRows || tScoringGoals.size(0) != expRows || tGcrlTrainMask.size(0) != expRows || tSegmentIds.size(0) != expRows)
 							RG_ERR_CLOSE("GCRL tensor alignment failed: states=" << expRows <<
 								", achievedGoals=" << tAchievedGoals.size(0) <<
 								", herGoals=" << tHERGoals.size(0) <<
 								", scoringGoals=" << tScoringGoals.size(0) <<
+								", gcrlTrainMask=" << tGcrlTrainMask.size(0) <<
 								", segmentIds=" << tSegmentIds.size(0));
 
 						if (!herSelectedOffsets.empty()) {
@@ -1094,6 +1155,7 @@ void GGL::Learner::Start() {
 						experience.data.achievedGoals = tAchievedGoals;
 						experience.data.herGoals = tHERGoals;
 						experience.data.scoringGoals = tScoringGoals;
+						experience.data.gcrlTrainMask = tGcrlTrainMask;
 						experience.data.segmentIds = tSegmentIds;
 						experience.data.segmentSteps = tSegmentSteps;
 					}

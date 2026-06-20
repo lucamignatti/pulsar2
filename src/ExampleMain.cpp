@@ -22,6 +22,15 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
+		// Dense approach + touch bootstrap. From a random init the event
+		// rewards below never fire (the bot never reaches the ball), so the
+		// policy gets no gradient. VelocityPlayerToBall pays for closing speed
+		// toward the ball every step (falls to ~0 once at the ball, so it pays
+		// for approaching, not stalling); StrongTouch pays for committed hits
+		// only (sub-20kph taps score 0, so it can't be soft-poke farmed).
+		{ teamMixed(new VelocityPlayerToBallReward()), 6.f },
+		{ teamMixed(new StrongTouchReward()), 60.f },
+
 		// Ball-goal shaping
 		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
 

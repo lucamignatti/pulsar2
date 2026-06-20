@@ -32,6 +32,27 @@ namespace GGL {
 		float targetSpeed = 1500.f;
 		float targetSpeedJitter = 0.f;
 
+		// (2A) Least-resistance scoring goal: lead the ball along its own
+		// velocity before clamping into the goal mouth, so a ball angled at the
+		// far post targets where it would actually cross, not the nearest point.
+		// The lead is scaled by alignment-to-goal and capped, and vanishes as the
+		// ball slows (degrading smoothly to the closest mouth point). See
+		// AppendScoringGoal().
+		float scoringGoalLeadTime = 0.6f;  // seconds of velocity lead
+		float scoringGoalMaxLead = 1500.f; // cap on lead distance (uu); <=0 disables
+
+		// (2B) Only train the contrastive critic on matches (segments between
+		// resets) where the ball actually moved (peak speed >= this), so it never
+		// learns the degenerate "ball never moves" manifold. Advantage scoring is
+		// unaffected.
+		float gcrlMinBallMoveSpeed = 300.f;
+
+		// (2C) Fraction of HER training goals drawn from the most-goalward future
+		// ball state within the offset window (the rest use short-biased horizon
+		// sampling), so real near-net states populate the critic's goal space and
+		// the (2A) scoring goal becomes in-distribution.
+		float herGoalwardBias = 0.5f;
+
 		// Deprecated by v1 short-biased HER sampling. Kept for source compatibility.
 		int immediateMin = 1;
 		int immediateMax = 4;

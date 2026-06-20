@@ -71,14 +71,31 @@ namespace GGL {
 		Tensor metricAccum;
 		int64_t batches = 0;
 
-		std::vector<int64_t> indices(n);
-		std::iota(indices.begin(), indices.end(), 0);
+		// (2B) Only train on rows whose match saw real ball movement; a dead
+		// kickoff->timeout match would just reteach the stationary-ball manifold.
+		// Advantage scoring (PrepareGCRLPolicyAdvantages) still uses every row.
+		std::vector<int64_t> indices;
+		if (data.gcrlTrainMask.defined() && data.gcrlTrainMask.size(0) == n) {
+			Tensor maskCpu = data.gcrlTrainMask.to(kCPU).contiguous();
+			const uint8_t* maskPtr = maskCpu.data_ptr<uint8_t>();
+			indices.reserve(n);
+			for (int64_t i = 0; i < n; i++)
+				if (maskPtr[i])
+					indices.push_back(i);
+		} else {
+			indices.resize(n);
+			std::iota(indices.begin(), indices.end(), 0);
+		}
+
+		int64_t numTrainRows = (int64_t)indices.size();
+		if (numTrainRows <= 1)
+			return stats;
 
 		for (int epoch = 0; epoch < config.criticEpochs; epoch++) {
 			std::shuffle(indices.begin(), indices.end(), rng);
 
-			for (int64_t start = 0; start < n; start += miniBatchSize) {
-				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, n - start);
+			for (int64_t start = 0; start < numTrainRows; start += miniBatchSize) {
+				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, numTrainRows - start);
 				if (curBatchSize <= 1)
 					continue;
 
@@ -147,7 +164,7 @@ namespace GGL {
 			}
 		}
 
-		stats.anchorsUsed = n;
+		stats.anchorsUsed = numTrainRows;
 		if (batches > 0 && metricAccum.defined()) {
 			auto m = (metricAccum / (float)batches).cpu();
 			stats.loss = m[0].item<float>();
