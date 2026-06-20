@@ -84,6 +84,10 @@ namespace RLGC {
 		std::vector<ActionParser*> actionParsers;
 		std::vector<StateSetter*> stateSetters;
 
+		// [arena][rewardIdx] -> reward name, cached at construction so callers can label
+		// per-reward metrics without dereferencing the reward objects.
+		std::vector<std::vector<std::string>> rewardNames;
+
 		EnvState state = {};
 
 		EnvSet(const EnvSetConfig& config);
@@ -107,5 +111,7 @@ namespace RLGC {
 		void Sync() { g_ThreadPool.WaitUntilDone(); }
 		void ResetArena(int index);
 		void Reset();
+
+		const std::vector<std::string>& GetRewardNames(int arenaIdx) const { return rewardNames[arenaIdx]; }
 	};
 }

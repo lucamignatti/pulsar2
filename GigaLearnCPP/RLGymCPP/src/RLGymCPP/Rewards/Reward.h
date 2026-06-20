@@ -35,6 +35,12 @@ namespace RLGC {
 			return rewards;
 		}
 
+		// The per-player value to surface to metrics for this reward. Defaults to the reward's
+		// own output; wrappers (e.g. ZeroSumReward) override this to log a pre-transform value.
+		virtual float GetLoggableReward(int playerIndex, const std::vector<float>& lastOutput) {
+			return lastOutput[playerIndex];
+		}
+
 		virtual std::string GetName() {
 
 			if (!_cachedName.empty())

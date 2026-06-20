@@ -60,3 +60,8 @@ libtorch
 /checkpoints
 /wandb
 /run_logs
+
+# AI / design artifacts — kept locally, not part of the product
+/CONTEXT.md
+/docs/adr/
+/architecture-review-*.html

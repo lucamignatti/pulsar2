@@ -3,7 +3,7 @@
 #include "Util/Models.h"
 #include <GigaLearnCPP/SkillTrackerConfig.h>
 #include <GigaLearnCPP/Util/Report.h>
-#include <GigaLearnCPP/Util/RenderSender.h>
+#include <GigaLearnCPP/Util/RenderSink.h>
 
 #include <nlohmann/json.hpp>
 
@@ -81,12 +81,12 @@ namespace GGL {
 			SkillRating curRatings = {};
 		} skill;
 
-		RenderSender* renderSender;
+		RenderSink* renderSender;
 
 		PolicyVersionManager(
 			std::filesystem::path saveFolder, int maxVersions, uint64_t tsPerVersion,
 			const SkillTrackerConfig& skillTrackerConfig, const RLGC::EnvSetConfig& envSetConfig,
-			RenderSender* renderSender = NULL);
+			RenderSink* renderSender = NULL);
 
 		// NOTE: Passed models should not be already cloned
 		PolicyVersion& AddVersion(ModelSet modelsToClone, uint64_t timesteps);

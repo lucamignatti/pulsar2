@@ -21,9 +21,12 @@
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
+#include <private/GigaLearnCPP/PPO/TrainingBatch.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
 
 #include "Util/KeyPressDetector.h"
+#include "Util/MetricSender.h"
+#include "Util/RenderSender.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 #include "Util/AvgTracker.h"
 #include <RLGymCPP/CommonValues.h>
@@ -187,10 +190,12 @@ static at::Device ResolveLearnerDevice(GGL::LearnerDeviceType deviceType) {
 	return at::Device(at::kCPU);
 }
 
-GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
+GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback,
+	MetricSink* injectedMetricSink, RenderSink* injectedRenderSink) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
 {
-	pybind11::initialize_interpreter();
+	// No interpreter init here — the pybind adapters (MetricSender/RenderSender) own the Python
+	// runtime via a refcounted guard, so a Learner with only injected in-memory sinks needs no Python.
 
 #ifndef NDEBUG
 	RG_LOG("===========================");
@@ -271,10 +276,15 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
 	}
 
-	if (config.renderMode) {
-		renderSender = new RenderSender(config.renderTimeScale);
+	if (injectedRenderSink) {
+		renderSink = injectedRenderSink;
+		ownsRenderSink = false;
+	} else if (config.renderMode) {
+		renderSink = new RenderSender(config.renderTimeScale);
+		ownsRenderSink = true;
 	} else {
-		renderSender = NULL;
+		renderSink = NULL;
+		ownsRenderSink = false;
 	}
 
 	if (config.skillTracker.enabled || config.trainAgainstOldVersions)
@@ -301,12 +311,17 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		versionMgr->LoadVersions(models, totalTimesteps);
 	}
 
-	if (config.sendMetrics && !config.renderMode) {
+	if (injectedMetricSink) {
+		metricSink = injectedMetricSink;
+		ownsMetricSink = false;
+	} else if (config.sendMetrics && !config.renderMode) {
 		if (!runID.empty())
 			RG_LOG("\tRun ID: " << runID);
-		metricSender = new MetricSender(config.metricsProjectName, config.metricsGroupName, config.metricsRunName, runID);
+		metricSink = new MetricSender(config.metricsProjectName, config.metricsGroupName, config.metricsRunName, runID);
+		ownsMetricSink = true;
 	} else {
-		metricSender = NULL;
+		metricSink = NULL;
+		ownsMetricSink = false;
 	}
 
 	RG_LOG(RG_DIVIDER);
@@ -325,8 +340,8 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	j["total_timesteps"] = totalTimesteps;
 	j["total_iterations"] = totalIterations;
 
-	if (config.sendMetrics)
-		j["run_id"] = metricSender->curRunID;
+	if (config.sendMetrics && metricSink)
+		j["run_id"] = metricSink->GetRunID();
 
 	if (returnStat)
 		j["return_stat"] = returnStat->ToJSON();
@@ -598,8 +613,8 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 
 			report.Finish();
 
-			if (metricSender)
-				metricSender->Send(report);
+			if (metricSink)
+				metricSink->Send(report);
 
 			report.Display(
 				{
@@ -949,7 +964,7 @@ void GGL::Learner::Start() {
 							stepCallback(this, envSet->state.gameStates, report);
 
 						if (render) {
-							renderSender->Send(envSet->state.gameStates[0]);
+							renderSink->Send(envSet->state.gameStates[0]);
 							continue;
 						}
 
@@ -961,10 +976,10 @@ void GGL::Learner::Start() {
 								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
 								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
 
-								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
-									std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();
-									avgRewards[rewardName] += prevRewards[j];
-								}
+								const auto& rewardNames = envSet->GetRewardNames(arenaIdx);
+								int numRewards = RS_MIN((int)rewardNames.size(), (int)prevRewards.size());
+								for (int j = 0; j < numRewards; j++)
+									avgRewards[rewardNames[j]] += prevRewards[j];
 							}
 
 							for (auto& pair : avgRewards)
@@ -1058,15 +1073,6 @@ void GGL::Learner::Start() {
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
 
-						int64_t expRows = tStates.size(0);
-						if (tAchievedGoals.size(0) != expRows || tHERGoals.size(0) != expRows || tScoringGoals.size(0) != expRows || tGcrlTrainMask.size(0) != expRows || tSegmentIds.size(0) != expRows)
-							RG_ERR_CLOSE("GCRL tensor alignment failed: states=" << expRows <<
-								", achievedGoals=" << tAchievedGoals.size(0) <<
-								", herGoals=" << tHERGoals.size(0) <<
-								", scoringGoals=" << tScoringGoals.size(0) <<
-								", gcrlTrainMask=" << tGcrlTrainMask.size(0) <<
-								", segmentIds=" << tSegmentIds.size(0));
-
 						if (!herSelectedOffsets.empty()) {
 							torch::Tensor tOffsets = torch::tensor(herSelectedOffsets);
 							report["HER Selected Offset Mean"] = tOffsets.mean().item<float>();
@@ -1119,46 +1125,51 @@ void GGL::Learner::Start() {
 					float normalTerminalRate = (tTerminals == RLGC::TerminalType::NORMAL).to(torch::kFloat32).mean().item<float>();
 					report["Episode Length"] = normalTerminalRate > 0 ? 1.f / normalTerminalRate : 0;
 
-					Timer gaeTimer = {};
-					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns;
-					float rewClipPortion;
-					GAE::Compute(
-						tRewards, tTerminals, tValPreds, tTruncValPreds,
-						tAdvantages, tTargetVals, tReturns, rewClipPortion,
-						config.ppo.gaeGamma, config.ppo.gaeLambda, returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange
-					);
-					report["GAE Time"] = gaeTimer.Elapsed();
-					report["Clipped Reward Portion"] = rewClipPortion;
+					// Build advantages + training batch: GAE, the goal-tensor alignment check, and buffer
+					// packing now live in one pure, tested unit (BuildTrainingBatch). The critic
+					// predictions above are passed in as data; the running return stat is read before
+					// the call and updated after it, so that ordering stays visible here.
+					TrainingBatchInputs batchIn;
+					batchIn.states = tStates;
+					batchIn.actions = tActions;
+					batchIn.logProbs = tLogProbs;
+					batchIn.actionMasks = tActionMasks;
+					batchIn.rewards = tRewards;
+					batchIn.terminals = tTerminals;
+					batchIn.valPreds = tValPreds;
+					batchIn.truncValPreds = tTruncValPreds;
+					batchIn.gcrlEnabled = config.ppo.contrastiveGoal.enabled;
+					if (batchIn.gcrlEnabled) {
+						batchIn.achievedGoals = tAchievedGoals;
+						batchIn.herGoals = tHERGoals;
+						batchIn.scoringGoals = tScoringGoals;
+						batchIn.gcrlTrainMask = tGcrlTrainMask;
+						batchIn.segmentIds = tSegmentIds;
+						batchIn.segmentSteps = tSegmentSteps;
+					}
+					batchIn.gaeGamma = config.ppo.gaeGamma;
+					batchIn.gaeLambda = config.ppo.gaeLambda;
+					batchIn.rewardClipRange = config.ppo.rewardClipRange;
+					batchIn.returnStd = returnStat ? returnStat->GetSTD() : 1;
 
+					Timer gaeTimer = {};
+					TrainingBatchResult batch = BuildTrainingBatch(batchIn, experience);
+					report["GAE Time"] = gaeTimer.Elapsed();
+					report["Clipped Reward Portion"] = batch.rewClipPortion;
+
+					// Caller owns the running return stat: read old std (above) -> GAE -> update now.
 					if (returnStat) {
 						report["GAE/Returns STD"] = returnStat->GetSTD();
 
-						int numToIncrement = RS_MIN(config.maxReturnSamples, tReturns.size(0));
+						int numToIncrement = RS_MIN(config.maxReturnSamples, batch.returns.size(0));
 						if (numToIncrement > 0) {
-							auto selectedReturns = tReturns.index_select(0, torch::randint(tReturns.size(0), { (int64_t)numToIncrement }));
+							auto selectedReturns = batch.returns.index_select(0, torch::randint(batch.returns.size(0), { (int64_t)numToIncrement }));
 							returnStat->Increment(TENSOR_TO_VEC<float>(selectedReturns));
 						}
 					}
-					report["GAE/Avg Return"] = tReturns.abs().mean().item<float>();
-					report["GAE/Avg Advantage"] = tAdvantages.abs().mean().item<float>();
-					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
-
-					// Set experience buffer
-					experience.data.actions = tActions;
-					experience.data.logProbs = tLogProbs;
-					experience.data.actionMasks = tActionMasks;
-					experience.data.states = tStates;
-					experience.data.advantages = tAdvantages;
-					experience.data.targetValues = tTargetVals;
-					if (config.ppo.contrastiveGoal.enabled) {
-						experience.data.achievedGoals = tAchievedGoals;
-						experience.data.herGoals = tHERGoals;
-						experience.data.scoringGoals = tScoringGoals;
-						experience.data.gcrlTrainMask = tGcrlTrainMask;
-						experience.data.segmentIds = tSegmentIds;
-						experience.data.segmentSteps = tSegmentSteps;
-					}
+					report["GAE/Avg Return"] = batch.avgReturn;
+					report["GAE/Avg Advantage"] = batch.avgAdvantage;
+					report["GAE/Avg Val Target"] = batch.avgValTarget;
 				}
 
 				// Free CUDA cache
@@ -1208,8 +1219,8 @@ void GGL::Learner::Start() {
 
 				report.Finish();
 
-				if (metricSender)
-					metricSender->Send(report);
+				if (metricSink)
+					metricSink->Send(report);
 
 				report.Display(
 					{
@@ -1249,7 +1260,10 @@ void GGL::Learner::Start() {
 GGL::Learner::~Learner() {
 	delete ppo;
 	delete versionMgr;
-	delete metricSender;
-	delete renderSender;
-	pybind11::finalize_interpreter();
+	// Only delete sinks we created; injected sinks are owned by the caller. The interpreter is
+	// finalized by each pybind adapter's PythonRuntime guard as it is destroyed here.
+	if (ownsMetricSink)
+		delete metricSink;
+	if (ownsRenderSink)
+		delete renderSink;
 }

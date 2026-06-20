@@ -1,5 +1,4 @@
 #include "EnvSet.h"
-#include  "../Rewards/ZeroSumReward.h"
 
 template<bool RLGC::PlayerEventState::* DATA_VAR>
 void IncPlayerCounter(Car* car, void* userInfoPtr) {
@@ -88,7 +87,16 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 
 	state.Resize(arenas);
-	
+
+	// Cache reward names once so the trainer can label per-reward metrics
+	// without reaching into the reward objects themselves.
+	rewardNames.resize(rewards.size());
+	for (int a = 0; a < (int)rewards.size(); a++) {
+		rewardNames[a].reserve(rewards[a].size());
+		for (auto& weighted : rewards[a])
+			rewardNames[a].push_back(weighted.reward->GetName());
+	}
+
 	// Determine obs size and action amount, initialize arrays accordingly
 	{
 		stateSetters[0]->ResetArena(arenas[0]);
@@ -218,12 +226,9 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 							}
 						}
 					}
-					// We will only take the reward from a random player
-					float rewardToSave = output[playerSampleIndex];
-						
-					// If zero-sum, use the inner reward
-					if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
-						rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
+					// Take the reward from a single representative player. Each reward decides which
+					// value it wants logged (e.g. ZeroSumReward logs its inner, pre-zero-sum value).
+					float rewardToSave = weightedReward.reward->GetLoggableReward(playerSampleIndex, output);
 
 					// If needed, initialize last rewards
 					if (state.lastRewards[arenaIdx].empty())

@@ -13,7 +13,7 @@ using namespace nlohmann;
 
 GGL::PolicyVersionManager::PolicyVersionManager(
 	std::filesystem::path saveFolder, int maxVersions, uint64_t tsPerVersion, 
-	const SkillTrackerConfig& skillTrackerConfig, const RLGC::EnvSetConfig& envSetConfig, RenderSender* renderSender) : 
+	const SkillTrackerConfig& skillTrackerConfig, const RLGC::EnvSetConfig& envSetConfig, RenderSink* renderSender) :
 	saveFolder(saveFolder), maxVersions(maxVersions), tsPerVersion(tsPerVersion), 
 	renderSender(renderSender) {
 

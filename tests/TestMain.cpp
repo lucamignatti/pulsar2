@@ -5,6 +5,8 @@ void RunWelfordTests();
 void RunGAETests();
 void RunExperienceBufferTests();
 void RunRewardNameTests();
+void RunTrainingBatchTests();
+void RunMetricSinkTests();
 
 int main() {
     printf("=== GigaLearn unit tests ===\n\n");
@@ -13,6 +15,8 @@ int main() {
     RunGAETests();
     RunExperienceBufferTests();
     RunRewardNameTests();
+    RunTrainingBatchTests();
+    RunMetricSinkTests();
 
     return TestHarness::Summary();
 }

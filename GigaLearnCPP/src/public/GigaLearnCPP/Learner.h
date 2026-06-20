@@ -2,8 +2,8 @@
 
 #include <atomic>
 #include <RLGymCPP/EnvSet/EnvSet.h>
-#include "Util/MetricSender.h"
-#include "Util/RenderSender.h"
+#include "Util/MetricSink.h"
+#include "Util/RenderSink.h"
 #include "LearnerConfig.h"
 #include "PPO/TransferLearnConfig.h"
 
@@ -22,8 +22,13 @@ namespace GGL {
 		class PolicyVersionManager* versionMgr;
 
 		RLGC::EnvCreateFn envCreateFn;
-		MetricSender* metricSender;
-		RenderSender* renderSender;
+
+		// Metric/render side-channels behind ports. Owned by the Learner only when it created the
+		// default (wandb / Python) adapter; an injected sink is owned by the caller.
+		MetricSink* metricSink;
+		RenderSink* renderSink;
+		bool ownsMetricSink = false;
+		bool ownsRenderSink = false;
 
 		int obsSize;
 		int numActions;
@@ -39,7 +44,10 @@ namespace GGL {
 
 		StepCallbackFn stepCallback = NULL;
 
-		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);
+		// metricSink/renderSink default to NULL, in which case the Learner builds the real
+		// wandb/Python adapters from `config`. Inject an in-memory sink to run without Python.
+		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL,
+			MetricSink* metricSink = NULL, RenderSink* renderSink = NULL);
 		void Start();
 
 		void StartTransferLearn(const TransferLearnConfig& transferLearnConfig);
