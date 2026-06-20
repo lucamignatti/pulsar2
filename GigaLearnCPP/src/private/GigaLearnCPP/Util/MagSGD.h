@@ -2,6 +2,7 @@
 #include "../FrameworkTorch.h"
 #include <torch/optim/sgd.h>
 #include <torch/csrc/api/include/torch/nn/utils/convert_parameters.h>
+#include <cmath>
 
 namespace GGL {
 
@@ -31,6 +32,9 @@ namespace GGL {
 						gradMag += param.grad().detach().square().sum().cpu().item<float>();
 			gradMag = sqrtf(gradMag);
 
+			if (gradMag <= 0 || !std::isfinite(gradMag))
+				return loss;
+
 			// Normalize the gradients by dividing them by the update magnitude
 			for (auto& group : this->param_groups()) {
 				for (auto& param : group.params()) {
@@ -43,7 +47,8 @@ namespace GGL {
 			}
 
 			// Let SGD do the step with our new gradients
-			return SGD::step(closure);
+			SGD::step(nullptr);
+			return loss;
 		}
 	};
 }

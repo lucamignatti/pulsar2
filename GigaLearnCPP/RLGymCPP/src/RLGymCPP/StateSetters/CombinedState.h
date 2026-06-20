@@ -29,19 +29,33 @@ namespace RLGC {
 				totalWeight += pair.second;
 				cumulativeWeights.push_back(totalWeight);
 			}
+
+			if (totalWeight <= 0)
+				RG_ERR_CLOSE("CombinedState: Total state setter weight must be positive");
 		}
 
 		void ResetArena(Arena* arena) override {
 			float f = RocketSim::Math::RandFloat(0, totalWeight);
 
+			float prevWeight = 0;
 			for (int i = 0; i < setters.size(); i++) {
-				if (f <= cumulativeWeights[i]) {
+				bool hasWeight = cumulativeWeights[i] > prevWeight;
+				if (hasWeight && f < cumulativeWeights[i]) {
+					setters[i]->ResetArena(arena);
+					return;
+				}
+				prevWeight = cumulativeWeights[i];
+			}
+
+			for (int i = (int)setters.size() - 1; i >= 0; i--) {
+				float prev = i > 0 ? cumulativeWeights[i - 1] : 0;
+				if (cumulativeWeights[i] > prev) {
 					setters[i]->ResetArena(arena);
 					return;
 				}
 			}
 
-			RG_ERR_CLOSE("CombinedState ran out of setters before the matching cumulative weight was found (this should never happen)");
+			RG_ERR_CLOSE("CombinedState ran out of positive-weight setters before the matching cumulative weight was found (this should never happen)");
 		}
 	};
 }

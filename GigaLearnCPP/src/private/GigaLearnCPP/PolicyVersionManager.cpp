@@ -1,5 +1,6 @@
 #include "PolicyVersionManager.h"
 #include <nlohmann/json.hpp>
+#include <cmath>
 
 #include <GigaLearnCPP/Util/Utils.h>
 
@@ -18,10 +19,28 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 
 	skill.config = skillTrackerConfig;
 
+	if (maxVersions <= 0)
+		RG_ERR_CLOSE("PolicyVersionManager maxVersions must be positive");
+	if (tsPerVersion == 0)
+		RG_ERR_CLOSE("PolicyVersionManager tsPerVersion must be positive");
+
 	if (!std::filesystem::exists(saveFolder))
 		std::filesystem::create_directories(saveFolder);
 
 	if (skill.config.enabled) {
+		if (skill.config.numArenas <= 0)
+			RG_ERR_CLOSE("SkillTrackerConfig::numArenas must be positive");
+		if (skill.config.simTime <= 0 || !std::isfinite(skill.config.simTime))
+			RG_ERR_CLOSE("SkillTrackerConfig::simTime must be positive and finite");
+		if (skill.config.maxSimTime <= 0 || !std::isfinite(skill.config.maxSimTime))
+			RG_ERR_CLOSE("SkillTrackerConfig::maxSimTime must be positive and finite");
+		if (skill.config.updateInterval <= 0)
+			RG_ERR_CLOSE("SkillTrackerConfig::updateInterval must be positive");
+		if (!std::isfinite(skill.config.ratingInc))
+			RG_ERR_CLOSE("SkillTrackerConfig::ratingInc must be finite");
+		if (!std::isfinite(skill.config.initialRating))
+			RG_ERR_CLOSE("SkillTrackerConfig::initialRating must be finite");
+
 		RLGC::EnvSetConfig skillEnvSetConfig = envSetConfig;
 		skillEnvSetConfig.numArenas = skill.config.numArenas;
 		skill.envSet = new RLGC::EnvSet(skillEnvSetConfig);

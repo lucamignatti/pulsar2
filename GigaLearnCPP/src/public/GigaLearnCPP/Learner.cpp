@@ -10,6 +10,7 @@
 #endif
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
+#include <cmath>
 
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
@@ -178,6 +179,25 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	if (config.tsPerSave == 0)
 		config.tsPerSave = config.ppo.tsPerItr;
+
+	if (config.numGames <= 0)
+		RG_ERR_CLOSE("LearnerConfig::numGames must be positive");
+	if (config.tickSkip <= 0)
+		RG_ERR_CLOSE("LearnerConfig::tickSkip must be positive");
+	if (config.tsPerSave <= 0)
+		RG_ERR_CLOSE("LearnerConfig::tsPerSave must be positive after defaulting");
+	if (config.ppo.tsPerItr <= 0)
+		RG_ERR_CLOSE("PPOLearnerConfig::tsPerItr must be positive");
+	if (config.addRewardsToMetrics && config.rewardSampleRandInterval <= 0)
+		RG_ERR_CLOSE("LearnerConfig::rewardSampleRandInterval must be positive when reward metrics are enabled");
+	if (config.renderMode && (config.renderTimeScale <= 0 || !std::isfinite(config.renderTimeScale)))
+		RG_ERR_CLOSE("LearnerConfig::renderTimeScale must be positive and finite in render mode");
+	if (config.savePolicyVersions || config.skillTracker.enabled || config.trainAgainstOldVersions) {
+		if (config.tsPerVersion <= 0)
+			RG_ERR_CLOSE("LearnerConfig::tsPerVersion must be positive when policy versions are enabled");
+		if (config.maxOldVersions <= 0)
+			RG_ERR_CLOSE("LearnerConfig::maxOldVersions must be positive when policy versions are enabled");
+	}
 
 	RG_LOG("Learner::Learner():");
 
@@ -1006,7 +1026,8 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					report["Episode Length"] = 1.f / (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
+					float normalTerminalRate = (tTerminals == RLGC::TerminalType::NORMAL).to(torch::kFloat32).mean().item<float>();
+					report["Episode Length"] = normalTerminalRate > 0 ? 1.f / normalTerminalRate : 0;
 
 					Timer gaeTimer = {};
 					// Run GAE
@@ -1064,9 +1085,13 @@ void GGL::Learner::Start() {
 				float consumptionTime = consumptionTimer.Elapsed();
 				report["Collection Time"] = collectionTime;
 				report["Consumption Time"] = consumptionTime;
-				report["Collection Steps/Second"] = stepsCollected / collectionTime;
-				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
-				report["Overall Steps/Second"] = stepsCollected / (collectionTime + consumptionTime);
+
+				auto calcStepsPerSecond = [](int steps, float seconds) {
+					return seconds > 0 ? steps / seconds : 0.f;
+				};
+				report["Collection Steps/Second"] = calcStepsPerSecond(stepsCollected, collectionTime);
+				report["Consumption Steps/Second"] = calcStepsPerSecond(stepsCollected, consumptionTime);
+				report["Overall Steps/Second"] = calcStepsPerSecond(stepsCollected, collectionTime + consumptionTime);
 
 				uint64_t prevTimesteps = totalTimesteps;
 				totalTimesteps += stepsCollected;

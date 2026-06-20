@@ -48,6 +48,8 @@ namespace GGL {
 			auto itr = avgs.find(key);
 			if (itr == avgs.end())
 				RG_ERR_CLOSE("Cannot call Report::FinishAvg() on non-existent average \"" << key << "\"!");
+			if (itr->second.count == 0)
+				RG_ERR_CLOSE("Cannot finish average metric \"" << key << "\" with zero samples!");
 
 			data[key] = itr->second.total / (Val)itr->second.count;
 
@@ -68,8 +70,11 @@ namespace GGL {
 		}
 
 		void Finish() {
-			for (auto& pair : avgs)
+			for (auto& pair : avgs) {
+				if (pair.second.count == 0)
+					RG_ERR_CLOSE("Cannot finish average metric \"" << pair.first << "\" with zero samples!");
 				data[pair.first] = pair.second.total / (Val)pair.second.count;
+			}
 			avgs.clear();
 		}
 

@@ -4,6 +4,7 @@
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
+#include <cmath>
 
 using namespace torch;
 
@@ -13,8 +14,25 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
 
+	if (config.batchSize <= 0)
+		RG_ERR_CLOSE("PPOLearner: config.batchSize must be positive");
+	if (config.miniBatchSize <= 0)
+		RG_ERR_CLOSE("PPOLearner: config.miniBatchSize must be positive");
+	if (config.policyTemperature <= 0 || !std::isfinite(config.policyTemperature))
+		RG_ERR_CLOSE("PPOLearner: config.policyTemperature must be finite and positive");
+
 	if (config.batchSize % config.miniBatchSize != 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
+
+	if (config.contrastiveGoal.enabled) {
+		auto& cfg = config.contrastiveGoal;
+		if (cfg.tau <= 0 || !std::isfinite(cfg.tau))
+			RG_ERR_CLOSE("PPOLearner: contrastiveGoal.tau must be finite and positive");
+		if (cfg.sigmaFloor <= 0 || !std::isfinite(cfg.sigmaFloor))
+			RG_ERR_CLOSE("PPOLearner: contrastiveGoal.sigmaFloor must be finite and positive");
+		if (cfg.posScaleX == 0 || cfg.posScaleY == 0 || cfg.posScaleZ == 0 || cfg.velScale == 0)
+			RG_ERR_CLOSE("PPOLearner: contrastive goal normalization scales must be non-zero");
+	}
 
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
@@ -155,7 +173,8 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 			torch::zeros_like(entropy)
 		);
 	} else {
-		entropy /= logf(actionMasks.size(-1));
+		float denom = logf(actionMasks.size(-1));
+		entropy = denom > 0 ? entropy / denom : torch::zeros_like(entropy);
 	}
 
 	return entropy.mean();
@@ -421,7 +440,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
 					avgPolicyLoss += curPolicyLoss;
 
-					avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+					if (std::abs(curPolicyLoss) > 1e-12f)
+						avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
 
 					ppoLoss = (policyLoss - entropy * config.entropyScale) * batchSizeRatio;
 

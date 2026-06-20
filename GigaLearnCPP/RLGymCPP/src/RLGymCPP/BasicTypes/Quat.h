@@ -5,7 +5,8 @@ namespace RLGC {
 		float w, x, y, z;
 
 		Quat() {
-			w = x = y = z = 1;
+			w = 1;
+			x = y = z = 0;
 		}
 
 		Quat(float w, float x, float y, float z) :

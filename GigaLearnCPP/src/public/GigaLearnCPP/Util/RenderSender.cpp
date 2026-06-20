@@ -1,12 +1,16 @@
 #include "RenderSender.h"
 
 #include <nlohmann/json.hpp>
+#include <cmath>
 
 using namespace nlohmann;
 using namespace RLGC;
 
 GGL::RenderSender::RenderSender(float timeScale) : timeScale(timeScale) {
 	RG_LOG("Initializing RenderSender...");
+
+	if (timeScale <= 0 || !std::isfinite(timeScale))
+		RG_ERR_CLOSE("RenderSender timeScale must be positive and finite");
 
 	try {
 		RG_LOG("Current dir: " << std::filesystem::current_path());

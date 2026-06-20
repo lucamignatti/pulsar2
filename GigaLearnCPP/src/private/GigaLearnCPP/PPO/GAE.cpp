@@ -61,6 +61,7 @@ void GGL::GAE::Compute(
 		} else {
 			curReward = _rews[step];
 			totalRew += abs(curReward);
+			totalClippedRew += abs(curReward);
 		}
 
 		float nextValPred = 0;

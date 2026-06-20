@@ -112,8 +112,19 @@ namespace GGL {
 		}
 
 		void ReadFromJSON(const nlohmann::json& json) {
-			runningMeans = Utils::MakeVecFromJSON<double>(json["mean"]);
-			runningVariances = Utils::MakeVecFromJSON<double>(json["var"]);
+			if (json.contains("means")) {
+				runningMeans = Utils::MakeVecFromJSON<double>(json["means"]);
+			} else {
+				runningMeans = Utils::MakeVecFromJSON<double>(json["mean"]);
+			}
+
+			if (json.contains("vars")) {
+				runningVariances = Utils::MakeVecFromJSON<double>(json["vars"]);
+			} else {
+				runningVariances = Utils::MakeVecFromJSON<double>(json["var"]);
+			}
+
+			width = runningMeans.size();
 			count = json["count"];
 		}
 	};
