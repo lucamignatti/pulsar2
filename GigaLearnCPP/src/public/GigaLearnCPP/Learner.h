@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <RLGymCPP/EnvSet/EnvSet.h>
 #include "Util/MetricSender.h"
 #include "Util/RenderSender.h"
@@ -43,7 +44,7 @@ namespace GGL {
 
 		void StartTransferLearn(const TransferLearnConfig& transferLearnConfig);
 
-		void StartQuitKeyThread(bool& quitPressed, std::thread& outThread);
+		void StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread);
 
 		void Save();
 		void Load();

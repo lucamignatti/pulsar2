@@ -92,7 +92,10 @@ namespace GGL {
 
 		Report operator+(const Report& other) const {
 			Report newReport = *this;
-			newReport.data.insert(other.data.begin(), other.data.end());
+			// insert() would silently keep our own value on key collisions; the merge
+			// semantics we want are "the right-hand report wins", so assign explicitly.
+			for (const auto& pair : other.data)
+				newReport.data[pair.first] = pair.second;
 			return newReport;
 		}
 

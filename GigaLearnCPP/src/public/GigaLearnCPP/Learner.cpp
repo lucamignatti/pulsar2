@@ -404,7 +404,7 @@ void GGL::Learner::Load() {
 	}
 }
 
-void GGL::Learner::StartQuitKeyThread(bool& quitPressed, std::thread& outThread) {
+void GGL::Learner::StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread) {
 	quitPressed = false;
 
 	if (!KeyPressDetector::HasTerminalInput()) {
@@ -473,7 +473,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 	}
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued{false};
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
@@ -614,7 +614,7 @@ void GGL::Learner::Start() {
 		RG_ERR_CLOSE("Learner::Start(): PPO deterministic mode cannot be used for training because sampled action log-probs are required.");
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued{false};
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
@@ -713,6 +713,24 @@ void GGL::Learner::Start() {
 				}
 			}
 
+			// When training against an old version, the players controlled by the old policy are not
+			// collected this iteration, but their arenas keep stepping and resetting. If we kept their
+			// partial trajectories around, the next time they're collected we'd glue pre-freeze data
+			// onto new data across one or more env resets with no terminal in between, corrupting GAE.
+			// So discard any partial trajectory for a player we won't collect this iteration.
+			if (oldVersion) {
+				std::vector<bool> willCollect(numPlayers, false);
+				for (int idx : newPlayerIndices)
+					willCollect[idx] = true;
+				for (int p = 0; p < numPlayers; p++) {
+					if (!willCollect[p] && trajectories[p].Length() > 0) {
+						trajectories[p].Clear();
+						curSegmentIds[p] = nextSegmentId++;
+						curSegmentSteps[p] = 0;
+					}
+				}
+			}
+
 			int numRealPlayers = oldVersion ? newPlayerIndices.size() : envSet->state.numPlayers;
 
 			int stepsCollected = 0;
@@ -779,6 +797,17 @@ void GGL::Learner::Start() {
 							if (isnan(f) || isinf(f))
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
 
+						// Snapshot of this step's obs standardization stats (empty when disabled).
+						// Reused below for the truncation next-state so it gets the SAME normalization
+						// the stored states received (otherwise the critic would be bootstrapped on raw obs).
+						std::vector<double> obsMean, obsStd;
+						auto standardizeObsRow = [&](float* row) {
+							if (obsMean.empty())
+								return;
+							for (int j = 0; j < obsSize; j++)
+								row[j] = (float)((row[j] - obsMean[j]) / obsStd[j]);
+						};
+
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too
 							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
@@ -787,18 +816,14 @@ void GGL::Learner::Start() {
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
 							}
 
-							std::vector<double> mean = obsStat->GetMean();
-							std::vector<double> std = obsStat->GetSTD();
-							for (double& f : mean)
+							obsMean = obsStat->GetMean();
+							obsStd = obsStat->GetSTD();
+							for (double& f : obsMean)
 								f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
-							for (double& f : std)
+							for (double& f : obsStd)
 								f = RS_MAX(f, config.minObsSTD);
-							for (int i = 0; i < envSet->state.numPlayers; i++) {
-								for (int j = 0; j < obsSize; j++) {
-									float& obsVal = envSet->state.obs.At(i, j);
-									obsVal = (obsVal - mean[j]) / std[j];
-								}
-							}
+							for (int i = 0; i < envSet->state.numPlayers; i++)
+								standardizeObsRow(&envSet->state.obs.At(i, 0));
 						}
 
 						torch::Tensor tActions, tLogProbs;
@@ -930,8 +955,12 @@ void GGL::Learner::Start() {
 							if (terminalType) {
 
 								if (terminalType == RLGC::TerminalType::TRUNCATED) {
-									// Truncation requires an additional next state for the critic
-									traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
+									// Truncation requires an additional next state for the critic.
+									// StepSecondHalf rebuilt obs as RAW values, so apply the same
+									// standardization the stored states got this step before bootstrapping.
+									FList nextStateRow = envSet->state.obs.GetRow(newPlayerIdx);
+									standardizeObsRow(nextStateRow.data());
+									traj.nextStates += nextStateRow;
 								}
 
 								relabelHERGoals(traj);
@@ -1140,7 +1169,7 @@ void GGL::Learner::Start() {
 						"-Env Step Time",
 						"Consumption Time",
 						"-GAE Time",
-						"-PPO Learn Time"
+						"-PPO Learn Time",
 						"",
 						"Collected Timesteps",
 						"Total Timesteps",

@@ -4,24 +4,24 @@
 // https://github.com/AechPro/rocket-league-gym-sim/blob/main/rlgym_sim/utils/reward_functions/reward_function.py
 namespace RLGC {
 	template<typename T>
-	class PlayerReward : public RewardFunction {
+	class PlayerReward : public Reward {
 	private:
 		std::vector<T*> _instances;
-		
+
 	public:
 		virtual void Reset(const GameState& initialState) {
 			if (_instances.empty()) {
 				// Generate instances
-				for (int i = 0; i < initialState.players.size())
+				for (int i = 0; i < (int)initialState.players.size(); i++)
 					_instances.push_back(new T());
 			}
 
-			for (auto inst : instances)
-				inst->Reset(state);
+			for (auto inst : _instances)
+				inst->Reset(initialState);
 		}
 
 		virtual void PreStep(const GameState& state) {
-			for (auto inst : instances)
+			for (auto inst : _instances)
 				inst->PreStep(state);
 		}
 
@@ -41,7 +41,7 @@ namespace RLGC {
 		}
 
 		virtual ~PlayerReward() {
-			for (auto inst : instances)
+			for (auto inst : _instances)
 				delete inst;
 		};
 	};

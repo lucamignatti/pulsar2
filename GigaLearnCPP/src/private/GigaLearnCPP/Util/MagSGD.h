@@ -24,13 +24,16 @@ namespace GGL {
 				loss = closure();
 			}
 
-			// Calculate total update magnitude
-			float gradMag = 0;
+			// Calculate total update magnitude.
+			// Accumulate on-device and sync once, instead of one CPU sync per parameter.
+			torch::Tensor gradMagSq;
 			for (auto& group : this->param_groups())
 				for (auto& param : group.params())
-					if (param.grad().defined())
-						gradMag += param.grad().detach().square().sum().cpu().item<float>();
-			gradMag = sqrtf(gradMag);
+					if (param.grad().defined()) {
+						auto contrib = param.grad().detach().square().sum();
+						gradMagSq = gradMagSq.defined() ? gradMagSq + contrib : contrib;
+					}
+			float gradMag = gradMagSq.defined() ? sqrtf(gradMagSq.cpu().item<float>()) : 0.f;
 
 			if (gradMag <= 0 || !std::isfinite(gradMag))
 				return loss;

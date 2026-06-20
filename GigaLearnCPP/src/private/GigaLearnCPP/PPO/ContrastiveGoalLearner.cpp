@@ -66,15 +66,9 @@ namespace GGL {
 		if (config.infoSubSample > 0)
 			miniBatchSize = RS_MIN(miniBatchSize, config.infoSubSample);
 
-		float totalLoss = 0;
-		float totalRowLoss = 0;
-		float totalColumnLoss = 0;
-		float totalPositiveLogit = 0;
-		float totalNegativeLogit = 0;
-		float totalSANorm = 0;
-		float totalGoalNorm = 0;
-		float totalAccuracy = 0;
-		float totalLogsumexp = 0;
+		// On-device running sum of per-batch metrics; synced to the host once after the loop
+		// instead of ~9 .item() device syncs per minibatch.
+		Tensor metricAccum;
 		int64_t batches = 0;
 
 		std::vector<int64_t> indices(n);
@@ -128,36 +122,43 @@ namespace GGL {
 				stateActionEncoder.StepOptim();
 				goalEncoder.StepOptim();
 
-				Tensor positiveLogits = logits.diag();
-				Tensor negativeLogits = logits.masked_select(~diag);
-				Tensor rowCorrect = logits.argmax(1).eq(labels);
-				Tensor columnCorrect = logits.argmax(0).eq(labels);
+				{
+					torch::NoGradGuard noGrad;
+					// curBatchSize > 1 is guaranteed above, so the off-diagonal (negatives) is never empty.
+					Tensor positiveLogits = logits.diag();
+					Tensor negativeLogits = logits.masked_select(~diag);
+					Tensor rowCorrect = logits.argmax(1).eq(labels).to(kFloat);
+					Tensor columnCorrect = logits.argmax(0).eq(labels).to(kFloat);
 
-				totalLoss += loss.item<float>();
-				totalRowLoss += rowLoss.item<float>();
-				totalColumnLoss += columnLoss.item<float>();
-				totalPositiveLogit += positiveLogits.mean().item<float>();
-				if (negativeLogits.numel() > 0)
-					totalNegativeLogit += negativeLogits.mean().item<float>();
-				totalSANorm += sa.norm(2, -1).mean().item<float>();
-				totalGoalNorm += g.norm(2, -1).mean().item<float>();
-				totalAccuracy += 0.5f * (rowCorrect.to(kFloat).mean().item<float>() + columnCorrect.to(kFloat).mean().item<float>());
-				totalLogsumexp += 0.5f * (logsumexpRows.mean().item<float>() + logsumexpColumns.mean().item<float>());
+					Tensor batchMetrics = torch::stack({
+						loss.detach(),
+						rowLoss.detach(),
+						columnLoss.detach(),
+						positiveLogits.mean(),
+						negativeLogits.mean(),
+						sa.norm(2, -1).mean(),
+						g.norm(2, -1).mean(),
+						0.5f * (rowCorrect.mean() + columnCorrect.mean()),
+						0.5f * (logsumexpRows.mean() + logsumexpColumns.mean())
+					});
+					metricAccum = metricAccum.defined() ? metricAccum + batchMetrics : batchMetrics;
+				}
 				batches++;
 			}
 		}
 
 		stats.anchorsUsed = n;
-		if (batches > 0) {
-			stats.loss = totalLoss / batches;
-			stats.rowLoss = totalRowLoss / batches;
-			stats.columnLoss = totalColumnLoss / batches;
-			stats.positiveLogitMean = totalPositiveLogit / batches;
-			stats.negativeLogitMean = totalNegativeLogit / batches;
-			stats.stateActionEmbeddingNorm = totalSANorm / batches;
-			stats.goalEmbeddingNorm = totalGoalNorm / batches;
-			stats.categoricalAccuracy = totalAccuracy / batches;
-			stats.logsumexpMean = totalLogsumexp / batches;
+		if (batches > 0 && metricAccum.defined()) {
+			auto m = (metricAccum / (float)batches).cpu();
+			stats.loss = m[0].item<float>();
+			stats.rowLoss = m[1].item<float>();
+			stats.columnLoss = m[2].item<float>();
+			stats.positiveLogitMean = m[3].item<float>();
+			stats.negativeLogitMean = m[4].item<float>();
+			stats.stateActionEmbeddingNorm = m[5].item<float>();
+			stats.goalEmbeddingNorm = m[6].item<float>();
+			stats.categoricalAccuracy = m[7].item<float>();
+			stats.logsumexpMean = m[8].item<float>();
 		}
 
 		return stats;

@@ -49,6 +49,10 @@ namespace RLGC {
 			boostPadTimersInv = std::vector<float>(CommonValues::BOOST_LOCATIONS_AMOUNT, 0);
 		}
 		explicit GameState(Arena* arena) {
+			// Seed lastTickCount so the initial state's tickSkip is 0 instead of the
+			// arena's entire lifetime tick count (which would give a bogus deltaTime
+			// and a spuriously-true ballTouchedStep for any car with a valid ballHitInfo).
+			lastTickCount = arena->tickCount;
 			UpdateFromArena(arena, std::vector<Action>(arena->_cars.size()), NULL);
 		}
 
