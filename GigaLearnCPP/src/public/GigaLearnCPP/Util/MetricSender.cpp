@@ -52,6 +52,11 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 		"Game/Goal Speed"
 	};
 
+	// Per-reward component metrics are logged under dynamic "Rewards/<name>" keys,
+	// so they can't be listed individually above — allow the whole prefix through.
+	if (key.rfind("Rewards/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 
