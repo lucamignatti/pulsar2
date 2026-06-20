@@ -188,7 +188,14 @@ namespace GGL {
 		static double AdjustedLR(double lr, const torch::Tensor& tensor) {
 			double rows = (double)tensor.size(0);
 			double cols = (double)(tensor.numel() / tensor.size(0));
-			return lr * std::sqrt(std::max(1.0, rows / cols));
+			// RMS-match the orthogonalized update to an Adam-scale step so the
+			// existing Adam-tuned LR (e.g. 1.5e-4) is effective. The NS5 output is
+			// semi-orthogonal (per-element magnitude ~1/sqrt(d)), so canonical
+			// Muon's sqrt(max(1, rows/cols)) scaling (==1 for square layers) makes
+			// each step ~sqrt(d) (~17x for 256-wide) smaller than Adam at the same
+			// LR -- which froze the policy (KL ~1e-7, entropy pinned at max).
+			// sqrt(max(rows, cols)) restores ~Adam-RMS per-element magnitude.
+			return lr * std::sqrt(std::max(rows, cols));
 		}
 
 		static void StepAdamW(torch::Tensor& param, const torch::Tensor& grad, const MuonOptions& options, MuonParamState& state) {
