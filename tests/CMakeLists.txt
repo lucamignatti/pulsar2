@@ -27,18 +27,11 @@ endif()
 # re-runs in this directory scope and references hip::amdhip64 — which CMake
 # then can't resolve at generate time.  Create a stub here if needed.
 if(Torch_DIR)
-    # ggl_prepare_rocm_torch_dependencies() calls find_package(hip) and
-    # find_package(hiprtc) which create directory-scoped IMPORTED targets in
-    # GigaLearnCPP's scope only.  Caffe2Targets.cmake re-runs here (its include
-    # guard is a plain variable, not a cache variable) and references both targets.
-    # Create stubs so the generate-time link-interface check passes.
-    if(NOT APPLE AND NOT WIN32)
-        foreach(_ggl_rocm_tgt hip::amdhip64 hiprtc::hiprtc)
-            if(NOT TARGET ${_ggl_rocm_tgt})
-                add_library(${_ggl_rocm_tgt} INTERFACE IMPORTED)
-            endif()
-        endforeach()
-    endif()
+    # Re-run the same ROCm stub setup that GigaLearnCPP does.  The IMPORTED
+    # GLOBAL targets it creates aren't reliably visible across directory scopes
+    # on all CMake versions, so we just run the function again in this scope.
+    # Targets that already exist hit the early-return inside the function.
+    ggl_prepare_rocm_torch_dependencies()
     find_package(Torch QUIET)
     if(Torch_FOUND)
         target_link_libraries(GigaLearnTests "${TORCH_LIBRARIES}")
