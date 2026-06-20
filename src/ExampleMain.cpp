@@ -20,16 +20,32 @@ EnvCreateResult EnvCreateFunc(int index) {
 		return new ZeroSumReward(reward, TEAM_SPIRIT, OPPONENT_PUNISH);
 	};
 
-	// Minimal generic bootstrap reward set. From a cold start the only active
-	// signal is car->ball velocity, which guides the policy to touches; ball->goal
-	// velocity then guides it to shots; goal/concede is the sparse objective the
-	// dense terms shape toward. Dense weights are kept small relative to the goal
-	// so they shape toward -- rather than drown -- actually scoring. Weights are
-	// the main knob; tune to taste.
 	std::vector<WeightedReward> rewards = {
-		{ teamMixed(new VelocityPlayerToBallReward()), 0.1f }, // car -> ball (cold-start approach)
-		{ teamMixed(new VelocityBallToGoalReward()),   1.0f }, // ball -> opponent goal
-		{ teamMixed(new TeamGoalReward()),            10.0f }, // goal(+) / concede(-) via zero-sum
+
+		// Nexto's dense player->ball "dist" approach term, restored (the repo's
+		// nexto transcription dropped it, leaving no cold-start approach signal).
+		// This is the bootstrap; weight is the main knob -- tune to taste.
+		{ teamMixed(new PlayerBallDistanceReward()), 2.f },
+
+		// Ball-goal shaping (Nexto goal_dist)
+		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
+
+		// Goals
+		{ teamMixed(new TeamGoalReward()), 12.5f },
+		{ teamMixed(new GoalSpeedBonusReward()), 1.25f },
+		{ teamMixed(new ConcedeDistanceReward()), 1.25f },
+
+		// Touches
+		{ teamMixed(new TouchHeightReward()), 1.f },
+		{ teamMixed(new FlipResetReward()), 5.f },
+
+		// Boost
+		{ teamMixed(new BoostGainReward()), 0.7f },
+		{ teamMixed(new BoostLoseReward()), 0.4f },
+
+		// Demos
+		{ teamMixed(new DemoReward()), 2.5f },
+		{ teamMixed(new DemoedPenalty()), 2.5f }
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
