@@ -134,16 +134,17 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL advantage blend ON. lambda anneals 0 -> 0.65 over the first 200M ts, so
-	// it stays ~off during the dense-reward bootstrap and ramps in as the bot gains
-	// competence. NOTE: the variance gate (sigmaMin 1e-6, PPOLearner.cpp:315) never
-	// closes, so if the contrastive advantage stays ~0 (taken ~= baseline) it adds
-	// normalized noise -- watch "GCRL Taken vs Baseline" / "CRL Variance Gate"; if
-	// GCRL hurts, gate it on taken-vs-baseline separation or hold lambda at 0.
+	// GCRL advantage blend ON at full strength from step 0 (no ramp), like the
+	// value critic is always-on. NOTE: the variance gate (sigmaMin 1e-6,
+	// PPOLearner.cpp:315) never closes, so while the contrastive advantage is ~0
+	// (taken ~= baseline -- e.g. a cold policy far from the ball) this injects
+	// ~lambda x unit-std noise into the policy gradient. Watch "GCRL Taken vs
+	// Baseline" / "CRL Variance Gate"; if it hurts the bootstrap, fix the gate to
+	// key on taken-vs-baseline separation, or restore a ramp.
 	cfg.ppo.contrastiveGoal.enabled = true;
-	cfg.ppo.contrastiveGoal.lambdaStart = 0.f;
+	cfg.ppo.contrastiveGoal.lambdaStart = 0.65f;   // full from the start (no warmup)
 	cfg.ppo.contrastiveGoal.lambda = 0.65f;
-	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
+	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 0; // no ramp; lambda is constant
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
