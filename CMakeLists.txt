@@ -28,3 +28,6 @@ target_link_libraries(GigaLearnBot GigaLearnCPP)
 # Include RLBot
 add_subdirectory(RLBotCPP)
 target_link_libraries(GigaLearnBot RLBotCPP)
+
+# Unit tests
+add_subdirectory(tests)
