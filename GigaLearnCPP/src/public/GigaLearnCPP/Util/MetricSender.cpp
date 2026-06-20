@@ -43,6 +43,8 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 		"GCRL Baseline Score Mean",
 		"GCRL Score Mean",
 		"GCRL Score Std",
+		"GCRL Separation",
+		"GCRL Baseline Spread",
 		"CRL Lambda Effective",
 		"CRL Variance Gate",
 		"A Policy Std",

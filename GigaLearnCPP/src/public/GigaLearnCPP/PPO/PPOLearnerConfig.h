@@ -14,6 +14,15 @@ namespace GGL {
 		float sigmaFloor = 1e-4f;
 		float sigmaMin = 1e-6f;
 
+		// Self-gate for the contrastive advantage blend: only blend GCRL into the
+		// policy gradient when meanAbsEdge >= gcrlGateRatio * baselineSpread -- i.e.
+		// the taken-action edge over random actions exceeds the baseline samples'
+		// own within-state spread (real action-discrimination, not sampling noise).
+		// ~1.0 means "edge indistinguishable from random-action noise" (no signal);
+		// >1 requires the critic to actually rank the taken action above random.
+		// Watch the logged "GCRL Separation" metric to tune.
+		float gcrlGateRatio = 1.3f;
+
 		int herMinOffset = 1;
 		int herMaxOffset = 90;
 		float herShortBiasPower = 2.f;

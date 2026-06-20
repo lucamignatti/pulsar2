@@ -235,23 +235,38 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	int64_t chunkSize,
 	int baselineSamples,
 	torch::Tensor* outTakenScores,
-	torch::Tensor* outBaselineScores
+	torch::Tensor* outBaselineScores,
+	torch::Tensor* outBaselineSpread
 ) {
 	torch::Tensor takenScores = ScoreGCRLChunks(learner, states, actions, goals, numActions, chunkSize);
-	torch::Tensor baselineScores = torch::zeros_like(takenScores);
+	torch::Tensor baselineSum = torch::zeros_like(takenScores);
+	torch::Tensor baselineSqSum = torch::zeros_like(takenScores);
 
 	if (baselineSamples > 0) {
 		for (int i = 0; i < baselineSamples; i++) {
 			torch::Tensor altActions = SampleValidActions(actionMasks);
-			baselineScores += ScoreGCRLChunks(learner, states, altActions, goals, numActions, chunkSize);
+			torch::Tensor s = ScoreGCRLChunks(learner, states, altActions, goals, numActions, chunkSize);
+			baselineSum += s;
+			baselineSqSum += s * s;
 		}
-		baselineScores /= baselineSamples;
 	}
+
+	torch::Tensor baselineScores = (baselineSamples > 0) ? (baselineSum / baselineSamples) : baselineSum;
 
 	if (outTakenScores)
 		*outTakenScores = takenScores;
 	if (outBaselineScores)
 		*outBaselineScores = baselineScores;
+	if (outBaselineSpread) {
+		// Within-state spread of the random-action baseline scores: the noise floor
+		// the taken-action edge must beat to count as real action-discrimination.
+		if (baselineSamples > 1) {
+			torch::Tensor var = (baselineSqSum / baselineSamples) - baselineScores * baselineScores;
+			*outBaselineSpread = var.clamp_min(0).sqrt();
+		} else {
+			*outBaselineSpread = torch::zeros_like(takenScores);
+		}
+	}
 
 	return takenScores - baselineScores;
 }
@@ -286,7 +301,7 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
 	torch::Tensor actionMasks = experience.data.actionMasks.to(device);
 	torch::Tensor scoringGoals = experience.data.scoringGoals.to(device);
-	torch::Tensor takenScores, baselineScores;
+	torch::Tensor takenScores, baselineScores, baselineSpread;
 	torch::Tensor gcrlScores = ComputeGCRLAdvantageWithBaseline(
 		learner->contrastiveGoalLearner,
 		states,
@@ -297,7 +312,8 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		cfg.policyScoreBatchSize,
 		cfg.baselineActionSamples,
 		&takenScores,
-		&baselineScores
+		&baselineScores,
+		&baselineSpread
 	);
 
 	experience.data.crlAdvantages = gcrlScores.detach().to(experience.data.advantages.device());
@@ -312,7 +328,19 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	report["CRL Advantage Std"] = gcrlStd;
 
 	float lambdaEffective = GetAnnealedContrastiveLambda(cfg, totalTimesteps);
-	bool varianceGate = gcrlStd >= cfg.sigmaMin;
+
+	// Self-gate on action-discrimination, NOT cross-state spread. Only blend GCRL
+	// when the taken-action edge over random actions exceeds the baseline samples'
+	// own within-state spread -- i.e. the taken action is reliably better than
+	// random, not just sampling noise. Otherwise NormalizeAdvantage would rescale a
+	// ~0 signal up to unit-std noise and inject it at lambda. The sigmaMin term is a
+	// degenerate-zero floor; the separation ratio is the real signal test.
+	float meanAbsEdge = TensorMean(gcrlScores.abs());
+	float meanBaseSpread = TensorMean(baselineSpread);
+	float separation = meanAbsEdge / (meanBaseSpread + cfg.sigmaFloor);
+	bool varianceGate = (gcrlStd >= cfg.sigmaMin) && (separation >= cfg.gcrlGateRatio);
+	report["GCRL Baseline Spread"] = meanBaseSpread;
+	report["GCRL Separation"] = separation;
 
 	torch::Tensor baseNorm = NormalizeAdvantage(baseAdvRaw, cfg.sigmaFloor);
 	torch::Tensor gcrlNorm = torch::zeros_like(baseNorm);
