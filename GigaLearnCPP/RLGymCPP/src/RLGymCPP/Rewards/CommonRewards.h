@@ -268,6 +268,20 @@ namespace RLGC {
 		}
 	};
 
+	// Nexto's dense player->ball "dist" approach term, restored. The repo's nexto
+	// reward transcription dropped the player->ball distance reward (it kept only
+	// ball->goal via BallGoalDistanceReward), which left no continuous approach
+	// signal for a cold policy. Absolute exp(-dist) like Nexto's dist, so the
+	// gradient points toward the ball from anywhere -- the cold-start bootstrap.
+	// (Zero-sum cancels mutual ball-camping; lower the weight or switch to a delta
+	// of SafeExpDist if camping appears.)
+	class PlayerBallDistanceReward : public Reward {
+	public:
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return ScoringRewardUtil::SafeExpDist(player.pos, state.ball.pos, CommonValues::CAR_MAX_SPEED);
+		}
+	};
+
 	class GoalSpeedBonusReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {

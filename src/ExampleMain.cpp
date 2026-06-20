@@ -22,16 +22,12 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// Dense approach + touch bootstrap. From a random init the event
-		// rewards below never fire (the bot never reaches the ball), so the
-		// policy gets no gradient. VelocityPlayerToBall pays for closing speed
-		// toward the ball every step (falls to ~0 once at the ball, so it pays
-		// for approaching, not stalling); StrongTouch pays for committed hits
-		// only (sub-20kph taps score 0, so it can't be soft-poke farmed).
-		{ teamMixed(new VelocityPlayerToBallReward()), 6.f },
-		{ teamMixed(new StrongTouchReward()), 60.f },
+		// Nexto's dense player->ball "dist" approach term, restored (the repo's
+		// nexto transcription dropped it, leaving no cold-start approach signal).
+		// This is the bootstrap; weight is the main knob -- tune to taste.
+		{ teamMixed(new PlayerBallDistanceReward()), 2.f },
 
-		// Ball-goal shaping
+		// Ball-goal shaping (Nexto goal_dist)
 		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
 
 		// Goals
@@ -58,7 +54,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 1; // 1v1 bootstrap test (mirrors the proven ryp4gxwv recipe)
+	int playersPerTeam = 3; // 3v3 SOCCAR (real training)
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -154,11 +150,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL advantage blend OFF for the bootstrap. From a cold policy the one-step
-	// contrastive advantage is ~0 (taken score ~= baseline far from the ball) and
-	// the variance gate (sigmaMin 1e-6) never closes, so the blend only injected
-	// ~0.65x unit-std noise into the policy gradient. Re-enable once the bot plays.
-	cfg.ppo.contrastiveGoal.enabled = false;
+	// GCRL advantage blend ON. lambda anneals 0 -> 0.65 over the first 200M ts, so
+	// it stays ~off during the dense-reward bootstrap and ramps in as the bot gains
+	// competence. NOTE: the variance gate (sigmaMin 1e-6, PPOLearner.cpp:315) never
+	// closes, so if the contrastive advantage stays ~0 (taken ~= baseline) it adds
+	// normalized noise -- watch "GCRL Taken vs Baseline" / "CRL Variance Gate"; if
+	// GCRL hurts, gate it on taken-vs-baseline separation or hold lambda at 0.
+	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.lambdaStart = 0.f;
 	cfg.ppo.contrastiveGoal.lambda = 0.65f;
 	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 200'000'000;
