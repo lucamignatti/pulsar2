@@ -18,11 +18,18 @@ endif()
 # imported target is created here too, giving us both the include paths and the
 # linker flags without duplicating the ROCm-workaround logic.
 #
-# On Linux/ROCm, GigaLearnCPP's ggl_prepare_rocm_torch_dependencies() sets up
-# fake CMake targets for ROCm libraries before find_package(Torch).  We don't
-# replicate that here; instead we just silence any missing-ROCm-target warnings
-# since the actual ROCm libraries are found transitively via the dylib anyway.
+# On Linux/ROCm, GigaLearnCPP's ggl_prepare_rocm_torch_dependencies() creates
+# stubs for ROCm targets before its find_package(Torch).  Library-backed stubs
+# (hipfft, roctracer, etc.) are IMPORTED GLOBAL and visible here.  But
+# hip::amdhip64 is typically created by find_package(hip CONFIG QUIET) which
+# produces a directory-scoped IMPORTED target visible only inside GigaLearnCPP.
+# Torch's Caffe2Targets.cmake uses a plain-variable include guard so it
+# re-runs in this directory scope and references hip::amdhip64 — which CMake
+# then can't resolve at generate time.  Create a stub here if needed.
 if(Torch_DIR)
+    if(NOT APPLE AND NOT WIN32 AND NOT TARGET hip::amdhip64)
+        add_library(hip::amdhip64 INTERFACE IMPORTED)
+    endif()
     find_package(Torch QUIET)
     if(Torch_FOUND)
         target_link_libraries(GigaLearnTests "${TORCH_LIBRARIES}")
