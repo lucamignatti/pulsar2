@@ -13,8 +13,9 @@ if (EXISTS "${PROJECT_SOURCE_DIR}/libtorch/")
 endif()
 
 # ROCm PyTorch packages can export Torch targets whose link interfaces reference
-# hip::amdhip64. Some pip installs do not put ROCm's CMake packages on
-# CMAKE_PREFIX_PATH, so register HIP before loading Torch.
+# ROCm package targets. Some pip installs do not put ROCm's CMake packages on
+# CMAKE_PREFIX_PATH, so register the ROCm targets Torch may reference before
+# loading Torch.
 function(ggl_prepare_rocm_torch_dependencies)
 	if (APPLE OR WIN32)
 		return()
@@ -40,43 +41,71 @@ function(ggl_prepare_rocm_torch_dependencies)
 	endforeach()
 	set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}" PARENT_SCOPE)
 
+	function(ggl_register_rocm_target TARGET_NAME PACKAGE_NAME)
+		find_package(${PACKAGE_NAME} CONFIG QUIET)
+		if (TARGET ${TARGET_NAME})
+			return()
+		endif()
+
+		foreach(GGL_ALIAS_TARGET IN LISTS ARGN)
+			if (TARGET ${GGL_ALIAS_TARGET})
+				add_library(${TARGET_NAME} INTERFACE IMPORTED GLOBAL)
+				set_target_properties(${TARGET_NAME} PROPERTIES
+					INTERFACE_LINK_LIBRARIES "${GGL_ALIAS_TARGET}"
+				)
+				return()
+			endif()
+		endforeach()
+
+		string(REGEX REPLACE "[^A-Za-z0-9_]" "_" GGL_ROCM_TARGET_KEY "${TARGET_NAME}")
+		set(GGL_ROCM_LIBRARY_VAR "GGL_ROCM_LIBRARY_${GGL_ROCM_TARGET_KEY}")
+		find_library(${GGL_ROCM_LIBRARY_VAR}
+			NAMES ${ARGN}
+			HINTS ${GGL_ROCM_PREFIXES}
+			PATH_SUFFIXES lib lib64
+		)
+
+		if (${GGL_ROCM_LIBRARY_VAR})
+			message("Found ${TARGET_NAME} library without a CMake target, creating fallback: ${${GGL_ROCM_LIBRARY_VAR}}")
+			add_library(${TARGET_NAME} SHARED IMPORTED GLOBAL)
+			set_target_properties(${TARGET_NAME} PROPERTIES
+				IMPORTED_LOCATION "${${GGL_ROCM_LIBRARY_VAR}}"
+			)
+		else()
+			message("Creating placeholder ROCm target ${TARGET_NAME}; no library was found during configure.")
+			add_library(${TARGET_NAME} INTERFACE IMPORTED GLOBAL)
+		endif()
+	endfunction()
+
 	find_package(amdhip64 CONFIG QUIET)
 	if (NOT TARGET hip::amdhip64)
 		find_package(hip CONFIG QUIET)
 	endif()
 	find_package(hiprtc CONFIG QUIET)
 
-	if (NOT TARGET hip::amdhip64)
-		find_library(GGL_AMDHIP64_LIBRARY
-			NAMES amdhip64
-			HINTS ${GGL_ROCM_PREFIXES}
-			PATH_SUFFIXES lib lib64
-		)
-
-		if (GGL_AMDHIP64_LIBRARY)
-			message("Found libamdhip64 without a CMake target, creating hip::amdhip64 fallback: ${GGL_AMDHIP64_LIBRARY}")
-			add_library(hip::amdhip64 SHARED IMPORTED GLOBAL)
-			set_target_properties(hip::amdhip64 PROPERTIES
-				IMPORTED_LOCATION "${GGL_AMDHIP64_LIBRARY}"
-			)
-		endif()
-	endif()
-
-	if (NOT TARGET hiprtc::hiprtc)
-		find_library(GGL_HIPRTC_LIBRARY
-			NAMES hiprtc
-			HINTS ${GGL_ROCM_PREFIXES}
-			PATH_SUFFIXES lib lib64
-		)
-
-		if (GGL_HIPRTC_LIBRARY)
-			message("Found libhiprtc without a CMake target, creating hiprtc::hiprtc fallback: ${GGL_HIPRTC_LIBRARY}")
-			add_library(hiprtc::hiprtc SHARED IMPORTED GLOBAL)
-			set_target_properties(hiprtc::hiprtc PROPERTIES
-				IMPORTED_LOCATION "${GGL_HIPRTC_LIBRARY}"
-			)
-		endif()
-	endif()
+	ggl_register_rocm_target(hip::amdhip64 amdhip64 amdhip64)
+	ggl_register_rocm_target(hiprtc::hiprtc hiprtc hiprtc)
+	ggl_register_rocm_target(roc::hipblas hipblas hipblas)
+	ggl_register_rocm_target(roc::hipblaslt hipblaslt hipblaslt)
+	ggl_register_rocm_target(roc::rocblas rocblas rocblas)
+	ggl_register_rocm_target(roc::hipfft hipfft hipfft)
+	ggl_register_rocm_target(roc::rocfft rocfft rocfft)
+	ggl_register_rocm_target(roc::hiprand hiprand hiprand)
+	ggl_register_rocm_target(roc::rocrand rocrand rocrand)
+	ggl_register_rocm_target(roc::hipsparse hipsparse hipsparse)
+	ggl_register_rocm_target(roc::rocsparse rocsparse rocsparse)
+	ggl_register_rocm_target(roc::hipsolver hipsolver hipsolver)
+	ggl_register_rocm_target(roc::rocsolver rocsolver rocsolver)
+	ggl_register_rocm_target(roc::miopen MIOpen MIOpen miopen)
+	ggl_register_rocm_target(MIOpen MIOpen MIOpen miopen)
+	ggl_register_rocm_target(roc::rccl rccl rccl)
+	ggl_register_rocm_target(hsa-runtime64::hsa-runtime64 hsa-runtime64 hsa-runtime64)
+	ggl_register_rocm_target(amd_comgr::amd_comgr amd_comgr amd_comgr)
+	ggl_register_rocm_target(amd_comgr amd_comgr amd_comgr)
+	ggl_register_rocm_target(roc::roctracer roctracer roctracer64 roctracer)
+	ggl_register_rocm_target(roctracer roctracer roctracer64 roctracer)
+	ggl_register_rocm_target(roc::roctx64 roctracer roctx64)
+	ggl_register_rocm_target(roctx64 roctracer roctx64)
 endfunction()
 
 ggl_prepare_rocm_torch_dependencies()
