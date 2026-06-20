@@ -151,7 +151,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
 	cfg.ppo.contrastiveGoal.targetSpeed = 1500.f;
-	cfg.ppo.contrastiveGoal.targetSpeedJitter = 500.f;
+	cfg.ppo.contrastiveGoal.targetSpeedJitter = 0.f;
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;

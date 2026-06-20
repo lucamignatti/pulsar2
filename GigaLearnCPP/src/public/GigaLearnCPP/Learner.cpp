@@ -44,7 +44,7 @@ static void AppendAchievedGoal(FList& out, const GameState& state, const Player&
 	AppendNormalizedGoal(out, ball.pos, ball.vel, cfg);
 }
 
-static void AppendCommandedGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
+static void AppendScoringGoal(FList& out, const GameState& state, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
 	PhysState ball = InvertPhys(state.ball, player.team == Team::ORANGE);
 
 	float targetXRange = CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS;
@@ -52,9 +52,9 @@ static void AppendCommandedGoal(FList& out, const GameState& state, const Player
 	float maxTargetZ = CommonValues::GOAL_HEIGHT - CommonValues::BALL_RADIUS;
 
 	Vec targetPos = {};
-	targetPos.x = RocketSim::Math::RandFloat(-targetXRange, targetXRange);
+	targetPos.x = RS_CLAMP(ball.pos.x, -targetXRange, targetXRange);
 	targetPos.y = CommonValues::BACK_NET_Y;
-	targetPos.z = RocketSim::Math::RandFloat(minTargetZ, maxTargetZ);
+	targetPos.z = RS_CLAMP(ball.pos.z, minTargetZ, maxTargetZ);
 
 	Vec direction = targetPos - ball.pos;
 	if (direction.Length() < 1e-3f)
@@ -64,7 +64,8 @@ static void AppendCommandedGoal(FList& out, const GameState& state, const Player
 
 	float minSpeed = RS_MAX(0.f, cfg.targetSpeed - cfg.targetSpeedJitter);
 	float maxSpeed = RS_MAX(minSpeed, cfg.targetSpeed + cfg.targetSpeedJitter);
-	Vec targetVel = direction * RocketSim::Math::RandFloat(minSpeed, maxSpeed);
+	float targetSpeed = (minSpeed == maxSpeed) ? minSpeed : RocketSim::Math::RandFloat(minSpeed, maxSpeed);
+	Vec targetVel = direction * targetSpeed;
 	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
 }
 
@@ -603,7 +604,7 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
-			FList commandedGoals, achievedGoals;
+			FList achievedGoals, herGoals, scoringGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
@@ -618,8 +619,9 @@ void GGL::Learner::Start() {
 				nextStates += other.nextStates;
 				rewards += other.rewards;
 				logProbs += other.logProbs;
-				commandedGoals += other.commandedGoals;
 				achievedGoals += other.achievedGoals;
+				herGoals += other.herGoals;
+				scoringGoals += other.scoringGoals;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -698,6 +700,48 @@ void GGL::Learner::Start() {
 
 				// Only contains complete episodes
 				auto combinedTraj = Trajectory();
+				FList herSelectedOffsets;
+				int herTotalRows = 0;
+
+				auto relabelHERGoals = [&](Trajectory& traj) {
+					if (!config.ppo.contrastiveGoal.enabled)
+						return;
+
+					int n = (int)traj.Length();
+					if (n <= 0)
+						return;
+
+					int minOffset = RS_MAX(1, config.ppo.contrastiveGoal.herMinOffset);
+					int maxOffsetCfg = RS_MAX(minOffset, config.ppo.contrastiveGoal.herMaxOffset);
+					float shortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.herShortBiasPower);
+
+					if ((int)traj.achievedGoals.size() != n * 6)
+						RG_ERR_CLOSE("GCRL HER relabeling expected " << n << " achieved goal rows, got " << (traj.achievedGoals.size() / 6));
+
+					traj.herGoals.resize((size_t)n * 6);
+					for (int t = 0; t < n; t++) {
+						herTotalRows++;
+						int remaining = n - t - 1;
+						int selectedOffset = 0;
+						if (remaining > 0) {
+							int maxOffset = RS_MIN(maxOffsetCfg, remaining);
+							if (maxOffset >= minOffset) {
+								float u = RocketSim::Math::RandFloat();
+								float biased = powf(u, shortBiasPower);
+								int span = maxOffset - minOffset + 1;
+								selectedOffset = minOffset + RS_MIN(span - 1, (int)floorf(biased * span));
+							} else {
+								selectedOffset = remaining;
+							}
+						}
+
+						int target = t + selectedOffset;
+						for (int d = 0; d < 6; d++)
+							traj.herGoals[(size_t)t * 6 + d] = traj.achievedGoals[(size_t)target * 6 + d];
+						if (selectedOffset > 0)
+							herSelectedOffsets += (float)selectedOffset;
+					}
+				};
 
 				Timer collectionTimer = {};
 				{ // Collect timesteps
@@ -752,7 +796,7 @@ void GGL::Learner::Start() {
 									const GameState& state = envSet->state.gameStates[arenaIdx];
 									const Player& player = state.players[localPlayerIdx];
 
-									AppendCommandedGoal(trajectories[newPlayerIdx].commandedGoals, state, player, config.ppo.contrastiveGoal);
+									AppendScoringGoal(trajectories[newPlayerIdx].scoringGoals, state, player, config.ppo.contrastiveGoal);
 									trajectories[newPlayerIdx].segmentIds.push_back(curSegmentIds[newPlayerIdx]);
 									trajectories[newPlayerIdx].segmentSteps.push_back(curSegmentSteps[newPlayerIdx]);
 								}
@@ -870,6 +914,7 @@ void GGL::Learner::Start() {
 									traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
 								}
 
+								relabelHERGoals(traj);
 								combinedTraj.Append(traj);
 								traj.Clear();
 								curSegmentIds[newPlayerIdx] = nextSegmentId++;
@@ -896,12 +941,31 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tCommandedGoals, tAchievedGoals, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tScoringGoals, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
-						tCommandedGoals = torch::tensor(combinedTraj.commandedGoals).reshape({ -1, 6 });
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
+						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
+						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
+
+						int64_t expRows = tStates.size(0);
+						if (tAchievedGoals.size(0) != expRows || tHERGoals.size(0) != expRows || tScoringGoals.size(0) != expRows || tSegmentIds.size(0) != expRows)
+							RG_ERR_CLOSE("GCRL tensor alignment failed: states=" << expRows <<
+								", achievedGoals=" << tAchievedGoals.size(0) <<
+								", herGoals=" << tHERGoals.size(0) <<
+								", scoringGoals=" << tScoringGoals.size(0) <<
+								", segmentIds=" << tSegmentIds.size(0));
+
+						if (!herSelectedOffsets.empty()) {
+							torch::Tensor tOffsets = torch::tensor(herSelectedOffsets);
+							report["HER Selected Offset Mean"] = tOffsets.mean().item<float>();
+							report["HER Selected Offset P10"] = tOffsets.quantile(0.1).item<float>();
+							report["HER Selected Offset P50"] = tOffsets.quantile(0.5).item<float>();
+							report["HER Selected Offset P90"] = tOffsets.quantile(0.9).item<float>();
+							report["HER Valid Relabel Count"] = (float)herSelectedOffsets.size();
+						}
+						report["HER Total Relabel Rows"] = (float)herTotalRows;
 					}
 
 					// States we truncated at (there could be none)
@@ -977,8 +1041,9 @@ void GGL::Learner::Start() {
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
 					if (config.ppo.contrastiveGoal.enabled) {
-						experience.data.commandedGoals = tCommandedGoals;
 						experience.data.achievedGoals = tAchievedGoals;
+						experience.data.herGoals = tHERGoals;
+						experience.data.scoringGoals = tScoringGoals;
 						experience.data.segmentIds = tSegmentIds;
 						experience.data.segmentSteps = tSegmentSteps;
 					}

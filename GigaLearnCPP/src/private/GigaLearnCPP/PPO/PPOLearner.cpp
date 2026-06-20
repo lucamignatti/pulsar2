@@ -190,6 +190,42 @@ static torch::Tensor ScoreGCRLChunks(GGL::ContrastiveGoalLearner* learner, torch
 	return torch::cat(chunks, 0);
 }
 
+static torch::Tensor SampleValidActions(torch::Tensor actionMasks) {
+	torch::Tensor weights = actionMasks.to(torch::kFloat32);
+	return torch::multinomial(weights, 1, true).flatten().to(torch::kLong);
+}
+
+static torch::Tensor ComputeGCRLAdvantageWithBaseline(
+	GGL::ContrastiveGoalLearner* learner,
+	torch::Tensor states,
+	torch::Tensor actions,
+	torch::Tensor actionMasks,
+	torch::Tensor goals,
+	int64_t numActions,
+	int64_t chunkSize,
+	int baselineSamples,
+	torch::Tensor* outTakenScores,
+	torch::Tensor* outBaselineScores
+) {
+	torch::Tensor takenScores = ScoreGCRLChunks(learner, states, actions, goals, numActions, chunkSize);
+	torch::Tensor baselineScores = torch::zeros_like(takenScores);
+
+	if (baselineSamples > 0) {
+		for (int i = 0; i < baselineSamples; i++) {
+			torch::Tensor altActions = SampleValidActions(actionMasks);
+			baselineScores += ScoreGCRLChunks(learner, states, altActions, goals, numActions, chunkSize);
+		}
+		baselineScores /= baselineSamples;
+	}
+
+	if (outTakenScores)
+		*outTakenScores = takenScores;
+	if (outBaselineScores)
+		*outBaselineScores = baselineScores;
+
+	return takenScores - baselineScores;
+}
+
 static float GetAnnealedContrastiveLambda(const GGL::ContrastiveGoalConfig& cfg, uint64_t totalTimesteps) {
 	if (cfg.lambdaAnnealSteps == 0)
 		return cfg.lambda;
@@ -204,7 +240,7 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 
 	if (!learner->contrastiveGoalLearner)
 		RG_ERR_CLOSE("GCRL config is enabled but no contrastive learner exists");
-	if (!experience.data.actions.defined() || !experience.data.commandedGoals.defined())
+	if (!experience.data.actions.defined() || !experience.data.scoringGoals.defined() || !experience.data.actionMasks.defined())
 		RG_ERR_CLOSE("GCRL config is enabled but rollout goal/action tensors are missing");
 
 	RG_NO_GRAD;
@@ -218,20 +254,28 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 
 	torch::Tensor states = experience.data.states.to(device);
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
-	torch::Tensor commandedGoals = experience.data.commandedGoals.to(device);
-	torch::Tensor gcrlScores = ScoreGCRLChunks(
+	torch::Tensor actionMasks = experience.data.actionMasks.to(device);
+	torch::Tensor scoringGoals = experience.data.scoringGoals.to(device);
+	torch::Tensor takenScores, baselineScores;
+	torch::Tensor gcrlScores = ComputeGCRLAdvantageWithBaseline(
 		learner->contrastiveGoalLearner,
 		states,
 		actions,
-		commandedGoals,
+		actionMasks,
+		scoringGoals,
 		learner->numActions,
-		cfg.policyScoreBatchSize
+		cfg.policyScoreBatchSize,
+		cfg.baselineActionSamples,
+		&takenScores,
+		&baselineScores
 	);
 
 	experience.data.crlAdvantages = gcrlScores.detach().to(experience.data.advantages.device());
 
 	float gcrlMean = TensorMean(gcrlScores);
 	float gcrlStd = TensorStd(gcrlScores);
+	report["GCRL Taken Score Mean"] = TensorMean(takenScores);
+	report["GCRL Baseline Score Mean"] = TensorMean(baselineScores);
 	report["GCRL Score Mean"] = gcrlMean;
 	report["GCRL Score Std"] = gcrlStd;
 	report["CRL Advantage Mean"] = gcrlMean;

@@ -14,16 +14,25 @@ namespace GGL {
 		float sigmaFloor = 1e-4f;
 		float sigmaMin = 1e-6f;
 
-		int representationSize = 64;
+		int herMinOffset = 1;
+		int herMaxOffset = 90;
+		float herShortBiasPower = 2.f;
+		int baselineActionSamples = 4;
+
+		int representationSize = 128;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
 		int64_t policyScoreBatchSize = 4096;
+		int64_t infoSubSample = 512;
 		float criticLR = 3e-4f;
-		float logsumexpPenaltyCoeff = 0.1f;
+		float tau = 0.02f;
+		float varReg = 0.3f;
+		float logsumexpPenaltyCoeff = 0.01f;
 
 		float targetSpeed = 1500.f;
-		float targetSpeedJitter = 500.f;
+		float targetSpeedJitter = 0.f;
 
+		// Deprecated by v1 short-biased HER sampling. Kept for source compatibility.
 		int immediateMin = 1;
 		int immediateMax = 4;
 		int shortMin = 5;
