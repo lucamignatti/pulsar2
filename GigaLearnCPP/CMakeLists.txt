@@ -12,6 +12,58 @@ if (EXISTS "${PROJECT_SOURCE_DIR}/libtorch/")
 	set(CMAKE_PREFIX_PATH "libtorch/share/cmake/Torch")
 endif()
 
+# ROCm PyTorch packages can export Torch targets whose link interfaces reference
+# hip::amdhip64. Some pip installs do not put ROCm's CMake packages on
+# CMAKE_PREFIX_PATH, so register HIP before loading Torch.
+function(ggl_prepare_rocm_torch_dependencies)
+	if (APPLE OR WIN32)
+		return()
+	endif()
+
+	set(GGL_ROCM_PREFIXES)
+	if (DEFINED ENV{ROCM_PATH})
+		list(APPEND GGL_ROCM_PREFIXES "$ENV{ROCM_PATH}")
+	endif()
+	if (DEFINED ENV{HIP_PATH})
+		list(APPEND GGL_ROCM_PREFIXES "$ENV{HIP_PATH}")
+	endif()
+	list(APPEND GGL_ROCM_PREFIXES "/opt/rocm" "/usr")
+
+	foreach(GGL_ROCM_PREFIX IN LISTS GGL_ROCM_PREFIXES)
+		if (EXISTS "${GGL_ROCM_PREFIX}")
+			list(APPEND CMAKE_PREFIX_PATH
+				"${GGL_ROCM_PREFIX}"
+				"${GGL_ROCM_PREFIX}/lib/cmake"
+				"${GGL_ROCM_PREFIX}/lib64/cmake"
+			)
+		endif()
+	endforeach()
+	set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}" PARENT_SCOPE)
+
+	find_package(amdhip64 CONFIG QUIET)
+	if (NOT TARGET hip::amdhip64)
+		find_package(hip CONFIG QUIET)
+	endif()
+
+	if (NOT TARGET hip::amdhip64)
+		find_library(GGL_AMDHIP64_LIBRARY
+			NAMES amdhip64
+			HINTS ${GGL_ROCM_PREFIXES}
+			PATH_SUFFIXES lib lib64
+		)
+
+		if (GGL_AMDHIP64_LIBRARY)
+			message("Found libamdhip64 without a CMake target, creating hip::amdhip64 fallback: ${GGL_AMDHIP64_LIBRARY}")
+			add_library(hip::amdhip64 SHARED IMPORTED GLOBAL)
+			set_target_properties(hip::amdhip64 PROPERTIES
+				IMPORTED_LOCATION "${GGL_AMDHIP64_LIBRARY}"
+			)
+		endif()
+	endif()
+endfunction()
+
+ggl_prepare_rocm_torch_dependencies()
+
 # Add libtorch (https://pytorch.org/cppdocs/installing.html#minimal-example)
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
