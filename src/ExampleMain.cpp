@@ -22,28 +22,27 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// Nexto's dense player->ball "dist" approach term, restored (the repo's
-		// nexto transcription dropped it, leaving no cold-start approach signal).
-		// This is the bootstrap; weight is the main knob -- tune to taste.
-		{ teamMixed(new PlayerBallDistanceReward()), 2.f },
+		// DENSE SHAPING IS NOW THE GCRL POTENTIAL HEADS, not rewards. Removed (they would
+		// double-shape on top of the potentials):
+		//   PlayerBallDistanceReward -> car head (egocentric ball -> contact)
+		//   BallGoalDistanceReward   -> goal head (HER ball -> scoring-mouth range)
+		//   ConcedeDistanceReward    -> defense head (opponents' scoring reachability)
+		// What remains: SPARSE task/event rewards (the objective + discrete achievements that a
+		// smooth reachability potential can't represent), plus boost (no GCRL head yet).
 
-		// Ball-goal shaping (Nexto goal_dist)
-		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
-
-		// Goals
+		// Goals (sparse task)
 		{ teamMixed(new TeamGoalReward()), 12.5f },
 		{ teamMixed(new GoalSpeedBonusReward()), 1.25f },
-		{ teamMixed(new ConcedeDistanceReward()), 1.25f },
 
-		// Touches
+		// Touches / aerial events
 		{ teamMixed(new TouchHeightReward()), 1.f },
 		{ teamMixed(new FlipResetReward()), 5.f },
 
-		// Boost
+		// Boost (dense, but no GCRL head yet -- the one remaining dense reward)
 		{ teamMixed(new BoostGainReward()), 0.7f },
 		{ teamMixed(new BoostLoseReward()), 0.4f },
 
-		// Demos
+		// Demos (events)
 		{ teamMixed(new DemoReward()), 2.5f },
 		{ teamMixed(new DemoedPenalty()), 2.5f }
 	};
@@ -161,7 +160,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.usePotentialShaping = true;  // POTENTIAL framework (false -> advantage A/B baseline)
 	cfg.ppo.contrastiveGoal.potentialDefense = true;     // defense head (opponent reachability); false = offense only
 	cfg.ppo.contrastiveGoal.useSharedBase = false;       // true -> one shared phi base across the heads
-	cfg.ppo.contrastiveGoal.potentialShapingScale = 0.3f;
+	// The potentials are now the PRIMARY dense signal (the dense shaping rewards are gone), so the
+	// scale is bumped from the 0.3 "augment" value. THIS IS THE CRITICAL COLD-START KNOB: the car
+	// head's contact potential must bootstrap ball approach in place of PlayerBallDistanceReward.
+	// If touch ratio doesn't climb in the first ~30M ts, raise this (toward 2-3).
+	cfg.ppo.contrastiveGoal.potentialShapingScale = 1.0f;
 	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // (advantage-mode only)
 	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // (advantage-mode only)
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
