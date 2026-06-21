@@ -32,6 +32,11 @@ namespace GGL {
 		std::string phiName, psiName;
 		Model stateActionEncoder;
 		Model goalEncoder;
+		// When non-null, the state-action encoder (phi) is SHARED with another critic; the owned
+		// stateActionEncoder above is then inert. Lets useSharedBase give all GCRL heads one phi base
+		// + small per-head psi. The owner (the critic that constructed the phi) saves/loads/LR-steps it.
+		Model* sharedStateActionEncoder = nullptr;
+		Model& Phi() { return sharedStateActionEncoder ? *sharedStateActionEncoder : stateActionEncoder; }
 		ContrastiveGoalConfig config;
 		torch::Device device;
 		int obsSize;
@@ -45,7 +50,7 @@ namespace GGL {
 		bool applyTrainMask = true;
 
 		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
-			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true);
+			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true, Model* sharedPhi = nullptr);
 
 		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionRepresentations);
 		torch::Tensor EncodeGoal(torch::Tensor goals);

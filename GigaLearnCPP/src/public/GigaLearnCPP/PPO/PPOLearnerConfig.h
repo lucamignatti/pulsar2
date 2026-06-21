@@ -35,6 +35,13 @@ namespace GGL {
 		// short, near-term HER window (no goalward bias). Needs the obs builder to
 		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
 		bool useCarCritic = false;
+		// Share ONE state-action encoder (phi) across the GCRL critics (goal + car), each with its own
+		// small goal encoder (psi). Default off (separate critics = the A/B baseline). The goal critic
+		// owns/saves/LR-steps the shared phi; the car critic references it. NOTE: the shared phi is
+		// updated SEQUENTIALLY each iteration -- goal Train steps it, then car Train steps it (StepOptim
+		// applies each gradient to the weights, so both land; this is alternating multi-task, not summed
+		// joint gradients). Pays off as the head count grows.
+		bool useSharedBase = false;
 		int carHerMinOffset = 1;
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2.f;
@@ -65,6 +72,11 @@ namespace GGL {
 		float potentialShapingScale = 0.3f;   // weight on the summed per-head shaping reward
 		int scoringRangeSamples = 5;          // goal-mouth x-samples defining the goal head's range
 		float potentialScoringTemp = 1.0f;    // soft-max temperature over the scoring range (->0 = hard max)
+		// Defense head: Phi_defense(s) = -(soft-max over the agent's opponents of their goal-reachability),
+		// reusing the goal head's Phi evaluated on each opponent's ego-obs, regrouped by (arena, step).
+		// Agency-correct (the threat is the opponents'), policy-invariant (a potential). Only active in
+		// potential-shaping mode. Costs nothing extra to compute Phi (reuses the goal head).
+		bool potentialDefense = true;
 
 		int representationSize = 128;
 		int criticEpochs = 1;

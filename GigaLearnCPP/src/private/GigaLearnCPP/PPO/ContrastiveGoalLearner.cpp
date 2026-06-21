@@ -23,18 +23,19 @@ namespace GGL {
 	}
 
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
-		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask) :
+		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask, Model* sharedPhi) :
 		phiName(namePrefix + "_phi"),
 		psiName(namePrefix + "_psi"),
 		stateActionEncoder(phiName.c_str(), MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
 		goalEncoder(psiName.c_str(), MakeEncoderConfig(6, config.representationSize), device),
+		sharedStateActionEncoder(sharedPhi),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
 	}
 
 	Tensor ContrastiveGoalLearner::EncodeStateAction(Tensor states, Tensor actionRepresentations) {
-		Tensor raw = stateActionEncoder.Forward(torch::cat({ states, actionRepresentations.to(kFloat32).to(states.device()) }, -1), false);
+		Tensor raw = Phi().Forward(torch::cat({ states, actionRepresentations.to(kFloat32).to(states.device()) }, -1), false);
 		return L2Normalize(raw);
 	}
 
@@ -141,10 +142,10 @@ namespace GGL {
 
 				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + varPenalty;
 
-				stateActionEncoder.optim->zero_grad();
+				Phi().optim->zero_grad();
 				goalEncoder.optim->zero_grad();
 				loss.backward();
-				stateActionEncoder.StepOptim();
+				Phi().StepOptim();
 				goalEncoder.StepOptim();
 
 				{
@@ -190,17 +191,21 @@ namespace GGL {
 	}
 
 	void ContrastiveGoalLearner::Save(std::filesystem::path folder, bool saveOptim) {
-		stateActionEncoder.Save(folder, saveOptim);
+		// The shared phi is owned/saved by the critic that created it; skip it here when shared.
+		if (!sharedStateActionEncoder)
+			stateActionEncoder.Save(folder, saveOptim);
 		goalEncoder.Save(folder, saveOptim);
 	}
 
 	void ContrastiveGoalLearner::Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim) {
-		stateActionEncoder.Load(folder, allowNotExist, loadOptim);
+		if (!sharedStateActionEncoder)
+			stateActionEncoder.Load(folder, allowNotExist, loadOptim);
 		goalEncoder.Load(folder, allowNotExist, loadOptim);
 	}
 
 	void ContrastiveGoalLearner::SetLearningRate(float lr) {
-		stateActionEncoder.SetOptimLR(lr);
+		if (!sharedStateActionEncoder)
+			stateActionEncoder.SetOptimLR(lr);
 		goalEncoder.SetOptimLR(lr);
 	}
 }

@@ -664,6 +664,10 @@ void GGL::Learner::Start() {
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
 			std::vector<int64_t> segmentIds, segmentSteps;
+			// Potential-defense regrouping: per-row (arena,step) group key + team, so the learner can
+			// find each row's simultaneous opponents and aggregate their goal-reachability into a threat.
+			std::vector<int64_t> defenseGroupKeys;
+			std::vector<int8_t> defenseTeams;
 
 			void Clear() {
 				*this = Trajectory();
@@ -684,6 +688,8 @@ void GGL::Learner::Start() {
 				actions += other.actions;
 				segmentIds += other.segmentIds;
 				segmentSteps += other.segmentSteps;
+				defenseGroupKeys += other.defenseGroupKeys;
+				defenseTeams += other.defenseTeams;
 			}
 
 			size_t Length() const {
@@ -938,6 +944,15 @@ void GGL::Learner::Start() {
 									AppendScoringGoal(trajectories[newPlayerIdx].scoringGoals, state, player, config.ppo.contrastiveGoal);
 									trajectories[newPlayerIdx].segmentIds.push_back(curSegmentIds[newPlayerIdx]);
 									trajectories[newPlayerIdx].segmentSteps.push_back(curSegmentSteps[newPlayerIdx]);
+									// Defense regrouping key = (arena, env-tick). `step` is the collection-loop
+									// counter -- one env tick per loop step across ALL arenas -- so same (arena,step)
+									// == physically simultaneous players, exactly the opponent set for the threat.
+									// Deliberately NOT the per-player episode step (curSegmentSteps): per-player
+									// truncation does not reset the env, so episode steps desync within an arena and
+									// would split simultaneous opponents. Scoped to one iteration's rollout (no
+									// cross-iteration aliasing); step is small (<< 1e6) so the packing can't collide.
+									trajectories[newPlayerIdx].defenseGroupKeys.push_back((int64_t)arenaIdx * 1000000 + step);
+									trajectories[newPlayerIdx].defenseTeams.push_back((int8_t)(player.team == Team::ORANGE ? 1 : 0));
 								}
 							}
 						}
@@ -1124,8 +1139,11 @@ void GGL::Learner::Start() {
 						}
 						torch::Tensor contactGoal = torch::tensor(contactF).reshape({ 1, 6 });
 						torch::Tensor scoringRange = torch::tensor(rangeF).reshape({ (int64_t)kg, 6 });
+						torch::Tensor tGroupKeys = torch::tensor(combinedTraj.defenseGroupKeys, torch::TensorOptions().dtype(torch::kInt64));
+						torch::Tensor tTeams = torch::tensor(combinedTraj.defenseTeams, torch::TensorOptions().dtype(torch::kInt8));
 						torch::Tensor shaping = ppo->ComputePotentialShaping(
-							tStates, tActionMasks, tSegmentIds, config.ppo.gaeGamma, contactGoal, scoringRange, report);
+							tStates, tActionMasks, tSegmentIds, config.ppo.gaeGamma, contactGoal, scoringRange,
+							tGroupKeys, tTeams, report);
 						tRewards = tRewards + shaping.to(tRewards.options());
 					}
 

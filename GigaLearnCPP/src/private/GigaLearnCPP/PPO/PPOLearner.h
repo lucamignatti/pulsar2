@@ -79,7 +79,8 @@ namespace GGL {
 		// is the car head's fixed goal; scoringRangeGoals [K,6] are the goal head's mouth samples.
 		torch::Tensor ComputePotentialShaping(
 			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
-			float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals, Report& report);
+			float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
+			torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report);
 
 		void TransferLearn(
 			ModelSet& oldModels, 

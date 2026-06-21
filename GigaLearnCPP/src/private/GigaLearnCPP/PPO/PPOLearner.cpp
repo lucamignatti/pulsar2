@@ -5,6 +5,8 @@
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <cmath>
+#include <cfloat>
+#include <unordered_map>
 
 using namespace torch;
 
@@ -43,8 +45,10 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		RG_LOG("GCRL scoring auxiliary enabled with separate critic encoders");
 		if (config.contrastiveGoal.useCarCritic) {
 			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
-			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false);
-			RG_LOG("GCRL car critic enabled (egocentric controllability)");
+			// When useSharedBase, reuse the goal critic's phi encoder (one base, per-head psi).
+			Model* sharedPhi = config.contrastiveGoal.useSharedBase ? &contrastiveGoalLearner->stateActionEncoder : nullptr;
+			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false, sharedPhi);
+			RG_LOG("GCRL car critic enabled (egocentric controllability)" << (sharedPhi ? " [shared phi base]" : ""));
 		}
 	}
 
@@ -73,8 +77,9 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 GGL::PPOLearner::~PPOLearner() {
 	models.Free();
 	guidingPolicyModels.Free();
-	delete contrastiveGoalLearner;
+	// Delete the car critic first: under useSharedBase it references the goal critic's phi encoder.
 	delete carContrastiveLearner;
+	delete contrastiveGoalLearner;
 	delete obsNorm;
 }
 
@@ -698,9 +703,48 @@ void GGL::PPOLearner::TransferLearn(
 	report["Policy Update Magnitude"] = (policyBefore - policyAfter).norm().item<float>();
 }
 
+// Phi_defense(s) = -(soft-max over the agent's opponents of their goal-reachability Phi_goal). Reuses
+// the already-computed goal-head Phi, regrouped by (arena,step) so each row's simultaneous opponents
+// are aggregated. A potential -> policy-invariant; agency-correct (the threat is the opponents').
+static torch::Tensor ComputeDefensePotential(
+	torch::Tensor phiGoal, torch::Tensor groupKeys, torch::Tensor teams, float temp
+) {
+	torch::Tensor pg = phiGoal.to(torch::kCPU).to(torch::kFloat32).contiguous();
+	torch::Tensor gk = groupKeys.to(torch::kCPU).to(torch::kLong).contiguous();
+	torch::Tensor tm = teams.to(torch::kCPU).to(torch::kInt8).contiguous();
+	int64_t n = pg.size(0);
+	const float* pgp = pg.data_ptr<float>();
+	const int64_t* gkp = gk.data_ptr<int64_t>();
+	const int8_t* tmp = tm.data_ptr<int8_t>();
+	float safeTemp = RS_MAX(1e-3f, temp);
+
+	std::unordered_map<int64_t, std::vector<int64_t>> groups;
+	groups.reserve((size_t)n);
+	for (int64_t i = 0; i < n; i++)
+		groups[gkp[i]].push_back(i);
+
+	torch::Tensor phiDef = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32));
+	float* pdp = phiDef.data_ptr<float>();
+	for (int64_t i = 0; i < n; i++) {
+		const std::vector<int64_t>& grp = groups[gkp[i]];
+		float maxV = -FLT_MAX;
+		for (int64_t j : grp)
+			if (tmp[j] != tmp[i])
+				maxV = RS_MAX(maxV, pgp[j]);
+		if (maxV == -FLT_MAX) { pdp[i] = 0.f; continue; } // no opponents in this group
+		float sum = 0.f;
+		for (int64_t j : grp)
+			if (tmp[j] != tmp[i])
+				sum += expf((pgp[j] - maxV) / safeTemp);
+		pdp[i] = -(maxV + safeTemp * logf(sum)); // negated soft-max threat
+	}
+	return phiDef;
+}
+
 torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
 	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
-	float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals, Report& report
+	float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
+	torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report
 ) {
 	RG_NO_GRAD;
 	auto& cfg = config.contrastiveGoal;
@@ -716,29 +760,41 @@ torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
 	torch::Tensor eq = (seg.slice(0, 1, n) == seg.slice(0, 0, n - 1)).to(torch::kFloat32);
 	torch::Tensor sameNext = torch::cat({ eq, torch::zeros({ 1 }, eq.options()) }, 0);
 
-	torch::Tensor total = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-
-	auto headShaping = [&](GGL::ContrastiveGoalLearner* critic, torch::Tensor goals, float temp) -> torch::Tensor {
-		torch::Tensor phi = ComputeHeadPotential(critic, s, masks, goals.to(device), temp,
-			cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
+	auto phiToShaping = [&](torch::Tensor phi) -> torch::Tensor {
 		torch::Tensor phiNext = torch::cat({ phi.slice(0, 1, n), torch::zeros({ 1 }, phi.options()) }, 0) * sameNext;
-		torch::Tensor shaping = gaeGamma * phiNext - phi;
-		return torch::stack({ phi, shaping });  // [2, n]
+		return gaeGamma * phiNext - phi;
 	};
 
-	// Goal head: soft-max over the scoring-mouth range (in-distribution-self-selecting).
+	torch::Tensor total = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+	// Goal head (offense) -- its Phi is reused for the defense head below.
+	torch::Tensor phiGoal = ComputeHeadPotential(contrastiveGoalLearner, s, masks, scoringRangeGoals.to(device),
+		cfg.potentialScoringTemp, cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
 	{
-		torch::Tensor r = headShaping(contrastiveGoalLearner, scoringRangeGoals, cfg.potentialScoringTemp);
-		total = total + r[1];
-		report["GCRL/Potential Goal Mean"] = TensorMean(r[0]);
-		report["GCRL/Shaping Goal AbsMean"] = TensorMean(r[1].abs());
+		torch::Tensor shaping = phiToShaping(phiGoal);
+		total = total + shaping;
+		report["GCRL/Potential Goal Mean"] = TensorMean(phiGoal);
+		report["GCRL/Shaping Goal AbsMean"] = TensorMean(shaping.abs());
 	}
-	// Car head: contact goal (single -> soft-max is a no-op).
+
+	// Car head (offense): contact goal (single -> soft-max is a no-op).
 	if (carContrastiveLearner) {
-		torch::Tensor r = headShaping(carContrastiveLearner, contactGoal, 1.0f);
-		total = total + r[1];
-		report["GCRL/Potential Car Mean"] = TensorMean(r[0]);
-		report["GCRL/Shaping Car AbsMean"] = TensorMean(r[1].abs());
+		torch::Tensor phiCar = ComputeHeadPotential(carContrastiveLearner, s, masks, contactGoal.to(device),
+			1.0f, cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
+		torch::Tensor shaping = phiToShaping(phiCar);
+		total = total + shaping;
+		report["GCRL/Potential Car Mean"] = TensorMean(phiCar);
+		report["GCRL/Shaping Car AbsMean"] = TensorMean(shaping.abs());
+	}
+
+	// Defense head: reuse phiGoal (each row = that agent's scoring reachability), regroup by (arena,step),
+	// aggregate the agent's opponents into a threat. Negated -> safer state = higher potential.
+	if (cfg.potentialDefense && defenseGroupKeys.defined() && defenseGroupKeys.size(0) == n) {
+		torch::Tensor phiDef = ComputeDefensePotential(phiGoal, defenseGroupKeys, defenseTeams, cfg.potentialScoringTemp).to(device);
+		torch::Tensor shaping = phiToShaping(phiDef);
+		total = total + shaping;
+		report["GCRL/Potential Defense Mean"] = TensorMean(phiDef);
+		report["GCRL/Shaping Defense AbsMean"] = TensorMean(shaping.abs());
 	}
 
 	total = total * cfg.potentialShapingScale;
