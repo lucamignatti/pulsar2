@@ -35,21 +35,6 @@ namespace GGL {
 		// short, near-term HER window (no goalward bias). Needs the obs builder to
 		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
 		bool useCarCritic = false;
-		// Boost critic: a head whose goal is the agent's own boost LEVEL (the obs slot just after the
-		// car-local ball, i.e. GetCarLocalBallOffset()+6). Trained via HER on achieved future boost; its
-		// fixed shaping-goal is full boost. Replaces BoostGain/BoostLose (farming-proof: hoarding full
-		// boost earns ~0, gaining earns positive). Needs the obs builder's car-local ball offset (>=0).
-		bool useBoostCritic = false;
-		int boostHerMinOffset = 1;
-		int boostHerMaxOffset = 30;
-		float boostHerShortBiasPower = 1.5f;
-		// Share ONE state-action encoder (phi) across the GCRL critics (goal + car), each with its own
-		// small goal encoder (psi). Default off (separate critics = the A/B baseline). The goal critic
-		// owns/saves/LR-steps the shared phi; the car critic references it. NOTE: the shared phi is
-		// updated SEQUENTIALLY each iteration -- goal Train steps it, then car Train steps it (StepOptim
-		// applies each gradient to the weights, so both land; this is alternating multi-task, not summed
-		// joint gradients). Pays off as the head count grows.
-		bool useSharedBase = false;
 		int carHerMinOffset = 1;
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2.f;
@@ -67,34 +52,9 @@ namespace GGL {
 		uint64_t gcrlLambdaWarmupSteps = 30'000'000;
 		float gcrlSepClamp = 3.f;
 
-		// ── Potential-based shaping (the unified consumption; vs the magnitude-blend above) ──
-		// When usePotentialShaping is true, GCRL enters as potential-based reward shaping
-		// reward_k = gamma*Phi_k(s') - Phi_k(s) added to the reward stream BEFORE GAE, instead of
-		// the advantage blend (PrepareGCRLPolicyAdvantages is skipped). Phi_k(s) = mean over
-		// baselineActionSamples random actions of the head's reachability toward a FIXED shaping-goal:
-		//   car  -> contact (car-local ball at origin),
-		//   goal -> soft-max over scoringRangeSamples goal-mouth points (temperature potentialScoringTemp).
-		// Policy-invariant (Ng'99) and farming-proof (deltas telescope). Default false = the
-		// magnitude-blend advantage, kept as the A/B baseline. Defense + shared-base are follow-ups.
-		bool usePotentialShaping = false;
-		float potentialShapingScale = 0.3f;   // weight on the summed per-head shaping reward
-		int scoringRangeSamples = 5;          // goal-mouth x-samples defining the goal head's range
-		float potentialScoringTemp = 1.0f;    // soft-max temperature over the scoring range (->0 = hard max)
-		// Defense head: Phi_defense(s) = -(soft-max over the agent's opponents of their goal-reachability),
-		// reusing the goal head's Phi evaluated on each opponent's ego-obs, regrouped by (arena, step).
-		// Agency-correct (the threat is the opponents'), policy-invariant (a potential). Only active in
-		// potential-shaping mode. Costs nothing extra to compute Phi (reuses the goal head).
-		bool potentialDefense = true;
-
 		int representationSize = 128;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
-		// Cap on the number of (masked) rollout rows each GCRL critic trains on per iteration. The critic
-		// training is compute-bound (3 InfoNCE encoders over the WHOLE rollout every iteration is the
-		// dominant PPO-Learn cost); a random subset per iteration (reshuffled, so all data is seen over
-		// successive iterations) cuts that cost ~linearly. 0 = no cap (train on every row; original
-		// behavior). Checkpoint-compatible (changes only how many rows are sampled, not the model).
-		int64_t criticMaxRowsPerIter = 0;
 		int64_t policyScoreBatchSize = 4096;
 		int64_t infoSubSample = 512;
 		float criticLR = 3e-4f;
@@ -184,13 +144,6 @@ namespace GGL {
 		// Use half-precision models for inference
 		// This is much faster on GPU, not so much for CPU
 		bool useHalfPrecision = false;
-
-		// Wrap the PPO training forward/backward in bfloat16 autocast on CUDA (matmul throughput + halved
-		// activation memory for the dense MLP). Autocast keeps softmax/log/exp/reductions and the MSE/KL in
-		// fp32 via its op policy. CUDA-only; no effect on MPS/CPU (the dev path stays fp32). NUMERICALLY
-		// INVASIVE: bf16 carries ~3 significant digits, which can perturb the PPO ratio/KL -- validate
-		// entropy/KL over a run before relying on it. Distinct from useHalfPrecision (inference-only).
-		bool useTrainAutocast = false;
 
 		PartialModelConfig policy, critic, sharedHead;
 

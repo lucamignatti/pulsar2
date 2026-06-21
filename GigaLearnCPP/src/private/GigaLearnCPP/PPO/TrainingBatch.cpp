@@ -24,31 +24,14 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 		if (in.carHerGoals.defined() && in.carHerGoals.size(0) != expRows)
 			RG_ERR_CLOSE("GCRL car goal alignment failed: states=" << expRows <<
 				", carHerGoals=" << in.carHerGoals.size(0));
-		if (in.boostHerGoals.defined() && in.boostHerGoals.size(0) != expRows)
-			RG_ERR_CLOSE("GCRL boost goal alignment failed: states=" << expRows <<
-				", boostHerGoals=" << in.boostHerGoals.size(0));
 	}
 
-	// Value targets + the running-return stat come from the SPARSE rewards: the value critic learns the
-	// true task value, not the shaped value V-Phi, so it never chases the nonstationary GCRL potential.
+	// Advantages via GAE. Reads the pre-update return std the caller supplied.
 	GAE::Compute(
 		in.rewards, in.terminals, in.valPreds, in.truncValPreds,
 		result.advantages, result.targetValues, result.returns, result.rewClipPortion,
 		in.gaeGamma, in.gaeLambda, in.returnStd, in.rewardClipRange
 	);
-
-	// The policy ADVANTAGE uses the shaped reward (sparse + potential shaping) via a second GAE pass
-	// sharing the same sparse return std -- potential-based shaping affects the advantage only.
-	if (in.shapingF.defined() && in.shapingF.size(0) == expRows) {
-		torch::Tensor shapedAdv, shapedTargets, shapedReturns;
-		float shapedClip;
-		GAE::Compute(
-			in.rewards + in.shapingF, in.terminals, in.valPreds, in.truncValPreds,
-			shapedAdv, shapedTargets, shapedReturns, shapedClip,
-			in.gaeGamma, in.gaeLambda, in.returnStd, in.rewardClipRange
-		);
-		result.advantages = shapedAdv; // targetValues + returns stay sparse
-	}
 
 	result.avgReturn = result.returns.abs().mean().item<float>();
 	result.avgAdvantage = result.advantages.abs().mean().item<float>();
@@ -65,7 +48,6 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 		outBuffer.data.achievedGoals = in.achievedGoals;
 		outBuffer.data.herGoals = in.herGoals;
 		outBuffer.data.carHerGoals = in.carHerGoals;
-		outBuffer.data.boostHerGoals = in.boostHerGoals;
 		outBuffer.data.scoringGoals = in.scoringGoals;
 		outBuffer.data.gcrlTrainMask = in.gcrlTrainMask;
 		outBuffer.data.segmentIds = in.segmentIds;

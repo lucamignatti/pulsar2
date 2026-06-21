@@ -25,8 +25,6 @@ namespace GGL {
 		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
 		// Optional second isolated critic: egocentric car-local ball goal (controllability).
 		ContrastiveGoalLearner* carContrastiveLearner = NULL;
-		// Optional boost critic: goal = the agent's own boost level (reachability toward full boost).
-		ContrastiveGoalLearner* boostContrastiveLearner = NULL;
 		// SimBa RSNorm (running obs normalization). NULL unless config.rsNorm.enabled.
 		// One shared normalizer for actor & critic; "canonical stats everywhere"
 		// (old-version & skill-eval inference use this same normalizer).
@@ -74,23 +72,6 @@ namespace GGL {
 		);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);
-
-		// Joint training of all GCRL heads over ONE shared phi base (config.contrastiveGoal.useSharedBase):
-		// the state-action embedding is computed once per minibatch and reused across the goal/car/boost
-		// heads in a single summed-loss update (1 big phi forward+backward instead of one per head). The
-		// goal head keeps its ball-moved (gcrlTrainMask) subset via in-minibatch row selection. Fills the
-		// per-head stats. Replaces the three separate per-critic Train() calls when useSharedBase is on.
-		void TrainGCRLSharedBase(ExperienceBuffer& experience, std::default_random_engine& rng,
-			ContrastiveGoalStats& goalStats, ContrastiveGoalStats& carStats, ContrastiveGoalStats& boostStats);
-
-		// Potential-based GCRL shaping (used when config.contrastiveGoal.usePotentialShaping): returns
-		// a per-row reward addon summing gamma*Phi_k(s') - Phi_k(s) over heads, computed from the current
-		// (previous-iteration) critics, to be added to the reward stream BEFORE GAE. contactGoal [1,6]
-		// is the car head's fixed goal; scoringRangeGoals [K,6] are the goal head's mouth samples.
-		torch::Tensor ComputePotentialShaping(
-			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds, torch::Tensor terminals,
-			torch::Tensor truncNextStates, float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
-			torch::Tensor boostGoal, torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report);
 
 		void TransferLearn(
 			ModelSet& oldModels, 

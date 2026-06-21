@@ -22,25 +22,28 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// DENSE SHAPING IS NOW THE GCRL POTENTIAL HEADS, not rewards. Removed (they would
-		// double-shape on top of the potentials):
-		//   PlayerBallDistanceReward -> car head (egocentric ball -> contact)
-		//   BallGoalDistanceReward   -> goal head (HER ball -> scoring-mouth range)
-		//   ConcedeDistanceReward    -> defense head (opponents' scoring reachability)
-		// What remains: SPARSE task/event rewards (the objective + discrete achievements that a
-		// smooth reachability potential can't represent), plus boost (no GCRL head yet).
+		// Nexto's dense player->ball "dist" approach term, restored (the repo's
+		// nexto transcription dropped it, leaving no cold-start approach signal).
+		// This is the bootstrap; weight is the main knob -- tune to taste.
+		{ teamMixed(new PlayerBallDistanceReward()), 2.f },
 
-		// Goals (sparse task)
+		// Ball-goal shaping (Nexto goal_dist)
+		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
+
+		// Goals
 		{ teamMixed(new TeamGoalReward()), 12.5f },
 		{ teamMixed(new GoalSpeedBonusReward()), 1.25f },
+		{ teamMixed(new ConcedeDistanceReward()), 1.25f },
 
-		// Touches / aerial events
+		// Touches
 		{ teamMixed(new TouchHeightReward()), 1.f },
 		{ teamMixed(new FlipResetReward()), 5.f },
 
-		// Boost is now the BOOST GCRL head (reachability toward full boost) -- no boost reward.
+		// Boost
+		{ teamMixed(new BoostGainReward()), 0.7f },
+		{ teamMixed(new BoostLoseReward()), 0.4f },
 
-		// Demos (events)
+		// Demos
 		{ teamMixed(new DemoReward()), 2.5f },
 		{ teamMixed(new DemoedPenalty()), 2.5f }
 	};
@@ -51,7 +54,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 1; // 1v1 SOCCAR
+	int playersPerTeam = 3; // 3v3 SOCCAR (real training)
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -112,8 +115,8 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars.
-	cfg.numGames = 5120;
+	// 3v3 SOCCAR: 1700 games * 6 cars ~= 10,200 simulated cars (the original setup).
+	cfg.numGames = 1700;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -146,43 +149,27 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL as the UNIFIED POTENTIAL-BASED SHAPING framework. Each head's reachability potential Phi(s)
-	// is injected as gamma*Phi(s')-Phi(s) into the reward stream (policy-invariant, farming-proof),
-	// instead of the magnitude-blend advantage. Heads: CAR (egocentric ball -> contact), GOAL (HER ball
-	// -> soft-max over the scoring-mouth range), DEFENSE (-soft-max over opponents' goal-reachability).
-	// Watch GCRL/Shaping {Car,Goal,Defense} AbsMean and GCRL/Potential * Mean.
-	//   A/B baseline = the magnitude-blend advantage: set usePotentialShaping=false (then gcrlLambda*
-	//   apply and the advantage path runs instead). useSharedBase folds goal+car onto one phi base.
+	// GCRL magnitude-blend with two isolated critics (goal + car). Per critic the
+	// policy-gradient contribution is (taken - baseline)/spread -- NOT unit-renormalized --
+	// so a critic that can't yet discriminate the action self-attenuates to ~0 (no noise
+	// injection, no gate). The CAR critic (egocentric ball, short HER window) carries early
+	// action-attributable controllability signal; the GOAL critic (HER achieved ball, not
+	// the synthetic net) firms up later. gcrlLambda ramps in over a short warmup, then holds.
+	// Watch GCRL/Car Separation (should climb first) vs GCRL/Goal Separation.
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.useCarCritic = true;
-	cfg.ppo.contrastiveGoal.useBoostCritic = true;       // boost head (reachability toward full boost)
-	cfg.ppo.contrastiveGoal.usePotentialShaping = true;  // POTENTIAL framework (false -> advantage A/B baseline)
-	cfg.ppo.contrastiveGoal.potentialDefense = true;     // defense head (opponent reachability); false = offense only
-	cfg.ppo.contrastiveGoal.useSharedBase = true;        // ONE shared phi base + small per-head psi (the locked design): phi(s,a) is computed once per minibatch and reused across the goal/car/boost heads in a joint update, instead of a full encoder per head
-	// The potentials are now the PRIMARY dense signal (the dense shaping rewards are gone), so the
-	// scale is bumped from the 0.3 "augment" value. THIS IS THE CRITICAL COLD-START KNOB: the car
-	// head's contact potential must bootstrap ball approach in place of PlayerBallDistanceReward.
-	// If touch ratio doesn't climb in the first ~30M ts, raise this (toward 2-3).
-	cfg.ppo.contrastiveGoal.potentialShapingScale = 1.0f;
-	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // (advantage-mode only)
-	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // (advantage-mode only)
+	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
+	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
-	// PERF: cap GCRL critic training to a random subset of rollout rows per iteration. Critic training (3
-	// InfoNCE encoders over the WHOLE ~150k-row rollout) was ~80% of wall-clock (PPO Learn ~9.3s, overall
-	// ~14k SPS in run xmct098w). The critics are running estimators (0.69-0.87 acc) and don't need every
-	// row each iter; a reshuffled subset still sees all data over successive iterations and cuts the
-	// compute ~linearly (measured ~2x overall SPS). Checkpoint-compatible. Raise toward 0 (=all) for more
-	// critic data per iter, lower for more speed; watch GCRL/*/Categorical Accuracy.
-	cfg.ppo.contrastiveGoal.criticMaxRowsPerIter = 32768;
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
 
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),
 	// updated once per rollout and frozen during the epochs, persisted with weights.
-	cfg.ppo.rsNorm.enabled = true;
+	cfg.ppo.rsNorm.enabled = false;
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
