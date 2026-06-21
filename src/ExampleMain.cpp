@@ -149,17 +149,21 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL magnitude-blend with two isolated critics (goal + car). Per critic the
-	// policy-gradient contribution is (taken - baseline)/spread -- NOT unit-renormalized --
-	// so a critic that can't yet discriminate the action self-attenuates to ~0 (no noise
-	// injection, no gate). The CAR critic (egocentric ball, short HER window) carries early
-	// action-attributable controllability signal; the GOAL critic (HER achieved ball, not
-	// the synthetic net) firms up later. gcrlLambda ramps in over a short warmup, then holds.
-	// Watch GCRL/Car Separation (should climb first) vs GCRL/Goal Separation.
+	// GCRL as the UNIFIED POTENTIAL-BASED SHAPING framework. Each head's reachability potential Phi(s)
+	// is injected as gamma*Phi(s')-Phi(s) into the reward stream (policy-invariant, farming-proof),
+	// instead of the magnitude-blend advantage. Heads: CAR (egocentric ball -> contact), GOAL (HER ball
+	// -> soft-max over the scoring-mouth range), DEFENSE (-soft-max over opponents' goal-reachability).
+	// Watch GCRL/Shaping {Car,Goal,Defense} AbsMean and GCRL/Potential * Mean.
+	//   A/B baseline = the magnitude-blend advantage: set usePotentialShaping=false (then gcrlLambda*
+	//   apply and the advantage path runs instead). useSharedBase folds goal+car onto one phi base.
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.useCarCritic = true;
-	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
-	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
+	cfg.ppo.contrastiveGoal.usePotentialShaping = true;  // POTENTIAL framework (false -> advantage A/B baseline)
+	cfg.ppo.contrastiveGoal.potentialDefense = true;     // defense head (opponent reachability); false = offense only
+	cfg.ppo.contrastiveGoal.useSharedBase = false;       // true -> one shared phi base across the heads
+	cfg.ppo.contrastiveGoal.potentialShapingScale = 0.3f;
+	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // (advantage-mode only)
+	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // (advantage-mode only)
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
