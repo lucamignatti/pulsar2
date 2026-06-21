@@ -17,7 +17,7 @@ GGL::Model::Model(
 	for (int i = 0; i < config.layerSizes.size(); i++) {
 		seq->push_back(torch::nn::Linear(lastSize, config.layerSizes[i]));
 		if (config.addLayerNorm)
-			seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({(int64_t)config.layerSizes[i]})));
+			seq->push_back(ManualLayerNorm((int64_t)config.layerSizes[i])); // ROCm-safe LayerNorm (see Models.h)
 		lastSize = config.layerSizes[i];
 		AddActivationFunc(seq, config.activationType);
 	}

@@ -17,7 +17,39 @@
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
 #include <GigaLearnCPP/Util/ModelConfig.h>
 
+#include <torch/nn/cloneable.h>
+
 namespace GGL {
+
+	// LayerNorm composed from primitives. The fused native_layer_norm(_backward)
+	// produces non-finite gradients on ROCm; building it from mean/var/rsqrt avoids
+	// that fused kernel. Normalizes over the last dimension (size normSize), with
+	// learnable affine "weight"/"bias" named to match torch::nn::LayerNorm (so the
+	// two are checkpoint-compatible). Cloneable so the half-precision seqHalf clone
+	// path works.
+	struct ManualLayerNormImpl : torch::nn::Cloneable<ManualLayerNormImpl> {
+		int64_t normSize;
+		double eps;
+		torch::Tensor weight, bias;
+
+		ManualLayerNormImpl(int64_t normSize, double eps = 1e-5) : normSize(normSize), eps(eps) {
+			reset();
+		}
+
+		void reset() override {
+			weight = register_parameter("weight", torch::ones({ normSize }));
+			bias = register_parameter("bias", torch::zeros({ normSize }));
+		}
+
+		torch::Tensor forward(torch::Tensor x) {
+			auto mean = x.mean(-1, /*keepdim=*/true);
+			auto centered = x - mean;
+			auto var = centered.pow(2).mean(-1, /*keepdim=*/true); // biased var (LayerNorm convention)
+			auto normed = centered * (var + eps).rsqrt();
+			return normed * weight + bias;
+		}
+	};
+	TORCH_MODULE(ManualLayerNorm);
 
 	inline void AddActivationFunc(torch::nn::Sequential& seq, ModelActivationType type) {
 		switch (type) {

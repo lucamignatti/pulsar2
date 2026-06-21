@@ -262,16 +262,6 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 			this->returnStat = NULL;
 		}
 
-		if (config.standardizeObs) {
-			this->obsStat = new BatchedWelfordStat(obsSize);
-		} else {
-			this->obsStat = NULL;
-		}
-
-		// RSNorm and the legacy collection-time standardizeObs both normalize the
-		// observation stream; running both double-normalizes. Require at most one.
-		if (config.standardizeObs && config.ppo.rsNorm.enabled)
-			RG_ERR_CLOSE("config.standardizeObs and config.ppo.rsNorm.enabled cannot both be enabled (double obs normalization); pick one.");
 	}
 
 	try {
@@ -350,8 +340,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 
 	if (returnStat)
 		j["return_stat"] = returnStat->ToJSON();
-	if (obsStat)
-		j["obs_stat"] = obsStat->ToJSON();
 	// RSNorm stats travel WITH the weights (part of the policy state).
 	if (ppo && ppo->obsNorm)
 		j["rsnorm_stat"] = ppo->obsNorm->ToJSON();
@@ -382,8 +370,6 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 
 	if (returnStat)
 		returnStat->ReadFromJSON(j["return_stat"]);
-	if (obsStat)
-		obsStat->ReadFromJSON(j["obs_stat"]);
 	// contains-guard so checkpoints predating RSNorm still load (stats stay at init).
 	if (ppo && ppo->obsNorm && j.contains("rsnorm_stat"))
 		ppo->obsNorm->ReadFromJSON(j["rsnorm_stat"]);
@@ -882,34 +868,8 @@ void GGL::Learner::Start() {
 							if (isnan(f) || isinf(f))
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
 
-						// Snapshot of this step's obs standardization stats (empty when disabled).
-						// Reused below for the truncation next-state so it gets the SAME normalization
-						// the stored states received (otherwise the critic would be bootstrapped on raw obs).
-						std::vector<double> obsMean, obsStd;
-						auto standardizeObsRow = [&](float* row) {
-							if (obsMean.empty())
-								return;
-							for (int j = 0; j < obsSize; j++)
-								row[j] = (float)((row[j] - obsMean[j]) / obsStd[j]);
-						};
-
-						if (!render && obsStat) {
-							// TODO: This samples from old versions too
-							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
-							for (int i = 0; i < numSamples; i++) {
-								int idx = Math::RandInt(0, envSet->state.numPlayers);
-								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
-							}
-
-							obsMean = obsStat->GetMean();
-							obsStd = obsStat->GetSTD();
-							for (double& f : obsMean)
-								f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
-							for (double& f : obsStd)
-								f = RS_MAX(f, config.minObsSTD);
-							for (int i = 0; i < envSet->state.numPlayers; i++)
-								standardizeObsRow(&envSet->state.obs.At(i, 0));
-						}
+						// Observations are stored RAW; normalization (if enabled) is RSNorm,
+						// applied inside the actor/critic forward (PPOLearner), not here.
 
 						torch::Tensor tActions, tLogProbs;
 						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
@@ -1041,10 +1001,8 @@ void GGL::Learner::Start() {
 
 								if (terminalType == RLGC::TerminalType::TRUNCATED) {
 									// Truncation requires an additional next state for the critic.
-									// StepSecondHalf rebuilt obs as RAW values, so apply the same
-									// standardization the stored states got this step before bootstrapping.
+									// Stored RAW; RSNorm (if enabled) normalizes it inside InferCritic.
 									FList nextStateRow = envSet->state.obs.GetRow(newPlayerIdx);
-									standardizeObsRow(nextStateRow.data());
 									traj.nextStates += nextStateRow;
 								}
 

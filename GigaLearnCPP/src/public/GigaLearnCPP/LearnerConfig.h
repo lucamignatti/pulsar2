@@ -39,11 +39,8 @@ namespace GGL {
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
 		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto uses MPS on macOS if available, otherwise CUDA, otherwise CPU
 
-		// Standardize the obs values (doesn't seem to help much from my testing)
-		bool standardizeObs = false;
-		float minObsSTD = 1 / 10.f;
-		float maxObsMeanRange = 3;
-		int maxObsSamples = 100;
+		// Observation normalization is provided by SimBa RSNorm (cfg.ppo.rsNorm);
+		// the old collection-time standardizeObs path was removed.
 
 		// Standardize the returns to help the critic (don't disable this unless you know what you're doing)
 		bool standardizeReturns = true;

@@ -87,7 +87,7 @@ namespace GGL {
 	// first op of the actor & critic forward (one shared normalizer). Stats are
 	// count-based running mean/var (var = M2/n), updated once per rollout and
 	// frozen during the K epochs; persisted with the weights. Default-off.
-	// Mutually exclusive with LearnerConfig::standardizeObs (double-normalization).
+	// This is the only obs-normalization path (the old standardizeObs was removed).
 	struct RSNormConfig {
 		bool enabled = false;
 		double eps = 1e-8;

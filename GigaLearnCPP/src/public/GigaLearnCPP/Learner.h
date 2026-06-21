@@ -34,7 +34,6 @@ namespace GGL {
 		int numActions;
 
 		struct WelfordStat* returnStat;
-		struct BatchedWelfordStat* obsStat;
 
 		std::string runID = {};
 

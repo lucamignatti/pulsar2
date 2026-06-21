@@ -170,7 +170,6 @@ int main(int argc, char* argv[]) {
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),
 	// updated once per rollout and frozen during the epochs, persisted with weights.
-	// Mutually exclusive with cfg.standardizeObs.
 	cfg.ppo.rsNorm.enabled = false;
 
 	auto optim = ModelOptimType::MUON;
@@ -183,7 +182,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
 
-	bool addLayerNorm = false;
+	bool addLayerNorm = true; // ROCm-safe ManualLayerNorm (see Models.h)
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
