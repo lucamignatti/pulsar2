@@ -18,6 +18,12 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 				", scoringGoals=" << in.scoringGoals.size(0) <<
 				", gcrlTrainMask=" << in.gcrlTrainMask.size(0) <<
 				", segmentIds=" << in.segmentIds.size(0));
+
+		// Car-critic goals are optional (only when useCarCritic + obs builder supports it);
+		// validate alignment only when present.
+		if (in.carHerGoals.defined() && in.carHerGoals.size(0) != expRows)
+			RG_ERR_CLOSE("GCRL car goal alignment failed: states=" << expRows <<
+				", carHerGoals=" << in.carHerGoals.size(0));
 	}
 
 	// Advantages via GAE. Reads the pre-update return std the caller supplied.
@@ -41,6 +47,7 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 	if (in.gcrlEnabled) {
 		outBuffer.data.achievedGoals = in.achievedGoals;
 		outBuffer.data.herGoals = in.herGoals;
+		outBuffer.data.carHerGoals = in.carHerGoals;
 		outBuffer.data.scoringGoals = in.scoringGoals;
 		outBuffer.data.gcrlTrainMask = in.gcrlTrainMask;
 		outBuffer.data.segmentIds = in.segmentIds;

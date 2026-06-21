@@ -41,6 +41,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.contrastiveGoal.enabled) {
 		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device);
 		RG_LOG("GCRL scoring auxiliary enabled with separate critic encoders");
+		if (config.contrastiveGoal.useCarCritic) {
+			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
+			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false);
+			RG_LOG("GCRL car critic enabled (egocentric controllability)");
+		}
 	}
 
 	if (config.rsNorm.enabled) {
@@ -69,6 +74,7 @@ GGL::PPOLearner::~PPOLearner() {
 	models.Free();
 	guidingPolicyModels.Free();
 	delete contrastiveGoalLearner;
+	delete carContrastiveLearner;
 	delete obsNorm;
 }
 
@@ -285,21 +291,13 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	return takenScores - baselineScores;
 }
 
-static float GetAnnealedContrastiveLambda(const GGL::ContrastiveGoalConfig& cfg, uint64_t totalTimesteps) {
-	if (cfg.lambdaAnnealSteps == 0)
-		return cfg.lambda;
-
-	float progress = RS_CLAMP(totalTimesteps / (float)cfg.lambdaAnnealSteps, 0.f, 1.f);
-	return cfg.lambdaStart + (cfg.lambda - cfg.lambdaStart) * progress;
-}
-
 static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::ExperienceBuffer& experience, GGL::Report& report, uint64_t totalTimesteps) {
 	if (!learner->config.contrastiveGoal.enabled)
 		return;
 
 	if (!learner->contrastiveGoalLearner)
 		RG_ERR_CLOSE("GCRL config is enabled but no contrastive learner exists");
-	if (!experience.data.actions.defined() || !experience.data.scoringGoals.defined() || !experience.data.actionMasks.defined())
+	if (!experience.data.actions.defined() || !experience.data.herGoals.defined() || !experience.data.actionMasks.defined())
 		RG_ERR_CLOSE("GCRL config is enabled but rollout goal/action tensors are missing");
 
 	RG_NO_GRAD;
@@ -314,63 +312,60 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	torch::Tensor states = experience.data.states.to(device);
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
 	torch::Tensor actionMasks = experience.data.actionMasks.to(device);
-	torch::Tensor scoringGoals = experience.data.scoringGoals.to(device);
-	torch::Tensor takenScores, baselineScores, baselineSpread;
-	torch::Tensor gcrlScores = ComputeGCRLAdvantageWithBaseline(
-		learner->contrastiveGoalLearner,
-		states,
-		actions,
-		actionMasks,
-		scoringGoals,
-		learner->numActions,
-		cfg.policyScoreBatchSize,
-		cfg.baselineActionSamples,
-		&takenScores,
-		&baselineScores,
-		&baselineSpread
-	);
+	// Magnitude-blend: each critic's per-row advantage is (taken - mean_baseline) /
+	// (baseline_spread + sigmaFloor), clamped, and NOT renormalized to unit std. A
+	// critic that can't discriminate the action -> numerator ~0 -> contributes
+	// ~nothing automatically; a strong critic contributes in proportion. Differential
+	// timing (car early / goal late) emerges from real contribution -- no gate.
+	auto criticSep = [&](GGL::ContrastiveGoalLearner* critic, torch::Tensor goals) {
+		torch::Tensor taken, baseline, spread;
+		torch::Tensor edge = ComputeGCRLAdvantageWithBaseline(
+			critic, states, actions, actionMasks, goals,
+			learner->numActions, cfg.policyScoreBatchSize, cfg.baselineActionSamples,
+			&taken, &baseline, &spread);
+		torch::Tensor sep = torch::clamp(edge / (spread + cfg.sigmaFloor), -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
+		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread));
+	};
 
-	experience.data.crlAdvantages = gcrlScores.detach().to(experience.data.advantages.device());
+	// Goal critic: scores HER achieved future ball (in-distribution), not the net.
+	auto goalRes = criticSep(learner->contrastiveGoalLearner, experience.data.herGoals.to(device));
+	torch::Tensor sepSum = std::get<0>(goalRes);
+	report["GCRL/Goal Edge Mean"] = std::get<1>(goalRes);
+	report["GCRL/Goal Baseline Spread"] = std::get<2>(goalRes);
+	report["GCRL/Goal Separation"] = TensorMean(sepSum.abs());
 
-	float gcrlMean = TensorMean(gcrlScores);
-	float gcrlStd = TensorStd(gcrlScores);
-	report["GCRL Taken Score Mean"] = TensorMean(takenScores);
-	report["GCRL Baseline Score Mean"] = TensorMean(baselineScores);
-	report["GCRL Score Mean"] = gcrlMean;
-	report["GCRL Score Std"] = gcrlStd;
-	report["CRL Advantage Mean"] = gcrlMean;
-	report["CRL Advantage Std"] = gcrlStd;
+	bool carActive = cfg.useCarCritic && learner->carContrastiveLearner
+		&& experience.data.carHerGoals.defined()
+		&& experience.data.carHerGoals.size(0) == states.size(0);
+	if (carActive) {
+		// Car critic: egocentric car-local ball (controllability), short-horizon goals.
+		auto carRes = criticSep(learner->carContrastiveLearner, experience.data.carHerGoals.to(device));
+		report["GCRL/Car Edge Mean"] = std::get<1>(carRes);
+		report["GCRL/Car Baseline Spread"] = std::get<2>(carRes);
+		report["GCRL/Car Separation"] = TensorMean(std::get<0>(carRes).abs());
+		sepSum = sepSum + std::get<0>(carRes);
+	}
+	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;
 
-	float lambdaEffective = GetAnnealedContrastiveLambda(cfg, totalTimesteps);
-
-	// Self-gate on action-discrimination, NOT cross-state spread. Only blend GCRL
-	// when the taken-action edge over random actions exceeds the baseline samples'
-	// own within-state spread -- i.e. the taken action is reliably better than
-	// random, not just sampling noise. Otherwise NormalizeAdvantage would rescale a
-	// ~0 signal up to unit-std noise and inject it at lambda. The sigmaMin term is a
-	// degenerate-zero floor; the separation ratio is the real signal test.
-	float meanAbsEdge = TensorMean(gcrlScores.abs());
-	float meanBaseSpread = TensorMean(baselineSpread);
-	float separation = meanAbsEdge / (meanBaseSpread + cfg.sigmaFloor);
-	bool varianceGate = (gcrlStd >= cfg.sigmaMin) && (separation >= cfg.gcrlGateRatio);
-	report["GCRL Baseline Spread"] = meanBaseSpread;
-	report["GCRL Separation"] = separation;
+	// Single global lambda: short bootstrap warmup -> hold. No separation gate; weak
+	// critics self-attenuate via their ~0 numerator above.
+	float warmupProgress = cfg.gcrlLambdaWarmupSteps == 0 ? 1.f
+		: RS_CLAMP(totalTimesteps / (float)cfg.gcrlLambdaWarmupSteps, 0.f, 1.f);
+	float lambdaEff = cfg.gcrlLambda * warmupProgress;
 
 	torch::Tensor baseNorm = NormalizeAdvantage(baseAdvRaw, cfg.sigmaFloor);
-	torch::Tensor gcrlNorm = torch::zeros_like(baseNorm);
-	if (varianceGate)
-		gcrlNorm = NormalizeAdvantage(gcrlScores, cfg.sigmaFloor);
-
-	torch::Tensor policyAdvantage = baseNorm + lambdaEffective * torch::clamp(gcrlNorm, -3, 3);
+	torch::Tensor gcrlAdv = lambdaEff * sepSum;
+	torch::Tensor policyAdvantage = baseNorm + gcrlAdv;
 	experience.data.advantages = policyAdvantage.detach().to(experience.data.advantages.device());
+	experience.data.crlAdvantages = gcrlAdv.detach().to(experience.data.advantages.device());
 
 	report["A Policy Mean"] = TensorMean(policyAdvantage);
 	report["A Policy Std"] = TensorStd(policyAdvantage);
-	report["CRL Lambda Start"] = cfg.lambdaStart;
-	report["CRL Lambda Target"] = cfg.lambda;
-	report["CRL Lambda Effective"] = lambdaEffective;
-	report["CRL Lambda Anneal Progress"] = cfg.lambdaAnnealSteps == 0 ? 1 : RS_CLAMP(totalTimesteps / (float)cfg.lambdaAnnealSteps, 0.f, 1.f);
-	report["CRL Variance Gate"] = varianceGate ? 1 : 0;
+	report["CRL Advantage Mean"] = TensorMean(gcrlAdv);
+	report["CRL Advantage Std"] = TensorStd(gcrlAdv);
+	report["CRL Lambda Target"] = cfg.gcrlLambda;
+	report["CRL Lambda Effective"] = lambdaEff;
+	report["CRL Lambda Warmup Progress"] = warmupProgress;
 }
 
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps) {
@@ -404,6 +399,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Horizon Long Realized"] = crlTrainStats.realizedLong;
 		report["CRL Anchors Used"] = crlTrainStats.anchorsUsed;
 		report["CRL Train Samples Used"] = crlTrainStats.trainSamplesUsed;
+
+		if (carContrastiveLearner && experience.data.carHerGoals.defined()) {
+			ContrastiveGoalStats carStats = carContrastiveLearner->Train(experience.data, experience.rng);
+			report["GCRL/Car Critic Loss"] = carStats.loss;
+			report["GCRL/Car Categorical Accuracy"] = carStats.categoricalAccuracy;
+			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
+		}
 
 		PrepareGCRLPolicyAdvantages(this, experience, report, totalTimesteps);
 	}
@@ -657,6 +659,8 @@ void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 	models.Save(folderPath);
 	if (contrastiveGoalLearner)
 		contrastiveGoalLearner->Save(folderPath);
+	if (carContrastiveLearner)
+		carContrastiveLearner->Save(folderPath);
 }
 
 void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
@@ -666,6 +670,9 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 	models.Load(folderPath, true, true);
 	if (contrastiveGoalLearner) {
 		contrastiveGoalLearner->Load(folderPath, true, true);
+	}
+	if (carContrastiveLearner) {
+		carContrastiveLearner->Load(folderPath, true, true);
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);
@@ -683,6 +690,8 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 
 	if (contrastiveGoalLearner)
 		contrastiveGoalLearner->SetLearningRate(config.contrastiveGoal.criticLR);
+	if (carContrastiveLearner)
+		carContrastiveLearner->SetLearningRate(config.contrastiveGoal.criticLR);
 
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }

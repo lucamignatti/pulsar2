@@ -23,6 +23,8 @@ namespace GGL {
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
 		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
+		// Optional second isolated critic: egocentric car-local ball goal (controllability).
+		ContrastiveGoalLearner* carContrastiveLearner = NULL;
 		// SimBa RSNorm (running obs normalization). NULL unless config.rsNorm.enabled.
 		// One shared normalizer for actor & critic; "canonical stats everywhere"
 		// (old-version & skill-eval inference use this same normalizer).

@@ -26,6 +26,10 @@ namespace GGL {
 
 	class ContrastiveGoalLearner {
 	public:
+		// Stable backing storage for the encoder names. Model keeps the const char* as-is,
+		// so the string must outlive the Model -- declared BEFORE the encoders so it is
+		// constructed first. (Passing a temporary's c_str() here is a use-after-free.)
+		std::string phiName, psiName;
 		Model stateActionEncoder;
 		Model goalEncoder;
 		ContrastiveGoalConfig config;
@@ -33,7 +37,15 @@ namespace GGL {
 		int obsSize;
 		int actionRepresentationSize;
 
-		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device);
+		// useCarGoals: train/score against data.carHerGoals (egocentric ball) instead of data.herGoals.
+		// applyTrainMask: when false, ignore the ball-moved gcrlTrainMask -- the car critic learns
+		// controllability even on episodes where the ball never moved. namePrefix keeps the two
+		// critics' encoders (and checkpoint files) distinct.
+		bool useCarGoals = false;
+		bool applyTrainMask = true;
+
+		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
+			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true);
 
 		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionRepresentations);
 		torch::Tensor EncodeGoal(torch::Tensor goals);

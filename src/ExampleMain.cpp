@@ -149,23 +149,22 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL advantage blend ON at full strength from step 0 (no ramp), like the
-	// value critic is always-on. NOTE: the variance gate (sigmaMin 1e-6,
-	// PPOLearner.cpp:315) never closes, so while the contrastive advantage is ~0
-	// (taken ~= baseline -- e.g. a cold policy far from the ball) this injects
-	// ~lambda x unit-std noise into the policy gradient. Watch "GCRL Taken vs
-	// Baseline" / "CRL Variance Gate"; if it hurts the bootstrap, fix the gate to
-	// key on taken-vs-baseline separation, or restore a ramp.
+	// GCRL magnitude-blend with two isolated critics (goal + car). Per critic the
+	// policy-gradient contribution is (taken - baseline)/spread -- NOT unit-renormalized --
+	// so a critic that can't yet discriminate the action self-attenuates to ~0 (no noise
+	// injection, no gate). The CAR critic (egocentric ball, short HER window) carries early
+	// action-attributable controllability signal; the GOAL critic (HER achieved ball, not
+	// the synthetic net) firms up later. gcrlLambda ramps in over a short warmup, then holds.
+	// Watch GCRL/Car Separation (should climb first) vs GCRL/Goal Separation.
 	cfg.ppo.contrastiveGoal.enabled = true;
-	cfg.ppo.contrastiveGoal.lambdaStart = 0.65f;   // full from the start (no warmup)
-	cfg.ppo.contrastiveGoal.lambda = 0.65f;
-	cfg.ppo.contrastiveGoal.lambdaAnnealSteps = 0; // no ramp; lambda is constant
+	cfg.ppo.contrastiveGoal.useCarCritic = true;
+	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
+	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
+	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
-	cfg.ppo.contrastiveGoal.targetSpeed = 1500.f;
-	cfg.ppo.contrastiveGoal.targetSpeedJitter = 0.f;
 
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),

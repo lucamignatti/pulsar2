@@ -658,7 +658,7 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
-			FList achievedGoals, herGoals, scoringGoals;
+			FList achievedGoals, herGoals, carHerGoals, scoringGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<int8_t> terminals;
@@ -676,6 +676,7 @@ void GGL::Learner::Start() {
 				logProbs += other.logProbs;
 				achievedGoals += other.achievedGoals;
 				herGoals += other.herGoals;
+				carHerGoals += other.carHerGoals;
 				scoringGoals += other.scoringGoals;
 				gcrlTrainMask += other.gcrlTrainMask;
 				actionMasks += other.actionMasks;
@@ -777,6 +778,23 @@ void GGL::Learner::Start() {
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
 
+				// Car-local ball obs offset for the car critic (-1 if this obs builder
+				// doesn't expose it, in which case the car critic is skipped).
+				int carLocalBallOffset = -1;
+				if (config.ppo.contrastiveGoal.useCarCritic && !envSet->obsBuilders.empty() && envSet->obsBuilders[0])
+					carLocalBallOffset = envSet->obsBuilders[0]->GetCarLocalBallOffset();
+				// Guard the 6-float car-local ball read against the obs layout; disable safely if it
+				// wouldn't fit (prevents a silent out-of-bounds states[] read for an unexpected builder).
+				if (carLocalBallOffset >= 0 && obsSize < carLocalBallOffset + 6)
+					carLocalBallOffset = -1;
+				if (config.ppo.contrastiveGoal.useCarCritic && carLocalBallOffset < 0) {
+					static bool warnedCarCritic = false;
+					if (!warnedCarCritic) {
+						RG_LOG("WARNING: GCRL car critic requested (useCarCritic=true) but the obs builder exposes no valid car-local ball offset; the car critic will be benched (watch GCRL/Car Active=0).");
+						warnedCarCritic = true;
+					}
+				}
+
 				auto relabelHERGoals = [&](Trajectory& traj) {
 					if (!config.ppo.contrastiveGoal.enabled)
 						return;
@@ -849,6 +867,37 @@ void GGL::Learner::Start() {
 							traj.herGoals[(size_t)t * 6 + d] = traj.achievedGoals[(size_t)target * 6 + d];
 						if (selectedOffset > 0)
 							herSelectedOffsets += (float)selectedOffset;
+					}
+
+					// Car critic: its OWN short, near-term HER window (no goalward bias).
+					// The goal is the car-local (egocentric) ball pos+vel at a near-future
+					// step, read straight from the stored obs at carLocalBallOffset.
+					// Controllability is local, so it samples short offsets independent of
+					// the ball goal's long/goalward window.
+					if (config.ppo.contrastiveGoal.useCarCritic && carLocalBallOffset >= 0
+						&& (int)traj.states.size() == n * obsSize) {
+						int carMin = RS_MAX(1, config.ppo.contrastiveGoal.carHerMinOffset);
+						int carMaxCfg = RS_MAX(carMin, config.ppo.contrastiveGoal.carHerMaxOffset);
+						float carShortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.carHerShortBiasPower);
+						traj.carHerGoals.resize((size_t)n * 6);
+						for (int t = 0; t < n; t++) {
+							int remaining = n - t - 1;
+							int carOffset = 0;
+							if (remaining > 0) {
+								int carMax = RS_MIN(carMaxCfg, remaining);
+								if (carMax >= carMin) {
+									float u = RocketSim::Math::RandFloat();
+									float biased = powf(u, carShortBiasPower);
+									int span = carMax - carMin + 1;
+									carOffset = carMin + RS_MIN(span - 1, (int)floorf(biased * span));
+								} else {
+									carOffset = remaining;
+								}
+							}
+							int carTarget = t + carOffset;
+							for (int d = 0; d < 6; d++)
+								traj.carHerGoals[(size_t)t * 6 + d] = traj.states[(size_t)carTarget * obsSize + carLocalBallOffset + d];
+						}
 					}
 				};
 
@@ -1033,10 +1082,12 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tAchievedGoals, tHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
+						if (config.ppo.contrastiveGoal.useCarCritic && !combinedTraj.carHerGoals.empty())
+							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
@@ -1111,6 +1162,8 @@ void GGL::Learner::Start() {
 					if (batchIn.gcrlEnabled) {
 						batchIn.achievedGoals = tAchievedGoals;
 						batchIn.herGoals = tHERGoals;
+						if (tCarHERGoals.defined())
+							batchIn.carHerGoals = tCarHERGoals;
 						batchIn.scoringGoals = tScoringGoals;
 						batchIn.gcrlTrainMask = tGcrlTrainMask;
 						batchIn.segmentIds = tSegmentIds;

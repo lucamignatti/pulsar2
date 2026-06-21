@@ -22,10 +22,14 @@ namespace GGL {
 		return t / t.norm(2, -1, true).clamp_min(1e-6f);
 	}
 
-	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device) :
-		stateActionEncoder("gcrl_phi", MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
-		goalEncoder("gcrl_psi", MakeEncoderConfig(6, config.representationSize), device),
-		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize) {
+	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
+		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask) :
+		phiName(namePrefix + "_phi"),
+		psiName(namePrefix + "_psi"),
+		stateActionEncoder(phiName.c_str(), MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
+		goalEncoder(psiName.c_str(), MakeEncoderConfig(6, config.representationSize), device),
+		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
+		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
 	}
 
@@ -48,16 +52,20 @@ namespace GGL {
 	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
 		ContrastiveGoalStats stats;
 
+		// Goal source: the car critic trains against the egocentric carHerGoals; the
+		// ball/goal critic against herGoals.
+		torch::Tensor goalsAll = useCarGoals ? data.carHerGoals : data.herGoals;
+
 		if (
 			!data.states.defined() ||
 			!data.actions.defined() ||
-			!data.herGoals.defined() ||
+			!goalsAll.defined() ||
 			data.states.size(0) == 0
 		)
 			return stats;
 
 		int64_t n = data.states.size(0);
-		if (data.actions.size(0) != n || data.herGoals.size(0) != n)
+		if (data.actions.size(0) != n || goalsAll.size(0) != n)
 			RG_ERR_CLOSE("ContrastiveGoalLearner::Train(): tensor alignment failed");
 
 		int64_t miniBatchSize = config.criticMiniBatchSize;
@@ -75,7 +83,7 @@ namespace GGL {
 		// kickoff->timeout match would just reteach the stationary-ball manifold.
 		// Advantage scoring (PrepareGCRLPolicyAdvantages) still uses every row.
 		std::vector<int64_t> indices;
-		if (data.gcrlTrainMask.defined() && data.gcrlTrainMask.size(0) == n) {
+		if (applyTrainMask && data.gcrlTrainMask.defined() && data.gcrlTrainMask.size(0) == n) {
 			Tensor maskCpu = data.gcrlTrainMask.to(kCPU).contiguous();
 			const uint8_t* maskPtr = maskCpu.data_ptr<uint8_t>();
 			indices.reserve(n);
@@ -110,7 +118,7 @@ namespace GGL {
 					{ curBatchSize, actionRepresentationSize },
 					TensorOptions().dtype(kFloat32).device(device)
 				).scatter_(1, actions.unsqueeze(1), 1.f);
-				Tensor goals = data.herGoals.index_select(0, tIndices.to(data.herGoals.device())).to(device);
+				Tensor goals = goalsAll.index_select(0, tIndices.to(goalsAll.device())).to(device);
 
 				Tensor sa = EncodeStateAction(states, actionRepresentations);
 				Tensor g = EncodeGoal(goals);

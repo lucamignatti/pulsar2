@@ -28,6 +28,30 @@ namespace GGL {
 		float herShortBiasPower = 2.f;
 		int baselineActionSamples = 4;
 
+		// ── Car critic ──────────────────────────────────────────────────────────
+		// A second, isolated contrastive critic whose goal is the car-local
+		// (egocentric) ball pos+vel a SHORT horizon ahead -- local controllability,
+		// the action-attributable signal the single ball-goal critic lacks. Its own
+		// short, near-term HER window (no goalward bias). Needs the obs builder to
+		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
+		bool useCarCritic = false;
+		int carHerMinOffset = 1;
+		int carHerMaxOffset = 20;
+		float carHerShortBiasPower = 2.f;
+
+		// ── Magnitude-blend advantage (replaces unit-renorm + the separation gate) ──
+		// Per critic, per-row advantage = (taken_score - mean_baseline)/(baseline_spread
+		// + sigmaFloor), clamped to +-gcrlSepClamp; NOT renormalized to unit std (that
+		// rescales a ~0 signal up to noise -- the bug that froze the single critic).
+		// Summed over critics, scaled by gcrlLambda, added onto NormalizeAdvantage(reward).
+		// gcrlLambda ramps 0->target over gcrlLambdaWarmupSteps (short bootstrap) then holds.
+		// Weak critics self-attenuate (numerator ~0); differential timing (car early /
+		// goal late) emerges from real contribution -- no gate. Goal critic scores HER
+		// (herGoals), not the synthetic net.
+		float gcrlLambda = 0.3f;
+		uint64_t gcrlLambdaWarmupSteps = 30'000'000;
+		float gcrlSepClamp = 3.f;
+
 		int representationSize = 128;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;

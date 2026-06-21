@@ -46,7 +46,7 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 		"GCRL Separation",
 		"GCRL Baseline Spread",
 		"CRL Lambda Effective",
-		"CRL Variance Gate",
+		"CRL Lambda Warmup Progress",
 		"A Policy Std",
 
 		"Player/Ball Touch Ratio",
@@ -66,6 +66,10 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 
 	// RSNorm running-obs-normalization summary stats.
 	if (key.rfind("RSNorm/", 0) == 0)
+		return true;
+
+	// Per-critic GCRL diagnostics (GCRL/Goal Separation, GCRL/Car Separation, ...).
+	if (key.rfind("GCRL/", 0) == 0)
 		return true;
 
 	return allowed.find(key) != allowed.end();
