@@ -12,3 +12,13 @@ add_library(RocketSim ${FILES_ROCKETSIM} ${FILES_BULLET})
 
 set_target_properties(RocketSim PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(RocketSim PROPERTIES CXX_STANDARD 20)
+
+# Match the trainer's vectorization flags. RocketSim/bullet IS the per-step physics engine and the
+# dominant CPU cost of collection, but it previously inherited only -O3 -DNDEBUG (scalar vector math on
+# the GCC/Clang path) -- it got none of the -march=native auto-vectorization (AVX2/FMA) the rest of the
+# trainer enjoys. NOTE: deliberately NO -ffast-math here -- physics determinism (FuzzedKickoffState /
+# replay) can be perturbed by float reassociation; -march + -funroll capture the win without that risk.
+# -march=native bakes in the build host's ISA, so the build box must not be newer than the run box.
+if(NOT MSVC)
+	target_compile_options(RocketSim PRIVATE -march=native -funroll-loops)
+endif()

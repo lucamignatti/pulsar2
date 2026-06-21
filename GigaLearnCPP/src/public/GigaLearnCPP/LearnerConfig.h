@@ -39,6 +39,24 @@ namespace GGL {
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
 		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto uses MPS on macOS if available, otherwise CUDA, otherwise CPU
 
+		// CUDA caching allocator: number of iterations between CUDACachingAllocator::emptyCache() calls.
+		// The old per-iteration empty (==1) defeats the caching allocator -- it forces a device sync and
+		// pushes the next allocations back through cudaMalloc every iteration. A larger interval lets the
+		// pool be reused across iterations (per-iteration tensor shapes are near-stable). <=0 disables it
+		// entirely (fastest, but watch peak VRAM / fragmentation on long runs). CUDA-only; ignored elsewhere.
+		int64_t cudaCacheClearInterval = 50;
+
+		// Enable TF32 matmuls on Ampere+ CUDA GPUs (near-free throughput for the dense MLP forward/backward).
+		// TF32 trims the matmul mantissa to ~10 bits; benign for PPO. Set false for strict fp32 reproducibility
+		// or A/B numeric comparisons against pre-TF32 runs. CUDA-only; no effect on MPS/CPU.
+		bool allowTF32 = true;
+
+		// Per-step scan of every collected observation for NaN/inf during collection. A debug aid for new
+		// obs builders; off by default because it scans the whole obs buffer every env step. When off, a
+		// NaN/inf obs will instead surface downstream (e.g. as a non-finite loss). Enable while developing
+		// an obs builder.
+		bool validateObs = false;
+
 		// Observation normalization is provided by SimBa RSNorm (cfg.ppo.rsNorm);
 		// the old collection-time standardizeObs path was removed.
 

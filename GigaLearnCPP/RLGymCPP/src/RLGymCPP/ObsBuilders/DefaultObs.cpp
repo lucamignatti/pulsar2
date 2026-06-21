@@ -18,6 +18,7 @@ void RLGC::DefaultObs::AddPlayerToObs(FList& obs, const Player& player, bool inv
 
 RLGC::FList RLGC::DefaultObs::BuildObs(const Player& player, const GameState& state) {
 	FList result = {};
+	if (_obsSizeHint) result.reserve(_obsSizeHint);
 
 	bool inv = player.team == Team::ORANGE;
 
@@ -36,6 +37,8 @@ RLGC::FList RLGC::DefaultObs::BuildObs(const Player& player, const GameState& st
 
 	AddPlayerToObs(result, player, inv);
 	FList teammates = {}, opponents = {};
+	teammates.reserve(28 * state.players.size());
+	opponents.reserve(28 * state.players.size());
 
 	for (auto& otherPlayer : state.players) {
 		if (otherPlayer.carId == player.carId)
@@ -50,5 +53,6 @@ RLGC::FList RLGC::DefaultObs::BuildObs(const Player& player, const GameState& st
 
 	result += teammates;
 	result += opponents;
+	_obsSizeHint = result.size();
 	return result;
 }

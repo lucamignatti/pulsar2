@@ -4,6 +4,7 @@
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
 
 #include <torch/cuda.h>
+#include <ATen/Context.h>
 #if defined(__APPLE__) && __has_include(<torch/mps.h>)
 #include <torch/mps.h>
 #define RG_MPS_SUPPORT
@@ -93,18 +94,6 @@ static void AppendScoringGoal(FList& out, const GameState& state, const Player& 
 	float targetSpeed = (minSpeed == maxSpeed) ? minSpeed : RocketSim::Math::RandFloat(minSpeed, maxSpeed);
 	Vec targetVel = direction * targetSpeed;
 	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
-}
-
-static int GetArenaIdxForPlayer(const EnvSet& envSet, int playerIdx) {
-	for (int arenaIdx = 0; arenaIdx < envSet.state.arenaPlayerStartIdx.size(); arenaIdx++) {
-		int start = envSet.state.arenaPlayerStartIdx[arenaIdx];
-		int stop = (arenaIdx + 1 < envSet.state.arenaPlayerStartIdx.size()) ?
-			envSet.state.arenaPlayerStartIdx[arenaIdx + 1] : envSet.state.numPlayers;
-		if (playerIdx >= start && playerIdx < stop)
-			return arenaIdx;
-	}
-	RG_ERR_CLOSE("Could not find arena for player index " << playerIdx);
-	return -1;
 }
 
 static bool CanMoveTensorToDevice(at::Device device) {
@@ -236,6 +225,15 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	torch::manual_seed(config.randomSeed);
 
 	at::Device device = ResolveLearnerDevice(config.deviceType);
+
+#ifdef RG_CUDA_SUPPORT
+	// TF32 matmuls: near-free throughput for the dense MLP on Ampere+ (off in libtorch by default).
+	if (device.is_cuda() && config.allowTF32) {
+		at::globalContext().setAllowTF32CuBLAS(true);
+		at::globalContext().setAllowTF32CuDNN(true);
+		RG_LOG("\tTF32 matmuls enabled (config.allowTF32)");
+	}
+#endif
 
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
 		RG_LOG("\tInitializing RocketSim...");
@@ -656,6 +654,17 @@ void GGL::Learner::Start() {
 
 		int numPlayers = envSet->state.numPlayers;
 
+		// Precompute player->arena map once (arena layout is fixed for the run). Replaces the per-player
+		// linear GetArenaIdxForPlayer scan that ran every step per player when GCRL is enabled.
+		std::vector<int> playerToArena((size_t)numPlayers, 0);
+		for (int a = 0; a < (int)envSet->state.arenaPlayerStartIdx.size(); a++) {
+			int pStart = envSet->state.arenaPlayerStartIdx[a];
+			int pStop = (a + 1 < (int)envSet->state.arenaPlayerStartIdx.size())
+				? envSet->state.arenaPlayerStartIdx[a + 1] : envSet->state.numPlayers;
+			for (int pi = pStart; pi < pStop; pi++)
+				playerToArena[(size_t)pi] = a;
+		}
+
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
 			FList achievedGoals, herGoals, carHerGoals, boostHerGoals, scoringGoals;
@@ -782,6 +791,27 @@ void GGL::Learner::Start() {
 
 				// Only contains complete episodes
 				auto combinedTraj = Trajectory();
+				// Reserve the combined-trajectory buffers to the iteration target up front so the per-episode
+				// Append()s don't repeatedly reallocate the largest buffers as the rollout fills.
+				{
+					size_t rows = (size_t)config.ppo.tsPerItr + (size_t)numPlayers;
+					combinedTraj.states.reserve(rows * (size_t)obsSize);
+					combinedTraj.actionMasks.reserve(rows * (size_t)numActions);
+					combinedTraj.actions.reserve(rows);
+					combinedTraj.rewards.reserve(rows);
+					combinedTraj.logProbs.reserve(rows);
+					combinedTraj.terminals.reserve(rows);
+					if (config.ppo.contrastiveGoal.enabled) {
+						combinedTraj.achievedGoals.reserve(rows * 6);
+						combinedTraj.herGoals.reserve(rows * 6);
+						combinedTraj.scoringGoals.reserve(rows * 6);
+						combinedTraj.segmentIds.reserve(rows);
+						combinedTraj.segmentSteps.reserve(rows);
+						combinedTraj.defenseGroupKeys.reserve(rows);
+						combinedTraj.defenseTeams.reserve(rows);
+						combinedTraj.gcrlTrainMask.reserve(rows);
+					}
+				}
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
 
@@ -953,9 +983,10 @@ void GGL::Learner::Start() {
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
-						for (float f : envSet->state.obs.data)
-							if (isnan(f) || isinf(f))
-								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
+						if (config.validateObs)
+							for (float f : envSet->state.obs.data)
+								if (isnan(f) || isinf(f))
+									RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
 
 						// Observations are stored RAW; normalization (if enabled) is RSNorm,
 						// applied inside the actor/critic forward (PPOLearner), not here.
@@ -970,7 +1001,7 @@ void GGL::Learner::Start() {
 								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
 
 								if (config.ppo.contrastiveGoal.enabled) {
-									int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+									int arenaIdx = playerToArena[(size_t)newPlayerIdx];
 									int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
 									const GameState& state = envSet->state.gameStates[arenaIdx];
 									const Player& player = state.players[localPlayerIdx];
@@ -1063,7 +1094,7 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
 
 							if (config.ppo.contrastiveGoal.enabled) {
-								int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+								int arenaIdx = playerToArena[(size_t)newPlayerIdx];
 								int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
 								const GameState& state = envSet->state.gameStates[arenaIdx];
 								const Player& player = state.players[localPlayerIdx];
@@ -1282,9 +1313,12 @@ void GGL::Learner::Start() {
 					report["GAE/Avg Val Target"] = batch.avgValTarget;
 				}
 
-				// Free CUDA cache
+				// Free CUDA cache periodically. Calling emptyCache() every iteration defeats the caching
+				// allocator (forces a sync + cudaMalloc churn); cudaCacheClearInterval reuses the pool across
+				// iterations. <=0 disables it entirely.
 #ifdef RG_CUDA_SUPPORT
-				if (ppo->device.is_cuda())
+				if (ppo->device.is_cuda() && config.cudaCacheClearInterval > 0
+					&& (totalIterations % config.cudaCacheClearInterval == 0))
 					c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 

@@ -179,6 +179,13 @@ namespace GGL {
 		// This is much faster on GPU, not so much for CPU
 		bool useHalfPrecision = false;
 
+		// Wrap the PPO training forward/backward in bfloat16 autocast on CUDA (matmul throughput + halved
+		// activation memory for the dense MLP). Autocast keeps softmax/log/exp/reductions and the MSE/KL in
+		// fp32 via its op policy. CUDA-only; no effect on MPS/CPU (the dev path stays fp32). NUMERICALLY
+		// INVASIVE: bf16 carries ~3 significant digits, which can perturb the PPO ratio/KL -- validate
+		// entropy/KL over a run before relying on it. Distinct from useHalfPrecision (inference-only).
+		bool useTrainAutocast = false;
+
 		PartialModelConfig policy, critic, sharedHead;
 
 		int epochs = 2;

@@ -10,8 +10,8 @@ void GGL::GAE::Compute(
 
 	float prevLambda = 0;
 	int numReturns = rews.size(0);
-	outAdvantages = torch::zeros(numReturns);
-	outReturns = torch::zeros(numReturns);
+	// (outAdvantages/outReturns are assigned from the computed vectors at the end of this function;
+	// the old zero-init here was dead -- immediately overwritten.)
 	float prevRet = 0;
 	int truncCount = 0;
 

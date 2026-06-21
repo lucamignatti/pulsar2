@@ -320,6 +320,10 @@ static torch::Tensor ComputeHeadPotential(
 	if (chunkSize <= 0)
 		chunkSize = n;
 
+	float tau = critic->config.tau;
+	// Goals are FIXED for the whole call -> encode psi ONCE here (was re-encoded numChunks*K*numGoals
+	// times, once per Score() call). The per-(chunk,k) phi is still encoded once below.
+	torch::Tensor G = critic->EncodeGoal(goals); // [numGoals, repr], L2-normalized
 	torch::Tensor phi = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(states.device()));
 	for (int64_t start = 0; start < n; start += chunkSize) {
 		int64_t stop = RS_MIN(start + chunkSize, n);
@@ -329,11 +333,8 @@ static torch::Tensor ComputeHeadPotential(
 		torch::Tensor acc = torch::zeros({ m }, phi.options());
 		for (int64_t k = 0; k < K; k++) {
 			torch::Tensor aRep = OneHotActions(aChunk.select(1, k), numActions);
-			torch::Tensor scores = torch::zeros({ m, numGoals }, phi.options());
-			for (int64_t g = 0; g < numGoals; g++) {
-				torch::Tensor gRow = goals.slice(0, g, g + 1).expand({ m, goals.size(1) });
-				scores.select(1, g).copy_(critic->Score(sChunk, aRep, gRow));
-			}
+			torch::Tensor sa = critic->EncodeStateAction(sChunk, aRep);        // [m, repr], encoded once per (chunk,k)
+			torch::Tensor scores = torch::matmul(sa, G.transpose(0, 1)) / tau; // [m, numGoals] == critic->Score per goal
 			torch::Tensor agg = (numGoals > 1)
 				? (safeTemp * torch::logsumexp(scores / safeTemp, 1))
 				: scores.select(1, 0);
@@ -444,8 +445,32 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgRelEntropyLoss,
 		avgCriticLoss,
 		avgGuidingLoss,
-		avgRatio,
 		avgClip;
+
+	// Device-side metric accumulators. We accumulate 0-d tensors per minibatch and sync to the host
+	// ONCE after the epoch loop, instead of ~6 GPU->CPU .item() syncs per minibatch (each of which
+	// stalled the GPU between minibatches). (sum, count) pairs preserve AvgTracker's NaN-skip averaging.
+	torch::Tensor accEntropySum, accEntropyCnt;
+	torch::Tensor accPolicyLossSum, accPolicyLossCnt;
+	torch::Tensor accRelEntSum, accRelEntCnt;
+	torch::Tensor accCriticLossSum, accCriticLossCnt;
+	torch::Tensor accGuidingSum, accGuidingCnt;
+	torch::Tensor accDivergenceSum, accDivergenceCnt;
+	torch::Tensor accClipSum, accClipCnt;
+	auto accMasked = [](torch::Tensor& sum, torch::Tensor& cnt, torch::Tensor value, torch::Tensor extraMask = {}) {
+		torch::Tensor x = value.detach();
+		torch::Tensor keep = ~x.isnan();          // AvgTracker skips NaN (matches its host behavior)
+		if (extraMask.defined())
+			keep = keep & extraMask;
+		torch::Tensor keepF = keep.to(torch::kFloat32);
+		torch::Tensor contrib = torch::where(keep, x, torch::zeros_like(x));
+		sum = sum.defined() ? sum + contrib : contrib;
+		cnt = cnt.defined() ? cnt + keepF : keepF;
+	};
+
+	// bf16 autocast for the PPO forward/backward, CUDA-only and opt-in. Off by default -> the
+	// default training path is bit-for-bit unchanged (the guards below are no-ops).
+	const bool useAutocast = config.useTrainAutocast && device.is_cuda();
 
 	if (config.contrastiveGoal.enabled) {
 		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng);
@@ -542,24 +567,28 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
 
+				// bf16 autocast wraps the matmul-heavy forward only (opt-in, CUDA-only); disabled again
+				// before the no-grad KL reporting + backward below.
+				if (useAutocast) {
+					at::autocast::set_enabled(true);
+					at::autocast::set_autocast_gpu_dtype(torch::kBFloat16);
+				}
+
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy
-					float curEntropy;
 					{
 						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false, obsNorm);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
-						curEntropy = entropy.detach().cpu().item<float>();
-						avgEntropy += curEntropy;
+						accMasked(accEntropySum, accEntropyCnt, entropy);
 					}
 
 					logProbs = logProbs.view_as(oldProbs);
 
 					// Compute PPO loss
 					ratio = exp(logProbs - oldProbs);
-					avgRatio += ratio.mean().detach().cpu().item<float>();
 					clipped = clamp(
 						ratio, 1 - config.clipRange, 1 + config.clipRange
 					);
@@ -568,11 +597,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					policyLoss = -min(
 						ratio * advantages, clipped * advantages
 					).mean();
-					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
-					avgPolicyLoss += curPolicyLoss;
+					accMasked(accPolicyLossSum, accPolicyLossCnt, policyLoss);
 
-					if (std::abs(curPolicyLoss) > 1e-12f)
-						avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+					{
+						// Relative entropy loss = (entropy*scale)/policyLoss, counted only when |policyLoss| > 1e-12
+						// (matches the old per-minibatch guard). Computed on-device, NaN-skipped on sync.
+						torch::Tensor relTerm = (entropy * config.entropyScale) / policyLoss;
+						torch::Tensor relMask = policyLoss.detach().abs() > 1e-12f;
+						accMasked(accRelEntSum, accRelEntCnt, relTerm, relMask);
+					}
 
 					ppoLoss = (policyLoss - entropy * config.entropyScale) * batchSizeRatio;
 
@@ -584,7 +617,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
-						avgGuidingLoss.Add(guidingLoss.detach().cpu().item<float>());
+						accMasked(accGuidingSum, accGuidingCnt, guidingLoss);
 						guidingLoss = guidingLoss * config.guidingStrength;
 						ppoLoss = ppoLoss + guidingLoss;
 					}
@@ -597,8 +630,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// Compute value loss
 					vals = vals.view_as(targetValues);
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
-					avgCriticLoss += criticLoss.detach().cpu().item<float>();
+					accMasked(accCriticLossSum, accCriticLossCnt, criticLoss);
 				}
+
+				// End bf16 autocast before no-grad KL reporting + backward (clip_grad / optimizer run fp32).
+				if (useAutocast)
+					at::autocast::set_enabled(false);
 
 				if (trainPolicy) {
 					// Compute KL divergence & clip fraction using SB3 method for reporting;
@@ -607,10 +644,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 						auto logRatio = logProbs - oldProbs;
 						auto klTensor = (exp(logRatio) - 1) - logRatio;
-						avgDivergence += klTensor.mean().detach().cpu().item<float>();
+						accMasked(accDivergenceSum, accDivergenceCnt, klTensor.mean());
 
 						auto clipFraction = mean((abs(ratio - 1) > config.clipRange).to(kFloat));
-						avgClip += clipFraction.cpu().item<float>();
+						accMasked(accClipSum, accClipCnt, clipFraction);
 					}
 				}
 
@@ -648,6 +685,25 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			models.StepOptims();
 		}
 	}
+
+	// Sync the device-accumulated PPO metrics to the host ONCE (one .item() per metric, not per
+	// minibatch). feedTracker reproduces AvgTracker's NaN-skip averaging via the (sum, count) pair.
+	auto feedTracker = [](MutAvgTracker& tracker, const torch::Tensor& sum, const torch::Tensor& cnt) {
+		if (!sum.defined() || !cnt.defined())
+			return;
+		float c = cnt.cpu().item<float>();
+		if (c > 0)
+			tracker.Add(sum.cpu().item<float>(), (uint64_t)llroundf(c));
+	};
+	feedTracker(avgEntropy, accEntropySum, accEntropyCnt);
+	feedTracker(avgPolicyLoss, accPolicyLossSum, accPolicyLossCnt);
+	feedTracker(avgRelEntropyLoss, accRelEntSum, accRelEntCnt);
+	feedTracker(avgCriticLoss, accCriticLossSum, accCriticLossCnt);
+	feedTracker(avgGuidingLoss, accGuidingSum, accGuidingCnt);
+	feedTracker(avgDivergence, accDivergenceSum, accDivergenceCnt);
+	feedTracker(avgClip, accClipSum, accClipCnt);
+	if (useAutocast)
+		at::autocast::clear_cache();
 
 	// Compute magnitude of updates made to the policy and value estimator
 	auto policyAfter = models["policy"]->CopyParams();

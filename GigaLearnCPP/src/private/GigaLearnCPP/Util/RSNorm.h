@@ -33,6 +33,14 @@ namespace GGL {
 		torch::Tensor runningMean, runningM2; // [width] double, CPU
 		torch::Tensor cacheMean, cacheInvStd; // [width] float, CPU (broadcast in Normalize)
 
+		// Device-side cache of (cacheMean, cacheInvStd) so Normalize doesn't re-copy the CPU stats to the
+		// model device on EVERY forward (once per minibatch inside the epoch loop). Rebuilt lazily when the
+		// stats change (RefreshCache invalidates) or the obs device/dtype differs from the cached one.
+		mutable torch::Tensor devMean, devInvStd;
+		mutable bool devCacheValid = false;
+		mutable c10::Device devCacheDevice = c10::Device(c10::kCPU);
+		mutable c10::ScalarType devCacheDtype = c10::kFloat;
+
 		RSNorm(int width, double eps = 1e-8, double initVar = 1.0, double initCount = 1e-4, double clipRange = 0.0)
 			: width(width), eps(eps), clipRange(clipRange), count(initCount) {
 			// Init: mu = 0, var = 1 (M2 = initVar * n), small n so early steps are
@@ -74,9 +82,14 @@ namespace GGL {
 
 		// (o - mu) / sqrt(var + eps), stop-gradient. obs: [..., width].
 		torch::Tensor Normalize(const torch::Tensor& obs) const {
-			torch::Tensor m = cacheMean.to(obs.device(), obs.scalar_type());
-			torch::Tensor s = cacheInvStd.to(obs.device(), obs.scalar_type());
-			torch::Tensor out = (obs - m) * s;
+			if (!devCacheValid || devCacheDevice != obs.device() || devCacheDtype != obs.scalar_type()) {
+				devMean = cacheMean.to(obs.device(), obs.scalar_type());
+				devInvStd = cacheInvStd.to(obs.device(), obs.scalar_type());
+				devCacheDevice = obs.device();
+				devCacheDtype = obs.scalar_type();
+				devCacheValid = true;
+			}
+			torch::Tensor out = (obs - devMean) * devInvStd;
 			if (clipRange > 0)
 				out = out.clamp(-clipRange, clipRange);
 			return out;
@@ -86,6 +99,7 @@ namespace GGL {
 			torch::Tensor var = runningM2 / std::max(count, 1e-12);
 			cacheMean = runningMean.to(torch::kFloat32).clone();
 			cacheInvStd = (1.0 / (var + eps).sqrt()).to(torch::kFloat32).clone();
+			devCacheValid = false; // stats changed -> rebuild the device-side cache on next Normalize
 		}
 
 		// Summary scalars for logging.

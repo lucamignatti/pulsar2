@@ -3,6 +3,7 @@
 
 RLGC::FList RLGC::DefaultObsPadded::BuildObs(const Player& player, const GameState& state) {
 	FList result = {};
+	if (_obsSizeHint) result.reserve(_obsSizeHint);
 
 	bool inv = player.team == Team::ORANGE;
 
@@ -64,5 +65,6 @@ RLGC::FList RLGC::DefaultObsPadded::BuildObs(const Player& player, const GameSta
 	for (auto& opponent : opponents)
 		result += opponent;
 
+	_obsSizeHint = result.size();
 	return result;
 }

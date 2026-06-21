@@ -7,6 +7,11 @@
 namespace RLGC {
 	class ObsBuilder {
 	public:
+		// Cache of the last produced obs size. Used to reserve() the output FList up front so BuildObs
+		// doesn't grow it geometrically via push_back from empty. One builder instance per arena, so
+		// BuildObs is single-threaded per builder -> this mutable cache is race-free.
+		mutable size_t _obsSizeHint = 0;
+
 		virtual void Reset(const GameState& initialState) {}
 
 		// NOTE: May be called once during environment initialization to determine policy neuron size
