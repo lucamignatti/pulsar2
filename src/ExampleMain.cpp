@@ -173,7 +173,7 @@ int main(int argc, char* argv[]) {
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),
 	// updated once per rollout and frozen during the epochs, persisted with weights.
-	cfg.ppo.rsNorm.enabled = false;
+	cfg.ppo.rsNorm.enabled = true;
 
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
