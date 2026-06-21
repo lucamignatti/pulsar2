@@ -54,7 +54,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 3; // 3v3 SOCCAR (real training)
+	int playersPerTeam = 1; // 1v1 SOCCAR
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -115,8 +115,8 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// 3v3 SOCCAR: 1700 games * 6 cars ~= 10,200 simulated cars (the original setup).
-	cfg.numGames = 1700;
+	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars (hold car count constant vs 3v3's 1700*6).
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
