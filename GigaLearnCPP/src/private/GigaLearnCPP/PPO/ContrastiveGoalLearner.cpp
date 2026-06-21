@@ -100,11 +100,18 @@ namespace GGL {
 		if (numTrainRows <= 1)
 			return stats;
 
+		// Optional per-iteration row cap: train on a random subset (the per-epoch shuffle below randomizes
+		// which rows fall in the first effRows), cutting the compute-bound critic cost ~linearly while still
+		// seeing all rows across successive iterations. 0 = no cap (original behavior).
+		int64_t effRows = (config.criticMaxRowsPerIter > 0)
+			? std::min<int64_t>(numTrainRows, config.criticMaxRowsPerIter)
+			: numTrainRows;
+
 		for (int epoch = 0; epoch < config.criticEpochs; epoch++) {
 			std::shuffle(indices.begin(), indices.end(), rng);
 
-			for (int64_t start = 0; start < numTrainRows; start += miniBatchSize) {
-				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, numTrainRows - start);
+			for (int64_t start = 0; start < effRows; start += miniBatchSize) {
+				int64_t curBatchSize = std::min<int64_t>(miniBatchSize, effRows - start);
 				if (curBatchSize <= 1)
 					continue;
 
@@ -173,7 +180,7 @@ namespace GGL {
 			}
 		}
 
-		stats.anchorsUsed = numTrainRows;
+		stats.anchorsUsed = effRows;
 		if (batches > 0 && metricAccum.defined()) {
 			auto m = (metricAccum / (float)batches).cpu();
 			stats.loss = m[0].item<float>();

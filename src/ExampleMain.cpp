@@ -170,6 +170,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
+	// PERF: cap GCRL critic training to a random subset of rollout rows per iteration. Critic training (3
+	// InfoNCE encoders over the WHOLE ~150k-row rollout) was ~80% of wall-clock (PPO Learn ~9.3s, overall
+	// ~14k SPS in run xmct098w). The critics are running estimators (0.69-0.87 acc) and don't need every
+	// row each iter; a reshuffled subset still sees all data over successive iterations and cuts the
+	// compute ~linearly (measured ~2x overall SPS). Checkpoint-compatible. Raise toward 0 (=all) for more
+	// critic data per iter, lower for more speed; watch GCRL/*/Categorical Accuracy.
+	cfg.ppo.contrastiveGoal.criticMaxRowsPerIter = 32768;
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
 
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it

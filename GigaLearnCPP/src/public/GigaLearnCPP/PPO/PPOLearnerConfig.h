@@ -89,6 +89,12 @@ namespace GGL {
 		int representationSize = 128;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
+		// Cap on the number of (masked) rollout rows each GCRL critic trains on per iteration. The critic
+		// training is compute-bound (3 InfoNCE encoders over the WHOLE rollout every iteration is the
+		// dominant PPO-Learn cost); a random subset per iteration (reshuffled, so all data is seen over
+		// successive iterations) cuts that cost ~linearly. 0 = no cap (train on every row; original
+		// behavior). Checkpoint-compatible (changes only how many rows are sampled, not the model).
+		int64_t criticMaxRowsPerIter = 0;
 		int64_t policyScoreBatchSize = 4096;
 		int64_t infoSubSample = 512;
 		float criticLR = 3e-4f;
