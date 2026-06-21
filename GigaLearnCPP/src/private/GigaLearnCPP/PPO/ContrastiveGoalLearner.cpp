@@ -18,6 +18,21 @@ namespace GGL {
 		return result;
 	}
 
+	// Small per-axis psi head (the locked design's "small per-axis psi heads"): a 6-float goal needs far
+	// less capacity than the (obs+action) phi base, so 2x256 instead of phi's 4x1024. Under a shared phi
+	// base this is the only per-head encoder, so keeping it small is most of the compute saving.
+	static ModelConfig MakeGoalEncoderConfig(int reprSize) {
+		ModelConfig result = PartialModelConfig{};
+		result.layerSizes = { 256, 256 };
+		result.activationType = ModelActivationType::SWISH;
+		result.optimType = ModelOptimType::ADAM;
+		result.addLayerNorm = true;
+		result.addOutputLayer = true;
+		result.numInputs = 6;
+		result.numOutputs = reprSize;
+		return result;
+	}
+
 	static Tensor L2Normalize(Tensor t) {
 		return t / t.norm(2, -1, true).clamp_min(1e-6f);
 	}
@@ -27,7 +42,7 @@ namespace GGL {
 		phiName(namePrefix + "_phi"),
 		psiName(namePrefix + "_psi"),
 		stateActionEncoder(phiName.c_str(), MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
-		goalEncoder(psiName.c_str(), MakeEncoderConfig(6, config.representationSize), device),
+		goalEncoder(psiName.c_str(), MakeGoalEncoderConfig(config.representationSize), device),
 		sharedStateActionEncoder(sharedPhi),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), useBoostGoals(useBoostGoals), applyTrainMask(applyTrainMask) {
@@ -48,6 +63,59 @@ namespace GGL {
 		Tensor sa = EncodeStateAction(states, actionRepresentations);
 		Tensor g = EncodeGoal(goals);
 		return (sa * g).sum(-1) / config.tau;
+	}
+
+	// InfoNCE loss for ONE head given a precomputed (shared) state-action embedding `sa` [B,repr] and this
+	// head's goals [B,6]. Forwards only this head's small psi. Does NOT include the sa (phi) variance
+	// penalty -- the caller adds StateActionVarPenalty once on the shared sa so a shared base doesn't
+	// triple-count it. Returns the loss to backprop plus a stacked 9-element metrics tensor.
+	ContrastiveGoalLearner::InfoNCEResult ContrastiveGoalLearner::ComputeInfoNCELoss(Tensor sa, Tensor goals) {
+		int64_t B = sa.size(0);
+		auto dev = sa.device();
+		Tensor g = EncodeGoal(goals);
+
+		Tensor logits = torch::matmul(sa, g.transpose(0, 1)) / config.tau;
+		Tensor labels = torch::arange(B, TensorOptions().dtype(kLong).device(dev));
+		Tensor diag = torch::eye(B, TensorOptions().dtype(kBool).device(dev));
+
+		Tensor rowLoss = torch::nn::CrossEntropyLoss()(logits, labels);
+		Tensor columnLoss = torch::nn::CrossEntropyLoss()(logits.transpose(0, 1), labels);
+		Tensor logsumexpRows = torch::logsumexp(logits, 1);
+		Tensor logsumexpColumns = torch::logsumexp(logits, 0);
+		Tensor logsumexpPenalty = config.logsumexpPenaltyCoeff * (logsumexpRows.pow(2).mean() + logsumexpColumns.pow(2).mean());
+
+		float stdNorm = sqrtf((float)config.representationSize);
+		Tensor goalVarPenalty = config.varReg * (1.0f / (g.std(0, false).mean() * stdNorm + 1e-4f));
+
+		Tensor loss = rowLoss + columnLoss + logsumexpPenalty + goalVarPenalty;
+
+		Tensor metrics;
+		{
+			torch::NoGradGuard noGrad;
+			// B > 1 is guaranteed by the callers, so the off-diagonal (negatives) is never empty.
+			Tensor positiveLogits = logits.diag();
+			Tensor negativeLogits = logits.masked_select(~diag);
+			Tensor rowCorrect = logits.argmax(1).eq(labels).to(kFloat);
+			Tensor columnCorrect = logits.argmax(0).eq(labels).to(kFloat);
+			metrics = torch::stack({
+				loss.detach(),
+				rowLoss.detach(),
+				columnLoss.detach(),
+				positiveLogits.mean(),
+				negativeLogits.mean(),
+				sa.norm(2, -1).mean(),
+				g.norm(2, -1).mean(),
+				0.5f * (rowCorrect.mean() + columnCorrect.mean()),
+				0.5f * (logsumexpRows.mean() + logsumexpColumns.mean())
+			});
+		}
+		return { loss, metrics };
+	}
+
+	// varReg penalty on the shared state-action (phi) embedding; added once per optimizer step by the caller.
+	Tensor ContrastiveGoalLearner::StateActionVarPenalty(Tensor sa) {
+		float stdNorm = sqrtf((float)config.representationSize);
+		return config.varReg * (1.0f / (sa.std(0, false).mean() * stdNorm + 1e-4f));
 	}
 
 	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
@@ -129,25 +197,8 @@ namespace GGL {
 				Tensor goals = goalsAll.index_select(0, tIndices.to(goalsAll.device())).to(device);
 
 				Tensor sa = EncodeStateAction(states, actionRepresentations);
-				Tensor g = EncodeGoal(goals);
-
-				Tensor logits = torch::matmul(sa, g.transpose(0, 1)) / config.tau;
-				Tensor labels = torch::arange(curBatchSize, TensorOptions().dtype(kLong).device(device));
-				Tensor diag = torch::eye(curBatchSize, TensorOptions().dtype(kBool).device(device));
-
-				Tensor rowLoss = torch::nn::CrossEntropyLoss()(logits, labels);
-				Tensor columnLoss = torch::nn::CrossEntropyLoss()(logits.transpose(0, 1), labels);
-				Tensor logsumexpRows = torch::logsumexp(logits, 1);
-				Tensor logsumexpColumns = torch::logsumexp(logits, 0);
-				Tensor logsumexpPenalty = config.logsumexpPenaltyCoeff * (logsumexpRows.pow(2).mean() + logsumexpColumns.pow(2).mean());
-
-				float stdNorm = sqrtf((float)config.representationSize);
-				Tensor varPenalty = config.varReg * (
-					1.0f / (sa.std(0, false).mean() * stdNorm + 1e-4f) +
-					1.0f / (g.std(0, false).mean() * stdNorm + 1e-4f)
-				);
-
-				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + varPenalty;
+				InfoNCEResult res = ComputeInfoNCELoss(sa, goals);
+				Tensor loss = res.loss + StateActionVarPenalty(sa);
 
 				Phi().optim->zero_grad();
 				goalEncoder.optim->zero_grad();
@@ -155,27 +206,7 @@ namespace GGL {
 				Phi().StepOptim();
 				goalEncoder.StepOptim();
 
-				{
-					torch::NoGradGuard noGrad;
-					// curBatchSize > 1 is guaranteed above, so the off-diagonal (negatives) is never empty.
-					Tensor positiveLogits = logits.diag();
-					Tensor negativeLogits = logits.masked_select(~diag);
-					Tensor rowCorrect = logits.argmax(1).eq(labels).to(kFloat);
-					Tensor columnCorrect = logits.argmax(0).eq(labels).to(kFloat);
-
-					Tensor batchMetrics = torch::stack({
-						loss.detach(),
-						rowLoss.detach(),
-						columnLoss.detach(),
-						positiveLogits.mean(),
-						negativeLogits.mean(),
-						sa.norm(2, -1).mean(),
-						g.norm(2, -1).mean(),
-						0.5f * (rowCorrect.mean() + columnCorrect.mean()),
-						0.5f * (logsumexpRows.mean() + logsumexpColumns.mean())
-					});
-					metricAccum = metricAccum.defined() ? metricAccum + batchMetrics : batchMetrics;
-				}
+				metricAccum = metricAccum.defined() ? metricAccum + res.metrics : res.metrics;
 				batches++;
 			}
 		}

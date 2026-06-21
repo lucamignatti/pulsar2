@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.useBoostCritic = true;       // boost head (reachability toward full boost)
 	cfg.ppo.contrastiveGoal.usePotentialShaping = true;  // POTENTIAL framework (false -> advantage A/B baseline)
 	cfg.ppo.contrastiveGoal.potentialDefense = true;     // defense head (opponent reachability); false = offense only
-	cfg.ppo.contrastiveGoal.useSharedBase = false;       // true -> one shared phi base across the heads
+	cfg.ppo.contrastiveGoal.useSharedBase = true;        // ONE shared phi base + small per-head psi (the locked design): phi(s,a) is computed once per minibatch and reused across the goal/car/boost heads in a joint update, instead of a full encoder per head
 	// The potentials are now the PRIMARY dense signal (the dense shaping rewards are gone), so the
 	// scale is bumped from the 0.3 "augment" value. THIS IS THE CRITICAL COLD-START KNOB: the car
 	// head's contact potential must bootstrap ball approach in place of PlayerBallDistanceReward.

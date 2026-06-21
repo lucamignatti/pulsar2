@@ -58,6 +58,15 @@ namespace GGL {
 		torch::Tensor EncodeGoal(torch::Tensor goals);
 		torch::Tensor Score(torch::Tensor states, torch::Tensor actionRepresentations, torch::Tensor goals);
 
+		struct InfoNCEResult { torch::Tensor loss; torch::Tensor metrics; };
+		// InfoNCE loss for ONE head given a precomputed (shared) state-action embedding `sa` and this
+		// head's goals. Forwards only this head's small psi; does NOT include the sa (phi) variance
+		// penalty (the caller adds StateActionVarPenalty once on the shared sa, so under a shared base it
+		// is not triple-counted). Returns the loss to backprop and a stacked 9-element metrics tensor.
+		InfoNCEResult ComputeInfoNCELoss(torch::Tensor sa, torch::Tensor goals);
+		// varReg penalty on the shared state-action (phi) embedding; added once per optimizer step.
+		torch::Tensor StateActionVarPenalty(torch::Tensor sa);
+
 		ContrastiveGoalStats Train(ExperienceTensors& data, std::default_random_engine& rng);
 
 		void Save(std::filesystem::path folder, bool saveOptim = true);

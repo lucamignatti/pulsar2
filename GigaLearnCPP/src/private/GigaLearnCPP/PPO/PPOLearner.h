@@ -75,6 +75,14 @@ namespace GGL {
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);
 
+		// Joint training of all GCRL heads over ONE shared phi base (config.contrastiveGoal.useSharedBase):
+		// the state-action embedding is computed once per minibatch and reused across the goal/car/boost
+		// heads in a single summed-loss update (1 big phi forward+backward instead of one per head). The
+		// goal head keeps its ball-moved (gcrlTrainMask) subset via in-minibatch row selection. Fills the
+		// per-head stats. Replaces the three separate per-critic Train() calls when useSharedBase is on.
+		void TrainGCRLSharedBase(ExperienceBuffer& experience, std::default_random_engine& rng,
+			ContrastiveGoalStats& goalStats, ContrastiveGoalStats& carStats, ContrastiveGoalStats& boostStats);
+
 		// Potential-based GCRL shaping (used when config.contrastiveGoal.usePotentialShaping): returns
 		// a per-row reward addon summing gamma*Phi_k(s') - Phi_k(s) over heads, computed from the current
 		// (previous-iteration) critics, to be added to the reward stream BEFORE GAE. contactGoal [1,6]

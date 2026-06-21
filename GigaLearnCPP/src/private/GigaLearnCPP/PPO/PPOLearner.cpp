@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cfloat>
 #include <unordered_map>
+#include <numeric>
+#include <algorithm>
 
 using namespace torch;
 
@@ -473,7 +475,27 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	const bool useAutocast = config.useTrainAutocast && device.is_cuda();
 
 	if (config.contrastiveGoal.enabled) {
-		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng);
+		ContrastiveGoalStats crlTrainStats, carStats, boostStats;
+		// Match the per-head training guard (size==rows) so we never report stale zero stats for a head
+		// that was skipped because its goal tensor was misaligned (TrainGCRLSharedBase's carActive/boostActive).
+		int64_t crlRows = experience.data.states.defined() ? experience.data.states.size(0) : 0;
+		bool carTrain = carContrastiveLearner && experience.data.carHerGoals.defined()
+			&& experience.data.carHerGoals.size(0) == crlRows;
+		bool boostTrain = boostContrastiveLearner && experience.data.boostHerGoals.defined()
+			&& experience.data.boostHerGoals.size(0) == crlRows;
+
+		if (config.contrastiveGoal.useSharedBase) {
+			// Shared phi base (the locked design): compute the state-action embedding ONCE per minibatch
+			// and reuse it across the goal/car/boost heads in a single joint update, instead of a full
+			// phi forward+backward per head. Collapses 3 big encoders into 1 big phi + small per-head psi.
+			TrainGCRLSharedBase(experience, experience.rng, crlTrainStats, carStats, boostStats);
+		} else {
+			crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng);
+			if (carTrain)
+				carStats = carContrastiveLearner->Train(experience.data, experience.rng);
+			if (boostTrain)
+				boostStats = boostContrastiveLearner->Train(experience.data, experience.rng);
+		}
 
 		report["CRL Critic Loss"] = crlTrainStats.loss;
 		report["GCRL Row Loss"] = crlTrainStats.rowLoss;
@@ -491,15 +513,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["CRL Anchors Used"] = crlTrainStats.anchorsUsed;
 		report["CRL Train Samples Used"] = crlTrainStats.trainSamplesUsed;
 
-		if (carContrastiveLearner && experience.data.carHerGoals.defined()) {
-			ContrastiveGoalStats carStats = carContrastiveLearner->Train(experience.data, experience.rng);
+		if (carTrain) {
 			report["GCRL/Car Critic Loss"] = carStats.loss;
 			report["GCRL/Car Categorical Accuracy"] = carStats.categoricalAccuracy;
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
 		}
 
-		if (boostContrastiveLearner && experience.data.boostHerGoals.defined()) {
-			ContrastiveGoalStats boostStats = boostContrastiveLearner->Train(experience.data, experience.rng);
+		if (boostTrain) {
 			report["GCRL/Boost Critic Loss"] = boostStats.loss;
 			report["GCRL/Boost Categorical Accuracy"] = boostStats.categoricalAccuracy;
 			report["GCRL/Boost Train Samples Used"] = (float)boostStats.trainSamplesUsed;
@@ -729,6 +749,161 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Policy Update Magnitude"] = policyUpdateMagnitude;
 		report["Critic Update Magnitude"] = criticUpdateMagnitude;
 	}
+}
+
+void GGL::PPOLearner::TrainGCRLSharedBase(ExperienceBuffer& experience, std::default_random_engine& rng,
+	ContrastiveGoalStats& goalStats, ContrastiveGoalStats& carStats, ContrastiveGoalStats& boostStats) {
+
+	auto& data = experience.data;
+	auto& cfg = config.contrastiveGoal;
+	ContrastiveGoalLearner* goal = contrastiveGoalLearner;
+	if (!goal)
+		RG_ERR_CLOSE("TrainGCRLSharedBase: no goal critic");
+
+	if (!data.states.defined() || !data.actions.defined() || !data.herGoals.defined() || data.states.size(0) == 0)
+		return;
+	int64_t n = data.states.size(0);
+	if (data.actions.size(0) != n || data.herGoals.size(0) != n)
+		RG_ERR_CLOSE("TrainGCRLSharedBase: tensor alignment failed");
+
+	bool carActive = carContrastiveLearner && data.carHerGoals.defined() && data.carHerGoals.size(0) == n;
+	bool boostActive = boostContrastiveLearner && data.boostHerGoals.defined() && data.boostHerGoals.size(0) == n;
+
+	int64_t miniBatchSize = cfg.criticMiniBatchSize;
+	if (miniBatchSize <= 0)
+		miniBatchSize = n;
+	if (cfg.infoSubSample > 0)
+		miniBatchSize = std::min<int64_t>(miniBatchSize, cfg.infoSubSample); // match the non-shared Train cap
+
+	// Shared iteration order over ALL rows. car/boost train on all rows; the goal head selects its
+	// ball-moved (gcrlTrainMask) subset within each minibatch, preserving its (2B) mask. NOTE: this makes
+	// the goal head's InfoNCE negatives pool = (minibatch * ball-moved-fraction), SMALLER than the
+	// non-shared Train (which pre-filters to ball-moved rows, so every goal minibatch is a dense block).
+	// Fewer negatives => an easier contrastive task => higher reported "GCRL Categorical Accuracy" that is
+	// NOT directly comparable to the non-shared path. The negatives are still valid (all ball-moved).
+	std::vector<int64_t> indices(n);
+	std::iota(indices.begin(), indices.end(), 0);
+	int64_t effRows = (cfg.criticMaxRowsPerIter > 0) ? std::min<int64_t>(n, cfg.criticMaxRowsPerIter) : n;
+
+	bool haveGoalMask = data.gcrlTrainMask.defined() && data.gcrlTrainMask.size(0) == n;
+	torch::Tensor goalMaskCpu;
+	const uint8_t* goalMaskPtr = nullptr;
+	if (haveGoalMask) {
+		goalMaskCpu = data.gcrlTrainMask.to(torch::kCPU).contiguous();
+		goalMaskPtr = goalMaskCpu.data_ptr<uint8_t>();
+	}
+
+	torch::Tensor goalAcc, carAcc, boostAcc;
+	int64_t goalBatches = 0, carBatches = 0, boostBatches = 0;
+
+	for (int epoch = 0; epoch < cfg.criticEpochs; epoch++) {
+		std::shuffle(indices.begin(), indices.end(), rng);
+
+		for (int64_t start = 0; start < effRows; start += miniBatchSize) {
+			int64_t B = std::min<int64_t>(miniBatchSize, effRows - start);
+			if (B <= 1)
+				continue;
+
+			std::vector<int64_t> batchIdx(indices.begin() + start, indices.begin() + start + B);
+			torch::Tensor tIdx = torch::tensor(batchIdx, torch::TensorOptions().dtype(torch::kLong));
+
+			torch::Tensor states = data.states.index_select(0, tIdx.to(data.states.device())).to(device);
+			torch::Tensor actions = data.actions.index_select(0, tIdx.to(data.actions.device())).to(device).to(torch::kLong);
+			torch::Tensor actionReps = torch::zeros({ B, (int64_t)numActions },
+				torch::TensorOptions().dtype(torch::kFloat32).device(device)).scatter_(1, actions.unsqueeze(1), 1.f);
+
+			// ONE shared phi forward for the whole minibatch, reused by every head.
+			torch::Tensor sa = goal->EncodeStateAction(states, actionReps);   // [B, repr]
+
+			// Zero the params we will step (the shared phi once + each active head's psi).
+			goal->Phi().optim->zero_grad();
+			goal->goalEncoder.optim->zero_grad();
+			if (carActive) carContrastiveLearner->goalEncoder.optim->zero_grad();
+			if (boostActive) boostContrastiveLearner->goalEncoder.optim->zero_grad();
+
+			torch::Tensor total;
+			auto addLoss = [&](torch::Tensor l) { total = total.defined() ? total + l : l; };
+
+			// Goal head: ball-moved subset of this minibatch.
+			{
+				torch::Tensor herG = data.herGoals.index_select(0, tIdx.to(data.herGoals.device())).to(device);
+				torch::Tensor saG = sa, goalsG = herG;
+				bool runGoal = true;
+				if (haveGoalMask) {
+					std::vector<int64_t> mpos;
+					mpos.reserve(B);
+					for (int64_t i = 0; i < B; i++)
+						if (goalMaskPtr[batchIdx[i]])
+							mpos.push_back(i);
+					if ((int64_t)mpos.size() > 1) {
+						torch::Tensor mp = torch::tensor(mpos, torch::TensorOptions().dtype(torch::kLong)).to(device);
+						saG = sa.index_select(0, mp);
+						goalsG = herG.index_select(0, mp);
+					} else {
+						runGoal = false; // too few ball-moved rows in this minibatch -> skip the goal head
+					}
+				}
+				if (runGoal) {
+					auto r = goal->ComputeInfoNCELoss(saG, goalsG);
+					addLoss(r.loss);
+					goalAcc = goalAcc.defined() ? goalAcc + r.metrics : r.metrics;
+					goalBatches++;
+					goalStats.trainSamplesUsed += saG.size(0);
+				}
+			}
+
+			// Car head: all rows of the minibatch.
+			if (carActive) {
+				torch::Tensor carG = data.carHerGoals.index_select(0, tIdx.to(data.carHerGoals.device())).to(device);
+				auto r = carContrastiveLearner->ComputeInfoNCELoss(sa, carG);
+				addLoss(r.loss);
+				carAcc = carAcc.defined() ? carAcc + r.metrics : r.metrics;
+				carBatches++;
+				carStats.trainSamplesUsed += B;
+			}
+
+			// Boost head: all rows of the minibatch.
+			if (boostActive) {
+				torch::Tensor boostG = data.boostHerGoals.index_select(0, tIdx.to(data.boostHerGoals.device())).to(device);
+				auto r = boostContrastiveLearner->ComputeInfoNCELoss(sa, boostG);
+				addLoss(r.loss);
+				boostAcc = boostAcc.defined() ? boostAcc + r.metrics : r.metrics;
+				boostBatches++;
+				boostStats.trainSamplesUsed += B;
+			}
+
+			if (!total.defined())
+				continue;
+			// Shared-phi variance penalty added ONCE (not per head).
+			total = total + goal->StateActionVarPenalty(sa);
+
+			total.backward();
+			// Step the shared phi ONCE + each active psi head (StepOptim also zeros grad after stepping).
+			goal->Phi().StepOptim();
+			goal->goalEncoder.StepOptim();
+			if (carActive) carContrastiveLearner->goalEncoder.StepOptim();
+			if (boostActive) boostContrastiveLearner->goalEncoder.StepOptim();
+		}
+	}
+
+	auto finalize = [](ContrastiveGoalStats& s, const torch::Tensor& acc, int64_t batches, int64_t anchors) {
+		s.anchorsUsed = anchors;
+		if (batches > 0 && acc.defined()) {
+			auto m = (acc / (float)batches).cpu();
+			s.loss = m[0].item<float>();
+			s.rowLoss = m[1].item<float>();
+			s.columnLoss = m[2].item<float>();
+			s.positiveLogitMean = m[3].item<float>();
+			s.negativeLogitMean = m[4].item<float>();
+			s.stateActionEmbeddingNorm = m[5].item<float>();
+			s.goalEmbeddingNorm = m[6].item<float>();
+			s.categoricalAccuracy = m[7].item<float>();
+			s.logsumexpMean = m[8].item<float>();
+		}
+	};
+	finalize(goalStats, goalAcc, goalBatches, effRows);
+	finalize(carStats, carAcc, carBatches, carActive ? effRows : 0);
+	finalize(boostStats, boostAcc, boostBatches, boostActive ? effRows : 0);
 }
 
 void GGL::PPOLearner::TransferLearn(
