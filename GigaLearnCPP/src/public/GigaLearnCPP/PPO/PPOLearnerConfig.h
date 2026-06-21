@@ -35,6 +35,14 @@ namespace GGL {
 		// short, near-term HER window (no goalward bias). Needs the obs builder to
 		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
 		bool useCarCritic = false;
+		// Boost critic: a head whose goal is the agent's own boost LEVEL (the obs slot just after the
+		// car-local ball, i.e. GetCarLocalBallOffset()+6). Trained via HER on achieved future boost; its
+		// fixed shaping-goal is full boost. Replaces BoostGain/BoostLose (farming-proof: hoarding full
+		// boost earns ~0, gaining earns positive). Needs the obs builder's car-local ball offset (>=0).
+		bool useBoostCritic = false;
+		int boostHerMinOffset = 1;
+		int boostHerMaxOffset = 30;
+		float boostHerShortBiasPower = 1.5f;
 		// Share ONE state-action encoder (phi) across the GCRL critics (goal + car), each with its own
 		// small goal encoder (psi). Default off (separate critics = the A/B baseline). The goal critic
 		// owns/saves/LR-steps the shared phi; the car critic references it. NOTE: the shared phi is

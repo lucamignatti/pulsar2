@@ -23,14 +23,14 @@ namespace GGL {
 	}
 
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
-		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask, Model* sharedPhi) :
+		const std::string& namePrefix, bool useCarGoals, bool useBoostGoals, bool applyTrainMask, Model* sharedPhi) :
 		phiName(namePrefix + "_phi"),
 		psiName(namePrefix + "_psi"),
 		stateActionEncoder(phiName.c_str(), MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
 		goalEncoder(psiName.c_str(), MakeEncoderConfig(6, config.representationSize), device),
 		sharedStateActionEncoder(sharedPhi),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
-		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
+		useCarGoals(useCarGoals), useBoostGoals(useBoostGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
 	}
 
@@ -53,9 +53,9 @@ namespace GGL {
 	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
 		ContrastiveGoalStats stats;
 
-		// Goal source: the car critic trains against the egocentric carHerGoals; the
-		// ball/goal critic against herGoals.
-		torch::Tensor goalsAll = useCarGoals ? data.carHerGoals : data.herGoals;
+		// Goal source: the car critic trains against the egocentric carHerGoals; the boost critic
+		// against boostHerGoals (own boost level); the ball/goal critic against herGoals.
+		torch::Tensor goalsAll = useBoostGoals ? data.boostHerGoals : (useCarGoals ? data.carHerGoals : data.herGoals);
 
 		if (
 			!data.states.defined() ||

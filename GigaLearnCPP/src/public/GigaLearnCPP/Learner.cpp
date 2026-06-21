@@ -658,7 +658,7 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
-			FList achievedGoals, herGoals, carHerGoals, scoringGoals;
+			FList achievedGoals, herGoals, carHerGoals, boostHerGoals, scoringGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<int8_t> terminals;
@@ -681,6 +681,7 @@ void GGL::Learner::Start() {
 				achievedGoals += other.achievedGoals;
 				herGoals += other.herGoals;
 				carHerGoals += other.carHerGoals;
+				boostHerGoals += other.boostHerGoals;
 				scoringGoals += other.scoringGoals;
 				gcrlTrainMask += other.gcrlTrainMask;
 				actionMasks += other.actionMasks;
@@ -784,20 +785,24 @@ void GGL::Learner::Start() {
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
 
-				// Car-local ball obs offset for the car critic (-1 if this obs builder
-				// doesn't expose it, in which case the car critic is skipped).
+				// Car-local ball obs offset, shared by the car critic (reads the 6-float ball block at
+				// +0..+5) and the boost critic (reads the boost slot at +6). -1 if this obs builder
+				// doesn't expose it, in which case those critics are skipped.
 				int carLocalBallOffset = -1;
-				if (config.ppo.contrastiveGoal.useCarCritic && !envSet->obsBuilders.empty() && envSet->obsBuilders[0])
+				bool needsCarLocalBall = config.ppo.contrastiveGoal.useCarCritic || config.ppo.contrastiveGoal.useBoostCritic;
+				if (needsCarLocalBall && !envSet->obsBuilders.empty() && envSet->obsBuilders[0])
 					carLocalBallOffset = envSet->obsBuilders[0]->GetCarLocalBallOffset();
-				// Guard the 6-float car-local ball read against the obs layout; disable safely if it
-				// wouldn't fit (prevents a silent out-of-bounds states[] read for an unexpected builder).
-				if (carLocalBallOffset >= 0 && obsSize < carLocalBallOffset + 6)
+				// Guard the reads against the obs layout; disable safely if they wouldn't fit (prevents a
+				// silent out-of-bounds states[] read). The boost critic reads one slot FURTHER (index +6)
+				// than the car critic's ball block, so require +7 when the boost critic is enabled.
+				int minBallObsSize = carLocalBallOffset + (config.ppo.contrastiveGoal.useBoostCritic ? 7 : 6);
+				if (carLocalBallOffset >= 0 && obsSize < minBallObsSize)
 					carLocalBallOffset = -1;
-				if (config.ppo.contrastiveGoal.useCarCritic && carLocalBallOffset < 0) {
-					static bool warnedCarCritic = false;
-					if (!warnedCarCritic) {
-						RG_LOG("WARNING: GCRL car critic requested (useCarCritic=true) but the obs builder exposes no valid car-local ball offset; the car critic will be benched (watch GCRL/Car Active=0).");
-						warnedCarCritic = true;
+				if (needsCarLocalBall && carLocalBallOffset < 0) {
+					static bool warnedBallCritic = false;
+					if (!warnedBallCritic) {
+						RG_LOG("WARNING: GCRL car/boost critic requested but the obs builder exposes no valid (large-enough) car-local ball offset; those critics will be benched (watch GCRL/Car Active=0).");
+						warnedBallCritic = true;
 					}
 				}
 
@@ -903,6 +908,35 @@ void GGL::Learner::Start() {
 							int carTarget = t + carOffset;
 							for (int d = 0; d < 6; d++)
 								traj.carHerGoals[(size_t)t * 6 + d] = traj.states[(size_t)carTarget * obsSize + carLocalBallOffset + d];
+						}
+
+						// Boost critic: HER on the agent's own future boost level (the obs slot right
+						// after the car-local ball, offset+6). Short window; goal = [boost, 0,0,0,0,0]
+						// (a 1-dim boost level placed in a 6-dim slot, the rest zero).
+						if (config.ppo.contrastiveGoal.useBoostCritic && carLocalBallOffset >= 0
+							&& (int)traj.states.size() == n * obsSize) {
+							int boostOffset = carLocalBallOffset + 6;
+							int bMin = RS_MAX(1, config.ppo.contrastiveGoal.boostHerMinOffset);
+							int bMaxCfg = RS_MAX(bMin, config.ppo.contrastiveGoal.boostHerMaxOffset);
+							float bShortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.boostHerShortBiasPower);
+							traj.boostHerGoals.resize((size_t)n * 6); // zero-filled -> slots 1..5 stay 0
+							for (int t = 0; t < n; t++) {
+								int remaining = n - t - 1;
+								int bOffset = 0;
+								if (remaining > 0) {
+									int bMax = RS_MIN(bMaxCfg, remaining);
+									if (bMax >= bMin) {
+										float u = RocketSim::Math::RandFloat();
+										float biased = powf(u, bShortBiasPower);
+										int span = bMax - bMin + 1;
+										bOffset = bMin + RS_MIN(span - 1, (int)floorf(biased * span));
+									} else {
+										bOffset = remaining;
+									}
+								}
+								int bTarget = t + bOffset;
+								traj.boostHerGoals[(size_t)t * 6 + 0] = traj.states[(size_t)bTarget * obsSize + boostOffset];
+							}
 						}
 					}
 				};
@@ -1097,12 +1131,14 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tBoostHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
 						if (config.ppo.contrastiveGoal.useCarCritic && !combinedTraj.carHerGoals.empty())
 							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
+						if (config.ppo.contrastiveGoal.useBoostCritic && !combinedTraj.boostHerGoals.empty())
+							tBoostHERGoals = torch::tensor(combinedTraj.boostHerGoals).reshape({ -1, 6 });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
@@ -1147,11 +1183,15 @@ void GGL::Learner::Start() {
 						}
 						torch::Tensor contactGoal = torch::tensor(contactF).reshape({ 1, 6 });
 						torch::Tensor scoringRange = torch::tensor(rangeF).reshape({ (int64_t)kg, 6 });
+						// Boost head fixed goal: FULL boost. Obs stores boost as boost/100, so full = 1.0,
+						// placed in slot 0 of a 6-dim goal (matching the boostHerGoals layout).
+						FList boostF(6, 0.f); boostF[0] = 1.f;
+						torch::Tensor boostGoal = torch::tensor(boostF).reshape({ 1, 6 });
 						torch::Tensor tGroupKeys = torch::tensor(combinedTraj.defenseGroupKeys, torch::TensorOptions().dtype(torch::kInt64));
 						torch::Tensor tTeams = torch::tensor(combinedTraj.defenseTeams, torch::TensorOptions().dtype(torch::kInt8));
 						tShapingF = ppo->ComputePotentialShaping(
 							tStates, tActionMasks, tSegmentIds, tTerminals, tNextTruncStates,
-							config.ppo.gaeGamma, contactGoal, scoringRange, tGroupKeys, tTeams, report);
+							config.ppo.gaeGamma, contactGoal, scoringRange, boostGoal, tGroupKeys, tTeams, report);
 					}
 
 					report["Average Step Reward"] = tRewards.mean().item<float>();
@@ -1210,6 +1250,8 @@ void GGL::Learner::Start() {
 						batchIn.herGoals = tHERGoals;
 						if (tCarHERGoals.defined())
 							batchIn.carHerGoals = tCarHERGoals;
+						if (tBoostHERGoals.defined())
+							batchIn.boostHerGoals = tBoostHERGoals;
 						batchIn.scoringGoals = tScoringGoals;
 						batchIn.gcrlTrainMask = tGcrlTrainMask;
 						batchIn.segmentIds = tSegmentIds;

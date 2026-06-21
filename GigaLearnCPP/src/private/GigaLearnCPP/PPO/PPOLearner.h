@@ -25,6 +25,8 @@ namespace GGL {
 		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
 		// Optional second isolated critic: egocentric car-local ball goal (controllability).
 		ContrastiveGoalLearner* carContrastiveLearner = NULL;
+		// Optional boost critic: goal = the agent's own boost level (reachability toward full boost).
+		ContrastiveGoalLearner* boostContrastiveLearner = NULL;
 		// SimBa RSNorm (running obs normalization). NULL unless config.rsNorm.enabled.
 		// One shared normalizer for actor & critic; "canonical stats everywhere"
 		// (old-version & skill-eval inference use this same normalizer).
@@ -80,7 +82,7 @@ namespace GGL {
 		torch::Tensor ComputePotentialShaping(
 			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds, torch::Tensor terminals,
 			torch::Tensor truncNextStates, float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
-			torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report);
+			torch::Tensor boostGoal, torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report);
 
 		void TransferLearn(
 			ModelSet& oldModels, 

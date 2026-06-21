@@ -47,8 +47,14 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
 			// When useSharedBase, reuse the goal critic's phi encoder (one base, per-head psi).
 			Model* sharedPhi = config.contrastiveGoal.useSharedBase ? &contrastiveGoalLearner->stateActionEncoder : nullptr;
-			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false, sharedPhi);
+			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false, false, sharedPhi);
 			RG_LOG("GCRL car critic enabled (egocentric controllability)" << (sharedPhi ? " [shared phi base]" : ""));
+		}
+		if (config.contrastiveGoal.useBoostCritic) {
+			// Boost goal (own boost level); trains on all rows. Shares phi when useSharedBase.
+			Model* sharedPhi = config.contrastiveGoal.useSharedBase ? &contrastiveGoalLearner->stateActionEncoder : nullptr;
+			boostContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_boost", false, true, false, sharedPhi);
+			RG_LOG("GCRL boost critic enabled (reachability toward full boost)" << (sharedPhi ? " [shared phi base]" : ""));
 		}
 	}
 
@@ -77,8 +83,9 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 GGL::PPOLearner::~PPOLearner() {
 	models.Free();
 	guidingPolicyModels.Free();
-	// Delete the car critic first: under useSharedBase it references the goal critic's phi encoder.
+	// Delete the head critics first: under useSharedBase they reference the goal critic's phi encoder.
 	delete carContrastiveLearner;
+	delete boostContrastiveLearner;
 	delete contrastiveGoalLearner;
 	delete obsNorm;
 }
@@ -393,6 +400,19 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	}
 	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;
 
+	bool boostActive = cfg.useBoostCritic && learner->boostContrastiveLearner
+		&& experience.data.boostHerGoals.defined()
+		&& experience.data.boostHerGoals.size(0) == states.size(0);
+	if (boostActive) {
+		// Boost critic: own boost level (reachability toward full boost), short-horizon goals.
+		auto boostRes = criticSep(learner->boostContrastiveLearner, experience.data.boostHerGoals.to(device));
+		report["GCRL/Boost Edge Mean"] = std::get<1>(boostRes);
+		report["GCRL/Boost Baseline Spread"] = std::get<2>(boostRes);
+		report["GCRL/Boost Separation"] = TensorMean(std::get<0>(boostRes).abs());
+		sepSum = sepSum + std::get<0>(boostRes);
+	}
+	report["GCRL/Boost Active"] = boostActive ? 1.f : 0.f;
+
 	// Single global lambda: short bootstrap warmup -> hold. No separation gate; weak
 	// critics self-attenuate via their ~0 numerator above.
 	float warmupProgress = cfg.gcrlLambdaWarmupSteps == 0 ? 1.f
@@ -451,6 +471,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Car Critic Loss"] = carStats.loss;
 			report["GCRL/Car Categorical Accuracy"] = carStats.categoricalAccuracy;
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
+		}
+
+		if (boostContrastiveLearner && experience.data.boostHerGoals.defined()) {
+			ContrastiveGoalStats boostStats = boostContrastiveLearner->Train(experience.data, experience.rng);
+			report["GCRL/Boost Critic Loss"] = boostStats.loss;
+			report["GCRL/Boost Categorical Accuracy"] = boostStats.categoricalAccuracy;
+			report["GCRL/Boost Train Samples Used"] = (float)boostStats.trainSamplesUsed;
 		}
 
 		// In potential-shaping mode GCRL enters via reward shaping (done pre-GAE in the collector),
@@ -745,7 +772,7 @@ static torch::Tensor ComputeDefensePotential(
 torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
 	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds, torch::Tensor terminals,
 	torch::Tensor truncNextStates, float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
-	torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report
+	torch::Tensor boostGoal, torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report
 ) {
 	RG_NO_GRAD;
 	auto& cfg = config.contrastiveGoal;
@@ -836,6 +863,19 @@ torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
 		report["GCRL/Shaping Car AbsMean"] = TensorMean(shaping.abs());
 	}
 
+	// Boost head (offense): goal = full boost (single -> soft-max is a no-op).
+	if (boostContrastiveLearner && boostGoal.defined()) {
+		torch::Tensor bGoal = boostGoal.to(device);
+		torch::Tensor phiBoost = ComputeHeadPotential(boostContrastiveLearner, s, sampledActions, bGoal, 1.0f, numActions, cfg.policyScoreBatchSize);
+		torch::Tensor phiBoostTrunc = hasTrunc
+			? ComputeHeadPotential(boostContrastiveLearner, truncS, truncSampled, bGoal, 1.0f, numActions, cfg.policyScoreBatchSize)
+			: torch::Tensor();
+		torch::Tensor shaping = gaeGamma * phiNextOf(phiBoost, phiBoostTrunc) - phiBoost;
+		total = total + shaping;
+		report["GCRL/Potential Boost Mean"] = TensorMean(phiBoost);
+		report["GCRL/Shaping Boost AbsMean"] = TensorMean(shaping.abs());
+	}
+
 	// Defense head: reuse phiGoal regrouped over opponents. No truncation bootstrap (trunc next-states
 	// have no opponent grouping), so Phi_defense(s')=0 at every boundary (mid-episode term only).
 	if (cfg.potentialDefense && defenseGroupKeys.defined() && defenseGroupKeys.size(0) == n) {
@@ -857,6 +897,8 @@ void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 		contrastiveGoalLearner->Save(folderPath);
 	if (carContrastiveLearner)
 		carContrastiveLearner->Save(folderPath);
+	if (boostContrastiveLearner)
+		boostContrastiveLearner->Save(folderPath);
 }
 
 void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
@@ -869,6 +911,9 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 	}
 	if (carContrastiveLearner) {
 		carContrastiveLearner->Load(folderPath, true, true);
+	}
+	if (boostContrastiveLearner) {
+		boostContrastiveLearner->Load(folderPath, true, true);
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);
@@ -888,6 +933,8 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 		contrastiveGoalLearner->SetLearningRate(config.contrastiveGoal.criticLR);
 	if (carContrastiveLearner)
 		carContrastiveLearner->SetLearningRate(config.contrastiveGoal.criticLR);
+	if (boostContrastiveLearner)
+		boostContrastiveLearner->SetLearningRate(config.contrastiveGoal.criticLR);
 
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }

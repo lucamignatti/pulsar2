@@ -24,6 +24,9 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 		if (in.carHerGoals.defined() && in.carHerGoals.size(0) != expRows)
 			RG_ERR_CLOSE("GCRL car goal alignment failed: states=" << expRows <<
 				", carHerGoals=" << in.carHerGoals.size(0));
+		if (in.boostHerGoals.defined() && in.boostHerGoals.size(0) != expRows)
+			RG_ERR_CLOSE("GCRL boost goal alignment failed: states=" << expRows <<
+				", boostHerGoals=" << in.boostHerGoals.size(0));
 	}
 
 	// Value targets + the running-return stat come from the SPARSE rewards: the value critic learns the
@@ -62,6 +65,7 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 		outBuffer.data.achievedGoals = in.achievedGoals;
 		outBuffer.data.herGoals = in.herGoals;
 		outBuffer.data.carHerGoals = in.carHerGoals;
+		outBuffer.data.boostHerGoals = in.boostHerGoals;
 		outBuffer.data.scoringGoals = in.scoringGoals;
 		outBuffer.data.gcrlTrainMask = in.gcrlTrainMask;
 		outBuffer.data.segmentIds = in.segmentIds;

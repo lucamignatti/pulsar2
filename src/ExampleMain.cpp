@@ -38,9 +38,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ teamMixed(new TouchHeightReward()), 1.f },
 		{ teamMixed(new FlipResetReward()), 5.f },
 
-		// Boost (dense, but no GCRL head yet -- the one remaining dense reward)
-		{ teamMixed(new BoostGainReward()), 0.7f },
-		{ teamMixed(new BoostLoseReward()), 0.4f },
+		// Boost is now the BOOST GCRL head (reachability toward full boost) -- no boost reward.
 
 		// Demos (events)
 		{ teamMixed(new DemoReward()), 2.5f },
@@ -53,7 +51,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	};
 
 	// Make the arena
-	int playersPerTeam = 3; // 3v3 SOCCAR (real training)
+	int playersPerTeam = 1; // 1v1 SOCCAR
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -114,8 +112,8 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// 3v3 SOCCAR: 1700 games * 6 cars ~= 10,200 simulated cars (the original setup).
-	cfg.numGames = 1700;
+	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars.
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -157,6 +155,7 @@ int main(int argc, char* argv[]) {
 	//   apply and the advantage path runs instead). useSharedBase folds goal+car onto one phi base.
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.useCarCritic = true;
+	cfg.ppo.contrastiveGoal.useBoostCritic = true;       // boost head (reachability toward full boost)
 	cfg.ppo.contrastiveGoal.usePotentialShaping = true;  // POTENTIAL framework (false -> advantage A/B baseline)
 	cfg.ppo.contrastiveGoal.potentialDefense = true;     // defense head (opponent reachability); false = offense only
 	cfg.ppo.contrastiveGoal.useSharedBase = false;       // true -> one shared phi base across the heads

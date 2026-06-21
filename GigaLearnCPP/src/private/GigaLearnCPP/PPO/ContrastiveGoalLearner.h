@@ -43,14 +43,16 @@ namespace GGL {
 		int actionRepresentationSize;
 
 		// useCarGoals: train/score against data.carHerGoals (egocentric ball) instead of data.herGoals.
-		// applyTrainMask: when false, ignore the ball-moved gcrlTrainMask -- the car critic learns
-		// controllability even on episodes where the ball never moved. namePrefix keeps the two
-		// critics' encoders (and checkpoint files) distinct.
+		// useBoostGoals: train/score against data.boostHerGoals (own boost level) -- the boost head.
+		// applyTrainMask: when false, ignore the ball-moved gcrlTrainMask -- the car/boost critics learn
+		// even on episodes where the ball never moved. namePrefix keeps the critics' encoders (and
+		// checkpoint files) distinct.
 		bool useCarGoals = false;
+		bool useBoostGoals = false;
 		bool applyTrainMask = true;
 
 		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
-			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true, Model* sharedPhi = nullptr);
+			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool useBoostGoals = false, bool applyTrainMask = true, Model* sharedPhi = nullptr);
 
 		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionRepresentations);
 		torch::Tensor EncodeGoal(torch::Tensor goals);
