@@ -43,6 +43,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		RG_LOG("GCRL scoring auxiliary enabled with separate critic encoders");
 	}
 
+	if (config.rsNorm.enabled) {
+		obsNorm = new RSNorm(obsSize, config.rsNorm.eps, config.rsNorm.initVar, config.rsNorm.initCount, config.rsNorm.clipRange);
+		RG_LOG("RSNorm (running observation normalization) enabled over " << obsSize << " dims");
+	}
+
 	// Print param counts
 	RG_LOG("Model parameter counts:");
 	uint64_t total = 0;
@@ -64,6 +69,7 @@ GGL::PPOLearner::~PPOLearner() {
 	models.Free();
 	guidingPolicyModels.Free();
 	delete contrastiveGoalLearner;
+	delete obsNorm;
 }
 
 void GGL::PPOLearner::MakeModels(
@@ -104,12 +110,16 @@ void GGL::PPOLearner::MakeModels(
 torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
-	float temperature, bool halfPrec) {
+	float temperature, bool halfPrec, const RSNorm* obsNorm) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
 	constexpr float ACTION_MIN_PROB = 1e-11f;
 	constexpr float ACTION_DISABLED_LOGIT = -1e10f;
+
+	// RSNorm: standardize observations as the FIRST op, before the trunk (stop-grad).
+	if (obsNorm)
+		obs = obsNorm->Normalize(obs);
 
 	if (models["shared_head"])
 		obs = models["shared_head"]->Forward(obs, halfPrec);
@@ -122,12 +132,12 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 
 void GGL::PPOLearner::InferActionsFromModels(
 	ModelSet& models,
-	torch::Tensor obs, torch::Tensor actionMasks, 
+	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor* outActionProbs) {
+	torch::Tensor* outActionProbs, const RSNorm* obsNorm) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec);
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, obsNorm);
 	if (outActionProbs)
 		*outActionProbs = probs;
 
@@ -147,10 +157,14 @@ void GGL::PPOLearner::InferActionsFromModels(
 }
 
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor* outActionProbs) {
-	InferActionsFromModels(models ? *models : this->models, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, outActionProbs);
+	InferActionsFromModels(models ? *models : this->models, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, outActionProbs, obsNorm);
 }
 
 torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
+
+	// RSNorm: same shared normalizer as the policy, first op (stop-grad).
+	if (obsNorm)
+		obs = obsNorm->Normalize(obs);
 
 	if (models["shared_head"])
 		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
@@ -412,6 +426,17 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	bool trainCritic = config.criticLR != 0;
 	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
 
+	// RSNorm: update the running obs stats ONCE per rollout from the freshly
+	// collected (raw) observations, BEFORE the K epochs. The stats are then frozen
+	// for the entire epoch pass (every minibatch normalizes with these stats inside
+	// InferPolicyProbsFromModels / InferCritic). Never update inside the epoch loop.
+	if (obsNorm) {
+		obsNorm->Update(experience.data.states);
+		report["RSNorm/Mean Mu"] = obsNorm->GetMeanMu();
+		report["RSNorm/Mean Var"] = obsNorm->GetMeanVar();
+		report["RSNorm/Count"] = obsNorm->GetCount();
+	}
+
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
@@ -445,7 +470,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// Get policy log probs and entropy
 					float curEntropy;
 					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
+						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false, obsNorm);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						curEntropy = entropy.detach().cpu().item<float>();
@@ -477,7 +502,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						torch::Tensor guidingProbs;
 						{
 							RG_NO_GRAD;
-							guidingProbs = InferPolicyProbsFromModels(guidingPolicyModels, obs, actionMasks, config.policyTemperature, config.useHalfPrecision);
+							guidingProbs = InferPolicyProbsFromModels(guidingPolicyModels, obs, actionMasks, config.policyTemperature, config.useHalfPrecision, obsNorm);
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
@@ -584,7 +609,7 @@ void GGL::PPOLearner::TransferLearn(
 	torch::Tensor oldProbs;
 	{ // No grad for old model inference
 		RG_NO_GRAD;
-		oldProbs = InferPolicyProbsFromModels(oldModels, oldObs, oldActionMasks, config.policyTemperature, config.useHalfPrecision);
+		oldProbs = InferPolicyProbsFromModels(oldModels, oldObs, oldActionMasks, config.policyTemperature, config.useHalfPrecision, obsNorm);
 		report["Old Policy Entropy"] = ComputeEntropy(oldProbs, oldActionMasks, config.maskEntropy).detach().cpu().item<float>();
 
 		if (actionMaps.defined())
@@ -597,7 +622,7 @@ void GGL::PPOLearner::TransferLearn(
 	auto policyBefore = models["policy"]->CopyParams();
 	
 	for (int i = 0; i < tlConfig.epochs; i++) {
-		torch::Tensor newProbs = InferPolicyProbsFromModels(models, newObs, newActionMasks, config.policyTemperature, false);
+		torch::Tensor newProbs = InferPolicyProbsFromModels(models, newObs, newActionMasks, config.policyTemperature, false, obsNorm);
 
 		// Non-summative KL div	loss
 		torch::Tensor transferLearnLoss;

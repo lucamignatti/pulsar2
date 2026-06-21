@@ -7,6 +7,7 @@
 #include <GigaLearnCPP/PPO/TransferLearnConfig.h>
 
 #include "../Util/Models.h"
+#include "../Util/RSNorm.h"
 
 #include <torch/optim/adam.h>
 #include <torch/nn/modules/loss.h>
@@ -22,6 +23,10 @@ namespace GGL {
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
 		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
+		// SimBa RSNorm (running obs normalization). NULL unless config.rsNorm.enabled.
+		// One shared normalizer for actor & critic; "canonical stats everywhere"
+		// (old-version & skill-eval inference use this same normalizer).
+		RSNorm* obsNorm = NULL;
 
 		PPOLearnerConfig config;
 		torch::Device device;
@@ -47,18 +52,21 @@ namespace GGL {
 		torch::Tensor InferCritic(torch::Tensor obs);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
+		// obsNorm: if non-null, RSNorm is applied as the first op (stop-grad) to obs.
 		static torch::Tensor InferPolicyProbsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
-			bool halfPrec
+			bool halfPrec,
+			const RSNorm* obsNorm = nullptr
 		);
 		static void InferActionsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
-			torch::Tensor* outActionProbs = NULL
+			torch::Tensor* outActionProbs = NULL,
+			const RSNorm* obsNorm = nullptr
 		);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);

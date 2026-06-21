@@ -251,14 +251,16 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		torch::Tensor tNewActions, tOldActions;
 		torch::Tensor _tLogProbs;
 
+		// RSNorm "canonical stats everywhere": normalize both sides with the live
+		// normalizer (the obs here are raw env observations).
 		PPOLearner::InferActionsFromModels(
-			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true), 
-			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, 
-			&tNewActions, &_tLogProbs);
-		PPOLearner::InferActionsFromModels(
-			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true), 
+			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true),
 			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
-			&tOldActions, &_tLogProbs);
+			&tNewActions, &_tLogProbs, NULL, ppo->obsNorm);
+		PPOLearner::InferActionsFromModels(
+			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true),
+			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
+			&tOldActions, &_tLogProbs, NULL, ppo->obsNorm);
 
 		auto newActions = TENSOR_TO_VEC<int>(tNewActions);
 		auto oldActions = TENSOR_TO_VEC<int>(tOldActions);

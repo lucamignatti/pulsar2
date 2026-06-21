@@ -83,6 +83,19 @@ namespace GGL {
 		float velScale = 6000.f;
 	};
 
+	// SimBa RSNorm: running per-dim observation standardization applied as the
+	// first op of the actor & critic forward (one shared normalizer). Stats are
+	// count-based running mean/var (var = M2/n), updated once per rollout and
+	// frozen during the K epochs; persisted with the weights. Default-off.
+	// Mutually exclusive with LearnerConfig::standardizeObs (double-normalization).
+	struct RSNormConfig {
+		bool enabled = false;
+		double eps = 1e-8;
+		double initVar = 1.0;    // variance at init (mu = 0)
+		double initCount = 1e-4; // small init count so early steps are well-defined
+		double clipRange = 0.0;  // optional clamp of normalized obs; <= 0 disables (NOT SimBa)
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
 
@@ -131,6 +144,7 @@ namespace GGL {
 		float rewardClipRange = 10; // Clip range for normalized rewards, set 0 to disable
 
 		ContrastiveGoalConfig contrastiveGoal;
+		RSNormConfig rsNorm;
 
 		bool useGuidingPolicy = false;
 		std::filesystem::path guidingPolicyPath = "guiding_policy/"; // Path of the guiding policy model(s)

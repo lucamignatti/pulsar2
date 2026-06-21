@@ -267,6 +267,11 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		} else {
 			this->obsStat = NULL;
 		}
+
+		// RSNorm and the legacy collection-time standardizeObs both normalize the
+		// observation stream; running both double-normalizes. Require at most one.
+		if (config.standardizeObs && config.ppo.rsNorm.enabled)
+			RG_ERR_CLOSE("config.standardizeObs and config.ppo.rsNorm.enabled cannot both be enabled (double obs normalization); pick one.");
 	}
 
 	try {
@@ -347,6 +352,9 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["return_stat"] = returnStat->ToJSON();
 	if (obsStat)
 		j["obs_stat"] = obsStat->ToJSON();
+	// RSNorm stats travel WITH the weights (part of the policy state).
+	if (ppo && ppo->obsNorm)
+		j["rsnorm_stat"] = ppo->obsNorm->ToJSON();
 
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
@@ -376,6 +384,9 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		returnStat->ReadFromJSON(j["return_stat"]);
 	if (obsStat)
 		obsStat->ReadFromJSON(j["obs_stat"]);
+	// contains-guard so checkpoints predating RSNorm still load (stats stay at init).
+	if (ppo && ppo->obsNorm && j.contains("rsnorm_stat"))
+		ppo->obsNorm->ReadFromJSON(j["rsnorm_stat"]);
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);

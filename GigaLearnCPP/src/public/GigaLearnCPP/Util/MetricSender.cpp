@@ -64,6 +64,10 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 	if (key.rfind("Rating/", 0) == 0)
 		return true;
 
+	// RSNorm running-obs-normalization summary stats.
+	if (key.rfind("RSNorm/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 

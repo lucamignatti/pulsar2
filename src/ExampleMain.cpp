@@ -168,6 +168,12 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.targetSpeed = 1500.f;
 	cfg.ppo.contrastiveGoal.targetSpeedJitter = 0.f;
 
+	// SimBa RSNorm (running observation normalization), default-off. When enabled it
+	// standardizes obs as the first op of the actor & critic (one shared normalizer),
+	// updated once per rollout and frozen during the epochs, persisted with weights.
+	// Mutually exclusive with cfg.standardizeObs.
+	cfg.ppo.rsNorm.enabled = false;
+
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
