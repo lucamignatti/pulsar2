@@ -296,18 +296,19 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	return takenScores - baselineScores;
 }
 
-// Phi_head(s) = mean over K_a baseline (random valid) actions of a soft-max over the goal set of the
-// head's contrastive reachability score. A single-goal set (car contact) makes the soft-max a no-op.
-// Action-marginalized => a clean (action-independent) state potential. Chunked to bound memory.
+// Phi_head(s) = mean over the K provided action samples of a soft-max over the goal set of the head's
+// contrastive reachability score. The samples are drawn from the POLICY by the caller, so Phi is the
+// on-policy reachability potential (action-marginalized => a clean state potential). A single-goal set
+// (car contact) makes the soft-max a no-op. Chunked to bound memory.
 static torch::Tensor ComputeHeadPotential(
 	GGL::ContrastiveGoalLearner* critic,
-	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor goals,
-	float temp, int baselineSamples, int64_t numActions, int64_t chunkSize
+	torch::Tensor states, torch::Tensor sampledActions, torch::Tensor goals,
+	float temp, int64_t numActions, int64_t chunkSize
 ) {
 	RG_NO_GRAD;
 	int64_t n = states.size(0);
 	int64_t numGoals = goals.size(0);
-	int samples = RS_MAX(1, baselineSamples);
+	int64_t K = sampledActions.size(1);
 	float safeTemp = RS_MAX(1e-3f, temp);
 	if (chunkSize <= 0)
 		chunkSize = n;
@@ -317,10 +318,10 @@ static torch::Tensor ComputeHeadPotential(
 		int64_t stop = RS_MIN(start + chunkSize, n);
 		int64_t m = stop - start;
 		torch::Tensor sChunk = states.slice(0, start, stop);
-		torch::Tensor maskChunk = actionMasks.slice(0, start, stop);
+		torch::Tensor aChunk = sampledActions.slice(0, start, stop); // [m, K]
 		torch::Tensor acc = torch::zeros({ m }, phi.options());
-		for (int k = 0; k < samples; k++) {
-			torch::Tensor aRep = OneHotActions(SampleValidActions(maskChunk), numActions);
+		for (int64_t k = 0; k < K; k++) {
+			torch::Tensor aRep = OneHotActions(aChunk.select(1, k), numActions);
 			torch::Tensor scores = torch::zeros({ m, numGoals }, phi.options());
 			for (int64_t g = 0; g < numGoals; g++) {
 				torch::Tensor gRow = goals.slice(0, g, g + 1).expand({ m, goals.size(1) });
@@ -331,7 +332,7 @@ static torch::Tensor ComputeHeadPotential(
 				: scores.select(1, 0);
 			acc = acc + agg;
 		}
-		phi.slice(0, start, stop).copy_(acc / (float)samples);
+		phi.slice(0, start, stop).copy_(acc / (float)K);
 	}
 	return phi;
 }
@@ -742,36 +743,81 @@ static torch::Tensor ComputeDefensePotential(
 }
 
 torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
-	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
-	float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
+	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds, torch::Tensor terminals,
+	torch::Tensor truncNextStates, float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
 	torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report
 ) {
 	RG_NO_GRAD;
 	auto& cfg = config.contrastiveGoal;
 	torch::Tensor s = states.to(device);
 	torch::Tensor masks = actionMasks.to(device);
-	torch::Tensor seg = segmentIds.to(device).to(torch::kLong);
 	int64_t n = s.size(0);
 	if (n <= 1)
 		return torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32));
+	int K = RS_MAX(1, cfg.baselineActionSamples);
 
-	// Episode-boundary mask: sameNext[i] = (segment(i+1) == segment(i)); last row = false. Where false,
-	// Phi(s') is treated as 0 (terminal potential), so each episode's shaping telescopes cleanly.
-	torch::Tensor eq = (seg.slice(0, 1, n) == seg.slice(0, 0, n - 1)).to(torch::kFloat32);
-	torch::Tensor sameNext = torch::cat({ eq, torch::zeros({ 1 }, eq.options()) }, 0);
+	// Sample K actions per state from the POLICY -> on-policy reachability potential.
+	torch::Tensor sampledActions = torch::multinomial(
+		InferPolicyProbsFromModels(models, s, masks, config.policyTemperature, false, obsNorm), K, /*replacement=*/true);
 
-	auto phiToShaping = [&](torch::Tensor phi) -> torch::Tensor {
-		torch::Tensor phiNext = torch::cat({ phi.slice(0, 1, n), torch::zeros({ 1 }, phi.options()) }, 0) * sameNext;
-		return gaeGamma * phiNext - phi;
+	// Truncation next-states + their policy action samples, for the Phi bootstrap at TRUNCATED boundaries.
+	bool hasTrunc = truncNextStates.defined() && truncNextStates.size(0) > 0;
+	torch::Tensor truncS, truncSampled;
+	if (hasTrunc) {
+		truncS = truncNextStates.to(device);
+		int64_t numTruncs = truncS.size(0);
+		torch::Tensor truncMasks = torch::ones({ numTruncs, (int64_t)numActions }, masks.options());
+		truncSampled = torch::multinomial(
+			InferPolicyProbsFromModels(models, truncS, truncMasks, config.policyTemperature, false, obsNorm), K, true);
+	}
+
+	// Boundary structure (CPU, built once, shared across heads): per row -> mid-episode next row, or a
+	// TRUNCATED forward-index (into truncNextStates), or NORMAL/last (-> Phi(s')=0). The forward trunc
+	// counter advances on EVERY truncation so it stays aligned with truncNextStates order.
+	torch::Tensor segCpu = segmentIds.to(torch::kCPU).to(torch::kLong).contiguous();
+	torch::Tensor termCpu = terminals.to(torch::kCPU).to(torch::kInt8).contiguous();
+	const int64_t* segP = segCpu.data_ptr<int64_t>();
+	const int8_t* termP = termCpu.data_ptr<int8_t>();
+	std::vector<int64_t> nextRow(n, 0), truncGather(n, 0);
+	std::vector<float> midSel(n, 0.f), truncSel(n, 0.f);
+	int64_t tIdx = 0;
+	for (int64_t i = 0; i < n; i++) {
+		if (i + 1 < n && segP[i + 1] == segP[i]) {
+			nextRow[i] = i + 1; midSel[i] = 1.f;            // mid-episode -> Phi[i+1]
+		} else if (termP[i] == RLGC::TerminalType::TRUNCATED) {
+			if (hasTrunc) { truncGather[i] = tIdx; truncSel[i] = 1.f; } // TRUNCATED -> Phi(trunc next)
+			tIdx++;
+		} // else NORMAL terminal / last row -> Phi(s') = 0
+	}
+	// Contract: one truncation next-state per TRUNCATED boundary, in order. Guard against a mismatch
+	// (would otherwise be an out-of-bounds index_select on phiTrunc below).
+	if (hasTrunc && tIdx != truncS.size(0))
+		RG_ERR_CLOSE("Potential shaping: counted " << tIdx << " TRUNCATED boundaries but have "
+			<< truncS.size(0) << " truncation next-states");
+	auto opts = torch::TensorOptions().dtype(torch::kLong);
+	torch::Tensor nextRowT = torch::tensor(nextRow, opts).to(device);
+	torch::Tensor truncGatherT = torch::tensor(truncGather, opts).to(device);
+	torch::Tensor midSelT = torch::tensor(midSel).to(device);
+	torch::Tensor truncSelT = torch::tensor(truncSel).to(device);
+
+	// Phi(s') with proper boundaries: mid -> Phi[next]; TRUNCATED -> Phi(trunc next); NORMAL/last -> 0.
+	auto phiNextOf = [&](torch::Tensor phi, torch::Tensor phiTrunc) -> torch::Tensor {
+		torch::Tensor out = phi.index_select(0, nextRowT) * midSelT;
+		if (phiTrunc.defined() && phiTrunc.size(0) > 0)
+			out = out + phiTrunc.index_select(0, truncGatherT) * truncSelT;
+		return out;
 	};
 
 	torch::Tensor total = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 
-	// Goal head (offense) -- its Phi is reused for the defense head below.
-	torch::Tensor phiGoal = ComputeHeadPotential(contrastiveGoalLearner, s, masks, scoringRangeGoals.to(device),
-		cfg.potentialScoringTemp, cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
+	// Goal head (offense) -- its Phi (states + trunc next-states) is reused for the defense head below.
+	torch::Tensor goalGoals = scoringRangeGoals.to(device);
+	torch::Tensor phiGoal = ComputeHeadPotential(contrastiveGoalLearner, s, sampledActions, goalGoals, cfg.potentialScoringTemp, numActions, cfg.policyScoreBatchSize);
+	torch::Tensor phiGoalTrunc = hasTrunc
+		? ComputeHeadPotential(contrastiveGoalLearner, truncS, truncSampled, goalGoals, cfg.potentialScoringTemp, numActions, cfg.policyScoreBatchSize)
+		: torch::Tensor();
 	{
-		torch::Tensor shaping = phiToShaping(phiGoal);
+		torch::Tensor shaping = gaeGamma * phiNextOf(phiGoal, phiGoalTrunc) - phiGoal;
 		total = total + shaping;
 		report["GCRL/Potential Goal Mean"] = TensorMean(phiGoal);
 		report["GCRL/Shaping Goal AbsMean"] = TensorMean(shaping.abs());
@@ -779,19 +825,22 @@ torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
 
 	// Car head (offense): contact goal (single -> soft-max is a no-op).
 	if (carContrastiveLearner) {
-		torch::Tensor phiCar = ComputeHeadPotential(carContrastiveLearner, s, masks, contactGoal.to(device),
-			1.0f, cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
-		torch::Tensor shaping = phiToShaping(phiCar);
+		torch::Tensor carGoal = contactGoal.to(device);
+		torch::Tensor phiCar = ComputeHeadPotential(carContrastiveLearner, s, sampledActions, carGoal, 1.0f, numActions, cfg.policyScoreBatchSize);
+		torch::Tensor phiCarTrunc = hasTrunc
+			? ComputeHeadPotential(carContrastiveLearner, truncS, truncSampled, carGoal, 1.0f, numActions, cfg.policyScoreBatchSize)
+			: torch::Tensor();
+		torch::Tensor shaping = gaeGamma * phiNextOf(phiCar, phiCarTrunc) - phiCar;
 		total = total + shaping;
 		report["GCRL/Potential Car Mean"] = TensorMean(phiCar);
 		report["GCRL/Shaping Car AbsMean"] = TensorMean(shaping.abs());
 	}
 
-	// Defense head: reuse phiGoal (each row = that agent's scoring reachability), regroup by (arena,step),
-	// aggregate the agent's opponents into a threat. Negated -> safer state = higher potential.
+	// Defense head: reuse phiGoal regrouped over opponents. No truncation bootstrap (trunc next-states
+	// have no opponent grouping), so Phi_defense(s')=0 at every boundary (mid-episode term only).
 	if (cfg.potentialDefense && defenseGroupKeys.defined() && defenseGroupKeys.size(0) == n) {
 		torch::Tensor phiDef = ComputeDefensePotential(phiGoal, defenseGroupKeys, defenseTeams, cfg.potentialScoringTemp).to(device);
-		torch::Tensor shaping = phiToShaping(phiDef);
+		torch::Tensor shaping = gaeGamma * (phiDef.index_select(0, nextRowT) * midSelT) - phiDef;
 		total = total + shaping;
 		report["GCRL/Potential Defense Mean"] = TensorMean(phiDef);
 		report["GCRL/Shaping Defense AbsMean"] = TensorMean(shaping.abs());

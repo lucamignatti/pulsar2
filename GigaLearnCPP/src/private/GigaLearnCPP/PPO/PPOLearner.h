@@ -78,8 +78,8 @@ namespace GGL {
 		// (previous-iteration) critics, to be added to the reward stream BEFORE GAE. contactGoal [1,6]
 		// is the car head's fixed goal; scoringRangeGoals [K,6] are the goal head's mouth samples.
 		torch::Tensor ComputePotentialShaping(
-			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
-			float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
+			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds, torch::Tensor terminals,
+			torch::Tensor truncNextStates, float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals,
 			torch::Tensor defenseGroupKeys, torch::Tensor defenseTeams, Report& report);
 
 		void TransferLearn(

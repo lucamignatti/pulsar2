@@ -1119,9 +1119,17 @@ void GGL::Learner::Start() {
 						report["HER Total Relabel Rows"] = (float)herTotalRows;
 					}
 
-					// Potential-based GCRL shaping: add gamma*Phi(s')-Phi(s) per head to the reward
-					// stream BEFORE GAE (the unified consumption; replaces the advantage blend, which
-					// is skipped in PPOLearner::Learn for this mode).
+					// States we truncated at (there could be none). Built before the shaping so the
+					// potential can bootstrap Phi at truncation boundaries.
+					torch::Tensor tNextTruncStates;
+					if (!combinedTraj.nextStates.empty())
+						tNextTruncStates = torch::tensor(combinedTraj.nextStates).reshape({ -1, obsSize });
+
+					// Potential-based GCRL shaping F = gamma*Phi(s')-Phi(s) per head. It is NOT added to the
+					// reward stream -- it's handed to BuildTrainingBatch as an ADVANTAGE-only term (a 2nd GAE
+					// pass), so the value critic trains on the sparse reward only and never chases the
+					// nonstationary GCRL potential. Phi is on-policy (policy-sampled) and bootstraps at truncations.
+					torch::Tensor tShapingF;
 					if (config.ppo.contrastiveGoal.enabled && config.ppo.contrastiveGoal.usePotentialShaping) {
 						auto& gcfg = config.ppo.contrastiveGoal;
 						// Car head fixed goal: contact (car-local ball at origin) -> zeros (normalization-agnostic).
@@ -1141,16 +1149,10 @@ void GGL::Learner::Start() {
 						torch::Tensor scoringRange = torch::tensor(rangeF).reshape({ (int64_t)kg, 6 });
 						torch::Tensor tGroupKeys = torch::tensor(combinedTraj.defenseGroupKeys, torch::TensorOptions().dtype(torch::kInt64));
 						torch::Tensor tTeams = torch::tensor(combinedTraj.defenseTeams, torch::TensorOptions().dtype(torch::kInt8));
-						torch::Tensor shaping = ppo->ComputePotentialShaping(
-							tStates, tActionMasks, tSegmentIds, config.ppo.gaeGamma, contactGoal, scoringRange,
-							tGroupKeys, tTeams, report);
-						tRewards = tRewards + shaping.to(tRewards.options());
+						tShapingF = ppo->ComputePotentialShaping(
+							tStates, tActionMasks, tSegmentIds, tTerminals, tNextTruncStates,
+							config.ppo.gaeGamma, contactGoal, scoringRange, tGroupKeys, tTeams, report);
 					}
-
-					// States we truncated at (there could be none)
-					torch::Tensor tNextTruncStates;
-					if (!combinedTraj.nextStates.empty())
-						tNextTruncStates = torch::tensor(combinedTraj.nextStates).reshape({ -1, obsSize });
 
 					report["Average Step Reward"] = tRewards.mean().item<float>();
 					report["Collected Timesteps"] = stepsCollected;
@@ -1201,6 +1203,7 @@ void GGL::Learner::Start() {
 					batchIn.terminals = tTerminals;
 					batchIn.valPreds = tValPreds;
 					batchIn.truncValPreds = tTruncValPreds;
+					batchIn.shapingF = tShapingF; // potential shaping -> advantage only (undefined unless potential mode)
 					batchIn.gcrlEnabled = config.ppo.contrastiveGoal.enabled;
 					if (batchIn.gcrlEnabled) {
 						batchIn.achievedGoals = tAchievedGoals;

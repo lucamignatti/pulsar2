@@ -22,6 +22,10 @@ namespace GGL {
 		torch::Tensor valPreds;       // [N]
 		torch::Tensor truncValPreds;  // [numTruncations] (may be undefined)
 
+		// Potential-based GCRL shaping reward per step (may be undefined). Added to the rewards for
+		// the ADVANTAGE only (a second GAE pass); the value target + return stat stay on sparse rewards.
+		torch::Tensor shapingF;
+
 		// Goal-conditioning (GCRL) tensors. Only consulted when gcrlEnabled.
 		bool gcrlEnabled = false;
 		torch::Tensor achievedGoals, herGoals, carHerGoals, scoringGoals, gcrlTrainMask, segmentIds, segmentSteps;

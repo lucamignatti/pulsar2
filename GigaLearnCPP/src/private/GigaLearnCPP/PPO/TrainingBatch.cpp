@@ -26,12 +26,26 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 				", carHerGoals=" << in.carHerGoals.size(0));
 	}
 
-	// Advantages via GAE. Reads the pre-update return std the caller supplied.
+	// Value targets + the running-return stat come from the SPARSE rewards: the value critic learns the
+	// true task value, not the shaped value V-Phi, so it never chases the nonstationary GCRL potential.
 	GAE::Compute(
 		in.rewards, in.terminals, in.valPreds, in.truncValPreds,
 		result.advantages, result.targetValues, result.returns, result.rewClipPortion,
 		in.gaeGamma, in.gaeLambda, in.returnStd, in.rewardClipRange
 	);
+
+	// The policy ADVANTAGE uses the shaped reward (sparse + potential shaping) via a second GAE pass
+	// sharing the same sparse return std -- potential-based shaping affects the advantage only.
+	if (in.shapingF.defined() && in.shapingF.size(0) == expRows) {
+		torch::Tensor shapedAdv, shapedTargets, shapedReturns;
+		float shapedClip;
+		GAE::Compute(
+			in.rewards + in.shapingF, in.terminals, in.valPreds, in.truncValPreds,
+			shapedAdv, shapedTargets, shapedReturns, shapedClip,
+			in.gaeGamma, in.gaeLambda, in.returnStd, in.rewardClipRange
+		);
+		result.advantages = shapedAdv; // targetValues + returns stay sparse
+	}
 
 	result.avgReturn = result.returns.abs().mean().item<float>();
 	result.avgAdvantage = result.advantages.abs().mean().item<float>();
