@@ -73,6 +73,14 @@ namespace GGL {
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);
 
+		// Potential-based GCRL shaping (used when config.contrastiveGoal.usePotentialShaping): returns
+		// a per-row reward addon summing gamma*Phi_k(s') - Phi_k(s) over heads, computed from the current
+		// (previous-iteration) critics, to be added to the reward stream BEFORE GAE. contactGoal [1,6]
+		// is the car head's fixed goal; scoringRangeGoals [K,6] are the goal head's mouth samples.
+		torch::Tensor ComputePotentialShaping(
+			torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
+			float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals, Report& report);
+
 		void TransferLearn(
 			ModelSet& oldModels, 
 			torch::Tensor newObs, torch::Tensor oldObs, 

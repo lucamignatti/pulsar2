@@ -291,6 +291,46 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	return takenScores - baselineScores;
 }
 
+// Phi_head(s) = mean over K_a baseline (random valid) actions of a soft-max over the goal set of the
+// head's contrastive reachability score. A single-goal set (car contact) makes the soft-max a no-op.
+// Action-marginalized => a clean (action-independent) state potential. Chunked to bound memory.
+static torch::Tensor ComputeHeadPotential(
+	GGL::ContrastiveGoalLearner* critic,
+	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor goals,
+	float temp, int baselineSamples, int64_t numActions, int64_t chunkSize
+) {
+	RG_NO_GRAD;
+	int64_t n = states.size(0);
+	int64_t numGoals = goals.size(0);
+	int samples = RS_MAX(1, baselineSamples);
+	float safeTemp = RS_MAX(1e-3f, temp);
+	if (chunkSize <= 0)
+		chunkSize = n;
+
+	torch::Tensor phi = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(states.device()));
+	for (int64_t start = 0; start < n; start += chunkSize) {
+		int64_t stop = RS_MIN(start + chunkSize, n);
+		int64_t m = stop - start;
+		torch::Tensor sChunk = states.slice(0, start, stop);
+		torch::Tensor maskChunk = actionMasks.slice(0, start, stop);
+		torch::Tensor acc = torch::zeros({ m }, phi.options());
+		for (int k = 0; k < samples; k++) {
+			torch::Tensor aRep = OneHotActions(SampleValidActions(maskChunk), numActions);
+			torch::Tensor scores = torch::zeros({ m, numGoals }, phi.options());
+			for (int64_t g = 0; g < numGoals; g++) {
+				torch::Tensor gRow = goals.slice(0, g, g + 1).expand({ m, goals.size(1) });
+				scores.select(1, g).copy_(critic->Score(sChunk, aRep, gRow));
+			}
+			torch::Tensor agg = (numGoals > 1)
+				? (safeTemp * torch::logsumexp(scores / safeTemp, 1))
+				: scores.select(1, 0);
+			acc = acc + agg;
+		}
+		phi.slice(0, start, stop).copy_(acc / (float)samples);
+	}
+	return phi;
+}
+
 static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::ExperienceBuffer& experience, GGL::Report& report, uint64_t totalTimesteps) {
 	if (!learner->config.contrastiveGoal.enabled)
 		return;
@@ -407,7 +447,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
 		}
 
-		PrepareGCRLPolicyAdvantages(this, experience, report, totalTimesteps);
+		// In potential-shaping mode GCRL enters via reward shaping (done pre-GAE in the collector),
+		// so the advantage-blend is skipped -- the critics are still trained above.
+		if (!config.contrastiveGoal.usePotentialShaping)
+			PrepareGCRLPolicyAdvantages(this, experience, report, totalTimesteps);
 	}
 
 	{
@@ -653,6 +696,54 @@ void GGL::PPOLearner::TransferLearn(
 
 	auto policyAfter = models["policy"]->CopyParams();
 	report["Policy Update Magnitude"] = (policyBefore - policyAfter).norm().item<float>();
+}
+
+torch::Tensor GGL::PPOLearner::ComputePotentialShaping(
+	torch::Tensor states, torch::Tensor actionMasks, torch::Tensor segmentIds,
+	float gaeGamma, torch::Tensor contactGoal, torch::Tensor scoringRangeGoals, Report& report
+) {
+	RG_NO_GRAD;
+	auto& cfg = config.contrastiveGoal;
+	torch::Tensor s = states.to(device);
+	torch::Tensor masks = actionMasks.to(device);
+	torch::Tensor seg = segmentIds.to(device).to(torch::kLong);
+	int64_t n = s.size(0);
+	if (n <= 1)
+		return torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32));
+
+	// Episode-boundary mask: sameNext[i] = (segment(i+1) == segment(i)); last row = false. Where false,
+	// Phi(s') is treated as 0 (terminal potential), so each episode's shaping telescopes cleanly.
+	torch::Tensor eq = (seg.slice(0, 1, n) == seg.slice(0, 0, n - 1)).to(torch::kFloat32);
+	torch::Tensor sameNext = torch::cat({ eq, torch::zeros({ 1 }, eq.options()) }, 0);
+
+	torch::Tensor total = torch::zeros({ n }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+	auto headShaping = [&](GGL::ContrastiveGoalLearner* critic, torch::Tensor goals, float temp) -> torch::Tensor {
+		torch::Tensor phi = ComputeHeadPotential(critic, s, masks, goals.to(device), temp,
+			cfg.baselineActionSamples, numActions, cfg.policyScoreBatchSize);
+		torch::Tensor phiNext = torch::cat({ phi.slice(0, 1, n), torch::zeros({ 1 }, phi.options()) }, 0) * sameNext;
+		torch::Tensor shaping = gaeGamma * phiNext - phi;
+		return torch::stack({ phi, shaping });  // [2, n]
+	};
+
+	// Goal head: soft-max over the scoring-mouth range (in-distribution-self-selecting).
+	{
+		torch::Tensor r = headShaping(contrastiveGoalLearner, scoringRangeGoals, cfg.potentialScoringTemp);
+		total = total + r[1];
+		report["GCRL/Potential Goal Mean"] = TensorMean(r[0]);
+		report["GCRL/Shaping Goal AbsMean"] = TensorMean(r[1].abs());
+	}
+	// Car head: contact goal (single -> soft-max is a no-op).
+	if (carContrastiveLearner) {
+		torch::Tensor r = headShaping(carContrastiveLearner, contactGoal, 1.0f);
+		total = total + r[1];
+		report["GCRL/Potential Car Mean"] = TensorMean(r[0]);
+		report["GCRL/Shaping Car AbsMean"] = TensorMean(r[1].abs());
+	}
+
+	total = total * cfg.potentialShapingScale;
+	report["GCRL/Shaping Total AbsMean"] = TensorMean(total.abs());
+	return total.detach().to(torch::kCPU);
 }
 
 void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {

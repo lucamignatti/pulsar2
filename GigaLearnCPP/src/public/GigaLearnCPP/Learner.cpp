@@ -1104,6 +1104,31 @@ void GGL::Learner::Start() {
 						report["HER Total Relabel Rows"] = (float)herTotalRows;
 					}
 
+					// Potential-based GCRL shaping: add gamma*Phi(s')-Phi(s) per head to the reward
+					// stream BEFORE GAE (the unified consumption; replaces the advantage blend, which
+					// is skipped in PPOLearner::Learn for this mode).
+					if (config.ppo.contrastiveGoal.enabled && config.ppo.contrastiveGoal.usePotentialShaping) {
+						auto& gcfg = config.ppo.contrastiveGoal;
+						// Car head fixed goal: contact (car-local ball at origin) -> zeros (normalization-agnostic).
+						FList contactF(6, 0.f);
+						// Goal head fixed goals: a range of points across the opponent goal mouth (canonical +y),
+						// crossing into the net at targetSpeed; same cfg normalization as herGoals.
+						FList rangeF;
+						int kg = RS_MAX(1, gcfg.scoringRangeSamples);
+						float targetXRange = CommonValues::GOAL_WIDTH_FROM_CENTER - CommonValues::BALL_RADIUS;
+						for (int i = 0; i < kg; i++) {
+							float t = (kg == 1) ? 0.5f : (float)i / (float)(kg - 1);
+							Vec pos(-targetXRange + t * (2.f * targetXRange), CommonValues::BACK_WALL_Y, CommonValues::GOAL_HEIGHT * 0.5f);
+							Vec vel(0.f, gcfg.targetSpeed, 0.f);
+							AppendNormalizedGoal(rangeF, pos, vel, gcfg);
+						}
+						torch::Tensor contactGoal = torch::tensor(contactF).reshape({ 1, 6 });
+						torch::Tensor scoringRange = torch::tensor(rangeF).reshape({ (int64_t)kg, 6 });
+						torch::Tensor shaping = ppo->ComputePotentialShaping(
+							tStates, tActionMasks, tSegmentIds, config.ppo.gaeGamma, contactGoal, scoringRange, report);
+						tRewards = tRewards + shaping.to(tRewards.options());
+					}
+
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
 					if (!combinedTraj.nextStates.empty())

@@ -52,6 +52,20 @@ namespace GGL {
 		uint64_t gcrlLambdaWarmupSteps = 30'000'000;
 		float gcrlSepClamp = 3.f;
 
+		// ── Potential-based shaping (the unified consumption; vs the magnitude-blend above) ──
+		// When usePotentialShaping is true, GCRL enters as potential-based reward shaping
+		// reward_k = gamma*Phi_k(s') - Phi_k(s) added to the reward stream BEFORE GAE, instead of
+		// the advantage blend (PrepareGCRLPolicyAdvantages is skipped). Phi_k(s) = mean over
+		// baselineActionSamples random actions of the head's reachability toward a FIXED shaping-goal:
+		//   car  -> contact (car-local ball at origin),
+		//   goal -> soft-max over scoringRangeSamples goal-mouth points (temperature potentialScoringTemp).
+		// Policy-invariant (Ng'99) and farming-proof (deltas telescope). Default false = the
+		// magnitude-blend advantage, kept as the A/B baseline. Defense + shared-base are follow-ups.
+		bool usePotentialShaping = false;
+		float potentialShapingScale = 0.3f;   // weight on the summed per-head shaping reward
+		int scoringRangeSamples = 5;          // goal-mouth x-samples defining the goal head's range
+		float potentialScoringTemp = 1.0f;    // soft-max temperature over the scoring range (->0 = hard max)
+
 		int representationSize = 128;
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
