@@ -115,9 +115,8 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// Bootstrap-debug run is 1v1 (see playersPerTeam below); keep total simulated
-	// cars (~10k) near the 3v3 setup so iteration time stays comparable.
-	cfg.numGames = 5120;
+	// 3v3 SOCCAR: 1700 games * 6 cars ~= 10,200 simulated cars (the original setup).
+	cfg.numGames = 1700;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
