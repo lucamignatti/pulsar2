@@ -25,7 +25,10 @@ GGL::Model::Model(
 	if (config.addOutputLayer) {
 		seq->push_back(torch::nn::Linear(lastSize, config.numOutputs));
 	} else {
-		config.numOutputs = config.layerSizes.back();
+		// No output layer -> the trunk's output width is its last hidden layer.
+		// Write to the member (this->config), not the by-value parameter, so readers
+		// like ContrastiveGoalLearner see the real embedding size (was silently 0).
+		this->config.numOutputs = config.layerSizes.back();
 	}
 
 	register_module("seq", seq);
