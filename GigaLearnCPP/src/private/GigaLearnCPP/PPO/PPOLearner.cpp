@@ -32,25 +32,29 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			RG_ERR_CLOSE("PPOLearner: contrastiveGoal.sigmaFloor must be finite and positive");
 		if (cfg.posScaleX == 0 || cfg.posScaleY == 0 || cfg.posScaleZ == 0 || cfg.velScale == 0)
 			RG_ERR_CLOSE("PPOLearner: contrastive goal normalization scales must be non-zero");
+		if (!config.sharedHead.IsValid())
+			RG_ERR_CLOSE("PPOLearner: contrastiveGoal requires a sharedHead (phi = shared_head + phi_tail)");
 	}
 
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
 	SetLearningRates(config.policyLR, config.criticLR);
 
-	if (config.contrastiveGoal.enabled) {
-		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device);
-		RG_LOG("GCRL scoring auxiliary enabled with separate critic encoders");
-		if (config.contrastiveGoal.useCarCritic) {
-			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
-			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, "gcrl_car", true, false);
-			RG_LOG("GCRL car critic enabled (egocentric controllability)");
-		}
-	}
-
+	// RSNorm must be created before GCRL so the pointer passed to the GCRL learners is valid.
 	if (config.rsNorm.enabled) {
 		obsNorm = new RSNorm(obsSize, config.rsNorm.eps, config.rsNorm.initVar, config.rsNorm.initCount, config.rsNorm.clipRange);
 		RG_LOG("RSNorm (running observation normalization) enabled over " << obsSize << " dims");
+	}
+
+	if (config.contrastiveGoal.enabled) {
+		Model* sh = models["shared_head"];
+		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, sh, obsNorm);
+		RG_LOG("GCRL scoring auxiliary enabled (phi = shared_head + phi_tail)");
+		if (config.contrastiveGoal.useCarCritic) {
+			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
+			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, sh, obsNorm, "gcrl_car", true, false);
+			RG_LOG("GCRL car critic enabled (egocentric controllability)");
+		}
 	}
 
 	// Print param counts
@@ -220,9 +224,10 @@ static torch::Tensor OneHotActions(torch::Tensor actions, int64_t numActions) {
 	return result.scatter_(1, actions.unsqueeze(1), 1.f);
 }
 
-static torch::Tensor ScoreGCRLChunks(GGL::ContrastiveGoalLearner* learner, torch::Tensor states, torch::Tensor actions, torch::Tensor goals, int64_t numActions, int64_t chunkSize) {
+// embeddings: pre-computed shared_head output [N, embeddingDim], already detached.
+static torch::Tensor ScoreGCRLChunks(GGL::ContrastiveGoalLearner* learner, torch::Tensor embeddings, torch::Tensor actions, torch::Tensor goals, int64_t numActions, int64_t chunkSize) {
 	std::vector<torch::Tensor> chunks;
-	int64_t n = states.size(0);
+	int64_t n = embeddings.size(0);
 	if (chunkSize <= 0)
 		chunkSize = n;
 
@@ -231,7 +236,7 @@ static torch::Tensor ScoreGCRLChunks(GGL::ContrastiveGoalLearner* learner, torch
 		int64_t stop = RS_MIN(start + chunkSize, n);
 		torch::Tensor actionRepresentations = OneHotActions(actions.slice(0, start, stop), numActions);
 		chunks.push_back(learner->Score(
-			states.slice(0, start, stop),
+			embeddings.slice(0, start, stop),
 			actionRepresentations,
 			goals.slice(0, start, stop)
 		));
@@ -245,9 +250,12 @@ static torch::Tensor SampleValidActions(torch::Tensor actionMasks) {
 	return torch::multinomial(weights, 1, true).flatten().to(torch::kLong);
 }
 
+// embeddings: shared_head output for all states [N, embeddingDim], already detached.
+// Baseline samples are batched into a single forward pass: states/goals tiled N_samples
+// times, all random action draws stacked, one ScoreGCRLChunks call instead of N_samples.
 static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	GGL::ContrastiveGoalLearner* learner,
-	torch::Tensor states,
+	torch::Tensor embeddings,
 	torch::Tensor actions,
 	torch::Tensor actionMasks,
 	torch::Tensor goals,
@@ -258,30 +266,46 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 	torch::Tensor* outBaselineScores,
 	torch::Tensor* outBaselineSpread
 ) {
-	torch::Tensor takenScores = ScoreGCRLChunks(learner, states, actions, goals, numActions, chunkSize);
-	torch::Tensor baselineSum = torch::zeros_like(takenScores);
-	torch::Tensor baselineSqSum = torch::zeros_like(takenScores);
-
-	if (baselineSamples > 0) {
-		for (int i = 0; i < baselineSamples; i++) {
-			torch::Tensor altActions = SampleValidActions(actionMasks);
-			torch::Tensor s = ScoreGCRLChunks(learner, states, altActions, goals, numActions, chunkSize);
-			baselineSum += s;
-			baselineSqSum += s * s;
-		}
-	}
-
-	torch::Tensor baselineScores = (baselineSamples > 0) ? (baselineSum / baselineSamples) : baselineSum;
+	torch::Tensor takenScores = ScoreGCRLChunks(learner, embeddings, actions, goals, numActions, chunkSize);
 
 	if (outTakenScores)
 		*outTakenScores = takenScores;
+
+	if (baselineSamples <= 0) {
+		torch::Tensor zero = torch::zeros_like(takenScores);
+		if (outBaselineScores) *outBaselineScores = zero;
+		if (outBaselineSpread) *outBaselineSpread = zero;
+		return takenScores;
+	}
+
+	int64_t n = embeddings.size(0);
+
+	// Draw all baseline action samples up front.
+	std::vector<torch::Tensor> altActionSamples(baselineSamples);
+	for (int i = 0; i < baselineSamples; i++)
+		altActionSamples[i] = SampleValidActions(actionMasks);
+
+	// Tile embeddings and goals [n*baselineSamples, D]:
+	// repeat({k,1}) on [n,D] gives [copy0_states..., copy1_states..., ...],
+	// which aligns with cat(altActionSamples, 0) = [sample0_actions..., sample1_actions..., ...].
+	torch::Tensor tiledEmbeddings = embeddings.repeat({ (int64_t)baselineSamples, 1 });
+	torch::Tensor tiledGoals = goals.repeat({ (int64_t)baselineSamples, 1 });
+	torch::Tensor stackedActions = torch::cat(altActionSamples, 0);
+
+	// One forward pass for all baseline samples combined.
+	torch::Tensor allScores = ScoreGCRLChunks(learner, tiledEmbeddings, stackedActions, tiledGoals, numActions, chunkSize);
+	// Reshape to [baselineSamples, n]: row i = scores under sample-i random actions.
+	allScores = allScores.view({ (int64_t)baselineSamples, n });
+
+	torch::Tensor baselineScores = allScores.mean(0);
+
 	if (outBaselineScores)
 		*outBaselineScores = baselineScores;
 	if (outBaselineSpread) {
-		// Within-state spread of the random-action baseline scores: the noise floor
-		// the taken-action edge must beat to count as real action-discrimination.
+		// Within-state variance across the baseline samples: noise floor for action-discrimination.
 		if (baselineSamples > 1) {
-			torch::Tensor var = (baselineSqSum / baselineSamples) - baselineScores * baselineScores;
+			torch::Tensor centered = allScores - baselineScores.unsqueeze(0);
+			torch::Tensor var = centered.pow(2).mean(0);
 			*outBaselineSpread = var.clamp_min(0).sqrt();
 		} else {
 			*outBaselineSpread = torch::zeros_like(takenScores);
@@ -309,9 +333,15 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	report["PPO Advantage Mean"] = TensorMean(baseAdvRaw);
 	report["PPO Advantage Std"] = TensorStd(baseAdvRaw);
 
-	torch::Tensor states = experience.data.states.to(device);
+	torch::Tensor rawStates = experience.data.states.to(device);
 	torch::Tensor actions = experience.data.actions.to(device).to(torch::kLong);
 	torch::Tensor actionMasks = experience.data.actionMasks.to(device);
+
+	// Compute shared_head embeddings once; both GCRL critics reuse this tensor.
+	// Apply RSNorm first if enabled (consistent with how actor/critic use the trunk).
+	torch::Tensor normStates = learner->obsNorm ? learner->obsNorm->Normalize(rawStates) : rawStates;
+	torch::Tensor embeddings = learner->models["shared_head"]->Forward(normStates, false).detach();
+
 	// Magnitude-blend: each critic's per-row advantage is (taken - mean_baseline) /
 	// (baseline_spread + sigmaFloor), clamped, and NOT renormalized to unit std. A
 	// critic that can't discriminate the action -> numerator ~0 -> contributes
@@ -320,7 +350,7 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	auto criticSep = [&](GGL::ContrastiveGoalLearner* critic, torch::Tensor goals) {
 		torch::Tensor taken, baseline, spread;
 		torch::Tensor edge = ComputeGCRLAdvantageWithBaseline(
-			critic, states, actions, actionMasks, goals,
+			critic, embeddings, actions, actionMasks, goals,
 			learner->numActions, cfg.policyScoreBatchSize, cfg.baselineActionSamples,
 			&taken, &baseline, &spread);
 		torch::Tensor sep = torch::clamp(edge / (spread + cfg.sigmaFloor), -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
@@ -336,7 +366,7 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 
 	bool carActive = cfg.useCarCritic && learner->carContrastiveLearner
 		&& experience.data.carHerGoals.defined()
-		&& experience.data.carHerGoals.size(0) == states.size(0);
+		&& experience.data.carHerGoals.size(0) == rawStates.size(0);
 	if (carActive) {
 		// Car critic: egocentric car-local ball (controllability), short-horizon goals.
 		auto carRes = criticSep(learner->carContrastiveLearner, experience.data.carHerGoals.to(device));

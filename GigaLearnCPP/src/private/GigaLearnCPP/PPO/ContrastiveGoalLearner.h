@@ -3,6 +3,7 @@
 #include "ExperienceBuffer.h"
 
 #include "../Util/Models.h"
+#include "../Util/RSNorm.h"
 
 namespace GGL {
 
@@ -26,30 +27,35 @@ namespace GGL {
 
 	class ContrastiveGoalLearner {
 	public:
-		// Stable backing storage for the encoder names. Model keeps the const char* as-is,
-		// so the string must outlive the Model -- declared BEFORE the encoders so it is
-		// constructed first. (Passing a temporary's c_str() here is a use-after-free.)
-		std::string phiName, psiName;
-		Model stateActionEncoder;
+		// Stable backing storage for the encoder names (must outlive the Model that holds c_str()).
+		std::string phiTailName, psiName;
+		// phi tail: action-fusion MLP on top of the shared_head embedding (non-owning ptr).
+		// Input = cat(shared_head(obs).detach(), one_hot(action)).
+		Model phiTail;
 		Model goalEncoder;
+		// Non-owning. shared_head is owned and checkpointed by PPOLearner.
+		Model* sharedHead = nullptr;
+		// Non-owning. Applied to obs before shared_head (consistent with actor/critic).
+		const RSNorm* obsNorm = nullptr;
+
 		ContrastiveGoalConfig config;
 		torch::Device device;
 		int obsSize;
 		int actionRepresentationSize;
 
-		// useCarGoals: train/score against data.carHerGoals (egocentric ball) instead of data.herGoals.
-		// applyTrainMask: when false, ignore the ball-moved gcrlTrainMask -- the car critic learns
-		// controllability even on episodes where the ball never moved. namePrefix keeps the two
-		// critics' encoders (and checkpoint files) distinct.
 		bool useCarGoals = false;
 		bool applyTrainMask = true;
 
+		// sharedHead: the PPO actor/critic trunk (owned by PPOLearner).
+		// obsNorm:    optional running normalizer applied before sharedHead (may be null).
 		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
+			Model* sharedHead, const RSNorm* obsNorm = nullptr,
 			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true);
 
-		torch::Tensor EncodeStateAction(torch::Tensor states, torch::Tensor actionRepresentations);
+		// embeddings: output of shared_head(obs).detach() — [N, embeddingDim]
+		torch::Tensor EncodeStateAction(torch::Tensor embeddings, torch::Tensor actionRepresentations);
 		torch::Tensor EncodeGoal(torch::Tensor goals);
-		torch::Tensor Score(torch::Tensor states, torch::Tensor actionRepresentations, torch::Tensor goals);
+		torch::Tensor Score(torch::Tensor embeddings, torch::Tensor actionRepresentations, torch::Tensor goals);
 
 		ContrastiveGoalStats Train(ExperienceTensors& data, std::default_random_engine& rng);
 

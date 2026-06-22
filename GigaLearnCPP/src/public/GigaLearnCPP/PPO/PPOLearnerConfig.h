@@ -53,6 +53,9 @@ namespace GGL {
 		float gcrlSepClamp = 3.f;
 
 		int representationSize = 128;
+		// Hidden layers of the phi tail (action-fusion network on top of the shared_head embedding).
+		// Input = shared_head output size + numActions; output = representationSize.
+		std::vector<int> phiTailLayerSizes = { 256, 256 };
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
 		int64_t policyScoreBatchSize = 4096;

@@ -6,7 +6,19 @@ using namespace torch;
 
 namespace GGL {
 
-	static ModelConfig MakeEncoderConfig(int inputSize, int reprSize) {
+	static ModelConfig MakePhiTailConfig(int embeddingSize, int actionSize, int reprSize, const std::vector<int>& layerSizes) {
+		ModelConfig result = PartialModelConfig{};
+		result.layerSizes = layerSizes;
+		result.activationType = ModelActivationType::SWISH;
+		result.optimType = ModelOptimType::ADAM;
+		result.addLayerNorm = true;
+		result.addOutputLayer = true;
+		result.numInputs = embeddingSize + actionSize;
+		result.numOutputs = reprSize;
+		return result;
+	}
+
+	static ModelConfig MakePsiConfig(int inputSize, int reprSize) {
 		ModelConfig result = PartialModelConfig{};
 		result.layerSizes = { 1024, 1024, 1024, 1024 };
 		result.activationType = ModelActivationType::SWISH;
@@ -23,18 +35,28 @@ namespace GGL {
 	}
 
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
+		Model* sharedHead, const RSNorm* obsNorm,
 		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask) :
-		phiName(namePrefix + "_phi"),
+		phiTailName(namePrefix + "_phi_tail"),
 		psiName(namePrefix + "_psi"),
-		stateActionEncoder(phiName.c_str(), MakeEncoderConfig(obsSize + actionRepresentationSize, config.representationSize), device),
-		goalEncoder(psiName.c_str(), MakeEncoderConfig(6, config.representationSize), device),
+		phiTail(
+			phiTailName.c_str(),
+			MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
+			device
+		),
+		goalEncoder(psiName.c_str(), MakePsiConfig(6, config.representationSize), device),
+		sharedHead(sharedHead), obsNorm(obsNorm),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
 	}
 
-	Tensor ContrastiveGoalLearner::EncodeStateAction(Tensor states, Tensor actionRepresentations) {
-		Tensor raw = stateActionEncoder.Forward(torch::cat({ states, actionRepresentations.to(kFloat32).to(states.device()) }, -1), false);
+	// embeddings: shared_head(obs).detach() — already normalized and truncated at trunk
+	Tensor ContrastiveGoalLearner::EncodeStateAction(Tensor embeddings, Tensor actionRepresentations) {
+		Tensor raw = phiTail.Forward(
+			torch::cat({ embeddings, actionRepresentations.to(kFloat32).to(embeddings.device()) }, -1),
+			false
+		);
 		return L2Normalize(raw);
 	}
 
@@ -43,8 +65,8 @@ namespace GGL {
 		return L2Normalize(raw);
 	}
 
-	Tensor ContrastiveGoalLearner::Score(Tensor states, Tensor actionRepresentations, Tensor goals) {
-		Tensor sa = EncodeStateAction(states, actionRepresentations);
+	Tensor ContrastiveGoalLearner::Score(Tensor embeddings, Tensor actionRepresentations, Tensor goals) {
+		Tensor sa = EncodeStateAction(embeddings, actionRepresentations);
 		Tensor g = EncodeGoal(goals);
 		return (sa * g).sum(-1) / config.tau;
 	}
@@ -52,8 +74,6 @@ namespace GGL {
 	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
 		ContrastiveGoalStats stats;
 
-		// Goal source: the car critic trains against the egocentric carHerGoals; the
-		// ball/goal critic against herGoals.
 		torch::Tensor goalsAll = useCarGoals ? data.carHerGoals : data.herGoals;
 
 		if (
@@ -74,14 +94,9 @@ namespace GGL {
 		if (config.infoSubSample > 0)
 			miniBatchSize = RS_MIN(miniBatchSize, config.infoSubSample);
 
-		// On-device running sum of per-batch metrics; synced to the host once after the loop
-		// instead of ~9 .item() device syncs per minibatch.
 		Tensor metricAccum;
 		int64_t batches = 0;
 
-		// (2B) Only train on rows whose match saw real ball movement; a dead
-		// kickoff->timeout match would just reteach the stationary-ball manifold.
-		// Advantage scoring (PrepareGCRLPolicyAdvantages) still uses every row.
 		std::vector<int64_t> indices;
 		if (applyTrainMask && data.gcrlTrainMask.defined() && data.gcrlTrainMask.size(0) == n) {
 			Tensor maskCpu = data.gcrlTrainMask.to(kCPU).contiguous();
@@ -120,7 +135,12 @@ namespace GGL {
 				).scatter_(1, actions.unsqueeze(1), 1.f);
 				Tensor goals = goalsAll.index_select(0, tIndices.to(goalsAll.device())).to(device);
 
-				Tensor sa = EncodeStateAction(states, actionRepresentations);
+				// Run shared_head with stop-gradient: GCRL trains only the phi tail.
+				if (obsNorm)
+					states = obsNorm->Normalize(states);
+				Tensor embeddings = sharedHead->Forward(states, false).detach();
+
+				Tensor sa = EncodeStateAction(embeddings, actionRepresentations);
 				Tensor g = EncodeGoal(goals);
 
 				Tensor logits = torch::matmul(sa, g.transpose(0, 1)) / config.tau;
@@ -141,15 +161,14 @@ namespace GGL {
 
 				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + varPenalty;
 
-				stateActionEncoder.optim->zero_grad();
+				phiTail.optim->zero_grad();
 				goalEncoder.optim->zero_grad();
 				loss.backward();
-				stateActionEncoder.StepOptim();
+				phiTail.StepOptim();
 				goalEncoder.StepOptim();
 
 				{
 					torch::NoGradGuard noGrad;
-					// curBatchSize > 1 is guaranteed above, so the off-diagonal (negatives) is never empty.
 					Tensor positiveLogits = logits.diag();
 					Tensor negativeLogits = logits.masked_select(~diag);
 					Tensor rowCorrect = logits.argmax(1).eq(labels).to(kFloat);
@@ -190,17 +209,17 @@ namespace GGL {
 	}
 
 	void ContrastiveGoalLearner::Save(std::filesystem::path folder, bool saveOptim) {
-		stateActionEncoder.Save(folder, saveOptim);
+		phiTail.Save(folder, saveOptim);
 		goalEncoder.Save(folder, saveOptim);
 	}
 
 	void ContrastiveGoalLearner::Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim) {
-		stateActionEncoder.Load(folder, allowNotExist, loadOptim);
+		phiTail.Load(folder, allowNotExist, loadOptim);
 		goalEncoder.Load(folder, allowNotExist, loadOptim);
 	}
 
 	void ContrastiveGoalLearner::SetLearningRate(float lr) {
-		stateActionEncoder.SetOptimLR(lr);
+		phiTail.SetOptimLR(lr);
 		goalEncoder.SetOptimLR(lr);
 	}
 }
