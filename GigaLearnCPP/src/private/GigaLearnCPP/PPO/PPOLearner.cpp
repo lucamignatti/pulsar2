@@ -14,6 +14,12 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
 
+	// Adaptive entropy controller starts from the configured fixed scale (clamped
+	// to the ceiling); LoadStats overwrites it from the checkpoint on resume.
+	curEntropyScale = config.entropyScale;
+	if (config.adaptiveEntropy)
+		curEntropyScale = RS_CLAMP(curEntropyScale, 0.f, config.maxEntropyScale);
+
 	if (config.batchSize <= 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize must be positive");
 	if (config.miniBatchSize <= 0)
@@ -526,9 +532,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					avgPolicyLoss += curPolicyLoss;
 
 					if (std::abs(curPolicyLoss) > 1e-12f)
-						avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+						avgRelEntropyLoss += (curEntropy * curEntropyScale) / curPolicyLoss;
 
-					ppoLoss = (policyLoss - entropy * config.entropyScale) * batchSizeRatio;
+					ppoLoss = (policyLoss - entropy * curEntropyScale) * batchSizeRatio;
 
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
@@ -610,8 +616,20 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
 
+	// Adaptive entropy controller: nudge the effective entropy-bonus scale toward
+	// holding this iteration's mean entropy at config.targetEntropy. Raises the
+	// bonus when entropy is below target, lowers it when above; clamped to the
+	// ceiling. Updated AFTER the epochs (this iteration used last iteration's
+	// scale; this sets next iteration's). Persisted via Learner::SaveStats.
+	float curAvgEntropy = avgEntropy.Get();
+	if (config.adaptiveEntropy) {
+		curEntropyScale += config.entropyScaleAdjustRate * (config.targetEntropy - curAvgEntropy);
+		curEntropyScale = RS_CLAMP(curEntropyScale, 0.f, config.maxEntropyScale);
+	}
+
 	// Assemble and return report
-	report["Policy Entropy"] = avgEntropy.Get();
+	report["Policy Entropy"] = curAvgEntropy;
+	report["Entropy Scale"] = curEntropyScale;
 	report["Mean KL Divergence"] = avgDivergence.Get();
 	if (!isFirstIteration) {
 		// These metrics give bad data on the first iteration, which will mess up graph scaling

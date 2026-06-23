@@ -155,6 +155,22 @@ namespace GGL {
 		float criticLR = 3e-4f; // Critic learning rate
 
 		float entropyScale = 0.018f; // The scale of the normalized entropy loss
+
+		// Adaptive entropy controller. A FIXED entropyScale cannot hold an entropy
+		// level: too small and the policy collapses to a deterministic local optimum
+		// (run aooxff9n: entropy 0.73 -> 0.022, never discovered scoring); too large
+		// and the entropy bonus dominates a starved reward (run bgksd0wi). When
+		// adaptiveEntropy is set, the effective scale (PPOLearner::curEntropyScale,
+		// persisted in the checkpoint) is nudged each iteration toward holding the
+		// normalized policy entropy at targetEntropy, capped at maxEntropyScale. This
+		// is the proven recipe from runs g7jf6cwc / ryp4gxwv (rating 345 / 560), lost
+		// in the repo reset and restored here. targetEntropy/maxEntropyScale only
+		// apply when adaptiveEntropy is true.
+		bool adaptiveEntropy = false;
+		float targetEntropy = 0.6f;            // desired normalized entropy in [0,1]
+		float maxEntropyScale = 0.1f;          // ceiling for the adaptive scale
+		float entropyScaleAdjustRate = 0.01f;  // proportional gain per iteration
+
 		// Whether to ignore invalid actions in the entropy calculation.
 		// True means that entropy will be determined only from available actions.
 		// False means that entropy for unavailable actions will be zero, 

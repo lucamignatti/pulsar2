@@ -35,6 +35,13 @@ namespace GGL {
 		int obsSize;
 		int numActions;
 
+		// Adaptive entropy-bonus scale (controller state). Initialized from
+		// config.entropyScale; when config.adaptiveEntropy, updated each Learn()
+		// toward config.targetEntropy and clamped to [0, config.maxEntropyScale].
+		// Persisted in the checkpoint (Learner::SaveStats/LoadStats) and re-clamped
+		// against current config on resume.
+		float curEntropyScale = 0.f;
+
 		PPOLearner(
 			int obsSize, int numActions,
 			PPOLearnerConfig config, torch::Device device

@@ -24,11 +24,21 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 		// Nexto's dense player->ball "dist" approach term, restored (the repo's
 		// nexto transcription dropped it, leaving no cold-start approach signal).
-		// This is the bootstrap; weight is the main knob -- tune to taste.
-		{ teamMixed(new PlayerBallDistanceReward()), 2.f },
+		// This is the bootstrap. Weight lowered 2.0 -> 1.0 to de-emphasize the
+		// ball-race relative to scoring (run aooxff9n won the ball contest but never
+		// converted). Kept ABSOLUTE on purpose: a delta of SafeExpDist would charge a
+		// negative the instant the ball leaves the car, and since scoring ENDS the
+		// episode the bot never re-approaches to recoup it -- a delta would penalize
+		// the scoring strike (the same approach-then-idle trap the potential
+		// framework hit, commit fbd1b7c). Zero-sum already neutralizes mutual camping.
+		{ teamMixed(new PlayerBallDistanceReward()), 1.f },
 
-		// Ball-goal shaping (Nexto goal_dist)
-		{ teamMixed(new BallGoalDistanceReward()), 2.5f },
+		// Ball-goal shaping (Nexto goal_dist). Weight 2.5 -> 10.0: this is a per-step
+		// DELTA that realized ~0 in aooxff9n (no consistent goalward pull) and was
+		// dwarfed by per-step income. It is scoring-POSITIVE (driving the ball toward
+		// net, incl. the goal-scoring strike, gives a positive delta), so unlike the
+		// player->ball term it is safe to amplify -- this is the offense signal.
+		{ teamMixed(new BallGoalDistanceReward()), 10.f },
 
 		// Goals
 		{ teamMixed(new TeamGoalReward()), 12.5f },
@@ -135,11 +145,23 @@ int main(int argc, char* argv[]) {
 
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
-	cfg.ppo.entropyScale = 0.035f;
+	cfg.ppo.entropyScale = 0.035f; // initial/fallback scale; the adaptive controller takes over
+
+	// Adaptive entropy floor. A fixed entropyScale collapsed run aooxff9n to entropy
+	// 0.022 (deterministic, never scored). This is the proven g7jf6cwc/ryp4gxwv recipe:
+	// the controller ramps the entropy bonus up to maxEntropyScale and holds entropy
+	// near targetEntropy (those runs floated ~0.55 at the 0.10 ceiling and reached
+	// rating 345/560). Keeps exploration alive long enough to discover scoring.
+	cfg.ppo.adaptiveEntropy = true;
+	cfg.ppo.targetEntropy = 0.65f;
+	cfg.ppo.maxEntropyScale = 0.10f;
+	cfg.ppo.entropyScaleAdjustRate = 0.01f;
 
 	// Rate of reward decay
-	// Starting low tends to work out
-	cfg.ppo.gaeGamma = 0.99;
+	// 0.995 (~200-step horizon) so the terminal goal propagates back across the
+	// ~1000-step episodes to the buildup; 0.99 (~100 steps) was far too short and
+	// the goal reward never reached the positioning/strike that earned it.
+	cfg.ppo.gaeGamma = 0.995;
 
 	// Good learning rate to start
 	cfg.ppo.policyLR = 1.5e-4;

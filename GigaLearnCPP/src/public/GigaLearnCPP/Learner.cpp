@@ -344,6 +344,11 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (ppo && ppo->obsNorm)
 		j["rsnorm_stat"] = ppo->obsNorm->ToJSON();
 
+	// Adaptive entropy controller state (so a crash-resume doesn't re-ramp from
+	// the fixed seed and dip entropy each restart).
+	if (ppo)
+		j["entropy_scale"] = ppo->curEntropyScale;
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -373,6 +378,14 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	// contains-guard so checkpoints predating RSNorm still load (stats stay at init).
 	if (ppo && ppo->obsNorm && j.contains("rsnorm_stat"))
 		ppo->obsNorm->ReadFromJSON(j["rsnorm_stat"]);
+
+	// Restore the adaptive entropy scale, re-clamped against current config (a
+	// checkpoint predating it keeps the ctor seed). contains-guarded.
+	if (ppo && j.contains("entropy_scale")) {
+		ppo->curEntropyScale = j["entropy_scale"];
+		if (ppo->config.adaptiveEntropy)
+			ppo->curEntropyScale = RS_CLAMP(ppo->curEntropyScale, 0.f, ppo->config.maxEntropyScale);
+	}
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
@@ -1248,6 +1261,7 @@ void GGL::Learner::Start() {
 					{
 						"Average Step Reward",
 						"Policy Entropy",
+						"Entropy Scale",
 						"KL Div Loss",
 						"First Accuracy",
 						"",

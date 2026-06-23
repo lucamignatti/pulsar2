@@ -15,6 +15,7 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 		"Clipped Reward Portion",
 
 		"Policy Entropy",
+		"Entropy Scale",
 		"Mean KL Divergence",
 		"Policy Loss",
 		"Critic Loss",
