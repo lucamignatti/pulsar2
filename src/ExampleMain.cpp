@@ -117,7 +117,7 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
 	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars (hold car count constant vs 3v3's 1700*6).
-	cfg.numGames = 64; // TEMP SMOKE
+	cfg.numGames = 5120;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -199,7 +199,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = false; // TEMP SMOKE
+	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
 
