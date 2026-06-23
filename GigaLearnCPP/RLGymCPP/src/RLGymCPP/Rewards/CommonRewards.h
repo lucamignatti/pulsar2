@@ -268,17 +268,49 @@ namespace RLGC {
 		}
 	};
 
-	// Nexto's dense player->ball "dist" approach term, restored. The repo's nexto
-	// reward transcription dropped the player->ball distance reward (it kept only
-	// ball->goal via BallGoalDistanceReward), which left no continuous approach
-	// signal for a cold policy. Absolute exp(-dist) like Nexto's dist, so the
-	// gradient points toward the ball from anywhere -- the cold-start bootstrap.
-	// (Zero-sum cancels mutual ball-camping; lower the weight or switch to a delta
-	// of SafeExpDist if camping appears.)
+	// Nexto's dense player->ball "dist" term. FAITHFUL to NectoRewardFunction: it is a
+	// POTENTIAL-BASED DELTA of liu_dist = exp(-|player-ball| / 1410) (1410 = max DRIVE
+	// speed), applied as (quality_t - quality_{t-1}), NOT the absolute value. The repo
+	// previously returned the absolute exp(-dist) (~0.73/step), which paid ~110 cumulative
+	// per ~150-step episode for hugging the ball -- dwarfing the terminal goal (~12.5) and
+	// training ball-shepherding-without-scoring (runs aooxff9n, 5gjwloq2). Nexto uses the
+	// delta and scores; potential shaping is ~policy-invariant, and the small per-step
+	// delta cannot dominate the goal, so there is no "strike aversion".
 	class PlayerBallDistanceReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
-			return ScoringRewardUtil::SafeExpDist(player.pos, state.ball.pos, CommonValues::CAR_MAX_SPEED);
+			if (!state.prev)
+				return 0;
+			const Player* prevPlayer = ScoringRewardUtil::GetPrevPlayer(state, player);
+			if (!prevPlayer)
+				return 0;
+			constexpr float MAX_DRIVE_SPEED = 1410.f; // Nexto's liu_dist scale (not CAR_MAX_SPEED)
+			float cur = ScoringRewardUtil::SafeExpDist(player.pos, state.ball.pos, MAX_DRIVE_SPEED);
+			float prev = ScoringRewardUtil::SafeExpDist(prevPlayer->pos, state.prev->ball.pos, MAX_DRIVE_SPEED);
+			return cur - prev;
+		}
+	};
+
+	// Nexto's "align": potential-based DELTA of 0.5*(cos(player->ball, player->orangeNet)
+	// - cos(player->ball, player->blueNet)), team-signed. Rewards getting on the correct
+	// side of the ball to strike it toward the opponent net. Applied as a delta like dist.
+	// This term was MISSING from the repo's nexto transcription.
+	class AlignReward : public Reward {
+	public:
+		static float Quality(const Player& player, const GameState& state) {
+			Vec toBall = state.ball.pos - player.pos;
+			float a = 0.5f * (
+				ScoringRewardUtil::CosineSimilarity(toBall, CommonValues::ORANGE_GOAL_BACK - player.pos) -
+				ScoringRewardUtil::CosineSimilarity(toBall, CommonValues::BLUE_GOAL_BACK - player.pos));
+			return player.team == Team::BLUE ? a : -a;
+		}
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev)
+				return 0;
+			const Player* prevPlayer = ScoringRewardUtil::GetPrevPlayer(state, player);
+			if (!prevPlayer)
+				return 0;
+			return Quality(player, state) - Quality(*prevPlayer, *state.prev);
 		}
 	};
 

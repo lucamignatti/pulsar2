@@ -22,23 +22,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	std::vector<WeightedReward> rewards = {
 
-		// Nexto's dense player->ball "dist" approach term, restored (the repo's
-		// nexto transcription dropped it, leaving no cold-start approach signal).
-		// This is the bootstrap. Weight lowered 2.0 -> 1.0 to de-emphasize the
-		// ball-race relative to scoring (run aooxff9n won the ball contest but never
-		// converted). Kept ABSOLUTE on purpose: a delta of SafeExpDist would charge a
-		// negative the instant the ball leaves the car, and since scoring ENDS the
-		// episode the bot never re-approaches to recoup it -- a delta would penalize
-		// the scoring strike (the same approach-then-idle trap the potential
-		// framework hit, commit fbd1b7c). Zero-sum already neutralizes mutual camping.
-		{ teamMixed(new PlayerBallDistanceReward()), 1.f },
-
-		// Ball-goal shaping (Nexto goal_dist). Weight 2.5 -> 10.0: this is a per-step
-		// DELTA that realized ~0 in aooxff9n (no consistent goalward pull) and was
-		// dwarfed by per-step income. It is scoring-POSITIVE (driving the ball toward
-		// net, incl. the goal-scoring strike, gives a positive delta), so unlike the
-		// player->ball term it is safe to amplify -- this is the offense signal.
-		{ teamMixed(new BallGoalDistanceReward()), 10.f },
+		// Nexto's dense potential-based shaping (now FAITHFUL: dist + align + goal_dist
+		// are all DELTAS of quality functions, as in NectoRewardFunction). dist_w=2,
+		// align_w=0.5, goal_dist_w=10 match Nexto's v3-launch weights. PlayerBallDistance
+		// was previously ABSOLUTE (~0.73/step) which dominated the goal ~182x and trained
+		// ball-shepherding-without-scoring; it is now Nexto's potential delta.
+		{ teamMixed(new PlayerBallDistanceReward()), 2.f },   // Nexto dist
+		{ teamMixed(new AlignReward()), 0.5f },               // Nexto align (was missing)
+		{ teamMixed(new BallGoalDistanceReward()), 10.f },    // Nexto goal_dist (delta, matches 0.25*goal_dist_w)
 
 		// Goals
 		{ teamMixed(new TeamGoalReward()), 12.5f },
@@ -126,7 +117,7 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
 	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars (hold car count constant vs 3v3's 1700*6).
-	cfg.numGames = 5120;
+	cfg.numGames = 64; // TEMP SMOKE
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
@@ -208,7 +199,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 
-	cfg.sendMetrics = true; // Send metrics
+	cfg.sendMetrics = false; // TEMP SMOKE
 	cfg.renderMode = false; // Don't render
 	cfg.ppo.deterministic = cfg.renderMode;
 
