@@ -18,7 +18,7 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	// to the ceiling); LoadStats overwrites it from the checkpoint on resume.
 	curEntropyScale = config.entropyScale;
 	if (config.adaptiveEntropy)
-		curEntropyScale = RS_CLAMP(curEntropyScale, 0.f, config.maxEntropyScale);
+		curEntropyScale = RS_CLAMP(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
 
 	if (config.batchSize <= 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize must be positive");
@@ -391,7 +391,13 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 
 	torch::Tensor baseNorm = NormalizeAdvantage(baseAdvRaw, cfg.sigmaFloor);
 	torch::Tensor gcrlAdv = lambdaEff * sepSum;
-	torch::Tensor policyAdvantage = baseNorm + gcrlAdv;
+	// Re-normalize the BLENDED advantage to unit std before the PPO loss. The GCRL
+	// per-critic term (sepSum) is NOT unit-normalized, so its magnitude can EXPLODE
+	// (run z533fbde: GCRL/Car Edge Mean -> 8.0) and overpower the entropy bonus, forcing
+	// collapse. Renorm bounds the total advantage magnitude -- both critics still set its
+	// DIRECTION, and a near-zero (non-discriminating) critic contribution stays near-zero
+	// relatively, preserving self-attenuation. This is what lets the entropy pin hold.
+	torch::Tensor policyAdvantage = NormalizeAdvantage(baseNorm + gcrlAdv, cfg.sigmaFloor);
 	experience.data.advantages = policyAdvantage.detach().to(experience.data.advantages.device());
 	experience.data.crlAdvantages = gcrlAdv.detach().to(experience.data.advantages.device());
 
@@ -616,15 +622,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
 
-	// Adaptive entropy controller: nudge the effective entropy-bonus scale toward
-	// holding this iteration's mean entropy at config.targetEntropy. Raises the
-	// bonus when entropy is below target, lowers it when above; clamped to the
-	// ceiling. Updated AFTER the epochs (this iteration used last iteration's
-	// scale; this sets next iteration's). Persisted via Learner::SaveStats.
+	// Entropy PIN (Lagrangian temperature). Drive entropy to config.targetEntropy by
+	// adjusting the bonus scale MULTIPLICATIVELY in log-space: scale *= exp(rate*(target -
+	// entropy)). Log-space gives wide dynamic range and keeps the scale positive, so the
+	// controller can apply WHATEVER bonus is needed to hold entropy at target. The old
+	// additive rule clamped to a hard 0.10 ceiling, which let entropy collapse to 0.004
+	// once the reward/GCRL gradient overpowered it (runs 5gjwloq2, z533fbde) -- a soft
+	// capped bonus cannot pin entropy. maxEntropyScale is now a high sanity bound, not the
+	// operating point. Updated AFTER the epochs (sets next iteration's scale). Persisted.
 	float curAvgEntropy = avgEntropy.Get();
 	if (config.adaptiveEntropy) {
-		curEntropyScale += config.entropyScaleAdjustRate * (config.targetEntropy - curAvgEntropy);
-		curEntropyScale = RS_CLAMP(curEntropyScale, 0.f, config.maxEntropyScale);
+		curEntropyScale *= std::exp(config.entropyScaleAdjustRate * (config.targetEntropy - curAvgEntropy));
+		curEntropyScale = RS_CLAMP(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
 	}
 
 	// Assemble and return report

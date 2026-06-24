@@ -384,7 +384,7 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (ppo && j.contains("entropy_scale")) {
 		ppo->curEntropyScale = j["entropy_scale"];
 		if (ppo->config.adaptiveEntropy)
-			ppo->curEntropyScale = RS_CLAMP(ppo->curEntropyScale, 0.f, ppo->config.maxEntropyScale);
+			ppo->curEntropyScale = RS_CLAMP(ppo->curEntropyScale, ppo->config.minEntropyScale, ppo->config.maxEntropyScale);
 	}
 
 	if (versionMgr)

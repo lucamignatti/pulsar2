@@ -156,20 +156,21 @@ namespace GGL {
 
 		float entropyScale = 0.018f; // The scale of the normalized entropy loss
 
-		// Adaptive entropy controller. A FIXED entropyScale cannot hold an entropy
-		// level: too small and the policy collapses to a deterministic local optimum
-		// (run aooxff9n: entropy 0.73 -> 0.022, never discovered scoring); too large
-		// and the entropy bonus dominates a starved reward (run bgksd0wi). When
-		// adaptiveEntropy is set, the effective scale (PPOLearner::curEntropyScale,
-		// persisted in the checkpoint) is nudged each iteration toward holding the
-		// normalized policy entropy at targetEntropy, capped at maxEntropyScale. This
-		// is the proven recipe from runs g7jf6cwc / ryp4gxwv (rating 345 / 560), lost
-		// in the repo reset and restored here. targetEntropy/maxEntropyScale only
-		// apply when adaptiveEntropy is true.
+		// Entropy PIN (Lagrangian temperature). A FIXED entropyScale cannot hold an
+		// entropy level, and a SOFT capped controller cannot either: a hard maxEntropyScale
+		// ceiling (0.10) let entropy collapse to 0.004 once the reward/GCRL gradient
+		// overpowered it (runs aooxff9n, 5gjwloq2, z533fbde). When adaptiveEntropy is set,
+		// curEntropyScale (persisted in the checkpoint) is updated MULTIPLICATIVELY in
+		// log-space each iteration: scale *= exp(entropyScaleAdjustRate*(targetEntropy -
+		// entropy)), clamped to [minEntropyScale, maxEntropyScale]. maxEntropyScale should
+		// be set HIGH (e.g. 5.0) so it is only a sanity bound, not the operating point --
+		// the controller then applies whatever bonus is needed to PIN entropy at target.
+		// Only active when adaptiveEntropy is true.
 		bool adaptiveEntropy = false;
 		float targetEntropy = 0.6f;            // desired normalized entropy in [0,1]
-		float maxEntropyScale = 0.1f;          // ceiling for the adaptive scale
-		float entropyScaleAdjustRate = 0.01f;  // proportional gain per iteration
+		float maxEntropyScale = 5.0f;          // HIGH sanity bound (uncapped in practice)
+		float minEntropyScale = 1e-5f;         // floor (>0 so the multiplicative update can recover)
+		float entropyScaleAdjustRate = 0.2f;   // log-space (multiplicative) gain per iteration
 
 		// Whether to ignore invalid actions in the entropy calculation.
 		// True means that entropy will be determined only from available actions.

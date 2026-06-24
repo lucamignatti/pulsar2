@@ -138,15 +138,17 @@ int main(int argc, char* argv[]) {
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f; // initial/fallback scale; the adaptive controller takes over
 
-	// Adaptive entropy floor. A fixed entropyScale collapsed run aooxff9n to entropy
-	// 0.022 (deterministic, never scored). This is the proven g7jf6cwc/ryp4gxwv recipe:
-	// the controller ramps the entropy bonus up to maxEntropyScale and holds entropy
-	// near targetEntropy (those runs floated ~0.55 at the 0.10 ceiling and reached
-	// rating 345/560). Keeps exploration alive long enough to discover scoring.
+	// Entropy PIN at 0.70. Capped controllers (old 0.10 ceiling) could not hold entropy --
+	// it collapsed to ~0 once the reward/GCRL gradient overpowered the bonus (aooxff9n
+	// 0.022, 5gjwloq2 0.19, z533fbde 0.004, the last freezing the policy). The controller
+	// is now an uncapped multiplicative Lagrangian: it applies whatever bonus is needed to
+	// hold entropy here. Paired with the blended-advantage renorm (bounds the GCRL car
+	// critic, which otherwise explodes and fights the pin). Lower the target later once it
+	// learns; 0.70 keeps it exploratory so it never freezes.
 	cfg.ppo.adaptiveEntropy = true;
-	cfg.ppo.targetEntropy = 0.65f;
-	cfg.ppo.maxEntropyScale = 0.10f;
-	cfg.ppo.entropyScaleAdjustRate = 0.01f;
+	cfg.ppo.targetEntropy = 0.70f;
+	cfg.ppo.maxEntropyScale = 5.0f;        // high sanity bound; the pin is uncapped in practice
+	cfg.ppo.entropyScaleAdjustRate = 0.2f; // log-space (multiplicative) gain
 
 	// Rate of reward decay
 	// 0.995 (~200-step horizon) so the terminal goal propagates back across the
