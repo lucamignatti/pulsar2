@@ -20,33 +20,40 @@ EnvCreateResult EnvCreateFunc(int index) {
 		return new ZeroSumReward(reward, TEAM_SPIRIT, OPPONENT_PUNISH);
 	};
 
+	// === Nexto reward set (Rolv-Arild/Necto NectoRewardFunction, v3-era weights, commit 20449cd) ===
+	// Every term is wrapped in teamMixed = ZeroSumReward(team_spirit 0.6, opponent_punish 1.0),
+	// reproducing Nexto's single team-distribution pass: the distribution is linear, so wrapping
+	// each term and summing is identical to Nexto summing all terms then distributing once.
+	// dist/align/goal_dist are potential-based DELTAS of quality functions, exactly as in Nexto.
+	// OMITTED: win_prob (weight 10) -- it needs a scoreboard win-probability model plus a match
+	// clock / running score, none of which this engine's GameState exposes. Everything else is exact.
 	std::vector<WeightedReward> rewards = {
+		// Continuous state/player qualities (potential-based deltas)
+		{ teamMixed(new BallGoalDistanceReward()), 10.f },   // goal_dist_w 10 (0.25*(exp_o-exp_b) delta; x2 from zero-sum == Nexto 0.5*goal_dist_w)
+		{ teamMixed(new PlayerBallDistanceReward()), 0.25f },// dist_w 0.25 (liu_dist = exp(-|player-ball|/1410) delta)
+		{ teamMixed(new AlignReward()), 0.25f },             // align_w 0.25 (player->ball vs player->net alignment delta)
 
-		// Nexto's dense potential-based shaping (now FAITHFUL: dist + align + goal_dist
-		// are all DELTAS of quality functions, as in NectoRewardFunction). dist_w=2,
-		// align_w=0.5, goal_dist_w=10 match Nexto's v3-launch weights. PlayerBallDistance
-		// was previously ABSOLUTE (~0.73/step) which dominated the goal ~182x and trained
-		// ball-shepherding-without-scoring; it is now Nexto's potential delta.
-		{ teamMixed(new PlayerBallDistanceReward()), 2.f },   // Nexto dist
-		{ teamMixed(new AlignReward()), 0.5f },               // Nexto align (was missing)
-		{ teamMixed(new BallGoalDistanceReward()), 10.f },    // Nexto goal_dist (delta, matches 0.25*goal_dist_w)
+		// Goal events (terminal)
+		{ teamMixed(new TeamGoalReward()), 10.f },           // goal_w 10
+		{ teamMixed(new GoalSpeedBonusReward()), 2.5f },     // goal_dist_bonus_w 2.5 (scorer: goal_speed / BALL_MAX_SPEED)
+		{ teamMixed(new ConcedeDistanceReward()), 2.5f },    // goal_dist_bonus_w 2.5 (conceder: -(1 - exp(-dist/CMS)))
 
-		// Goals
-		{ teamMixed(new TeamGoalReward()), 12.5f },
-		{ teamMixed(new GoalSpeedBonusReward()), 1.25f },
-		{ teamMixed(new ConcedeDistanceReward()), 1.25f },
-
-		// Touches
-		{ teamMixed(new TouchHeightReward()), 1.f },
-		{ teamMixed(new FlipResetReward()), 5.f },
+		// Touch
+		{ teamMixed(new TouchHeightReward()), 3.f },         // touch_height_w 3 (squared height factor x (1 + wall factor))
+		{ teamMixed(new LowTouchAccelReward()), 0.5f },      // touch_accel_w 0.5 ((1 - height_factor) * |dBallVel| / CMS)
+		{ teamMixed(new FlipResetReward()), 10.f },          // flip_reset_w 10
 
 		// Boost
-		{ teamMixed(new BoostGainReward()), 0.7f },
-		{ teamMixed(new BoostLoseReward()), 0.4f },
+		{ teamMixed(new BoostGainReward()), 1.5f },          // boost_gain_w 1.5
+		{ teamMixed(new BoostLoseReward()), 0.8f },          // boost_lose_w 0.8
 
-		// Demos
-		{ teamMixed(new DemoReward()), 2.5f },
-		{ teamMixed(new DemoedPenalty()), 2.5f }
+		// Misc continuous
+		{ teamMixed(new AngularVelocityReward()), 0.005f },  // ang_vel_w 0.005
+		{ teamMixed(new TouchGrassPenalty()), 0.005f },      // touch_grass_w 0.005
+
+		// Demos (Nexto splits demo_w 8 equally: +4 demoer / -4 demoee)
+		{ teamMixed(new DemoReward()), 4.f },
+		{ teamMixed(new DemoedPenalty()), 4.f },
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {

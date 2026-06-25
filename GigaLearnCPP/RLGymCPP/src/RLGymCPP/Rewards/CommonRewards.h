@@ -216,7 +216,40 @@ namespace RLGC {
 		}
 
 		inline float HeightActivation(float z) {
-			return cbrtf((z - CommonValues::GOAL_HEIGHT) / CommonValues::CEILING_Z);
+			// Nexto centers this at 150 (approximate dribble height), NOT goal height
+			return cbrtf((z - 150.f) / CommonValues::CEILING_Z);
+		}
+
+		// Nexto's normalized, SQUARED height factor in [0,1] used by the touch rewards
+		inline float NextoHeightFactor(float avgHeight) {
+			float h0 = HeightActivation(0);
+			float h1 = HeightActivation(CommonValues::CEILING_Z);
+			float hx = HeightActivation(avgHeight);
+			float f = (hx - h0) / (h1 - h0);
+			return f * f; // squared, as in NectoRewardFunction
+		}
+
+		// Faithful port of NectoRewardFunction.dist_to_closest_wall(x, y) (uu).
+		// Distance to the nearest of: side wall (x=4096), back wall (y=5120),
+		// or the 45-degree corner wall segment.
+		inline float DistToClosestWall(float x, float y) {
+			float ax = fabsf(x), ay = fabsf(y);
+			float distSideWall = fabsf(CommonValues::SIDE_WALL_X - ax);
+			float distBackWall = fabsf(CommonValues::BACK_WALL_Y - ay);
+			// Corner segment from (4096-1152, 5120) to (4096, 5120-1152)
+			float x1 = CommonValues::SIDE_WALL_X - 1152, y1 = CommonValues::BACK_WALL_Y;
+			float x2 = CommonValues::SIDE_WALL_X, y2 = CommonValues::BACK_WALL_Y - 1152;
+			float A = ax - x1, B = ay - y1, C = x2 - x1, D = y2 - y1;
+			float dot = A * C + B * D;
+			float lenSq = C * C + D * D;
+			float param = (lenSq != 0) ? (dot / lenSq) : -1.f;
+			float xx, yy;
+			if (param < 0) { xx = x1; yy = y1; }
+			else if (param > 1) { xx = x2; yy = y2; }
+			else { xx = x1 + param * C; yy = y1 + param * D; }
+			float dx = ax - xx, dy = ay - yy;
+			float distCornerWall = sqrtf(dx * dx + dy * dy);
+			return RS_MIN(RS_MIN(distSideWall, distBackWall), distCornerWall);
 		}
 
 		inline float BallGoalDistanceQuality(const GameState& state) {
@@ -359,6 +392,9 @@ namespace RLGC {
 		}
 	};
 
+	// Nexto touch_height: rewards touching the ball high up (dribbles/aerials), scaled up
+	// near walls. Faithful to NectoRewardFunction: SQUARED height factor (150 dribble-height
+	// activation) times (1 + wall_dist_factor). No on-ground term (that lives in the factor).
 	class TouchHeightReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
@@ -366,13 +402,15 @@ namespace RLGC {
 				return 0;
 
 			float avgHeight = 0.5f * (player.pos.z + state.ball.pos.z);
-			float h0 = ScoringRewardUtil::HeightActivation(0);
-			float h1 = ScoringRewardUtil::HeightActivation(CommonValues::CEILING_Z);
-			float heightFactor = (ScoringRewardUtil::HeightActivation(avgHeight) - h0) / (h1 - h0);
-			return (2 - (float)player.isOnGround) * heightFactor;
+			float heightFactor = ScoringRewardUtil::NextoHeightFactor(avgHeight);
+			float wallDistFactor = 1 - expf(
+				-ScoringRewardUtil::DistToClosestWall(player.pos.x, player.pos.y) / CommonValues::CAR_MAX_SPEED);
+			return heightFactor * (1 + wallDistFactor);
 		}
 	};
 
+	// Nexto touch_accel: rewards changing ball speed on a LOW touch (ground/power shots),
+	// complementing touch_height via (1 - height_factor). Same squared Nexto height factor.
 	class LowTouchAccelReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
@@ -380,9 +418,7 @@ namespace RLGC {
 				return 0;
 
 			float avgHeight = 0.5f * (player.pos.z + state.ball.pos.z);
-			float h0 = ScoringRewardUtil::HeightActivation(0);
-			float h1 = ScoringRewardUtil::HeightActivation(CommonValues::CEILING_Z);
-			float heightFactor = (ScoringRewardUtil::HeightActivation(avgHeight) - h0) / (h1 - h0);
+			float heightFactor = ScoringRewardUtil::NextoHeightFactor(avgHeight);
 			return
 				(1 - heightFactor) *
 				(state.ball.vel - state.prev->ball.vel).Length() /
@@ -401,6 +437,24 @@ namespace RLGC {
 			bool closeToBall = player.pos.Dist(state.ball.pos) < 2 * CommonValues::BALL_RADIUS;
 			bool underBall = ScoringRewardUtil::CosineSimilarity(state.ball.pos - player.pos, -player.rotMat.up) > 0.9f;
 			return gainedFlip && player.pos.z > 3 * CommonValues::BALL_RADIUS && closeToBall && underBall ? 1 : 0;
+		}
+	};
+
+	// Nexto ang_vel: encourage spinning (slightly) -- helps keep flipping early in training
+	// and explore rotating in the air. Returns |angVel| / CAR_MAX_ANG_VEL in [0,1].
+	class AngularVelocityReward : public Reward {
+	public:
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return player.angVel.Length() / CommonValues::CAR_MAX_ANG_VEL;
+		}
+	};
+
+	// Nexto touch_grass: small constant penalty for sitting on the ground (z < ball radius).
+	// Returns -1 (the per-step penalty magnitude); apply the small weight at registration.
+	class TouchGrassPenalty : public Reward {
+	public:
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return (player.isOnGround && player.pos.z < CommonValues::BALL_RADIUS) ? -1.f : 0.f;
 		}
 	};
 }
