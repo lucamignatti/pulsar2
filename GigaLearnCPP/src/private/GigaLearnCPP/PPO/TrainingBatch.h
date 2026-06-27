@@ -24,7 +24,7 @@ namespace GGL {
 
 		// Goal-conditioning (GCRL) tensors. Only consulted when gcrlEnabled.
 		bool gcrlEnabled = false;
-		torch::Tensor achievedGoals, herGoals, carHerGoals, scoringGoals, gcrlTrainMask, segmentIds, segmentSteps;
+		torch::Tensor achievedGoals, herGoals, carHerGoals, scoringGoals, gcrlTrainMask, gcrlScoringMask, segmentIds, segmentSteps;
 
 		// GAE config + the *current* (pre-update) return std. The caller owns the running return
 		// statistic; this unit only reads the std and hands back the new returns to update it.

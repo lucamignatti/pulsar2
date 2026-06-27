@@ -453,7 +453,28 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgClip;
 
 	if (config.contrastiveGoal.enabled) {
-		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng);
+		// FORK2: precompute masked policy probs for every buffer state (host, chunked) for the GOALSHORT
+		// TD bootstrap's pi-sampled soft value. Only when TD is enabled; CAR/TD-off get an undefined tensor.
+		// Kept on CPU (the [N, numActions] tensor is ~0.65GB at N~1.3M — never resident on the GPU).
+		torch::Tensor nextPolicyProbs;
+		if (config.contrastiveGoal.useTDContrastive
+			&& experience.data.states.defined() && experience.data.actionMasks.defined()) {
+			RG_NO_GRAD;
+			int64_t nRows = experience.data.states.size(0);
+			int64_t chunk = std::max<int64_t>(1, config.contrastiveGoal.policyScoreBatchSize);
+			std::vector<torch::Tensor> parts;
+			parts.reserve((size_t)((nRows + chunk - 1) / chunk));
+			for (int64_t s = 0; s < nRows; s += chunk) {
+				int64_t e = std::min<int64_t>(s + chunk, nRows);
+				torch::Tensor obsChunk = experience.data.states.slice(0, s, e).to(device);
+				torch::Tensor maskChunk = experience.data.actionMasks.slice(0, s, e).to(device);
+				torch::Tensor probs = InferPolicyProbsFromModels(models, obsChunk, maskChunk, config.policyTemperature, false, obsNorm);
+				parts.push_back(probs.to(torch::kCPU));
+			}
+			nextPolicyProbs = torch::cat(parts, 0);   // [N, numActions], CPU
+		}
+
+		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng, totalTimesteps, nextPolicyProbs);
 
 		report["CRL Critic Loss"] = crlTrainStats.loss;
 		report["GCRL Row Loss"] = crlTrainStats.rowLoss;
@@ -471,8 +492,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["CRL Anchors Used"] = crlTrainStats.anchorsUsed;
 		report["CRL Train Samples Used"] = crlTrainStats.trainSamplesUsed;
 
+		// FORK2 TD-contrastive diagnostics (GOALSHORT). GCRL/ prefix auto-allowlisted.
+		report["GCRL/Goal TD Blend R"] = crlTrainStats.tdBlendR;
+		report["GCRL/Goal TD Reverted"] = crlTrainStats.tdReverted;
+		report["GCRL/Goal TD SoftValue EntropyFrac"] = crlTrainStats.tdSoftValueEntropyFrac;
+		report["GCRL/Goal TD Row Loss"] = crlTrainStats.tdRowLoss;
+		report["GCRL/Goal TD EMA Drift"] = crlTrainStats.tdEmaDrift;
+		report["GCRL/Goal TD Valid Bootstrap Rows"] = crlTrainStats.tdValidBootstrapRows;
+
 		if (carContrastiveLearner && experience.data.carHerGoals.defined()) {
-			ContrastiveGoalStats carStats = carContrastiveLearner->Train(experience.data, experience.rng);
+			ContrastiveGoalStats carStats = carContrastiveLearner->Train(experience.data, experience.rng, totalTimesteps, {});
 			report["GCRL/Car Critic Loss"] = carStats.loss;
 			report["GCRL/Car Categorical Accuracy"] = carStats.categoricalAccuracy;
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;

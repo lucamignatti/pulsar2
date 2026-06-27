@@ -37,13 +37,16 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Defensive/offensive event impulses (event-gated, one-shot, pro-scoring)
 		{ teamMixed(new SaveReward()), 20.f },               // PlayerEventState::save
 		{ teamMixed(new ShotReward()), 35.f },               // PlayerEventState::shot
-		// Dense GOALWARD-STRIKE gradient (xddib2kd fix): rewards the goalward ball-speed INCREASE the
+		// Dense GOALWARD-STRIKE gradient (xddib2kd fix; weight bumped 50->100 per the wucwxpfx
+		// diagnosis: touch-PRESENCE rewards were ~70% of income and finishing was only ~6% ->
+		// possession/dribble drift, goal speed decaying). Rewards the goalward ball-speed INCREASE the
 		// agent's touch produces -> breaks the approach-then-idle peak (the CONTROL critic's ball-hold
-		// pull). The graded striking signal the event-only touch rewards below could not provide.
-		{ teamMixed(new GoalwardImpactReward()), 50.f },
-		// Touch impulses
-		{ teamMixed(new StrongTouchReward(20.f, 130.f)), 60.f }, // |dBallVel| in [20,130]kph -> committed strike
-		{ teamMixed(new TouchBallReward()), 30.f },          // any contact (touch-volume engine)
+		// pull) AND pays for HARD goalward contact over mere contact.
+		{ teamMixed(new GoalwardImpactReward()), 100.f },
+		// Touch impulses — TRIMMED (StrongTouch 60->40, TouchBall 30->15) so finishing outweighs
+		// presence; a small TouchBall floor is kept for cold-start "go touch the ball" bootstrap.
+		{ teamMixed(new StrongTouchReward(20.f, 130.f)), 40.f }, // |dBallVel| in [20,130]kph -> committed strike
+		{ teamMixed(new TouchBallReward()), 15.f },          // any contact (touch-volume engine, trimmed floor)
 		{ teamMixed(new AerialTouchReward()), 12.f },        // genuine aerial touch (the reward-stream aerial mechanism)
 		// The ONLY sustained LEVEL term: absolute approach velocity, UNWRAPPED (cannot telescope-hug-farm).
 		{ new VelocityPlayerToBallReward(), 0.5f },
@@ -190,8 +193,15 @@ int main(int argc, char* argv[]) {
 	// approach (it climbed to edge ~1.0). If approach-then-idle persists, lower further toward 0.3.
 	cfg.ppo.contrastiveGoal.gcrlRatioTarget = 0.5f;
 	// tau 0.05, VICReg, masked-random K16 baseline, the always-on variance-weight + ratio-pinned lambda
-	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic + TD-contrastive are
-	// flagged off by default (useAntiCritic / useTDContrastive) pending their dedicated builds + validation.
+	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic still flagged off.
+	// FORK2 (wucwxpfx-diagnosis-driven): the REACH/Goal critic was MC-only and action-INERT (Goal Edge
+	// ~0.03 vs Car ~0.3) -> GCRL was effectively CONTROL-only. Enable TD-contrastive on GOALSHORT (CAR stays
+	// pure MC) so the world-ball critic gains per-action discrimination; soft-label CE bootstrap, EMA
+	// targets, K-sampled pi-soft value, MC->TD ramp, collapse guard (defaults in PPOLearnerConfig.h).
+	cfg.ppo.contrastiveGoal.useTDContrastive = true;
+	// FORK2 Part C: GOALSHORT HER goal = 0.5 achieved-future + 0.5 net-directed scoring goal (synthetic
+	// rows are excluded from the TD bootstrap). Populates real near-net states + the scoring-goal manifold.
+	cfg.ppo.contrastiveGoal.scoringGoalMixFrac = 0.5f;
 
 	// TRIAD-NATIVE self-play (fork 10): 0.15 vs a rolling frozen-checkpoint pool (no ES; BC-seeded once the
 	// offline warmstart lands -- until then version 0 is the initial policy). Breaks mutual-idle equilibria.

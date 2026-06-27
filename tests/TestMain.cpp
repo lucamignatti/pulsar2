@@ -9,6 +9,7 @@ void RunTrainingBatchTests();
 void RunMetricSinkTests();
 void RunMuonTests();
 void RunRSNormTests();
+void RunTDContrastiveTests();
 
 int main() {
     printf("=== GigaLearn unit tests ===\n\n");
@@ -21,6 +22,7 @@ int main() {
     RunMetricSinkTests();
     RunMuonTests();
     RunRSNormTests();
+    RunTDContrastiveTests();
 
     return TestHarness::Summary();
 }

@@ -73,6 +73,10 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 	if (key.rfind("GCRL/", 0) == 0)
 		return true;
 
+	// FORK2 striking-quality / income-vs-finishing-vs-scoring decomposition + per-touch metrics.
+	if (key.rfind("Striking/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 

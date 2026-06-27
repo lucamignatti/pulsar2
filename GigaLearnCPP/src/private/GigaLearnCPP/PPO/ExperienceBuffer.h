@@ -7,7 +7,7 @@ namespace GGL {
 		torch::Tensor
 			states, actions, logProbs, targetValues, actionMasks, advantages,
 			achievedGoals, herGoals, carHerGoals, scoringGoals, gcrlTrainMask,
-			segmentIds, segmentSteps, crlAdvantages;
+			segmentIds, segmentSteps, gcrlScoringMask, crlAdvantages;
 
 		auto begin() { return &states; }
 		auto end() { return &crlAdvantages + 1; }

@@ -89,8 +89,35 @@ namespace GGL {
 		int antiHerMaxOffset = 15;
 		// ── TRIAD-NATIVE TD-contrastive (CDPC) for GOALSHORT/ANTI: EMA target + pi-weighted soft bootstrap ──
 		bool useTDContrastive = false;
-		float tdEmaDecay = 0.005f;            // EMA target tracking rate
+		float tdEmaDecay = 0.005f;            // EMA target tracking rate (legacy per-step; superseded by tdEmaHalfLifeIters)
 		uint64_t tdRampSteps = 20'000'000;    // MC->TD target-blend ramp (in-run stability schedule)
+		// ── FORK2 TD-contrastive additions (design-locked + adversarially verified) ──
+		// Reachability-horizon discount for the GOALSHORT/REACH one-step bootstrap. SEPARATE from
+		// gaeGamma (return horizon vs reachability horizon). H ~= 1/(1-gamma); 0.93 => ~14-step
+		// strike window, matching production herMaxOffset=15. Do NOT overload gaeGamma.
+		float tdContrastiveGamma = 0.93f;
+		// EMA cadence as a HALF-LIFE IN ITERATIONS, applied once per Train() call (NOT per minibatch:
+		// 0.005/step over ~5100 steps/iter would turn the target over ~37x/iter -> no lag). Per-iteration
+		// lerp coefficient = 1 - 2^(-1/tdEmaHalfLifeIters).
+		float tdEmaHalfLifeIters = 10.f;
+		// EMA the TRUNK into the target branch too (target = EMA of the WHOLE encoder), not just the
+		// tail+goalEncoder, so f^- is not phiTail^-(live drifting trunk) off-manifold.
+		bool tdEmaTrunk = true;
+		// Policy-sampled actions K for the soft-value bootstrap (importance form
+		// V^- = tau*(logsumexp_{a'~pi}(f^-) - log K)). Full 126-action enumeration is ~10x the MC FLOPs;
+		// K=12 gives the same operator at ~K/126 cost.
+		int tdSoftValueActionSamples = 12;
+		// Per-iteration collapse guard (hysteresis): if the soft-value action-distribution entropy
+		// fraction (mean over valid rows of H_i/log n_valid_i) drops below tdCollapseEnterFrac, force
+		// r_eff=0 (pure MC) until it recovers above tdCollapseExitFrac.
+		float tdCollapseEnterFrac = 0.10f;
+		float tdCollapseExitFrac = 0.20f;
+		// ── FORK2 Part C: GOALSHORT scoring-goal mix ──
+		// Fraction of GOALSHORT (herGoals, useCarGoals==false) training rows whose goal is drawn from the
+		// SYNTHETIC scoring goal (net-mouth + velocity lead) instead of the achieved future. Construction-
+		// side in relabelHERGoals. Synthetic rows are flagged (gcrlScoringMask) and EXCLUDED from the TD
+		// bootstrap (MC-only) since V^-(s',g_synthetic) would be an OOD extrapolation. CAR is never mixed.
+		float scoringGoalMixFrac = 0.5f;
 
 		float targetSpeed = 1500.f;
 		float targetSpeedJitter = 0.f;

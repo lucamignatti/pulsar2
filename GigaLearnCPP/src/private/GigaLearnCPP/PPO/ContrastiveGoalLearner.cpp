@@ -1,6 +1,7 @@
 #include "ContrastiveGoalLearner.h"
 
 #include <torch/nn/modules/loss.h>
+#include <cmath>
 
 using namespace torch;
 
@@ -34,6 +35,15 @@ namespace GGL {
 		return t / t.norm(2, -1, true).clamp_min(1e-6f);
 	}
 
+	// FORK2: lerp dst toward src by coeff (coeff=1 => hard copy). Param order matches because the two
+	// Models are built from the same ModelConfig. Caller guards with NoGrad.
+	static void LerpModelParams(Model* dst, Model* src, float coeff) {
+		auto dp = dst->parameters();
+		auto sp = src->parameters();
+		for (size_t i = 0; i < dp.size(); i++)
+			dp[i].copy_(dp[i] * (1.0f - coeff) + sp[i] * coeff, true);
+	}
+
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
 		Model* sharedHead, const RSNorm* obsNorm,
 		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask) :
@@ -49,6 +59,29 @@ namespace GGL {
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
+
+		// FORK2: TD-contrastive is GOALSHORT/REACH-only (CAR stays pure MC). Build the EMA target nets
+		// (phi tail + goal encoder, + the trunk when tdEmaTrunk) with DISTINCT names so Save never collides.
+		// Params are lazily synced live->target on the first Train (handles fresh + resume identically).
+		useTD = config.useTDContrastive && !useCarGoals;
+		if (useTD) {
+			phiTailTgtName = namePrefix + "_phi_tail_tgt";
+			psiTgtName = namePrefix + "_psi_tgt";
+			trunkTgtName = namePrefix + "_trunk_tgt";
+			phiTailTarget = new Model(phiTailTgtName.c_str(),
+				MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
+				device);
+			goalEncoderTarget = new Model(psiTgtName.c_str(),
+				MakePsiConfig(config.goalInputSize, config.representationSize), device);
+			if (config.tdEmaTrunk)
+				sharedHeadTarget = new Model(trunkTgtName.c_str(), sharedHead->config, device);
+		}
+	}
+
+	ContrastiveGoalLearner::~ContrastiveGoalLearner() {
+		delete phiTailTarget;
+		delete goalEncoderTarget;
+		delete sharedHeadTarget;
 	}
 
 	// embeddings: shared_head(obs).detach() — already normalized and truncated at trunk
@@ -71,7 +104,8 @@ namespace GGL {
 		return (sa * g).sum(-1) / config.tau;
 	}
 
-	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng) {
+	ContrastiveGoalStats ContrastiveGoalLearner::Train(ExperienceTensors& data, std::default_random_engine& rng,
+		uint64_t totalTimesteps, torch::Tensor nextPolicyProbs) {
 		ContrastiveGoalStats stats;
 
 		torch::Tensor goalsAll = useCarGoals ? data.carHerGoals : data.herGoals;
@@ -113,6 +147,35 @@ namespace GGL {
 		int64_t numTrainRows = (int64_t)indices.size();
 		if (numTrainRows <= 1)
 			return stats;
+
+		// ── FORK2 TD-contrastive setup (GOALSHORT/REACH only) ──
+		// TD is active iff: this critic is GOALSHORT (useTD), the policy-probs + segmentIds are provided,
+		// and the ramp is past 0. The collapse latch (set last iter) forces r=0 as a 1-iter safety valve.
+		const bool tdOn = useTD
+			&& nextPolicyProbs.defined() && nextPolicyProbs.size(0) == n
+			&& data.segmentIds.defined() && data.segmentIds.size(0) == n
+			&& data.achievedGoals.defined() && data.achievedGoals.size(0) == n;
+		const float rRamp = tdOn
+			? std::clamp((float)totalTimesteps / (float)std::max<uint64_t>(config.tdRampSteps, 1), 0.f, 1.f)
+			: 0.f;
+		const float rEff = tdCollapseLatched ? 0.f : rRamp;
+		const bool runTD = tdOn && rEff > 0.f;
+
+		// Lazy one-time sync live->target (handles fresh + resume: targets start == current live params,
+		// then EMA-lag). Done before the first target forward.
+		if (tdOn && !tdTargetsSynced) {
+			RG_NO_GRAD;
+			LerpModelParams(phiTailTarget, &phiTail, 1.0f);
+			LerpModelParams(goalEncoderTarget, &goalEncoder, 1.0f);
+			if (config.tdEmaTrunk && sharedHeadTarget)
+				LerpModelParams(sharedHeadTarget, sharedHead, 1.0f);
+			tdTargetsSynced = true;
+		}
+
+		// TD stat accumulators (tensor-accumulated, .item()'d once at the end to avoid per-minibatch syncs):
+		// [0]=sum_i HkFrac_i*valid_i, [1]=sum_i valid_i, [2]=sum_batches tdTerm
+		torch::Tensor tdAccum;
+		int64_t tdBatches = 0;
 
 		for (int epoch = 0; epoch < config.criticEpochs; epoch++) {
 			std::shuffle(indices.begin(), indices.end(), rng);
@@ -175,7 +238,91 @@ namespace GGL {
 					(covG.pow(2).sum() - covG.diagonal().pow(2).sum()) / reprD;
 				Tensor vicPenalty = config.vicVar * varTerm + config.vicCov * covTerm;
 
-				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + vicPenalty;
+				Tensor mcSymmetric = rowLoss + columnLoss;
+				Tensor loss;
+
+				if (!runTD) {
+					// Byte-identical legacy path (CAR, TD-off, r==0, or collapse-latched).
+					loss = rowLoss + columnLoss + logsumexpPenalty + vicPenalty;
+				} else {
+					// ── one-step within-segment shift: s'_i = states[i+1] iff same segment ──
+					Tensor nextIdx = tIndices + 1;                                   // host [B]
+					Tensor inBounds = nextIdx.lt(n);
+					Tensor safeNext = torch::where(inBounds, nextIdx, tIndices);     // host [B]
+					Tensor segCur = data.segmentIds.index_select(0, tIndices);       // host int64 [B]
+					Tensor segNext = data.segmentIds.index_select(0, safeNext);
+					Tensor validHost = inBounds & segNext.eq(segCur);                // host bool [B]
+					if (data.gcrlScoringMask.defined() && data.gcrlScoringMask.size(0) == n)
+						// synthetic scoring-goal rows are MC-only (OOD-bootstrap guard): mask==0 => achieved
+						validHost = validHost & data.gcrlScoringMask.index_select(0, tIndices).eq(0);
+					Tensor bootstrapValid = validHost.to(kFloat32).to(device);       // device [B]
+
+					Tensor sNext = data.states.index_select(0, safeNext).to(device); // [B, obsSize]
+					if (obsNorm)
+						sNext = obsNorm->Normalize(sNext);
+					Tensor nextProbs = nextPolicyProbs.index_select(0, safeNext).to(device).clamp_min(1e-12f); // [B,A]
+
+					// delta_i = (HER goal == own achieved next-state)  <=>  HER offset == 1
+					Tensor achievedRows = data.achievedGoals.index_select(0, tIndices).to(device); // [B,6]
+					Tensor delta = (goals - achievedRows).abs().sum(-1).lt(1e-5f).to(kFloat32);     // [B]
+
+					Tensor yPos, pOffTgt, hkFrac;
+					{
+						RG_NO_GRAD;
+						Model* trunkTgt = (config.tdEmaTrunk && sharedHeadTarget) ? sharedHeadTarget : sharedHead;
+						Tensor embNext = trunkTgt->Forward(sNext, false).detach();                       // [B, embed]
+						Tensor gTgt = L2Normalize(goalEncoderTarget->Forward(goals.to(kFloat32), false)); // [B, repr]
+
+						int K = std::max(1, config.tdSoftValueActionSamples);
+						Tensor sampled = torch::multinomial(nextProbs, K, true);                          // [B,K] ~ pi(.|s')
+						Tensor runningBB;                                                                 // [B,B] online logsumexp
+						std::vector<Tensor> innerDiag;
+						innerDiag.reserve(K);
+						for (int k = 0; k < K; k++) {
+							Tensor aK = sampled.select(1, k);                                             // [B]
+							Tensor oneH = torch::zeros({ curBatchSize, actionRepresentationSize }, TensorOptions().dtype(kFloat32).device(device))
+								.scatter_(1, aK.unsqueeze(1), 1.f);
+							Tensor saK = L2Normalize(phiTailTarget->Forward(torch::cat({ embNext, oneH }, -1), false)); // [B,repr]
+							Tensor scoreBB = torch::matmul(saK, gTgt.transpose(0, 1)) / config.tau;       // [B,B] f^-(s',a_k,g_j)
+							runningBB = runningBB.defined() ? torch::logaddexp(runningBB, scoreBB) : scoreBB;
+							innerDiag.push_back(scoreBB.diagonal());                                      // [B] f^-(s',a_k,g_i)
+						}
+						// log E_{a'~pi} exp f^- per goal (importance form: a_k ~ pi => uniform 1/K average)
+						Tensor softLogitBB = runningBB - std::log((float)K);                              // [B,B]
+						Tensor tgtRowProb = torch::softmax(softLogitBB, 1);                               // [B,B] target classifier
+						Tensor pDiagTgt = tgtRowProb.diagonal();                                          // [B]
+						Tensor gammaEff = config.tdContrastiveGamma * bootstrapValid;                     // [B]
+						yPos = (1.f - config.tdContrastiveGamma) * delta + gammaEff * pDiagTgt;           // [B] in (0,1)
+						Tensor eyeOff = 1.f - torch::eye(curBatchSize, TensorOptions().dtype(kFloat32).device(device));
+						Tensor offProb = tgtRowProb * eyeOff;
+						pOffTgt = offProb / offProb.sum(1, true).clamp_min(1e-12f);                       // [B,B] off-diag, row-normed
+
+						// collapse signal: entropy of the soft-value action posterior toward the OWN goal
+						Tensor wK = torch::softmax(torch::stack(innerDiag, 1), 1);                        // [B,K]
+						Tensor Hk = -(wK * wK.clamp_min(1e-12f).log()).sum(1);                            // [B]
+						hkFrac = Hk / std::log((float)std::max(K, 2));                                    // [B] in [0,1]
+					}
+
+					// ROW-ONLY soft-CE vs the (detached) bootstrap target dist; grad flows only via LIVE logits.
+					Tensor logSoftRow = torch::log_softmax(logits, 1);                                    // [B,B] live
+					Tensor eyeB = torch::eye(curBatchSize, TensorOptions().dtype(kFloat32).device(device));
+					Tensor tgtDist = yPos.unsqueeze(1) * eyeB + (1.f - yPos).unsqueeze(1) * pOffTgt;       // [B,B] detached
+					Tensor tdRowPer = -(tgtDist * logSoftRow).sum(1);                                      // [B]
+					Tensor tdTerm = (bootstrapValid * tdRowPer).sum() / bootstrapValid.sum().clamp_min(1.f);
+
+					loss = (1.f - rEff) * mcSymmetric + rEff * tdTerm + logsumexpPenalty + vicPenalty;
+
+					{
+						RG_NO_GRAD;
+						Tensor batchTd = torch::stack({
+							(hkFrac * bootstrapValid).sum(),
+							bootstrapValid.sum(),
+							tdTerm.detach()
+						});
+						tdAccum = tdAccum.defined() ? tdAccum + batchTd : batchTd;
+						tdBatches++;
+					}
+				}
 
 				phiTail.optim->zero_grad();
 				goalEncoder.optim->zero_grad();
@@ -205,6 +352,46 @@ namespace GGL {
 				}
 				batches++;
 			}
+		}
+
+		// ── FORK2: per-ITERATION EMA target update (NOT per minibatch: tdEmaDecay 0.005/step over
+		// thousands of steps/iter would give no lag). lerp coeff = 1 - 2^(-1/halfLifeIters). ──
+		if (tdOn) {
+			RG_NO_GRAD;
+			float emaCoeff = 1.0f - std::pow(2.0f, -1.0f / std::max(config.tdEmaHalfLifeIters, 1e-3f));
+			LerpModelParams(phiTailTarget, &phiTail, emaCoeff);
+			LerpModelParams(goalEncoderTarget, &goalEncoder, emaCoeff);
+			if (config.tdEmaTrunk && sharedHeadTarget)
+				LerpModelParams(sharedHeadTarget, sharedHead, emaCoeff);
+
+			// drift observability: ||phiTail^- - phiTail|| / ||phiTail||
+			double driftSq = 0, liveSq = 0;
+			auto lp = phiTail.parameters();
+			auto tp = phiTailTarget->parameters();
+			for (size_t i = 0; i < lp.size(); i++) {
+				driftSq += (tp[i] - lp[i]).pow(2).sum().item<double>();
+				liveSq += lp[i].pow(2).sum().item<double>();
+			}
+			stats.tdEmaDrift = (float)(std::sqrt(driftSq) / std::max(std::sqrt(liveSq), 1e-6));
+		}
+
+		// TD aggregate stats + collapse-latch update (hysteresis; applied with 1-iter latency next call).
+		stats.tdBlendR = tdOn ? rEff : -1.f;
+		stats.tdReverted = (tdOn && tdCollapseLatched) ? 1.f : 0.f;
+		if (tdOn && tdAccum.defined() && tdBatches > 0) {
+			auto t = tdAccum.cpu();
+			double entWeightedSum = t[0].item<double>();
+			double validRowSum = t[1].item<double>();
+			double tdLossSum = t[2].item<double>();
+			float entFrac = (validRowSum > 0) ? (float)(entWeightedSum / validRowSum) : 0.f;
+			stats.tdSoftValueEntropyFrac = entFrac;
+			stats.tdRowLoss = (float)(tdLossSum / (double)tdBatches);
+			stats.tdValidBootstrapRows = (float)(validRowSum / (double)tdBatches);
+			// hysteretic latch: trip on low entropy (soft value collapsing to greedy), release above exit
+			if (entFrac < config.tdCollapseEnterFrac)
+				tdCollapseLatched = true;
+			else if (entFrac > config.tdCollapseExitFrac)
+				tdCollapseLatched = false;
 		}
 
 		stats.anchorsUsed = numTrainRows;

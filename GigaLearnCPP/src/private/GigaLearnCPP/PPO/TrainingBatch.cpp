@@ -50,6 +50,7 @@ GGL::TrainingBatchResult GGL::BuildTrainingBatch(const TrainingBatchInputs& in, 
 		outBuffer.data.carHerGoals = in.carHerGoals;
 		outBuffer.data.scoringGoals = in.scoringGoals;
 		outBuffer.data.gcrlTrainMask = in.gcrlTrainMask;
+		outBuffer.data.gcrlScoringMask = in.gcrlScoringMask;
 		outBuffer.data.segmentIds = in.segmentIds;
 		outBuffer.data.segmentSteps = in.segmentSteps;
 	}

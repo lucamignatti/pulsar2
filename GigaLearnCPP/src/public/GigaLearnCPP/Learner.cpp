@@ -686,6 +686,7 @@ void GGL::Learner::Start() {
 			FList achievedGoals, herGoals, carHerGoals, scoringGoals;
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
+			std::vector<uint8_t> gcrlScoringMask; // FORK2 Part C: 1 = this row's herGoal is a SYNTHETIC scoring goal (excluded from TD bootstrap)
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
 			std::vector<int64_t> segmentIds, segmentSteps;
@@ -704,6 +705,7 @@ void GGL::Learner::Start() {
 				carHerGoals += other.carHerGoals;
 				scoringGoals += other.scoringGoals;
 				gcrlTrainMask += other.gcrlTrainMask;
+				gcrlScoringMask += other.gcrlScoringMask;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -832,6 +834,7 @@ void GGL::Learner::Start() {
 					int maxOffsetCfg = RS_MAX(minOffset, config.ppo.contrastiveGoal.herMaxOffset);
 					float shortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.herShortBiasPower);
 					float goalwardBias = RS_CLAMP(config.ppo.contrastiveGoal.herGoalwardBias, 0.f, 1.f);
+					float scoringGoalMixFrac = RS_CLAMP(config.ppo.contrastiveGoal.scoringGoalMixFrac, 0.f, 1.f);
 
 					if ((int)traj.achievedGoals.size() != n * 6)
 						RG_ERR_CLOSE("GCRL HER relabeling expected " << n << " achieved goal rows, got " << (traj.achievedGoals.size() / 6));
@@ -852,6 +855,7 @@ void GGL::Learner::Start() {
 							ballMoved = true;
 					}
 					traj.gcrlTrainMask.assign((size_t)n, ballMoved ? 1 : 0);
+					traj.gcrlScoringMask.assign((size_t)n, 0); // FORK2 Part C
 
 					traj.herGoals.resize((size_t)n * 6);
 					for (int t = 0; t < n; t++) {
@@ -888,10 +892,23 @@ void GGL::Learner::Start() {
 						}
 
 						int target = t + selectedOffset;
-						for (int d = 0; d < 6; d++)
-							traj.herGoals[(size_t)t * 6 + d] = traj.achievedGoals[(size_t)target * 6 + d];
-						if (selectedOffset > 0)
-							herSelectedOffsets += (float)selectedOffset;
+						// FORK2 Part C: with prob scoringGoalMixFrac, draw a SYNTHETIC net-directed
+						// scoring goal (scoringGoals[t]) instead of the achieved future. Flagged so the
+						// TD bootstrap excludes it (V^-(s',g_synthetic) would be an OOD extrapolation).
+						// CAR (carHerGoals) is NEVER mixed. Synthetic rows don't add offset stats.
+						bool useScoring = scoringGoalMixFrac > 0.f
+							&& (size_t)(t + 1) * 6 <= traj.scoringGoals.size()
+							&& RocketSim::Math::RandFloat() < scoringGoalMixFrac;
+						if (useScoring) {
+							for (int d = 0; d < 6; d++)
+								traj.herGoals[(size_t)t * 6 + d] = traj.scoringGoals[(size_t)t * 6 + d];
+							traj.gcrlScoringMask[(size_t)t] = 1;
+						} else {
+							for (int d = 0; d < 6; d++)
+								traj.herGoals[(size_t)t * 6 + d] = traj.achievedGoals[(size_t)target * 6 + d];
+							if (selectedOffset > 0)
+								herSelectedOffsets += (float)selectedOffset;
+						}
 					}
 
 					// Car critic: its OWN short, near-term HER window (no goalward bias).
@@ -1107,7 +1124,7 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tScoringGoals, tGcrlTrainMask, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tScoringGoals, tGcrlTrainMask, tGcrlScoringMask, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
@@ -1115,6 +1132,7 @@ void GGL::Learner::Start() {
 							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
+						tGcrlScoringMask = torch::tensor(combinedTraj.gcrlScoringMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tSegmentIds = torch::tensor(combinedTraj.segmentIds, torch::TensorOptions().dtype(torch::kInt64));
 						tSegmentSteps = torch::tensor(combinedTraj.segmentSteps, torch::TensorOptions().dtype(torch::kInt64));
 
@@ -1191,6 +1209,7 @@ void GGL::Learner::Start() {
 							batchIn.carHerGoals = tCarHERGoals;
 						batchIn.scoringGoals = tScoringGoals;
 						batchIn.gcrlTrainMask = tGcrlTrainMask;
+						batchIn.gcrlScoringMask = tGcrlScoringMask;
 						batchIn.segmentIds = tSegmentIds;
 						batchIn.segmentSteps = tSegmentSteps;
 					}
@@ -1265,6 +1284,38 @@ void GGL::Learner::Start() {
 				}
 
 				report.Finish();
+
+				// FORK2 Part D: derived striking-quality metrics. report.Finish() has materialized all
+				// AddAvg means into report.data, so these reads/divisions are valid here.
+				// NOTE on what is/ isn't usable: GoalReward logs ~0 (zero-sum 1v1 cancellation), and
+				// Save/Shot log under mangled "PlayerDataEventReward<...>" keys -> a "scoring" bucket
+				// from them is unreliable. The RELIABLE, diagnostic decomposition is among the DENSE
+				// terms: FINISHING (GoalwardImpact, the channel we boosted) vs PRESENCE (TouchBall +
+				// StrongTouch + AerialTouch, the channel we trimmed) vs APPROACH (VPB). The key metric is
+				// "Striking/Finishing Share": it should climb as the rebalance shifts play toward power
+				// strikes (the wucwxpfx diagnosis had finishing ~6% of weighted dense income). Rewards/*
+				// are RAW (pre-weight) -> multiply each by its ExampleMain weight (keep in sync).
+				{
+					const double eps = 1e-6;
+					if (report.Has("Rewards/GoalwardImpactReward") && report.Has("Player/Ball Touch Ratio"))
+						report["Striking/GoalwardImpact Per Touch"] =
+							report["Rewards/GoalwardImpactReward"] / (report["Player/Ball Touch Ratio"] + eps);
+
+					auto wget = [&](const char* k, double w) -> double {
+						std::string key = std::string("Rewards/") + k;
+						return report.Has(key) ? w * report[key] : 0.0;
+					};
+					double finishing = wget("GoalwardImpactReward", 100.0);
+					double presence  = wget("StrongTouchReward", 40.0) + wget("TouchBallReward", 15.0)
+						+ wget("AerialTouchReward", 12.0);
+					double approach  = wget("VelocityPlayerToBallReward", 0.5);
+					report["Striking/Finishing Weighted"] = finishing;
+					report["Striking/Presence Weighted"] = presence;
+					report["Striking/Approach Weighted"] = approach;
+					double denom = std::abs(finishing) + std::abs(presence) + std::abs(approach) + eps;
+					report["Striking/Finishing Share"] = finishing / denom;
+					report["Striking/Presence Share"] = presence / denom;
+				}
 
 				if (metricSink)
 					metricSink->Send(report);
