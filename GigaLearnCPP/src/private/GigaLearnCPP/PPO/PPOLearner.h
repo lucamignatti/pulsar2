@@ -42,6 +42,14 @@ namespace GGL {
 		// against current config on resume.
 		float curEntropyScale = 0.f;
 
+		// TRIAD-NATIVE GCRL coupling controller state (persisted in Learner::SaveStats/LoadStats):
+		// gcrlLambdaEff  = the ratio-controlled lambda target (warmup-ramped before use each iter);
+		// gcrlRatioEma   = EMA of std(gcrlAdv)/std(baseNorm), driven toward config gcrlRatioTarget (~1:1);
+		// gcrlRenormStd  = EMA of std(sepSum) for RenormToStd (the inner z533fbde explosion guard).
+		float gcrlLambdaEff = 0.3f;
+		float gcrlRatioEma = 1.f;
+		float gcrlRenormStd = 1.f;
+
 		PPOLearner(
 			int obsSize, int numActions,
 			PPOLearnerConfig config, torch::Device device

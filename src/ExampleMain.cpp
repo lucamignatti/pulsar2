@@ -14,46 +14,35 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	constexpr float TEAM_SPIRIT = 0.6f;
-	constexpr float OPPONENT_PUNISH = 1.f;
+	// TRIAD-NATIVE reward stack (the income-unfreeze keystone, fork 9).
+	// opponentScale=0.0 (and teamSpirit=0.0): in 1v1 ZeroSumReward becomes an IDENTITY
+	// pass-through (own*(1-0)+avgTeam*0-avgOpp*0 = own). The OLD op=1.0 made the dense
+	// stream anti-symmetric across the two cars so symmetric income cancelled to ~0 (the
+	// broken-run Average Step Reward~0 signature). At op=0 every dense/event term is pure
+	// positive income (L1). For >1v1, teamSpirit=0 = no team sharing, op=0 = no opp subtraction.
 	auto teamMixed = [](Reward* reward) {
-		return new ZeroSumReward(reward, TEAM_SPIRIT, OPPONENT_PUNISH);
+		return new ZeroSumReward(reward, /*teamSpirit*/0.0f, /*opponentScale*/0.0f);
 	};
 
-	// === Nexto reward set (Rolv-Arild/Necto NectoRewardFunction, v3-era weights, commit 20449cd) ===
-	// Every term is wrapped in teamMixed = ZeroSumReward(team_spirit 0.6, opponent_punish 1.0),
-	// reproducing Nexto's single team-distribution pass: the distribution is linear, so wrapping
-	// each term and summing is identical to Nexto summing all terms then distributing once.
-	// dist/align/goal_dist are potential-based DELTAS of quality functions, exactly as in Nexto.
-	// OMITTED: win_prob (weight 10) -- it needs a scoreboard win-probability model plus a match
-	// clock / running score, none of which this engine's GameState exposes. Everything else is exact.
+	// Non-telescoping table: TERMINAL (lands once) + IMPULSE (event-gated one-shot) + the
+	// single LEVEL term. The telescoping potential-DELTAS (BallGoalDistance/PlayerBallDistance/
+	// Align) and the farm-bait terms (AngVel/TouchGrass/TouchHeight/LowTouchAccel/FlipReset/
+	// Boost*/Demo*) are DELETED. Dense income sized <30% of one GoalReward by construction
+	// (~10.9%): the only sustained LEVEL term is VelocityPlayerToBall 0.5 (bounded [-1,1]).
 	std::vector<WeightedReward> rewards = {
-		// Continuous state/player qualities (potential-based deltas)
-		{ teamMixed(new BallGoalDistanceReward()), 10.f },   // goal_dist_w 10 (0.25*(exp_o-exp_b) delta; x2 from zero-sum == Nexto 0.5*goal_dist_w)
-		{ teamMixed(new PlayerBallDistanceReward()), 0.25f },// dist_w 0.25 (liu_dist = exp(-|player-ball|/1410) delta)
-		{ teamMixed(new AlignReward()), 0.25f },             // align_w 0.25 (player->ball vs player->net alignment delta)
-
-		// Goal events (terminal)
-		{ teamMixed(new TeamGoalReward()), 10.f },           // goal_w 10
-		{ teamMixed(new GoalSpeedBonusReward()), 2.5f },     // goal_dist_bonus_w 2.5 (scorer: goal_speed / BALL_MAX_SPEED)
-		{ teamMixed(new ConcedeDistanceReward()), 2.5f },    // goal_dist_bonus_w 2.5 (conceder: -(1 - exp(-dist/CMS)))
-
-		// Touch
-		{ teamMixed(new TouchHeightReward()), 3.f },         // touch_height_w 3 (squared height factor x (1 + wall factor))
-		{ teamMixed(new LowTouchAccelReward()), 0.5f },      // touch_accel_w 0.5 ((1 - height_factor) * |dBallVel| / CMS)
-		{ teamMixed(new FlipResetReward()), 10.f },          // flip_reset_w 10
-
-		// Boost
-		{ teamMixed(new BoostGainReward()), 1.5f },          // boost_gain_w 1.5
-		{ teamMixed(new BoostLoseReward()), 0.8f },          // boost_lose_w 0.8
-
-		// Misc continuous
-		{ teamMixed(new AngularVelocityReward()), 0.005f },  // ang_vel_w 0.005
-		{ teamMixed(new TouchGrassPenalty()), 0.005f },      // touch_grass_w 0.005
-
-		// Demos (Nexto splits demo_w 8 equally: +4 demoer / -4 demoee)
-		{ teamMixed(new DemoReward()), 4.f },
-		{ teamMixed(new DemoedPenalty()), 4.f },
+		// Terminal scoring (GoalReward self-zero-sums via concedeScale -1: scorer +275 / conceder -275,
+		// NOT routed through opponentScale). Dominant + non-telescoping.
+		{ new GoalReward(/*concedeScale*/-1.f), 275.f },
+		{ teamMixed(new GoalSpeedBonusReward()), 15.f },     // scorer-only, fires on goal: goal_speed/BALL_MAX_SPEED
+		// Defensive/offensive event impulses (event-gated, one-shot, pro-scoring)
+		{ teamMixed(new SaveReward()), 20.f },               // PlayerEventState::save
+		{ teamMixed(new ShotReward()), 35.f },               // PlayerEventState::shot
+		// Touch impulses
+		{ teamMixed(new StrongTouchReward(20.f, 130.f)), 60.f }, // |dBallVel| in [20,130]kph -> committed strike
+		{ teamMixed(new TouchBallReward()), 30.f },          // any contact (touch-volume engine)
+		{ teamMixed(new AerialTouchReward()), 12.f },        // genuine aerial touch (the reward-stream aerial mechanism)
+		// The ONLY sustained LEVEL term: absolute approach velocity, UNWRAPPED (cannot telescope-hug-farm).
+		{ new VelocityPlayerToBallReward(), 0.5f },
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -187,6 +176,20 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
+	// TRIAD-NATIVE: GOALSHORT = world-ball REACH, HER window CAPPED short (long horizons re-enter the
+	// 0.055 state-dominated, action-invalid regime); drop the off-policy goalward HER bias.
+	cfg.ppo.contrastiveGoal.herMaxOffset = 15;
+	cfg.ppo.contrastiveGoal.herGoalwardBias = 0.f;
+	// tau 0.05, VICReg, masked-random K16 baseline, the always-on variance-weight + ratio-pinned lambda
+	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic + TD-contrastive are
+	// flagged off by default (useAntiCritic / useTDContrastive) pending their dedicated builds + validation.
+
+	// TRIAD-NATIVE self-play (fork 10): 0.15 vs a rolling frozen-checkpoint pool (no ES; BC-seeded once the
+	// offline warmstart lands -- until then version 0 is the initial policy). Breaks mutual-idle equilibria.
+	cfg.trainAgainstOldVersions = true;
+	cfg.trainAgainstOldChance = 0.15f;
+	cfg.maxOldVersions = 20;
+	cfg.tsPerVersion = 25'000'000;
 
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),

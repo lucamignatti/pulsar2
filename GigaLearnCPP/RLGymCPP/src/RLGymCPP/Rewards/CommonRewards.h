@@ -97,6 +97,23 @@ namespace RLGC {
 		}
 	};
 
+	// Non-telescoping aerial-ball-contact impulse: +1 on a GENUINE aerial touch
+	// (ball contacted while airborne, past the jump-impulse transient, not wall-driving).
+	// One-shot, no accumulation/potential. The reward-stream half of the aerial conjunction
+	// (the BC aux + 126-action set + IDM-BC init are the other three mechanisms).
+	class AerialTouchReward : public Reward {
+	public:
+		float minAirTimeSinceJump;
+		AerialTouchReward(float minAirTimeSinceJump = 0.10f) : minAirTimeSinceJump(minAirTimeSinceJump) {}
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {
+			if (!player.ballTouchedStep) return 0;
+			if (player.isOnGround) return 0;
+			if (player.airTimeSinceJump <= minAirTimeSinceJump) return 0;
+			if (player.worldContact.hasContact) return 0; // exclude wall-driving
+			return 1.f;
+		}
+	};
+
 	class SpeedReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {

@@ -346,8 +346,14 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 
 	// Adaptive entropy controller state (so a crash-resume doesn't re-ramp from
 	// the fixed seed and dip entropy each restart).
-	if (ppo)
+	if (ppo) {
 		j["entropy_scale"] = ppo->curEntropyScale;
+		// TRIAD-NATIVE GCRL coupling controller state (so resume doesn't re-seed the ratio
+		// controller / RenormToStd EMA and re-ramp the GCRL blend each restart).
+		j["gcrl_lambda_eff"] = ppo->gcrlLambdaEff;
+		j["gcrl_ratio_ema"] = ppo->gcrlRatioEma;
+		j["gcrl_renorm_std"] = ppo->gcrlRenormStd;
+	}
 
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
@@ -385,6 +391,12 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		ppo->curEntropyScale = j["entropy_scale"];
 		if (ppo->config.adaptiveEntropy)
 			ppo->curEntropyScale = RS_CLAMP(ppo->curEntropyScale, ppo->config.minEntropyScale, ppo->config.maxEntropyScale);
+	}
+	// TRIAD-NATIVE GCRL coupling controller state (contains-guarded; pre-TRIAD checkpoints keep ctor seeds).
+	if (ppo) {
+		if (j.contains("gcrl_lambda_eff")) ppo->gcrlLambdaEff = j["gcrl_lambda_eff"];
+		if (j.contains("gcrl_ratio_ema")) ppo->gcrlRatioEma = j["gcrl_ratio_ema"];
+		if (j.contains("gcrl_renorm_std")) ppo->gcrlRenormStd = j["gcrl_renorm_std"];
 	}
 
 	if (versionMgr)

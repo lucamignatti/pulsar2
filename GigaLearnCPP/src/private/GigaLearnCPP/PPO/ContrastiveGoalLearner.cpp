@@ -44,7 +44,7 @@ namespace GGL {
 			MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
 			device
 		),
-		goalEncoder(psiName.c_str(), MakePsiConfig(6, config.representationSize), device),
+		goalEncoder(psiName.c_str(), MakePsiConfig(config.goalInputSize, config.representationSize), device),
 		sharedHead(sharedHead), obsNorm(obsNorm),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
@@ -140,8 +140,14 @@ namespace GGL {
 					states = obsNorm->Normalize(states);
 				Tensor embeddings = sharedHead->Forward(states, false).detach();
 
-				Tensor sa = EncodeStateAction(embeddings, actionRepresentations);
-				Tensor g = EncodeGoal(goals);
+				// Raw (pre-L2-norm) embeddings kept for VICReg; L2-normalized for the cosine logits.
+				Tensor rawSa = phiTail.Forward(
+					torch::cat({ embeddings, actionRepresentations.to(kFloat32).to(embeddings.device()) }, -1),
+					false
+				);
+				Tensor rawG = goalEncoder.Forward(goals.to(kFloat32), false);
+				Tensor sa = L2Normalize(rawSa);
+				Tensor g = L2Normalize(rawG);
 
 				Tensor logits = torch::matmul(sa, g.transpose(0, 1)) / config.tau;
 				Tensor labels = torch::arange(curBatchSize, TensorOptions().dtype(kLong).device(device));
@@ -153,13 +159,23 @@ namespace GGL {
 				Tensor logsumexpColumns = torch::logsumexp(logits, 0);
 				Tensor logsumexpPenalty = config.logsumexpPenaltyCoeff * (logsumexpRows.pow(2).mean() + logsumexpColumns.pow(2).mean());
 
-				float stdNorm = sqrtf((float)config.representationSize);
-				Tensor varPenalty = config.varReg * (
-					1.0f / (sa.std(0, false).mean() * stdNorm + 1e-4f) +
-					1.0f / (g.std(0, false).mean() * stdNorm + 1e-4f)
-				);
+				// TRIAD-NATIVE VICReg anti-collapse on the PRE-L2-norm RAW embeddings (the unit-variance
+				// hinge is unsatisfiable on the normalized unit sphere). var = hinge(1 - per-dim std);
+				// cov = off-diagonal Gram of the centered batch, normalized by reprDim.
+				float invBM1 = 1.0f / (float)std::max<int64_t>(curBatchSize - 1, (int64_t)1);
+				float reprD = (float)config.representationSize;
+				Tensor varTerm = torch::relu(1.0f - rawSa.std(0, false)).mean()
+					+ torch::relu(1.0f - rawG.std(0, false)).mean();
+				Tensor cSa = rawSa - rawSa.mean(0, true);
+				Tensor cG = rawG - rawG.mean(0, true);
+				Tensor covSa = torch::matmul(cSa.transpose(0, 1), cSa) * invBM1;
+				Tensor covG = torch::matmul(cG.transpose(0, 1), cG) * invBM1;
+				Tensor covTerm =
+					(covSa.pow(2).sum() - covSa.diagonal().pow(2).sum()) / reprD +
+					(covG.pow(2).sum() - covG.diagonal().pow(2).sum()) / reprD;
+				Tensor vicPenalty = config.vicVar * varTerm + config.vicCov * covTerm;
 
-				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + varPenalty;
+				Tensor loss = rowLoss + columnLoss + logsumexpPenalty + vicPenalty;
 
 				phiTail.optim->zero_grad();
 				goalEncoder.optim->zero_grad();

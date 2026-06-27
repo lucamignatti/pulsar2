@@ -36,9 +36,11 @@ RLGC::DefaultAction::DefaultAction() {
 			for (float roll : R_F) {
 				for (float jump : R_B) {
 					for (float boost : R_B) {
-						// Only need roll for sideflip
-						if (jump == 1 && yaw != 0)
-							continue;
+						// TRIAD-NATIVE fork 7: diagonal-air-dodge actions (jump==1 && yaw!=0)
+						// RE-ENABLED (this was the only blocker). Aerial basin is unreachable by
+						// cold exploration (L6: 0 air touches @592) and the IDM cannot legally map
+						// human diagonal dodges without them. 66->102 aerial, total 90->126.
+						// jumpMask below gates them (airborne + HasFlipOrJump => dodge available).
 
 						// Duplicate with ground
 						if (pitch == roll && roll == jump && jump == 0)

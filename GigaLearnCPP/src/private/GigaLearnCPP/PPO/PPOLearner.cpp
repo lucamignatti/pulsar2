@@ -20,6 +20,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.adaptiveEntropy)
 		curEntropyScale = RS_CLAMP(curEntropyScale, config.minEntropyScale, config.maxEntropyScale);
 
+	// TRIAD-NATIVE GCRL coupling controller seed (LoadStats overwrites on resume).
+	gcrlLambdaEff = config.contrastiveGoal.gcrlLambda;
+	gcrlRatioEma = config.contrastiveGoal.gcrlRatioTarget;
+	gcrlRenormStd = config.contrastiveGoal.gcrlRenormStdEma; // seed at the target std (~0.7)
+
 	if (config.batchSize <= 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize must be positive");
 	if (config.miniBatchSize <= 0)
@@ -359,7 +364,15 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 			critic, embeddings, actions, actionMasks, goals,
 			learner->numActions, cfg.policyScoreBatchSize, cfg.baselineActionSamples,
 			&taken, &baseline, &spread);
-		torch::Tensor sep = torch::clamp(edge / (spread + cfg.sigmaFloor), -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
+		// TRIAD-NATIVE: BATCH-normalize the edge -- the within-state spread DIVISOR is REMOVED
+		// (it was 0/0 in the non-discriminating far-field: tiny numerator over a collapsing
+		// denominator slammed to the +-clamp, the structural z533fbde 0.27->8 CAR explosion).
+		// Then weight by the ALWAYS-ON smooth variance-weight w=sigmoid((crossActionSpread -
+		// sigmaMin)/scale): ~1 when the critic discriminates the action, ->0 when it can't
+		// (replaces the dead binary gcrlGateRatio gate; per-state suppression is automatic).
+		torch::Tensor edgeBN = (edge - edge.mean()) / (edge.std() + 1e-4f);
+		torch::Tensor w = torch::sigmoid((spread - cfg.gcrlVarWeightSigmaMin) / cfg.gcrlVarWeightScale);
+		torch::Tensor sep = torch::clamp(w * edgeBN, -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
 		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread));
 	};
 
@@ -383,21 +396,38 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	}
 	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;
 
-	// Single global lambda: short bootstrap warmup -> hold. No separation gate; weak
-	// critics self-attenuate via their ~0 numerator above.
 	float warmupProgress = cfg.gcrlLambdaWarmupSteps == 0 ? 1.f
 		: RS_CLAMP(totalTimesteps / (float)cfg.gcrlLambdaWarmupSteps, 0.f, 1.f);
-	float lambdaEff = cfg.gcrlLambda * warmupProgress;
 
 	torch::Tensor baseNorm = NormalizeAdvantage(baseAdvRaw, cfg.sigmaFloor);
-	torch::Tensor gcrlAdv = lambdaEff * sepSum;
-	// Re-normalize the BLENDED advantage to unit std before the PPO loss. The GCRL
-	// per-critic term (sepSum) is NOT unit-normalized, so its magnitude can EXPLODE
-	// (run z533fbde: GCRL/Car Edge Mean -> 8.0) and overpower the entropy bonus, forcing
-	// collapse. Renorm bounds the total advantage magnitude -- both critics still set its
-	// DIRECTION, and a near-zero (non-discriminating) critic contribution stays near-zero
-	// relatively, preserving self-attenuation. This is what lets the entropy pin hold.
-	torch::Tensor policyAdvantage = NormalizeAdvantage(baseNorm + gcrlAdv, cfg.sigmaFloor);
+
+	// TRIAD-NATIVE RenormToStd: scale sepSum to a target std (~rho), tracked by an EMA of its
+	// own std -- the INNER z533fbde explosion guard (KEPT; the OUTER unit-renorm is DROPPED
+	// because it reinflated a weak GCRL signal to unit std exactly in the cold regime).
+	float sepStd = sepSum.std().item<float>();
+	if (std::isfinite(sepStd))
+		learner->gcrlRenormStd = cfg.gcrlRatioEmaDecay * learner->gcrlRenormStd + (1.f - cfg.gcrlRatioEmaDecay) * sepStd;
+	float rho = cfg.gcrlRenormStdEma; // target combined std (~0.7)
+	torch::Tensor combinedGCRL = sepSum * (rho / (learner->gcrlRenormStd + 1e-6f));
+
+	// Lambda INTEGRAL CONTROLLER: drive std(gcrlAdv)/std(baseNorm) -> gcrlRatioTarget (~1:1, the
+	// working-run signature), turning the L3 invariant from a hoped-for property into a set-point.
+	// Cold-start protection = the warmup ramp (GCRL ~0 early, ramps to the controlled value).
+	float controlledLambda = RS_CLAMP(learner->gcrlLambdaEff, cfg.gcrlLambdaMin, cfg.gcrlLambdaMax);
+	float lambdaEff = warmupProgress * controlledLambda;
+	torch::Tensor gcrlAdv = lambdaEff * combinedGCRL;
+
+	float stdBase = baseNorm.std().item<float>();
+	float stdGcrl = gcrlAdv.std().item<float>();
+	float ratioObs = stdGcrl / (stdBase + 1e-6f);
+	if (std::isfinite(ratioObs))
+		learner->gcrlRatioEma = cfg.gcrlRatioEmaDecay * learner->gcrlRatioEma + (1.f - cfg.gcrlRatioEmaDecay) * ratioObs;
+	learner->gcrlLambdaEff = RS_CLAMP(
+		controlledLambda * std::exp(cfg.gcrlLambdaCtrlGain * (cfg.gcrlRatioTarget - learner->gcrlRatioEma)),
+		cfg.gcrlLambdaMin, cfg.gcrlLambdaMax);
+
+	// NO outer renorm: baseNorm carries the reward DIRECTION, gcrlAdv the bounded GCRL nudge.
+	torch::Tensor policyAdvantage = baseNorm + gcrlAdv;
 	experience.data.advantages = policyAdvantage.detach().to(experience.data.advantages.device());
 	experience.data.crlAdvantages = gcrlAdv.detach().to(experience.data.advantages.device());
 
@@ -405,8 +435,11 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	report["A Policy Std"] = TensorStd(policyAdvantage);
 	report["CRL Advantage Mean"] = TensorMean(gcrlAdv);
 	report["CRL Advantage Std"] = TensorStd(gcrlAdv);
-	report["CRL Lambda Target"] = cfg.gcrlLambda;
+	report["CRL/Std Ratio (gcrl over base)"] = ratioObs;
+	report["CRL/Ratio Ema"] = learner->gcrlRatioEma;
+	report["CRL/Renorm Std"] = learner->gcrlRenormStd;
 	report["CRL Lambda Effective"] = lambdaEff;
+	report["CRL Lambda Controlled"] = learner->gcrlLambdaEff;
 	report["CRL Lambda Warmup Progress"] = warmupProgress;
 }
 

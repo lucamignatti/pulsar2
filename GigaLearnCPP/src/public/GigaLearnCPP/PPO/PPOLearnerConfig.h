@@ -26,7 +26,7 @@ namespace GGL {
 		int herMinOffset = 1;
 		int herMaxOffset = 90;
 		float herShortBiasPower = 2.f;
-		int baselineActionSamples = 4;
+		int baselineActionSamples = 16; // TRIAD-NATIVE: masked-random K (4->16, var of mean(4) is 4x noisy)
 
 		// ── Car critic ──────────────────────────────────────────────────────────
 		// A second, isolated contrastive critic whose goal is the car-local
@@ -53,6 +53,8 @@ namespace GGL {
 		float gcrlSepClamp = 3.f;
 
 		int representationSize = 128;
+		// TRIAD-NATIVE: per-critic goal input dim (de-hardcodes MakePsiConfig(6)). CAR=6, GOALSHORT=6, ANTI=8.
+		int goalInputSize = 6;
 		// Hidden layers of the phi tail (action-fusion network on top of the shared_head embedding).
 		// Input = shared_head output size + numActions; output = representationSize.
 		std::vector<int> phiTailLayerSizes = { 256, 256 };
@@ -61,9 +63,34 @@ namespace GGL {
 		int64_t policyScoreBatchSize = 4096;
 		int64_t infoSubSample = 512;
 		float criticLR = 3e-4f;
-		float tau = 0.02f;
-		float varReg = 0.3f;
+		float tau = 0.05f; // TRIAD-NATIVE: 0.02->0.05 (0.02 saturated logits +-50, starved early gradient; unified train+Score)
+		float varReg = 0.3f; // (UNUSED: replaced by VICReg below)
 		float logsumexpPenaltyCoeff = 0.01f;
+		// TRIAD-NATIVE VICReg anti-collapse, applied to the PRE-L2-normalization RAW phiTail/psi output
+		// (the unit-variance hinge is unsatisfiable on the L2-normalized unit sphere where per-dim std is
+		// structurally pinned ~1/sqrt(reprDim)). Replaces the inverse-std varReg (which pushed std unbounded).
+		float vicVar = 1.0f;  // variance-hinge coeff
+		float vicCov = 0.04f; // off-diagonal covariance coeff
+		// ── TRIAD-NATIVE coupling controller (used by the PPOLearner advantage rewrite) ──
+		// lambda integral controller (replaces the fixed warmup ramp + the outer renorm):
+		// lambdaEff *= exp(gain*(ratioTarget - std(gcrl)/std(base))), clamped [max(min,warmupFloor(t)),max].
+		float gcrlLambdaCtrlGain = 0.05f;
+		float gcrlLambdaMin = 0.0f;
+		float gcrlLambdaMax = 2.0f;
+		float gcrlRatioTarget = 1.0f;   // target std(gcrl)/std(base) ~ 1:1 (the working-run signature)
+		float gcrlRatioEmaDecay = 0.9f;
+		float gcrlRenormStdEma = 0.7f;  // RenormToStd EMA (the inner z533fbde explosion guard, KEPT)
+		// always-on smooth variance-weight w=sigmoid((crossActionSpread - sigmaMin)/scale) (replaces the dead gate)
+		float gcrlVarWeightSigmaMin = 0.05f;
+		float gcrlVarWeightScale = 0.05f;
+		// ── TRIAD-NATIVE anti (defensive) critic: net-relative opponent-threat goal (8d), TD row-only ──
+		bool useAntiCritic = false;
+		int antiHerMinOffset = 1;
+		int antiHerMaxOffset = 15;
+		// ── TRIAD-NATIVE TD-contrastive (CDPC) for GOALSHORT/ANTI: EMA target + pi-weighted soft bootstrap ──
+		bool useTDContrastive = false;
+		float tdEmaDecay = 0.005f;            // EMA target tracking rate
+		uint64_t tdRampSteps = 20'000'000;    // MC->TD target-blend ramp (in-run stability schedule)
 
 		float targetSpeed = 1500.f;
 		float targetSpeedJitter = 0.f;
