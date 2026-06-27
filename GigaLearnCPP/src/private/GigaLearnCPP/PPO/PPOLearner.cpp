@@ -289,34 +289,30 @@ static torch::Tensor ComputeGCRLAdvantageWithBaseline(
 		return takenScores;
 	}
 
-	int64_t n = embeddings.size(0);
-
-	// Draw all baseline action samples up front.
-	std::vector<torch::Tensor> altActionSamples(baselineSamples);
-	for (int i = 0; i < baselineSamples; i++)
-		altActionSamples[i] = SampleValidActions(actionMasks);
-
-	// Tile embeddings and goals [n*baselineSamples, D]:
-	// repeat({k,1}) on [n,D] gives [copy0_states..., copy1_states..., ...],
-	// which aligns with cat(altActionSamples, 0) = [sample0_actions..., sample1_actions..., ...].
-	torch::Tensor tiledEmbeddings = embeddings.repeat({ (int64_t)baselineSamples, 1 });
-	torch::Tensor tiledGoals = goals.repeat({ (int64_t)baselineSamples, 1 });
-	torch::Tensor stackedActions = torch::cat(altActionSamples, 0);
-
-	// One forward pass for all baseline samples combined.
-	torch::Tensor allScores = ScoreGCRLChunks(learner, tiledEmbeddings, stackedActions, tiledGoals, numActions, chunkSize);
-	// Reshape to [baselineSamples, n]: row i = scores under sample-i random actions.
-	allScores = allScores.view({ (int64_t)baselineSamples, n });
-
-	torch::Tensor baselineScores = allScores.mean(0);
+	// TRIAD-NATIVE memory fix (ROCm OOM): score the K baseline samples ONE AT A TIME and
+	// accumulate a running sum + sum-of-squares, instead of tiling embeddings/goals to
+	// [n*K, D] up front. The old embeddings.repeat({K,1}) materialized n*K*embeddingDim*4
+	// bytes in a SINGLE tensor (22 GiB at K=16, n~1.34M -> HIP OOM on the 16 GB card).
+	// ScoreGCRLChunks already chunks internally, so total compute is identical and peak
+	// memory is O(n) not O(n*K). The baseline mean and population spread are numerically
+	// identical to the old batched form (var = E[x^2] - E[x]^2 == centered.pow(2).mean(0)).
+	torch::Tensor baselineSum = torch::zeros_like(takenScores);
+	torch::Tensor baselineSqSum = (outBaselineSpread && baselineSamples > 1)
+		? torch::zeros_like(takenScores) : torch::Tensor();
+	for (int i = 0; i < baselineSamples; i++) {
+		torch::Tensor altActions = SampleValidActions(actionMasks);
+		torch::Tensor sampleScores = ScoreGCRLChunks(learner, embeddings, altActions, goals, numActions, chunkSize);
+		baselineSum = baselineSum + sampleScores;
+		if (baselineSqSum.defined())
+			baselineSqSum = baselineSqSum + sampleScores.pow(2);
+	}
+	torch::Tensor baselineScores = baselineSum / (float)baselineSamples;
 
 	if (outBaselineScores)
 		*outBaselineScores = baselineScores;
 	if (outBaselineSpread) {
-		// Within-state variance across the baseline samples: noise floor for action-discrimination.
-		if (baselineSamples > 1) {
-			torch::Tensor centered = allScores - baselineScores.unsqueeze(0);
-			torch::Tensor var = centered.pow(2).mean(0);
+		if (baselineSqSum.defined()) {
+			torch::Tensor var = baselineSqSum / (float)baselineSamples - baselineScores.pow(2);
 			*outBaselineSpread = var.clamp_min(0).sqrt();
 		} else {
 			*outBaselineSpread = torch::zeros_like(takenScores);
