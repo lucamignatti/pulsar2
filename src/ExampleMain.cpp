@@ -37,6 +37,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Defensive/offensive event impulses (event-gated, one-shot, pro-scoring)
 		{ teamMixed(new SaveReward()), 20.f },               // PlayerEventState::save
 		{ teamMixed(new ShotReward()), 35.f },               // PlayerEventState::shot
+		// Dense GOALWARD-STRIKE gradient (xddib2kd fix): rewards the goalward ball-speed INCREASE the
+		// agent's touch produces -> breaks the approach-then-idle peak (the CONTROL critic's ball-hold
+		// pull). The graded striking signal the event-only touch rewards below could not provide.
+		{ teamMixed(new GoalwardImpactReward()), 50.f },
 		// Touch impulses
 		{ teamMixed(new StrongTouchReward(20.f, 130.f)), 60.f }, // |dBallVel| in [20,130]kph -> committed strike
 		{ teamMixed(new TouchBallReward()), 30.f },          // any contact (touch-volume engine)
@@ -180,6 +184,11 @@ int main(int argc, char* argv[]) {
 	// 0.055 state-dominated, action-invalid regime); drop the off-policy goalward HER bias.
 	cfg.ppo.contrastiveGoal.herMaxOffset = 15;
 	cfg.ppo.contrastiveGoal.herGoalwardBias = 0.f;
+	// xddib2kd fix: lower GCRL's target share of the policy gradient (was 1:1) so the egocentric
+	// CONTROL critic's continuous ball-HOLD pull stops dominating the strike action and the reward
+	// (now with the goalward-strike impulse) gets more relative weight. CONTROL still leads cold-start
+	// approach (it climbed to edge ~1.0). If approach-then-idle persists, lower further toward 0.3.
+	cfg.ppo.contrastiveGoal.gcrlRatioTarget = 0.5f;
 	// tau 0.05, VICReg, masked-random K16 baseline, the always-on variance-weight + ratio-pinned lambda
 	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic + TD-contrastive are
 	// flagged off by default (useAntiCritic / useTDContrastive) pending their dedicated builds + validation.

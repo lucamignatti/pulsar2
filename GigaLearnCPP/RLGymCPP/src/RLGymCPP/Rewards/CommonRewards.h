@@ -114,6 +114,26 @@ namespace RLGC {
 		}
 	};
 
+	// Dense touch-anchored GOALWARD-STRIKE impulse: on the agent's own touch, reward the
+	// INCREASE in the ball's goalward speed the touch produced (max(0, delta)). This is the
+	// graded striking gradient that breaks the approach-then-idle peak (the egocentric CONTROL
+	// critic rewards holding the ball at the car; striking moves it away and drops its score,
+	// so without a goalward-strike reward the policy parks at the ball). Non-telescoping (an
+	// impulse), fires ONLY on own contact, holding/parking/whiffing pays 0; team-signed target.
+	class GoalwardImpactReward : public Reward {
+	public:
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {
+			if (!player.ballTouchedStep || !state.prev) return 0;
+			Vec target = (player.team == Team::BLUE) ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+			Vec dirNow = (target - state.ball.pos).Normalized();
+			Vec dirPrev = (target - state.prev->ball.pos).Normalized();
+			float gsNow = dirNow.Dot(state.ball.vel); if (gsNow < 0) gsNow = 0;
+			float gsPrev = dirPrev.Dot(state.prev->ball.vel); if (gsPrev < 0) gsPrev = 0;
+			float delta = (gsNow - gsPrev) / CommonValues::BALL_MAX_SPEED;
+			return delta > 0 ? delta : 0.f;
+		}
+	};
+
 	class SpeedReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) {
