@@ -35,6 +35,11 @@ namespace GGL {
 		// short, near-term HER window (no goalward bias). Needs the obs builder to
 		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
 		bool useCarCritic = false;
+		// World-frame "GOALSHORT" ball-goal critic (the default contrastiveGoalLearner). It is action-INERT
+		// far-field (edge ~0.04, successor-feature asymptote) and its batch-normed edge reinflates to
+		// unit-std noise (~30% of the GCRL nudge). Set false to DROP it from training + coupling (CAR-only
+		// governs the advantage); it stays constructed+checkpoint-loadable, just untrained/unscored.
+		bool useGoalCritic = true;
 		int carHerMinOffset = 1;
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2.f;

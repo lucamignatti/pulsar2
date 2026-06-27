@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
 	// policy only a single gradient step per iteration's data AND made Mean KL a
 	// meaningless ~0 (ratio==1 by construction, so reported KL was just float
 	// noise), hiding whether the policy was actually moving.
-	cfg.ppo.epochs = 2;
+	cfg.ppo.epochs = 3; // Run1: extract KL headroom (KL ~0.005 vs clip 0.2). Judge on rating-per-WALLCLOCK (SPS drops ~14k->~9-10k); KL>0.02 sustained = revert.
 
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
@@ -161,7 +161,7 @@ int main(int argc, char* argv[]) {
 
 	// Good learning rate to start
 	cfg.ppo.policyLR = 1.5e-4;
-	cfg.ppo.criticLR = 1.5e-4;
+	cfg.ppo.criticLR = 3e-4; // Run1: value head only (Critic Loss drifting 0.006->0.07 w/ reward scale). Trunk stays at policyLR via min(policyLR,criticLR) in SetLearningRates.
 
 	cfg.ppo.sharedHead.layerSizes = { 256, 256 };
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
@@ -176,6 +176,11 @@ int main(int argc, char* argv[]) {
 	// Watch GCRL/Car Separation (should climb first) vs GCRL/Goal Separation.
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.useCarCritic = true;
+	// Run1: DROP the world-frame GOALSHORT critic from training + coupling. It is action-INERT far-field
+	// (edge ~0.04, SF asymptote) and was injecting ~30% unit-std NOISE into the policy gradient (the edge
+	// batch-norm reinflated its ~0 action-edge; w floored at ~0.27 not 0). GCRL is now CAR-only. The critic
+	// stays constructed + checkpoint-loadable (resume from 2fkzih10 works), just untrained/unscored/uncoupled.
+	cfg.ppo.contrastiveGoal.useGoalCritic = false;
 	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
 	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
@@ -194,11 +199,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.gcrlRatioTarget = 0.5f;
 	// tau 0.05, VICReg, masked-random K16 baseline, the always-on variance-weight + ratio-pinned lambda
 	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic still flagged off.
-	// FORK2 (wucwxpfx-diagnosis-driven): the REACH/Goal critic was MC-only and action-INERT (Goal Edge
-	// ~0.03 vs Car ~0.3) -> GCRL was effectively CONTROL-only. Enable TD-contrastive on GOALSHORT (CAR stays
-	// pure MC) so the world-ball critic gains per-action discrimination; soft-label CE bootstrap, EMA
-	// targets, K-sampled pi-soft value, MC->TD ramp, collapse guard (defaults in PPOLearnerConfig.h).
-	cfg.ppo.contrastiveGoal.useTDContrastive = true;
+	// FORK2 TD-contrastive on GOALSHORT: TESTED in run 2fkzih10 and REVERTED. It FAILED its falsification
+	// gate (Goal Edge stayed ~0.044, never near the 0.15 target, over 71M ts at r=1) and DEGRADED the Goal
+	// head (Categorical Accuracy 0.20->0.10 while MC climbs to 0.88). Root cause is STRUCTURAL: the MC
+	// baseline pins Goal Edge ~0.03 to 984M ts (successor-feature asymptote) and the pi-soft bootstrap value
+	// is itself action-invariant (SoftValue EntropyFrac 0.999), so TD has no per-action signal to inject.
+	// The far-field world-ball critic is the WRONG geometry; the only action-discriminating critic is the
+	// egocentric CAR critic (edge ~0.78). Retuning the ramp will NOT help. Code stays (flag-gated) for a
+	// future geometry-changed revival, not a re-enable on this critic.
+	cfg.ppo.contrastiveGoal.useTDContrastive = false;
 	// FORK2 Part C: GOALSHORT HER goal = 0.5 achieved-future + 0.5 net-directed scoring goal (synthetic
 	// rows are excluded from the TD bootstrap). Populates real near-net states + the scoring-goal manifold.
 	cfg.ppo.contrastiveGoal.scoringGoalMixFrac = 0.5f;

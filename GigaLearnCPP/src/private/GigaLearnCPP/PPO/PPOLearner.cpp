@@ -368,16 +368,29 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		// (replaces the dead binary gcrlGateRatio gate; per-state suppression is automatic).
 		torch::Tensor edgeBN = (edge - edge.mean()) / (edge.std() + 1e-4f);
 		torch::Tensor w = torch::sigmoid((spread - cfg.gcrlVarWeightSigmaMin) / cfg.gcrlVarWeightScale);
-		torch::Tensor sep = torch::clamp(w * edgeBN, -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
+		// FORK: HARD-suppress a near-zero-spread (non-discriminating) critic so its batch-normed edge cannot
+		// reinflate to unit-std noise (the GOALSHORT failure: w's sigmoid floors at ~0.27, not 0, so a dead
+		// critic still injected ~30% noise). Linear ramp to 0 as spread->0, complementing the soft sigmoid w.
+		// =1 for any healthy critic (spread >= sigmaMin), so CAR is unaffected.
+		torch::Tensor spreadGate = torch::clamp(spread / RS_MAX(cfg.gcrlVarWeightSigmaMin, 1e-6f), 0.f, 1.f);
+		torch::Tensor sep = torch::clamp(w * spreadGate * edgeBN, -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
 		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread));
 	};
 
-	// Goal critic: scores HER achieved future ball (in-distribution), not the net.
-	auto goalRes = criticSep(learner->contrastiveGoalLearner, experience.data.herGoals.to(device));
-	torch::Tensor sepSum = std::get<0>(goalRes);
-	report["GCRL/Goal Edge Mean"] = std::get<1>(goalRes);
-	report["GCRL/Goal Baseline Spread"] = std::get<2>(goalRes);
-	report["GCRL/Goal Separation"] = TensorMean(sepSum.abs());
+	// Goal (world-frame GOALSHORT) critic: action-INERT far-field. DROPPED from the advantage when
+	// useGoalCritic=false (CAR-only governs coupling); kept logged at 0 so downstream/Display is stable.
+	torch::Tensor sepSum;
+	if (cfg.useGoalCritic) {
+		auto goalRes = criticSep(learner->contrastiveGoalLearner, experience.data.herGoals.to(device));
+		sepSum = std::get<0>(goalRes);
+		report["GCRL/Goal Edge Mean"] = std::get<1>(goalRes);
+		report["GCRL/Goal Baseline Spread"] = std::get<2>(goalRes);
+		report["GCRL/Goal Separation"] = TensorMean(sepSum.abs());
+	} else {
+		report["GCRL/Goal Edge Mean"] = 0.f;
+		report["GCRL/Goal Baseline Spread"] = 0.f;
+		report["GCRL/Goal Separation"] = 0.f;
+	}
 
 	bool carActive = cfg.useCarCritic && learner->carContrastiveLearner
 		&& experience.data.carHerGoals.defined()
@@ -388,9 +401,13 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		report["GCRL/Car Edge Mean"] = std::get<1>(carRes);
 		report["GCRL/Car Baseline Spread"] = std::get<2>(carRes);
 		report["GCRL/Car Separation"] = TensorMean(std::get<0>(carRes).abs());
-		sepSum = sepSum + std::get<0>(carRes);
+		sepSum = sepSum.defined() ? sepSum + std::get<0>(carRes) : std::get<0>(carRes);
 	}
 	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;
+
+	// No active GCRL critic (both off): contribute zero so the policy uses the base advantage alone.
+	if (!sepSum.defined())
+		sepSum = torch::zeros_like(baseAdvRaw);
 
 	float warmupProgress = cfg.gcrlLambdaWarmupSteps == 0 ? 1.f
 		: RS_CLAMP(totalTimesteps / (float)cfg.gcrlLambdaWarmupSteps, 0.f, 1.f);
@@ -474,7 +491,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			nextPolicyProbs = torch::cat(parts, 0);   // [N, numActions], CPU
 		}
 
-		ContrastiveGoalStats crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng, totalTimesteps, nextPolicyProbs);
+		// FORK: skip the GOALSHORT critic's training (reclaim its 1024x4 goalEncoder InfoNCE compute) when
+		// it is dropped from coupling. Default-constructed stats (zeros) keep the report/Display stable.
+		ContrastiveGoalStats crlTrainStats;
+		if (config.contrastiveGoal.useGoalCritic)
+			crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng, totalTimesteps, nextPolicyProbs);
 
 		report["CRL Critic Loss"] = crlTrainStats.loss;
 		report["GCRL Row Loss"] = crlTrainStats.rowLoss;
