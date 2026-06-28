@@ -4,6 +4,7 @@
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
 
 #include <torch/cuda.h>
+#include <ATen/Context.h>
 #if defined(__APPLE__) && __has_include(<torch/mps.h>)
 #include <torch/mps.h>
 #define RG_MPS_SUPPORT
@@ -236,6 +237,17 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	torch::manual_seed(config.randomSeed);
 
 	at::Device device = ResolveLearnerDevice(config.deviceType);
+
+	// Apply the TF32 matmul policy on CUDA. libtorch defaults cuBLAS-matmul TF32 to OFF, so without this the
+	// dense MLP forward/backward run as strict fp32 and never touch the Ampere+/Blackwell TF32 tensor-core
+	// path -- config.allowTF32 (default true) is otherwise inert. Set it false for strict-fp32 reproducibility.
+	// cuDNN TF32 is already on by default and irrelevant to this conv-free MLP; we set it for symmetry. The
+	// setters exist on every build but only bite on CUDA, so this is gated to a CUDA device.
+	if (device.is_cuda()) {
+		at::globalContext().setAllowTF32CuBLAS(config.allowTF32);
+		at::globalContext().setAllowTF32CuDNN(config.allowTF32);
+		RG_LOG("\tTF32 matmuls (CUDA tensor cores): " << (config.allowTF32 ? "enabled" : "disabled"));
+	}
 
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
 		RG_LOG("\tInitializing RocketSim...");

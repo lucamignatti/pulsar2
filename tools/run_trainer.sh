@@ -47,6 +47,18 @@ RESTART_DELAY_SECS="${RESTART_DELAY_SECS:-5}"
 FAST_CRASH_SECS="${FAST_CRASH_SECS:-120}"
 MAX_FAST_CRASHES="${MAX_FAST_CRASHES:-5}"
 
+# --- GPU runtime defaults (NVIDIA CUDA) -------------------------------------
+# Set before the process starts so they're honored before the CUDA context /
+# caching allocator initialize. expandable_segments keeps the caching allocator
+# from fragmenting on the 16 GB card (Blackwell/RTX 5080) -- the biggest anti-OOM
+# lever for PPO's varying minibatch shapes. CUBLAS_WORKSPACE_CONFIG gives cuBLASLt
+# enough scratch (~24 MiB) to pick fast tensor-core GEMM kernels. Both respect a
+# value you set yourself and are harmless on non-CUDA (ROCm/MPS/CPU) builds.
+: "${PYTORCH_CUDA_ALLOC_CONF:=expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF
+: "${CUBLAS_WORKSPACE_CONFIG:=:4096:8}"
+export CUBLAS_WORKSPACE_CONFIG
+
 usage() {
 	sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }

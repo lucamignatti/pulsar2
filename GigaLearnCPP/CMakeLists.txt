@@ -16,8 +16,32 @@ endif()
 # ROCm package targets. Some pip installs do not put ROCm's CMake packages on
 # CMAKE_PREFIX_PATH, so register the ROCm targets Torch may reference before
 # loading Torch.
+#
+# ROCm/HIP target-stubbing mode. AUTO (default) stubs only when a ROCm install is
+# actually present (/opt/rocm or the ROCM_PATH/HIP_PATH env); ON forces it; OFF
+# disables it. The stubs exist solely to satisfy a ROCm libtorch's Torch targets.
+# A CUDA build never needs them -- but if this box still has ROCm leftovers in
+# /opt/rocm from a previous AMD card, AUTO would still run the (harmless but noisy)
+# stubbing, so configure a clean CUDA build with -DGGL_ROCM=OFF.
+set(GGL_ROCM "AUTO" CACHE STRING "ROCm/HIP libtorch dependency stubbing: AUTO, ON, or OFF")
+set_property(CACHE GGL_ROCM PROPERTY STRINGS AUTO ON OFF)
+
 function(ggl_prepare_rocm_torch_dependencies)
 	if (APPLE OR WIN32)
+		return()
+	endif()
+
+	if (GGL_ROCM STREQUAL "OFF")
+		return()
+	endif()
+
+	# AUTO: only stub when a ROCm install is actually present, so a CUDA (or CPU-only) box is a clean no-op
+	# -- no "Creating placeholder ROCm target" spam and no chance of pulling in a stray ROCm package.
+	# ON: always stub (e.g. a pip ROCm wheel with no /opt/rocm and no ROCM_PATH/HIP_PATH).
+	if (NOT GGL_ROCM STREQUAL "ON"
+			AND NOT DEFINED ENV{ROCM_PATH}
+			AND NOT DEFINED ENV{HIP_PATH}
+			AND NOT EXISTS "/opt/rocm")
 		return()
 	endif()
 
