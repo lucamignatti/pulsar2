@@ -131,6 +131,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.batchSize = tsPerItr;
 	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target
 
+	// BF16 inference (collection forward + GAE value prediction). Gradient-free, native on Blackwell,
+	// big collection speedup. A/B it: watch Mean KL / Clip Fraction don't drift (collection-vs-update
+	// prob precision can interact). See also cfg.ppo.useAMP (BF16 on the update, default off).
+	cfg.ppo.useHalfPrecision = true;
+
 	// 2 epochs (the value this comment has always recommended). epochs=1 gave the
 	// policy only a single gradient step per iteration's data AND made Mean KL a
 	// meaningless ~0 (ratio==1 by construction, so reported KL was just float

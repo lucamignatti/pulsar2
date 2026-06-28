@@ -16,8 +16,17 @@ GGL::Model::Model(
 	int lastSize = config.numInputs;
 	for (int i = 0; i < config.layerSizes.size(); i++) {
 		seq->push_back(torch::nn::Linear(lastSize, config.layerSizes[i]));
-		if (config.addLayerNorm)
-			seq->push_back(ManualLayerNorm((int64_t)config.layerSizes[i])); // ROCm-safe LayerNorm (see Models.h)
+		if (config.addLayerNorm) {
+			// On CUDA use the native fused LayerNorm: faster, and it stays fp32 under AMP autocast
+			// (the hand-rolled mean/var/rsqrt would compute the variance in BF16). ManualLayerNorm is
+			// the ROCm-safe fallback (fused native_layer_norm gave non-finite grads on ROCm). Both
+			// register weight/bias of size [layerSize], so checkpoints are interchangeable (Load()'s
+			// size check passes and torch::load fills by name/index).
+			if (device.is_cuda())
+				seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ (int64_t)config.layerSizes[i] })));
+			else
+				seq->push_back(ManualLayerNorm((int64_t)config.layerSizes[i]));
+		}
 		lastSize = config.layerSizes[i];
 		AddActivationFunc(seq, config.activationType);
 	}

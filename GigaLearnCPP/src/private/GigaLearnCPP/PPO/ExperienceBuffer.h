@@ -28,9 +28,9 @@ namespace GGL {
 
 		ExperienceBuffer(int seed, torch::Device device);
 
-		ExperienceTensors _GetSamples(const int64_t* indices, size_t size) const;
+		ExperienceTensors _GetSamples(const int64_t* indices, size_t size, bool pinMemory = false) const;
 
 		// Not const because it uses our random engine
-		std::vector<ExperienceTensors> GetAllBatchesShuffled(int64_t batchSize, bool overbatching);
+		std::vector<ExperienceTensors> GetAllBatchesShuffled(int64_t batchSize, bool overbatching, bool pinMemory = false);
 	};
 }

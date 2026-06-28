@@ -207,6 +207,20 @@ namespace GGL {
 		// This is much faster on GPU, not so much for CPU
 		bool useHalfPrecision = false;
 
+		// BF16 autocast (AMP) for the PPO *update* on CUDA. Casts the dense policy/critic matmuls in the
+		// forward+backward to BF16 tensor-core ops; numerically-sensitive ops (softmax/exp/log, layer_norm,
+		// losses) stay fp32 via autocast's promotion lists. Master weights stay fp32 and BF16 needs no
+		// GradScaler. ~up to 2x on the update matmuls + ~half the activation memory on Ampere+/Blackwell.
+		// OFF by default: BF16 adds noise to logits/ratios, so validate KL/entropy/touch + non-finite
+		// counts on a real run before trusting it. CUDA-only (ignored on CPU/MPS).
+		bool useAMP = false;
+
+		// Allocate the shuffled minibatch tensors in pinned (page-locked) host memory so the per-minibatch
+		// .to(device, non_blocking=true) copies are real async DMA transfers instead of silently synchronous
+		// (a pageable source makes non_blocking a no-op). No extra copy -- the gather writes straight into
+		// the pinned buffer. Helps a data-transfer/consumption-bound loop. CUDA-only.
+		bool pinBatchMemory = false;
+
 		PartialModelConfig policy, critic, sharedHead;
 
 		int epochs = 2;

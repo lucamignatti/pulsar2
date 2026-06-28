@@ -549,6 +549,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	bool trainCritic = config.criticLR != 0;
 	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
 
+	// BF16 autocast (AMP) and pinned H2D batches are CUDA-only perf levers; both no-op elsewhere.
+	bool ampOn = config.useAMP && device.is_cuda();
+	bool pinBatches = config.pinBatchMemory && device.is_cuda();
+
 	// RSNorm: update the running obs stats ONCE per rollout from the freshly
 	// collected (raw) observations, BEFORE the K epochs. The stats are then frozen
 	// for the entire epoch pass (every minibatch normalizes with these stats inside
@@ -563,7 +567,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
-		auto batches = experience.GetAllBatchesShuffled(config.batchSize, config.overbatching);
+		auto batches = experience.GetAllBatchesShuffled(config.batchSize, config.overbatching, pinBatches);
 
 		for (auto& batch : batches) {
 			auto batchActs = batch.actions;
@@ -586,6 +590,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto advantages = batchAdvantages.slice(0, start, stop).to(device, true, true);
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
+
+				// AMP region: the policy/critic forward + loss run under BF16 autocast (matmuls -> BF16
+				// tensor cores; softmax/exp/log/layer_norm/losses auto-promote to fp32). backward() runs
+				// AFTER RG_AUTOCAST_OFF on fp32 master weights. No-op when useAMP is off / not on CUDA.
+				if (ampOn) RG_AUTOCAST_ON();
 
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
@@ -644,6 +653,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
 					avgCriticLoss += criticLoss.detach().cpu().item<float>();
 				}
+
+				// End of AMP region: backward() and the KL/clip reporting below run outside autocast.
+				if (ampOn) RG_AUTOCAST_OFF();
 
 				if (trainPolicy) {
 					// Compute KL divergence & clip fraction using SB3 method for reporting;

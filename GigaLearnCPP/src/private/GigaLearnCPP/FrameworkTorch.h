@@ -9,15 +9,17 @@
 
 #define RG_NO_GRAD torch::NoGradGuard _noGradGuard
 
+// Device-typed autocast API (the old global set_enabled/set_autocast_gpu_dtype are deprecated and
+// removed in newer libtorch). Enables BF16 autocast for CUDA ops only; numerically-sensitive ops
+// (softmax/exp/log, layer_norm, losses) stay fp32 via autocast's own promotion lists.
 #define RG_AUTOCAST_ON() { \
-at::autocast::set_enabled(true); \
-at::autocast::set_autocast_gpu_dtype(torch::kBFloat16); \
-at::autocast::set_autocast_cpu_dtype(torch::kFloat); \
+at::autocast::set_autocast_dtype(at::kCUDA, torch::kBFloat16); \
+at::autocast::set_autocast_enabled(at::kCUDA, true); \
 }
 
 #define RG_AUTOCAST_OFF() { \
 at::autocast::clear_cache(); \
-at::autocast::set_enabled(false); \
+at::autocast::set_autocast_enabled(at::kCUDA, false); \
 }
 
 #define RG_HALFPERC_TYPE torch::ScalarType::BFloat16
