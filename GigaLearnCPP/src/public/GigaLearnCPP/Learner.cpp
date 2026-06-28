@@ -98,18 +98,6 @@ static void AppendScoringGoal(FList& out, const GameState& state, const Player& 
 	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
 }
 
-static int GetArenaIdxForPlayer(const EnvSet& envSet, int playerIdx) {
-	for (int arenaIdx = 0; arenaIdx < envSet.state.arenaPlayerStartIdx.size(); arenaIdx++) {
-		int start = envSet.state.arenaPlayerStartIdx[arenaIdx];
-		int stop = (arenaIdx + 1 < envSet.state.arenaPlayerStartIdx.size()) ?
-			envSet.state.arenaPlayerStartIdx[arenaIdx + 1] : envSet.state.numPlayers;
-		if (playerIdx >= start && playerIdx < stop)
-			return arenaIdx;
-	}
-	RG_ERR_CLOSE("Could not find arena for player index " << playerIdx);
-	return -1;
-}
-
 static bool CanMoveTensorToDevice(at::Device device) {
 	try {
 		torch::Tensor t = torch::tensor(0);
@@ -1002,6 +990,26 @@ void GGL::Learner::Start() {
 					float prepTime = 0;
 					float recordTime = 0;
 
+					// Chunked parallel-for over [0,n): ~4 chunks per worker on the global pool, blocking until done.
+					// Parallelizes the per-player prep/record loops. INVARIANT: g_ThreadPool must be quiescent when
+					// called -- wait_for_tasks() is pool-global, not per-batch -- so call only from the (single)
+					// producer thread, sequentially, never nested in a pool job and never while async arena jobs run.
+					auto fnParallelFor = [](int n, const std::function<void(int)>& body) {
+						if (n <= 0) return;
+						int nChunks = RS_MIN(n, RS_MAX(1, RLGC::g_ThreadPool.GetNumThreads() * 4));
+						int chunkSize = (n + nChunks - 1) / nChunks;
+						RLGC::g_ThreadPool.StartBatchedJobs([&body, n, chunkSize](int c) {
+							int start = c * chunkSize;
+							int end = RS_MIN(start + chunkSize, n);
+							for (int k = start; k < end; k++)
+								body(k);
+						}, nChunks, false);
+					};
+					// Reused per-step scratch: player->arena map (replaces the per-player O(numArenas) scan) and
+					// terminalType-per-player (parallel terminal pass -> serial finalize).
+					std::vector<int> playerArena(numPlayers, 0);
+					std::vector<int8_t> finalTerminals(numPlayers, 0);
+
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
 						envSet->Reset();
@@ -1020,13 +1028,27 @@ void GGL::Learner::Start() {
 						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
 						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
+						// Player->arena lookup for this step: replaces the per-player O(numArenas) linear scan
+						// (GetArenaIdxForPlayer) with an O(1) lookup. Rebuilt each step since resets can change layout.
+						{
+							int nA = (int)envSet->state.arenaPlayerStartIdx.size();
+							for (int a = 0; a < nA; a++) {
+								int start = envSet->state.arenaPlayerStartIdx[a];
+								int stop = (a + 1 < nA) ? (int)envSet->state.arenaPlayerStartIdx[a + 1] : numPlayers;
+								for (int p = start; p < stop; p++)
+									playerArena[p] = a;
+							}
+						}
+
 						if (!render) {
-							for (int newPlayerIdx : newPlayerIndices) {
+							// Parallel per-player: each task writes only its own trajectories[newPlayerIdx], race-free.
+							fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+								int newPlayerIdx = newPlayerIndices[k];
 								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
 								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
 
 								if (config.ppo.contrastiveGoal.enabled) {
-									int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+									int arenaIdx = playerArena[newPlayerIdx];
 									int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
 									const GameState& state = envSet->state.gameStates[arenaIdx];
 									const Player& player = state.players[localPlayerIdx];
@@ -1035,7 +1057,7 @@ void GGL::Learner::Start() {
 									trajectories[newPlayerIdx].segmentIds.push_back(curSegmentIds[newPlayerIdx]);
 									trajectories[newPlayerIdx].segmentSteps.push_back(curSegmentSteps[newPlayerIdx]);
 								}
-							}
+							});
 						}
 
 						prepTime += prepTimer.Elapsed();
@@ -1105,22 +1127,22 @@ void GGL::Learner::Start() {
 								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
 						}
 
-						// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
-						int i = 0;
-						for (int newPlayerIdx : newPlayerIndices) {
+						// Now that we've inferred and stepped the env, add that stuff to the trajectories.
+						// Parallel per-player: writes only trajectories[newPlayerIdx]; logProbs indexed by ordinal k.
+						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+							int newPlayerIdx = newPlayerIndices[k];
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
+							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
 
 							if (config.ppo.contrastiveGoal.enabled) {
-								int arenaIdx = GetArenaIdxForPlayer(*envSet, newPlayerIdx);
+								int arenaIdx = playerArena[newPlayerIdx];
 								int localPlayerIdx = newPlayerIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
 								const GameState& state = envSet->state.gameStates[arenaIdx];
 								const Player& player = state.players[localPlayerIdx];
 								AppendAchievedGoal(trajectories[newPlayerIdx].achievedGoals, state, player, config.ppo.contrastiveGoal);
 							}
-							i++;
-						}
+						});
 
 						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
@@ -1134,34 +1156,42 @@ void GGL::Learner::Start() {
 								curTerminals[playerStartIdx + i] = terminalType;
 						}
 
-						for (int newPlayerIdx : newPlayerIndices) {
+						// Parallel per-player: terminal type, append it, truncation next-state, advance live-episode steps.
+						// Writes only per-player-distinct slots (traj[idx], curSegmentSteps[idx], finalTerminals[idx]).
+						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+							int newPlayerIdx = newPlayerIndices[k];
 							int8_t terminalType = curTerminals[newPlayerIdx];
 							auto& traj = trajectories[newPlayerIdx];
 
 							if (!terminalType && traj.Length() >= maxEpisodeLength) {
-								// Episode is too long, truncate it here
-								// This won't actually reset the env, but rather will just add it to experience buffer as truncated
+								// Episode too long: truncate here (added to buffer as truncated, no env reset).
 								terminalType = RLGC::TerminalType::TRUNCATED;
 							}
 
 							traj.terminals.push_back(terminalType);
-							if (terminalType) {
-
-								if (terminalType == RLGC::TerminalType::TRUNCATED) {
-									// Truncation requires an additional next state for the critic.
-									// Stored RAW; RSNorm (if enabled) normalizes it inside InferCritic.
-									FList nextStateRow = envSet->state.obs.GetRow(newPlayerIdx);
-									traj.nextStates += nextStateRow;
-								}
-
-								relabelHERGoals(traj);
-								combinedTraj.Append(traj);
-								traj.Clear();
-								curSegmentIds[newPlayerIdx] = nextSegmentId++;
-								curSegmentSteps[newPlayerIdx] = 0;
-							} else {
-								curSegmentSteps[newPlayerIdx]++;
+							if (terminalType == RLGC::TerminalType::TRUNCATED) {
+								// Truncation requires an additional next state for the critic (stored RAW).
+								traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
 							}
+							if (!terminalType)
+								curSegmentSteps[newPlayerIdx]++;
+
+							finalTerminals[newPlayerIdx] = terminalType;
+						});
+
+						// Serial finalize (deterministic newPlayerIndices order == original row order): HER relabel + append
+						// completed episodes into the shared combinedTraj + bump the shared segment counter. Kept serial
+						// because relabelHERGoals writes shared HER metrics and combinedTraj.Append/nextSegmentId++ are
+						// shared mutations -- as serial as the original, while the per-player bulk above is now parallel.
+						for (int newPlayerIdx : newPlayerIndices) {
+							if (!finalTerminals[newPlayerIdx])
+								continue;
+							auto& traj = trajectories[newPlayerIdx];
+							relabelHERGoals(traj);
+							combinedTraj.Append(traj);
+							traj.Clear();
+							curSegmentIds[newPlayerIdx] = nextSegmentId++;
+							curSegmentSteps[newPlayerIdx] = 0;
 						}
 
 						recordTime += recordTimer.Elapsed();
