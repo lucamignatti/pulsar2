@@ -215,11 +215,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	// THE consumption lever: the InfoNCE critic train was 2.17s = 81% of "PPO Learn" at bs=256 (~960 serial
-	// minibatches over the rollout). 256->1024 = ~4x fewer serial steps. Logits scale quadratically (1024^2
-	// ~= 4MB, trivial on the 5080) and more in-batch negatives usually IMPROVES the contrastive critic, so
-	// this is likely faster AND better -- but it changes the loss landscape (effective negatives interact
-	// with the InfoNCE temperature), so A/B GCRL/Car Categorical Accuracy + loss. Push to 2048 if it holds.
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 2048;
+	// minibatches over the rollout). 256->1024 = ~4x fewer serial steps. Total InfoNCE cost is A/B + C*B
+	// (launch overhead/MB falls as 1/B; the [B,B] logits matmul + dual softmax/CE total grows LINEARLY in B),
+	// minimized at B* = sqrt(A/C). Empirically 256->1024 helped (launch-bound side) but 1024->2048 was SLOWER
+	// (crossed onto the compute-bound side) AND lowered Car accuracy (0.63@256 -> 0.585@1024, harder task +
+	// fewer steps). So 1024 sits at the sweet spot; do NOT push higher -- the real launch-bound fix is CUDA
+	// Graphs (capture/replay the MB step), not a bigger batch (which only trades launches for quadratic compute).
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 1024;
 	// GCRL scoring chunk size. PURE chunking (numerically identical): bigger = fewer/larger kernels in the
 	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
 	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.
