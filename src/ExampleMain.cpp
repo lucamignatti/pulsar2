@@ -136,10 +136,11 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.batchSize = tsPerItr;
 	// Pure VRAM chunking, NOT a learning knob: grads accumulate across minibatches (each loss pre-scaled by
 	// batchSizeRatio) and the optimizer steps once per batch, so any miniBatchSize gives the IDENTICAL
-	// gradient -- bigger just means fewer/larger GPU kernels + fewer per-minibatch syncs. Raised toward a
-	// single chunk for the ~330k-step rollout. Watch nvidia-smi: push to ~340k for one chunk if there's room,
-	// back off toward the 16 GB ceiling.
-	cfg.ppo.miniBatchSize = 256'000;
+	// gradient -- bigger just means fewer/larger GPU kernels + fewer per-minibatch syncs. MUST divide
+	// batchSize (=tsPerItr), so it's capped there; = batchSize gives the largest chunk. (Overbatching extends
+	// the actual rollout to ~330k, which then runs as 240k + ~90k.) To use more VRAM per kernel, raise
+	// tsPerItr (raises this cap too); watch nvidia-smi for the 16 GB ceiling.
+	cfg.ppo.miniBatchSize = 240'000;
 
 	// Blackwell/RTX 5080 perf levers (all enabled). useHalfPrecision: BF16 inference (collection +
 	// GAE value pred). useAMP: BF16 autocast on the PPO update (matmuls -> tensor cores; softmax/exp/
