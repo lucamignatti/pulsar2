@@ -215,13 +215,18 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	// THE consumption lever: the InfoNCE critic train was 2.17s = 81% of "PPO Learn" at bs=256 (~960 serial
-	// minibatches over the rollout). 256->1024 = ~4x fewer serial steps. Total InfoNCE cost is A/B + C*B
-	// (launch overhead/MB falls as 1/B; the [B,B] logits matmul + dual softmax/CE total grows LINEARLY in B),
-	// minimized at B* = sqrt(A/C). Empirically 256->1024 helped (launch-bound side) but 1024->2048 was SLOWER
-	// (crossed onto the compute-bound side) AND lowered Car accuracy (0.63@256 -> 0.585@1024, harder task +
-	// fewer steps). So 1024 sits at the sweet spot; do NOT push higher -- the real launch-bound fix is CUDA
-	// Graphs (capture/replay the MB step), not a bigger batch (which only trades launches for quadratic compute).
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 1024;
+	// minibatches over the rollout). The effective InfoNCE minibatch is min(criticMiniBatchSize,
+	// infoSubSample) (ContrastiveGoalLearner.cpp:128); infoSubSample=0 below DISABLES that cap, so this is
+	// now the SOLE lever (it was silently clamped to 512 -- the old "1024/2048" values were no-ops).
+	// FIRST REAL large-B test: total InfoNCE matmul work scales ~linearly with B (= numRows * B * reprDim),
+	// so 512->2048 is ~4x the dominant [B,B] matmul compute but ~4x fewer serial launches -- net effect
+	// UNKNOWN (the audit says this path is only PARTIALLY launch-bound). Watch Consumption/GCRL Train Time:
+	// if it balloons we're compute-bound (dial back, or cut the TD K-sample multiplier); if it holds/drops,
+	// push to 4096. NOTE: GCRL/Car Categorical Accuracy MECHANICALLY falls as B grows (1-of-B is a harder
+	// pick), so a lower number at 2048 is NOT a regression -- judge the critic by the policy/score signal.
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 2048;
+	// Disable the infoSubSample clamp so criticMiniBatchSize is the true effective minibatch.
+	cfg.ppo.contrastiveGoal.infoSubSample = 0;
 	// GCRL scoring chunk size. PURE chunking (numerically identical): bigger = fewer/larger kernels in the
 	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
 	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.
