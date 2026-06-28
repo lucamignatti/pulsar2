@@ -198,6 +198,14 @@ namespace GGL {
 				).scatter_(1, actions.unsqueeze(1), 1.f);
 				Tensor goals = goalsAll.index_select(0, tIndices.to(goalsAll.device())).to(device);
 
+				// BF16 autocast for the InfoNCE forward: the phi/psi Linear forwards, the [B,B] logits matmul,
+				// and the VICReg covariance matmuls run on BF16 tensor cores; CrossEntropy/logsumexp/softmax
+				// auto-promote to fp32. backward() runs after RG_AUTOCAST_OFF on fp32 master weights. The
+				// matmul cost grows with the minibatch (B^2 logits), so BF16 here is what keeps cranking
+				// criticMiniBatchSize paying off. CUDA-only (no-op on MPS/CPU).
+				const bool gcrlAmp = device.is_cuda();
+				if (gcrlAmp) RG_AUTOCAST_ON();
+
 				// Run shared_head with stop-gradient: GCRL trains only the phi tail.
 				if (obsNorm)
 					states = obsNorm->Normalize(states);
@@ -323,6 +331,8 @@ namespace GGL {
 						tdBatches++;
 					}
 				}
+
+				if (gcrlAmp) RG_AUTOCAST_OFF();
 
 				phiTail.optim->zero_grad();
 				goalEncoder.optim->zero_grad();

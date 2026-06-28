@@ -219,7 +219,7 @@ int main(int argc, char* argv[]) {
 	// ~= 4MB, trivial on the 5080) and more in-batch negatives usually IMPROVES the contrastive critic, so
 	// this is likely faster AND better -- but it changes the loss landscape (effective negatives interact
 	// with the InfoNCE temperature), so A/B GCRL/Car Categorical Accuracy + loss. Push to 2048 if it holds.
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 1024;
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 2048;
 	// GCRL scoring chunk size. PURE chunking (numerically identical): bigger = fewer/larger kernels in the
 	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
 	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.
