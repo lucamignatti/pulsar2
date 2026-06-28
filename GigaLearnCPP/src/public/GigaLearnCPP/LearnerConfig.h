@@ -51,6 +51,14 @@ namespace GGL {
 		// or A/B numeric comparisons against pre-TF32 runs. CUDA-only; no effect on MPS/CPU.
 		bool allowTF32 = true;
 
+		// Overlap collection with consumption (IMPALA-style depth-1 pipeline): collect rollout N+1 on a
+		// background thread using a FROZEN clone of the policy + an RSNorm snapshot, while the main thread runs
+		// the PPO update on rollout N. The 1-iteration staleness is corrected by PPO's clipped importance ratio
+		// (safe at the small per-iter KL this trainer holds). Hides the shorter of collect/consume behind the
+		// longer. OFF by default: it is a concurrency change in the most stateful path -- validate on a real run
+		// (watch KL/entropy/touch/non-finite AND that Overall SPS rises) and fall back by flipping this off.
+		bool overlapCollection = false;
+
 		// Per-step scan of every collected observation for NaN/inf during collection. A debug aid for new
 		// obs builders; off by default because it scans the whole obs buffer every env step. When off, a
 		// NaN/inf obs will instead surface downstream (e.g. as a non-finite loss). Enable while developing

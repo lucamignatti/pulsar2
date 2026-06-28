@@ -116,6 +116,11 @@ int main(int argc, char* argv[]) {
 
 	cfg.deviceType = LearnerDeviceType::AUTO;
 
+	// Overlap collection with the PPO update (IMPALA-style depth-1 pipeline): collect rollout N+1 on a
+	// background thread (frozen actor clone + RSNorm snapshot) while the main thread runs Learn on rollout N.
+	// Hides the shorter of collect/consume behind the longer; PPO's clipped ratio absorbs the 1-iter staleness.
+	cfg.overlapCollection = true;
+
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
@@ -209,7 +214,12 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
-	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
+	// THE consumption lever: the InfoNCE critic train was 2.17s = 81% of "PPO Learn" at bs=256 (~960 serial
+	// minibatches over the rollout). 256->1024 = ~4x fewer serial steps. Logits scale quadratically (1024^2
+	// ~= 4MB, trivial on the 5080) and more in-batch negatives usually IMPROVES the contrastive critic, so
+	// this is likely faster AND better -- but it changes the loss landscape (effective negatives interact
+	// with the InfoNCE temperature), so A/B GCRL/Car Categorical Accuracy + loss. Push to 2048 if it holds.
+	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 1024;
 	// GCRL scoring chunk size. PURE chunking (numerically identical): bigger = fewer/larger kernels in the
 	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
 	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.

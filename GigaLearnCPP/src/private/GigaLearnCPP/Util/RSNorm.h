@@ -102,6 +102,17 @@ namespace GGL {
 			devCacheValid = false; // stats changed -> rebuild the device-side cache on next Normalize
 		}
 
+		// Deep-copy another normalizer's stats into this one (a frozen snapshot for overlapped collection:
+		// the producer thread reads this while Learn mutates the live obsNorm). Update() always REPLACES the
+		// stat tensors and RefreshCache() clones, so the cloned tensors here are never written underneath us.
+		void CopyStatsFrom(const RSNorm& o) {
+			RG_NO_GRAD;
+			width = o.width; eps = o.eps; clipRange = o.clipRange; count = o.count;
+			runningMean = o.runningMean.clone();
+			runningM2 = o.runningM2.clone();
+			RefreshCache();
+		}
+
 		// Summary scalars for logging.
 		double GetMeanMu() const { return runningMean.mean().item<double>(); }
 		double GetMeanVar() const { return (runningM2 / std::max(count, 1e-12)).mean().item<double>(); }

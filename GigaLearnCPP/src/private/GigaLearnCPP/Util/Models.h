@@ -259,6 +259,21 @@ namespace GGL {
 			return clone;
 		}
 
+		// In-place copy of every model's parameters from src (which must have the same structure). Refreshes
+		// a frozen actor clone for overlapped collection each iteration without reallocating the models.
+		void CopyParamsFrom(ModelSet& src) {
+			RG_NO_GRAD;
+			for (auto& kv : map) {
+				Model* s = src[kv.first];
+				if (!s)
+					continue;
+				auto dp = kv.second->parameters();
+				auto sp = s->parameters();
+				for (size_t i = 0; i < dp.size() && i < sp.size(); i++)
+					dp[i].copy_(sp[i], true);
+			}
+		}
+
 		void Free() {
 			for (Model* model : *this)
 				delete model;

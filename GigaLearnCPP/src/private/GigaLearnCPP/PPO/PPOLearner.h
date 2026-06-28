@@ -85,6 +85,11 @@ namespace GGL {
 			torch::Tensor* outActionProbs = NULL,
 			const RSNorm* obsNorm = nullptr
 		);
+		// Critic value prediction against an explicit model set + normalizer (so overlapped collection can
+		// score the GAE baseline with a FROZEN actor clone + RSNorm snapshot instead of the live, mutating models).
+		static torch::Tensor InferCriticFromModels(
+			ModelSet& models, torch::Tensor obs, bool halfPrec, const RSNorm* obsNorm = nullptr
+		);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration, uint64_t totalTimesteps);
 

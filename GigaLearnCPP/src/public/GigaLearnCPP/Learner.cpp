@@ -12,6 +12,8 @@
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
 #include <cmath>
+#include <future>
+#include <private/GigaLearnCPP/Util/RSNorm.h>
 
 #ifdef RG_CUDA_SUPPORT
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
@@ -689,7 +691,36 @@ void GGL::Learner::Start() {
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
-		ExperienceBuffer experience = ExperienceBuffer(config.randomSeed, torch::kCPU);
+		// Double-buffered rollout production. The producer (collection + value-pred + GAE) fills one slot
+		// using a FROZEN actor clone + RSNorm snapshot; the consumer (PPO update) reads the other. With
+		// overlapCollection on, the producer runs on a background thread while the main thread runs Learn.
+		ExperienceBuffer expBuf[2] = {
+			ExperienceBuffer(config.randomSeed, torch::kCPU),
+			ExperienceBuffer(config.randomSeed, torch::kCPU)
+		};
+		Report repBuf[2];
+		int stepsBuf[2] = { 0, 0 };
+
+		const bool overlap = config.overlapCollection && !config.renderMode;
+		int curBuf = 0;
+		bool overlapPrimed = false;
+
+		// Frozen actor copy the producer reads while Learn mutates the live ppo->models. CloneAll deep-copies
+		// shared_head/policy/critic; CopyParamsFrom refreshes it each iteration. RSNorm snapshot likewise.
+		ModelSet actorClone = ppo->models.CloneAll();
+		RSNorm rsnormSnap(obsSize);
+		const RSNorm* snapPtr = ppo->obsNorm ? &rsnormSnap : nullptr;
+		auto fnRefreshActor = [&]() {
+			actorClone.CopyParamsFrom(ppo->models);
+			if (ppo->obsNorm)
+				rsnormSnap.CopyStatsFrom(*ppo->obsNorm);
+#ifdef RG_CUDA_SUPPORT
+			if (ppo->device.is_cuda()) torch::cuda::synchronize();
+#endif
+#ifdef RG_MPS_SUPPORT
+			if (ppo->device.is_mps()) torch::mps::synchronize();
+#endif
+		};
 
 		int numPlayers = envSet->state.numPlayers;
 
@@ -740,9 +771,17 @@ void GGL::Learner::Start() {
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
 
 		while (true) {
-			Report report = {};
+			Timer iterTimer = {};
 
-			bool isFirstIteration = (totalTimesteps == 0);
+			// Producer: collect a rollout, value-predict, and run GAE into buffer slot outIdx using the FROZEN
+			// actor clone + RSNorm snapshot (so the live models/obsNorm can be updated by Learn concurrently).
+			// Runs on a background thread when overlapping; otherwise called inline.
+			auto fnProduce = [&](int outIdx) {
+			Report& report = repBuf[outIdx];
+			ExperienceBuffer& experience = expBuf[outIdx];
+			int& stepsCollected = stepsBuf[outIdx];
+			report = Report{};
+			stepsCollected = 0;
 
 			// TODO: Old version switching messes up the gameplay potentially
 			GGL::PolicyVersion* oldVersion = NULL;
@@ -809,7 +848,6 @@ void GGL::Learner::Start() {
 
 			int numRealPlayers = oldVersion ? newPlayerIndices.size() : envSet->state.numPlayers;
 
-			int stepsCollected = 0;
 			{ // Generate experience
 
 				// Only contains complete episodes
@@ -1009,8 +1047,8 @@ void GGL::Learner::Start() {
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
-							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
+							PPOLearner::InferActionsFromModels(actorClone, tdNewStates, tdNewActionMasks, ppo->config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, &tNewActions, &tLogProbs, nullptr, snapPtr);
+							PPOLearner::InferActionsFromModels(oldVersion->models, tdOldStates, tdOldActionMasks, ppo->config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, &tOldActions, nullptr, nullptr, snapPtr);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
@@ -1018,7 +1056,7 @@ void GGL::Learner::Start() {
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs);
+							PPOLearner::InferActionsFromModels(actorClone, tdStates, tdActionMasks, ppo->config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, &tActions, &tLogProbs, nullptr, snapPtr);
 							tActions = tActions.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
@@ -1124,8 +1162,8 @@ void GGL::Learner::Start() {
 					report["Env Step Time"] = envStepTime;
 				}
 				float collectionTime = collectionTimer.Elapsed();
+				report["Collection Time"] = collectionTime;
 
-				Timer consumptionTimer = {};
 				{ // Process timesteps
 					RG_NO_GRAD;
 
@@ -1172,9 +1210,9 @@ void GGL::Learner::Start() {
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
-						tValPreds = ppo->InferCritic(tStates.to(ppo->device, true, true)).cpu();
+						tValPreds = PPOLearner::InferCriticFromModels(actorClone, tStates.to(ppo->device, true, true), ppo->config.useHalfPrecision, snapPtr).cpu();
 						if (tNextTruncStates.defined())
-							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+							tTruncValPreds = PPOLearner::InferCriticFromModels(actorClone, tNextTruncStates.to(ppo->device, true, true), ppo->config.useHalfPrecision, snapPtr).cpu();
 					} else {
 						// Predict values using minibatching
 						tValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
@@ -1183,7 +1221,7 @@ void GGL::Learner::Start() {
 							int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
 							torch::Tensor tStatesPart = tStates.slice(0, start, end);
 
-							auto valPredsPart = ppo->InferCritic(tStatesPart.to(ppo->device, true, true)).cpu();
+							auto valPredsPart = PPOLearner::InferCriticFromModels(actorClone, tStatesPart.to(ppo->device, true, true), ppo->config.useHalfPrecision, snapPtr).cpu();
 							RG_ASSERT(valPredsPart.size(0) == (end - start));
 							tValPreds.slice(0, start, end).copy_(valPredsPart, true);
 						}
@@ -1193,7 +1231,7 @@ void GGL::Learner::Start() {
 							// If this is ever actually a real problem in a legitimate use case, ping Zealan in the dead of night
 							RG_ASSERT(tNextTruncStates.size(0) <= ppo->config.miniBatchSize);
 
-							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+							tTruncValPreds = PPOLearner::InferCriticFromModels(actorClone, tNextTruncStates.to(ppo->device, true, true), ppo->config.useHalfPrecision, snapPtr).cpu();
 						}
 					}
 
@@ -1249,6 +1287,36 @@ void GGL::Learner::Start() {
 					report["GAE/Avg Advantage"] = batch.avgAdvantage;
 					report["GAE/Avg Val Target"] = batch.avgValTarget;
 				}
+			} // end "Generate experience" (producer scope)
+			}; // end fnProduce
+
+			// ===== Pipeline =====
+			// Overlap: collect rollout N+1 on a background thread (frozen actor clone + RSNorm snapshot) while
+			// the main thread runs Learn on rollout N. Join BEFORE versionMgr->OnIteration so version-save /
+			// skill-eval / checkpoint never run concurrently with collection. Depth-1 staleness, PPO-ratio-corrected.
+			std::future<void> prodFut;
+			int consumeIdx;
+			if (overlap) {
+				if (!overlapPrimed) {
+					fnRefreshActor();
+					fnProduce(curBuf);
+					overlapPrimed = true;
+				}
+				int nextBuf = 1 - curBuf;
+				fnRefreshActor();
+				prodFut = std::async(std::launch::async, [&, nextBuf]() { fnProduce(nextBuf); });
+				consumeIdx = curBuf;
+				curBuf = nextBuf;
+			} else {
+				fnProduce(curBuf);
+				consumeIdx = curBuf;
+			}
+
+			// ===== Consume buffer consumeIdx =====
+			Report& report = repBuf[consumeIdx];
+			ExperienceBuffer& experience = expBuf[consumeIdx];
+			int stepsCollected = stepsBuf[consumeIdx];
+			bool isFirstIteration = (totalTimesteps == 0);
 
 				// Free CUDA cache
 #ifdef RG_CUDA_SUPPORT
@@ -1259,19 +1327,26 @@ void GGL::Learner::Start() {
 				// Learn
 				Timer learnTimer = {};
 				ppo->Learn(experience, report, isFirstIteration, totalTimesteps);
-				report["PPO Learn Time"] = learnTimer.Elapsed();
+				float consumptionTime = learnTimer.Elapsed();
+				report["PPO Learn Time"] = consumptionTime;
 
-				// Set metrics
-				float consumptionTime = consumptionTimer.Elapsed();
-				report["Collection Time"] = collectionTime;
+				// Join the background producer before the version manager / checkpoint touch shared state
+				// (the producer reads the version manager + steps the env; OnIteration mutates them).
+				if (prodFut.valid())
+					prodFut.get();
+
+				// Set metrics. With overlap the iteration wall-clock is ~max(produce, learn), so Overall SPS is
+				// measured from the real iteration time (iterTimer), not collection+consumption summed.
 				report["Consumption Time"] = consumptionTime;
+				float collTime = report.Has("Collection Time") ? (float)report["Collection Time"] : 0.f;
+				float iterTime = (float)iterTimer.Elapsed();
 
 				auto calcStepsPerSecond = [](int steps, float seconds) {
 					return seconds > 0 ? steps / seconds : 0.f;
 				};
-				report["Collection Steps/Second"] = calcStepsPerSecond(stepsCollected, collectionTime);
+				report["Collection Steps/Second"] = calcStepsPerSecond(stepsCollected, collTime);
 				report["Consumption Steps/Second"] = calcStepsPerSecond(stepsCollected, consumptionTime);
-				report["Overall Steps/Second"] = calcStepsPerSecond(stepsCollected, collectionTime + consumptionTime);
+				report["Overall Steps/Second"] = calcStepsPerSecond(stepsCollected, iterTime);
 
 				uint64_t prevTimesteps = totalTimesteps;
 				totalTimesteps += stepsCollected;
@@ -1360,9 +1435,8 @@ void GGL::Learner::Start() {
 						"Total Iterations"
 					}
 				);
-			}
 		}
-		
+
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Exception thrown during main learner loop: " << e.what());
 	}

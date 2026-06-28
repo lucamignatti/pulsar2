@@ -183,16 +183,20 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 	InferActionsFromModels(models ? *models : this->models, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, outActionProbs, obsNorm);
 }
 
-torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
+torch::Tensor GGL::PPOLearner::InferCriticFromModels(ModelSet& models, torch::Tensor obs, bool halfPrec, const RSNorm* obsNorm) {
 
 	// RSNorm: same shared normalizer as the policy, first op (stop-grad).
 	if (obsNorm)
 		obs = obsNorm->Normalize(obs);
 
 	if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+		obs = models["shared_head"]->Forward(obs, halfPrec);
 
-	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
+	return models["critic"]->Forward(obs, halfPrec).flatten();
+}
+
+torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
+	return InferCriticFromModels(this->models, obs, config.useHalfPrecision, obsNorm);
 }
 
 torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
