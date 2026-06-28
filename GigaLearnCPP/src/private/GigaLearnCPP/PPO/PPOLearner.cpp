@@ -3,7 +3,9 @@
 #include <torch/nn/utils/convert_parameters.h>
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/api/include/torch/serialize.h>
+#include <torch/cuda.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
+#include <public/GigaLearnCPP/Util/Timer.h>
 #include <cmath>
 
 using namespace torch;
@@ -470,6 +472,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgClip;
 
 	if (config.contrastiveGoal.enabled) {
+		// Consumption breakdown timers: GCRL critic training vs the counterfactual-baseline scoring vs the
+		// PPO epochs (reported as Consumption/* below). GPU work is async, so each phase is bracketed by a
+		// CUDA sync (3/iter, negligible) to attribute wall time honestly instead of to the next sync point.
+		if (device.is_cuda()) torch::cuda::synchronize();
+		Timer gcrlTrainTimer = {};
+
 		// FORK2: precompute masked policy probs for every buffer state (host, chunked) for the GOALSHORT
 		// TD bootstrap's pi-sampled soft value. Only when TD is enabled; CAR/TD-off get an undefined tensor.
 		// Kept on CPU (the [N, numActions] tensor is ~0.65GB at N~1.3M — never resident on the GPU).
@@ -528,7 +536,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
 		}
 
+		if (device.is_cuda()) torch::cuda::synchronize();
+		report["Consumption/GCRL Train Time"] = gcrlTrainTimer.Elapsed();
+
+		Timer gcrlScoreTimer = {};
 		PrepareGCRLPolicyAdvantages(this, experience, report, totalTimesteps);
+		if (device.is_cuda()) torch::cuda::synchronize();
+		report["Consumption/GCRL Score Time"] = gcrlScoreTimer.Elapsed();
 	}
 
 	{
@@ -564,6 +578,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["RSNorm/Count"] = obsNorm->GetCount();
 	}
 
+	if (device.is_cuda()) torch::cuda::synchronize();
+	Timer epochTimer = {};
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
@@ -741,6 +757,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			models.StepOptims();
 		}
 	}
+
+	if (device.is_cuda()) torch::cuda::synchronize();
+	report["Consumption/PPO Epoch Time"] = epochTimer.Elapsed();
 
 	// Compute magnitude of updates made to the policy and value estimator
 	auto policyAfter = models["policy"]->CopyParams();

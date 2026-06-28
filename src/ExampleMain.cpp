@@ -119,22 +119,27 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// 1v1 SOCCAR: 5120 games * 2 cars ~= 10,240 simulated cars (hold car count constant vs 3v3's 1700*6).
-	cfg.numGames = 5120;
+	// 1v1 SOCCAR. Raised 5120->8192 to spend the idle CPU headroom (the 7900X sat ~20% even at peak) on more
+	// parallel collection. LEARNING-AFFECTING (unlike the chunk knobs): more arenas = more decorrelated
+	// samples, and with tsPerItr scaled below the per-update batch grows (fewer optimizer steps per million
+	// timesteps). Judge on rating-per-WALLCLOCK, not SPS alone; revert to 5120/150k if sample-efficiency drops.
+	cfg.numGames = 8192;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 67;
 
-	int tsPerItr = 150'000;
+	// Scaled 150k->240k with numGames so per-env segment length holds (~240k/8192 ~= 29 steps/env) while the
+	// per-update batch grows to amortize the overhead-bound consumption over more samples. LEARNING-AFFECTING.
+	int tsPerItr = 240'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
 	// Pure VRAM chunking, NOT a learning knob: grads accumulate across minibatches (each loss pre-scaled by
 	// batchSizeRatio) and the optimizer steps once per batch, so any miniBatchSize gives the IDENTICAL
-	// gradient -- bigger just means fewer/larger GPU kernels + fewer per-minibatch syncs. With the psi
-	// rebalance + BF16 autocast the run sits ~3.5/16 GB, so this was raised 50k->150k. Push toward a single
-	// chunk (~256k for a ~205k rollout) if nvidia-smi shows headroom; back off if you approach the 16 GB ceiling.
-	cfg.ppo.miniBatchSize = 150'000;
+	// gradient -- bigger just means fewer/larger GPU kernels + fewer per-minibatch syncs. Raised toward a
+	// single chunk for the ~330k-step rollout. Watch nvidia-smi: push to ~340k for one chunk if there's room,
+	// back off toward the 16 GB ceiling.
+	cfg.ppo.miniBatchSize = 256'000;
 
 	// Blackwell/RTX 5080 perf levers (all enabled). useHalfPrecision: BF16 inference (collection +
 	// GAE value pred). useAMP: BF16 autocast on the PPO update (matmuls -> tensor cores; softmax/exp/
@@ -204,7 +209,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	cfg.ppo.contrastiveGoal.criticMiniBatchSize = 256; // GCRL InfoNCE logits scale quadratically with this
-	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 4096;
+	// GCRL scoring chunk size. PURE chunking (numerically identical): bigger = fewer/larger kernels in the
+	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
+	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.
+	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 32768;
 	// TRIAD-NATIVE: GOALSHORT = world-ball REACH, HER window CAPPED short (long horizons re-enter the
 	// 0.055 state-dominated, action-invalid regime); drop the off-policy goalward HER bias.
 	cfg.ppo.contrastiveGoal.herMaxOffset = 15;

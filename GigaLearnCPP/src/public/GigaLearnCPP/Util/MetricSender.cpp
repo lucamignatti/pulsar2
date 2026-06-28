@@ -77,6 +77,10 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 	if (key.rfind("Striking/", 0) == 0)
 		return true;
 
+	// Consumption-phase breakdown (Consumption/GCRL Train Time, GCRL Score Time, PPO Epoch Time, ...).
+	if (key.rfind("Consumption/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 
