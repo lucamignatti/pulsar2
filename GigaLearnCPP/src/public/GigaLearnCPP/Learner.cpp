@@ -999,12 +999,16 @@ void GGL::Learner::Start() {
 
 					float inferTime = 0;
 					float envStepTime = 0;
+					float prepTime = 0;
+					float recordTime = 0;
 
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
+						// Serial main-thread prep: obs NaN-check + obs->tensor build + pre-step trajectory setup.
+						Timer prepTimer = {};
 						for (float f : envSet->state.obs.data)
 							if (isnan(f) || isinf(f))
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
@@ -1034,6 +1038,7 @@ void GGL::Learner::Start() {
 							}
 						}
 
+						prepTime += prepTimer.Elapsed();
 						envSet->StepFirstHalf(true);
 
 						Timer inferTimer = {};
@@ -1072,6 +1077,8 @@ void GGL::Learner::Start() {
 						envSet->StepSecondHalf(curActions, false);
 						envStepTime += stepTimer.Elapsed();
 
+						// Serial main-thread record: reward sampling + per-player trajectory append + terminals/HER.
+						Timer recordTimer = {};
 						if (stepCallback)
 							stepCallback(this, envSet->state.gameStates, report);
 
@@ -1156,10 +1163,14 @@ void GGL::Learner::Start() {
 								curSegmentSteps[newPlayerIdx]++;
 							}
 						}
+
+						recordTime += recordTimer.Elapsed();
 					}
 
-					report["Inference Time"] = inferTime;
-					report["Env Step Time"] = envStepTime;
+					report["Collection/Prep Time"] = prepTime;
+					report["Collection/Inference Time"] = inferTime;
+					report["Collection/Env Step Time"] = envStepTime;
+					report["Collection/Record Time"] = recordTime;
 				}
 				float collectionTime = collectionTimer.Elapsed();
 				report["Collection Time"] = collectionTime;
@@ -1424,8 +1435,10 @@ void GGL::Learner::Start() {
 						"Overall Steps/Second",
 						"",
 						"Collection Time",
-						"-Inference Time",
-						"-Env Step Time",
+						"-Collection/Prep Time",
+						"-Collection/Inference Time",
+						"-Collection/Env Step Time",
+						"-Collection/Record Time",
 						"Consumption Time",
 						"-GAE Time",
 						"-PPO Learn Time",

@@ -81,6 +81,11 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 	if (key.rfind("Consumption/", 0) == 0)
 		return true;
 
+	// Collection-phase breakdown (Collection/Prep|Inference|Env Step|Record Time) -- distinguishes
+	// serial main-thread cost (Prep+Record) from arena-stepping (Env Step) from GPU inference.
+	if (key.rfind("Collection/", 0) == 0)
+		return true;
+
 	return allowed.find(key) != allowed.end();
 }
 
