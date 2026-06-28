@@ -596,24 +596,27 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// AFTER RG_AUTOCAST_OFF on fp32 master weights. No-op when useAMP is off / not on CUDA.
 				if (ampOn) RG_AUTOCAST_ON();
 
+				// Per-minibatch metric scalars are kept ON-DEVICE here and pulled to the host in ONE hop at the
+				// end of the minibatch (the single torch::cat(...).cpu() below) instead of a separate
+				// .cpu().item() per metric -- each of those forces a full GPU pipeline drain. The host-side
+				// AvgTracker semantics (NaN-skip via Add, the relEntropyLoss guard) are preserved exactly.
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
+				torch::Tensor mEntropy, mRatio, mPolicyLoss, mCriticLoss, mKL, mClip;
+				bool didGuiding = false;
+				float curGuidingLoss = 0.f;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy
-					float curEntropy;
-					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false, obsNorm);
-						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
-						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
-						curEntropy = entropy.detach().cpu().item<float>();
-						avgEntropy += curEntropy;
-					}
+					probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false, obsNorm);
+					logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
+					entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
+					mEntropy = entropy.detach();
 
 					logProbs = logProbs.view_as(oldProbs);
 
 					// Compute PPO loss
 					ratio = exp(logProbs - oldProbs);
-					avgRatio += ratio.mean().detach().cpu().item<float>();
+					mRatio = ratio.mean().detach();
 					clipped = clamp(
 						ratio, 1 - config.clipRange, 1 + config.clipRange
 					);
@@ -622,11 +625,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					policyLoss = -min(
 						ratio * advantages, clipped * advantages
 					).mean();
-					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
-					avgPolicyLoss += curPolicyLoss;
-
-					if (std::abs(curPolicyLoss) > 1e-12f)
-						avgRelEntropyLoss += (curEntropy * curEntropyScale) / curPolicyLoss;
+					mPolicyLoss = policyLoss.detach();
 
 					ppoLoss = (policyLoss - entropy * curEntropyScale) * batchSizeRatio;
 
@@ -638,7 +637,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
-						avgGuidingLoss.Add(guidingLoss.detach().cpu().item<float>());
+						curGuidingLoss = guidingLoss.detach().cpu().item<float>();
+						didGuiding = true;
 						guidingLoss = guidingLoss * config.guidingStrength;
 						ppoLoss = ppoLoss + guidingLoss;
 					}
@@ -651,24 +651,20 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// Compute value loss
 					vals = vals.view_as(targetValues);
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
-					avgCriticLoss += criticLoss.detach().cpu().item<float>();
+					mCriticLoss = criticLoss.detach();
 				}
 
 				// End of AMP region: backward() and the KL/clip reporting below run outside autocast.
 				if (ampOn) RG_AUTOCAST_OFF();
 
 				if (trainPolicy) {
-					// Compute KL divergence & clip fraction using SB3 method for reporting;
-					{
-						RG_NO_GRAD;
+					// KL divergence & clip fraction (SB3 method), for reporting. Computed on-device; synced below.
+					RG_NO_GRAD;
 
-						auto logRatio = logProbs - oldProbs;
-						auto klTensor = (exp(logRatio) - 1) - logRatio;
-						avgDivergence += klTensor.mean().detach().cpu().item<float>();
-
-						auto clipFraction = mean((abs(ratio - 1) > config.clipRange).to(kFloat));
-						avgClip += clipFraction.cpu().item<float>();
-					}
+					auto logRatio = logProbs - oldProbs;
+					auto klTensor = (exp(logRatio) - 1) - logRatio;
+					mKL = klTensor.mean().detach();
+					mClip = mean((abs(ratio - 1) > config.clipRange).to(kFloat)).detach();
 				}
 
 				if (trainPolicy && trainCritic) {
@@ -679,6 +675,46 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						ppoLoss.backward();
 					if (trainCritic)
 						criticLoss.backward();
+				}
+
+				// SINGLE device->host sync for all per-minibatch metrics (one torch::cat(...).cpu() in place of
+				// ~6 separate .item() syncs). Reading elements from the resident CPU tensor does NOT re-sync.
+				{
+					std::vector<torch::Tensor> scal;
+					if (trainPolicy) {
+						scal.push_back(mEntropy.reshape({ 1 }));
+						scal.push_back(mRatio.reshape({ 1 }));
+						scal.push_back(mPolicyLoss.reshape({ 1 }));
+						scal.push_back(mKL.reshape({ 1 }));
+						scal.push_back(mClip.reshape({ 1 }));
+					}
+					if (trainCritic)
+						scal.push_back(mCriticLoss.reshape({ 1 }));
+
+					if (!scal.empty()) {
+						torch::Tensor host = torch::cat(scal).to(torch::kFloat).cpu();
+						const float* h = host.data_ptr<float>();
+						int i = 0;
+						if (trainPolicy) {
+							float curEntropy = h[i++];
+							float curRatio = h[i++];
+							float curPolicyLoss = h[i++];
+							float curKL = h[i++];
+							float curClip = h[i++];
+							avgEntropy += curEntropy;
+							avgRatio += curRatio;
+							avgPolicyLoss += curPolicyLoss;
+							if (std::abs(curPolicyLoss) > 1e-12f)
+								avgRelEntropyLoss += (curEntropy * curEntropyScale) / curPolicyLoss;
+							avgDivergence += curKL;
+							avgClip += curClip;
+						}
+						if (trainCritic)
+							avgCriticLoss += h[i++];
+					}
+
+					if (didGuiding)
+						avgGuidingLoss.Add(curGuidingLoss);
 				}
 			};
 

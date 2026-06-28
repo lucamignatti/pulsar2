@@ -129,12 +129,24 @@ int main(int argc, char* argv[]) {
 	int tsPerItr = 150'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 50'000; // 16 GB VRAM target
+	// Pure VRAM chunking, NOT a learning knob: grads accumulate across minibatches (each loss pre-scaled by
+	// batchSizeRatio) and the optimizer steps once per batch, so any miniBatchSize gives the IDENTICAL
+	// gradient -- bigger just means fewer/larger GPU kernels + fewer per-minibatch syncs. With the psi
+	// rebalance + BF16 autocast the run sits ~3.5/16 GB, so this was raised 50k->150k. Push toward a single
+	// chunk (~256k for a ~205k rollout) if nvidia-smi shows headroom; back off if you approach the 16 GB ceiling.
+	cfg.ppo.miniBatchSize = 150'000;
 
-	// BF16 inference (collection forward + GAE value prediction). Gradient-free, native on Blackwell,
-	// big collection speedup. A/B it: watch Mean KL / Clip Fraction don't drift (collection-vs-update
-	// prob precision can interact). See also cfg.ppo.useAMP (BF16 on the update, default off).
+	// Blackwell/RTX 5080 perf levers (all enabled). useHalfPrecision: BF16 inference (collection +
+	// GAE value pred). useAMP: BF16 autocast on the PPO update (matmuls -> tensor cores; softmax/exp/
+	// log/layer_norm/losses auto-promote to fp32; master weights fp32, no GradScaler). pinBatchMemory:
+	// pinned host batches so the non_blocking H2D copies are real async DMA. Watch Mean KL / Clip
+	// Fraction / touch / non-finite counts on the first run since BF16 shifts numerics.
 	cfg.ppo.useHalfPrecision = true;
+	cfg.ppo.useAMP = true;
+	// pinBatchMemory left OFF: it pinned the whole rollout (~GB) in page-locked host RAM every iteration,
+	// which the kernel can't compact -> kcompactd soft-lockups on the training box. Marginal benefit
+	// without prefetch anyway. Revisit only with a small reused minibatch-sized pinned staging buffer.
+	cfg.ppo.pinBatchMemory = false;
 
 	// 2 epochs (the value this comment has always recommended). epochs=1 gave the
 	// policy only a single gradient step per iteration's data AND made Mean KL a

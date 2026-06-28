@@ -63,6 +63,10 @@ namespace GGL {
 		// Hidden layers of the phi tail (action-fusion network on top of the shared_head embedding).
 		// Input = shared_head output size + numActions; output = representationSize.
 		std::vector<int> phiTailLayerSizes = { 256, 256 };
+		// Hidden layers of the psi goal encoder (maps a goalInputSize-dim goal -> representationSize).
+		// Was hardcoded at {1024,1024,1024,1024} (~3.3M params PER critic) to encode a ~6-dim goal --
+		// wildly oversized vs the 256-wide actor/critic. 2x256 is still generous for a tiny input.
+		std::vector<int> psiLayerSizes = { 256, 256 };
 		int criticEpochs = 1;
 		int64_t criticMiniBatchSize = 256;
 		int64_t policyScoreBatchSize = 4096;

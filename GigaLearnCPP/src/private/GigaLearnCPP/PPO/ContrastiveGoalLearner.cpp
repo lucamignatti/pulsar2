@@ -19,9 +19,9 @@ namespace GGL {
 		return result;
 	}
 
-	static ModelConfig MakePsiConfig(int inputSize, int reprSize) {
+	static ModelConfig MakePsiConfig(int inputSize, int reprSize, const std::vector<int>& layerSizes) {
 		ModelConfig result = PartialModelConfig{};
-		result.layerSizes = { 1024, 1024, 1024, 1024 };
+		result.layerSizes = layerSizes;
 		result.activationType = ModelActivationType::SWISH;
 		result.optimType = ModelOptimType::ADAM;
 		result.addLayerNorm = true;
@@ -54,7 +54,7 @@ namespace GGL {
 			MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
 			device
 		),
-		goalEncoder(psiName.c_str(), MakePsiConfig(config.goalInputSize, config.representationSize), device),
+		goalEncoder(psiName.c_str(), MakePsiConfig(config.goalInputSize, config.representationSize, config.psiLayerSizes), device),
 		sharedHead(sharedHead), obsNorm(obsNorm),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
@@ -72,7 +72,7 @@ namespace GGL {
 				MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
 				device);
 			goalEncoderTarget = new Model(psiTgtName.c_str(),
-				MakePsiConfig(config.goalInputSize, config.representationSize), device);
+				MakePsiConfig(config.goalInputSize, config.representationSize, config.psiLayerSizes), device);
 			if (config.tdEmaTrunk)
 				sharedHeadTarget = new Model(trunkTgtName.c_str(), sharedHead->config, device);
 		}
