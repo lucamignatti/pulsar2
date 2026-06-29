@@ -55,6 +55,7 @@ namespace GGL {
 		uint64_t timesteps;
 		ModelSet models;
 		SkillRating ratings;
+		bool isAnchor = false; // "gold" anchors are exempt from the rolling prune (see LearnerConfig anchor fields)
 	};
 
 	struct PolicyVersionManager {
@@ -62,6 +63,12 @@ namespace GGL {
 		std::filesystem::path saveFolder;
 		int maxVersions;
 		uint64_t tsPerVersion;
+
+		// Anchor-pool config (mirrored from LearnerConfig; set by the Learner after construction).
+		int maxAnchors = 0;
+		float anchorSelectChance = 0.5f;
+		float anchorPromoteMargin = 25.0f;
+		uint64_t anchorMinTsSpacing = 100'000'000;
 
 		//////////////////
 
@@ -89,12 +96,18 @@ namespace GGL {
 			RenderSink* renderSender = NULL);
 
 		// NOTE: Passed models should not be already cloned
-		PolicyVersion& AddVersion(ModelSet modelsToClone, uint64_t timesteps);
+		PolicyVersion& AddVersion(ModelSet modelsToClone, uint64_t timesteps, bool allowPrune = true);
 
 		void SaveVersions();
 		void LoadVersions(ModelSet modelsTemplate, uint64_t curTimesteps);
 
 		void SortVersions();
+
+		// Anchor-pool helpers.
+		float VersionRating(const PolicyVersion& v) const;   // mean ELO across modes (initialRating if unrated)
+		void PruneVersions();                                // evict oldest non-anchors down to maxVersions
+		void MaybeUpdateAnchors(uint64_t totalTimesteps);    // consider promoting the newest version to an anchor
+		PolicyVersion* PickOldVersion();                     // anchor (prob anchorSelectChance) or rolling recent
 
 		void RunSkillMatches(struct PPOLearner* ppo, Report& report);
 

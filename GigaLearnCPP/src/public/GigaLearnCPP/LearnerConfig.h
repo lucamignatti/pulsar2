@@ -91,6 +91,18 @@ namespace GGL {
 		bool trainAgainstOldVersions = false;
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
+		// "Gold anchor" opponents: a small set of strong, temporally-spaced old checkpoints kept AROUND
+		// (never recency-evicted) so the bot always faces a few diverse, capable past selves instead of only
+		// near-duplicate recent snapshots. Anchors live in the same version pool but are exempt from the
+		// rolling prune; when training against an old version, an anchor is drawn with probability
+		// anchorSelectChance (otherwise a rolling-recent). A new checkpoint is promoted to the anchor set when
+		// it is spaced >= anchorMinTsSpacing from the newest anchor AND (if the set is full) beats the weakest
+		// anchor's rating by anchorPromoteMargin ELO. Requires the skill tracker for the rating signal.
+		int maxAnchorVersions = 3;                  // 0 disables anchoring
+		float anchorSelectChance = 0.5f;            // of old-version games, fraction that face an anchor vs a rolling recent
+		float anchorPromoteMargin = 25.0f;          // ELO a candidate must beat the weakest anchor by to replace it
+		int64_t anchorMinTsSpacing = 100'000'000;   // min timesteps between anchors (keeps them behaviorally distinct)
+
 		SkillTrackerConfig skillTracker = {};
 	};
 }

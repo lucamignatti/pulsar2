@@ -445,8 +445,61 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		controlledLambda * std::exp(cfg.gcrlLambdaCtrlGain * (cfg.gcrlRatioTarget - learner->gcrlRatioEma)),
 		cfg.gcrlLambdaMin, cfg.gcrlLambdaMax);
 
-	// NO outer renorm: baseNorm carries the reward DIRECTION, gcrlAdv the bounded GCRL nudge.
-	torch::Tensor policyAdvantage = baseNorm + gcrlAdv;
+	// Goal POTENTIAL shaping (positioning). Consume the goal critic as a state-potential Phi(s) =
+	// action-marginalized reachability of the per-state SCORING goal (the net), NOT as the one-step
+	// action-edge (action-inert far-field -> noise, which is why the edge coupling above stays off).
+	// F_t = gamma*Phi(s') - Phi(s) telescopes, so it densely rewards moving toward scoreable states
+	// (positioning the egocentric CAR critic can't teach) without being farmable by loitering. Added as a
+	// bounded, normalized advantage term -- consistent with this advantage-level blend. Phi is just the
+	// action-marginalized baseline score (mean over the K masked-random actions), reused from the helper.
+	torch::Tensor goalPotentialAdv = torch::zeros_like(baseAdvRaw);
+	bool goalPotentialActive = cfg.useGoalPotential && learner->contrastiveGoalLearner
+		&& experience.data.scoringGoals.defined()
+		&& experience.data.scoringGoals.size(0) == rawStates.size(0)
+		&& experience.data.segmentIds.defined()
+		&& experience.data.segmentIds.size(0) == rawStates.size(0);
+	// Surface a silently-benched potential (enabled but missing its inputs) instead of just emitting zeros.
+	if (cfg.useGoalPotential && !goalPotentialActive) {
+		static bool warnedGoalPotential = false;
+		if (!warnedGoalPotential) {
+			RG_LOG("WARNING: useGoalPotential=true but scoringGoals/segmentIds are undefined or row-misaligned; goal-potential shaping is BENCHED (watch GCRL/Goal Potential Active=0).");
+			warnedGoalPotential = true;
+		}
+	}
+	if (goalPotentialActive) {
+		torch::Tensor takenG, phi, spreadG;
+		ComputeGCRLAdvantageWithBaseline(
+			learner->contrastiveGoalLearner, embeddings, actions, actionMasks,
+			experience.data.scoringGoals.to(device),
+			learner->numActions, cfg.policyScoreBatchSize, cfg.baselineActionSamples,
+			&takenG, &phi, &spreadG); // phi = E_a[score(s,a,g*)] = Phi(s)
+
+		int64_t N = phi.size(0);
+		torch::Tensor segIds = experience.data.segmentIds.to(device);
+		torch::Tensor phiNext = torch::zeros_like(phi);
+		torch::Tensor sameSeg = torch::zeros_like(phi);
+		if (N > 1) {
+			// NB: slice() returns a VIEW; must copy_ through it (operator= would rebind the temporary, a no-op).
+			phiNext.slice(0, 0, N - 1).copy_(phi.slice(0, 1, N));                                  // Phi(s_{t+1})
+			sameSeg.slice(0, 0, N - 1).copy_((segIds.slice(0, 1, N) == segIds.slice(0, 0, N - 1)).to(torch::kFloat32));
+		}
+		// At a segment boundary Phi(s')=0 => F = -Phi(s) (standard terminal shaping). The LAST buffer row is
+		// likewise treated as terminal-by-construction (phiNext/sameSeg stay 0 there) even if it's a truncation
+		// that continues next buffer -- 1 row of ~1.3M, then normalized, so negligible.
+		float potGamma = learner->config.gaeGamma;
+		torch::Tensor F = potGamma * phiNext * sameSeg - phi;
+		goalPotentialAdv = NormalizeAdvantage(F, cfg.sigmaFloor) * cfg.gcrlGoalPotentialScale;
+		report["GCRL/Goal Potential Mean"] = TensorMean(phi);
+		report["GCRL/Goal Potential Shaping Std"] = TensorStd(goalPotentialAdv);
+	} else {
+		report["GCRL/Goal Potential Mean"] = 0.f;
+		report["GCRL/Goal Potential Shaping Std"] = 0.f;
+	}
+	report["GCRL/Goal Potential Active"] = goalPotentialActive ? 1.f : 0.f;
+
+	// NO outer renorm: baseNorm carries the reward DIRECTION, gcrlAdv the bounded GCRL nudge,
+	// goalPotentialAdv the bounded positioning potential.
+	torch::Tensor policyAdvantage = baseNorm + gcrlAdv + goalPotentialAdv;
 	experience.data.advantages = policyAdvantage.detach().to(experience.data.advantages.device());
 	experience.data.crlAdvantages = gcrlAdv.detach().to(experience.data.advantages.device());
 
@@ -506,7 +559,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// FORK: skip the GOALSHORT critic's training (reclaim its 1024x4 goalEncoder InfoNCE compute) when
 		// it is dropped from coupling. Default-constructed stats (zeros) keep the report/Display stable.
 		ContrastiveGoalStats crlTrainStats;
-		if (config.contrastiveGoal.useGoalCritic)
+		// Train the goal critic when its action-edge coupling is on (useGoalCritic) OR when its POTENTIAL is
+		// consumed (useGoalPotential needs a trained Phi). Skipped otherwise to reclaim the InfoNCE compute.
+		if (config.contrastiveGoal.useGoalCritic || config.contrastiveGoal.useGoalPotential)
 			crlTrainStats = contrastiveGoalLearner->Train(experience.data, experience.rng, totalTimesteps, nextPolicyProbs);
 
 		report["CRL Critic Loss"] = crlTrainStats.loss;

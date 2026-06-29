@@ -54,7 +54,7 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 	}
 }
 
-GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone, uint64_t timesteps) {
+GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone, uint64_t timesteps, bool allowPrune) {
 	RG_NO_GRAD;
 
 	auto models = modelsToClone.CloneAll();
@@ -70,14 +70,96 @@ GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone
 
 	SortVersions();
 
-	// Remove old versions
-	while (versions.size() > maxVersions) {
-		auto& toRemove = versions[0];
-		toRemove.models.Free();
-		versions.erase(versions.begin());
+	if (allowPrune)
+		PruneVersions();
+
+	// SortVersions keeps versions ascending by timesteps, so the just-added newest is at the back
+	// (it cannot have been pruned: PruneVersions only evicts the OLDEST non-anchors).
+	return versions.back();
+}
+
+float GGL::PolicyVersionManager::VersionRating(const PolicyVersion& v) const {
+	if (v.ratings.data.empty())
+		return skill.config.initialRating;
+	float sum = 0;
+	for (const auto& pair : v.ratings.data)
+		sum += pair.second;
+	return sum / (float)v.ratings.data.size();
+}
+
+void GGL::PolicyVersionManager::PruneVersions() {
+	// Anchors are exempt from the rolling prune; cap only the NON-anchor (rolling-recent) population
+	// at maxVersions, always evicting the oldest non-anchor first (versions stay sorted ascending by ts).
+	RG_NO_GRAD;
+	while (true) {
+		int nonAnchorCount = 0;
+		for (auto& v : versions)
+			if (!v.isAnchor)
+				nonAnchorCount++;
+		if (nonAnchorCount <= maxVersions)
+			break;
+
+		for (auto it = versions.begin(); it != versions.end(); ++it) {
+			if (!it->isAnchor) {
+				it->models.Free();
+				versions.erase(it);
+				break;
+			}
+		}
+	}
+}
+
+void GGL::PolicyVersionManager::MaybeUpdateAnchors(uint64_t totalTimesteps) {
+	if (maxAnchors <= 0 || versions.empty())
+		return;
+
+	// Candidate = the newest version (just added; == current policy strength via inherited ratings).
+	// Don't anchor the near-random early policy: require enough training before the first anchor.
+	PolicyVersion& cand = versions.back();
+	if (cand.isAnchor || cand.timesteps < anchorMinTsSpacing)
+		return;
+
+	// Must be temporally spaced from the most-recent existing anchor (keeps anchors behaviorally distinct).
+	uint64_t newestAnchorTs = 0;
+	int anchorCount = 0, weakestIdx = -1;
+	float weakestRating = 0;
+	for (int i = 0; i < (int)versions.size(); i++) {
+		if (!versions[i].isAnchor)
+			continue;
+		anchorCount++;
+		newestAnchorTs = RS_MAX(newestAnchorTs, versions[i].timesteps);
+		float r = VersionRating(versions[i]);
+		if (weakestIdx < 0 || r < weakestRating) {
+			weakestRating = r;
+			weakestIdx = i;
+		}
 	}
 
-	return versions.back();
+	if (anchorCount > 0 && cand.timesteps < newestAnchorTs + anchorMinTsSpacing)
+		return;
+
+	if (anchorCount < maxAnchors) {
+		cand.isAnchor = true;
+		RG_LOG("PolicyVersionManager: promoted version @" << cand.timesteps << " ts to anchor (" << (anchorCount + 1) << "/" << maxAnchors << ", rating " << VersionRating(cand) << ")");
+	} else if (VersionRating(cand) > weakestRating + anchorPromoteMargin) {
+		versions[weakestIdx].isAnchor = false; // demoted anchor rejoins the rolling pool (may be pruned next add)
+		cand.isAnchor = true;
+		RG_LOG("PolicyVersionManager: anchor swap -- version @" << cand.timesteps << " (rating " << VersionRating(cand) << ") replaces weakest anchor (rating " << weakestRating << ")");
+	}
+}
+
+GGL::PolicyVersion* GGL::PolicyVersionManager::PickOldVersion() {
+	if (versions.empty())
+		return nullptr;
+
+	std::vector<int> anchorIdx, rollingIdx;
+	for (int i = 0; i < (int)versions.size(); i++)
+		(versions[i].isAnchor ? anchorIdx : rollingIdx).push_back(i);
+
+	bool useAnchor = !anchorIdx.empty() && (rollingIdx.empty() || Math::RandFloat() < anchorSelectChance);
+	auto& pool = useAnchor ? anchorIdx : rollingIdx;
+	int idx = pool[Math::RandInt(0, (int)pool.size())];
+	return &versions[idx];
 }
 
 void GGL::PolicyVersionManager::SaveVersions() {
@@ -116,6 +198,7 @@ void GGL::PolicyVersionManager::SaveVersions() {
 
 			json j = {};
 			j["skill_ratings"] = version.ratings.ToJSON();
+			j["is_anchor"] = version.isAnchor;
 			std::string jStr = j.dump(4);
 			fOut << jStr;
 		}
@@ -142,7 +225,9 @@ void GGL::PolicyVersionManager::LoadVersions(ModelSet modelsTemplate, uint64_t c
 				"If you deleted some checkpoints, make sure to delete that far back in the saved policy versions as well");
 		}
 		auto path = saveFolder / std::to_string(savedTimesteps);
-		PolicyVersion& version = AddVersion(modelsTemplate, savedTimesteps);
+		// Defer pruning until all versions are loaded and their anchor flags are restored, so an
+		// anchor checkpoint can't be evicted by the rolling prune before we know it's an anchor.
+		PolicyVersion& version = AddVersion(modelsTemplate, savedTimesteps, false);
 		version.models.Load(path, false, false);
 
 		{ // Load JSON
@@ -154,10 +239,12 @@ void GGL::PolicyVersionManager::LoadVersions(ModelSet modelsTemplate, uint64_t c
 			json j = json::parse(fIn);
 			if (j.contains("skill_ratings"))
 				version.ratings.ReadFromJSON(j["skill_ratings"]);
+			version.isAnchor = j.value("is_anchor", false);
 		}
 	}
 
 	SortVersions();
+	PruneVersions();
 
 	RG_LOG(" > Loaded " << versions.size() << " versions(s)");
 }
@@ -324,6 +411,7 @@ void GGL::PolicyVersionManager::OnIteration(struct PPOLearner* ppo, Report& repo
 	if ((totalTimesteps / tsPerVersion > prevTotalTimesteps / tsPerVersion) || (prevTotalTimesteps == 0)) {
 		// Save version
 		AddVersion(ppo->GetPolicyModels(), totalTimesteps);
+		MaybeUpdateAnchors(totalTimesteps);
 	}
 
 	if (skill.config.enabled) {

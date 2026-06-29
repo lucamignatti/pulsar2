@@ -29,17 +29,26 @@ namespace GGL {
 		int baselineActionSamples = 16; // TRIAD-NATIVE: masked-random K (4->16, var of mean(4) is 4x noisy)
 
 		// ── Car critic ──────────────────────────────────────────────────────────
-		// A second, isolated contrastive critic whose goal is the car-local
-		// (egocentric) ball pos+vel a SHORT horizon ahead -- local controllability,
-		// the action-attributable signal the single ball-goal critic lacks. Its own
-		// short, near-term HER window (no goalward bias). Needs the obs builder to
-		// expose GetCarLocalBallOffset() (>=0); otherwise the car critic is skipped.
+		// A second, isolated contrastive critic. BALL-AGNOSTIC: its goal is the car's OWN future kinematic
+		// state (velocity + forward + up + angular velocity, carGoalInputSize floats; see AppendCarStateGoal)
+		// a SHORT horizon ahead -- i.e. car CONTROL (speedflips, wavedashes, aerial control, recoveries), the
+		// action-attributable motor-skill signal. Its own short HER window, no goalward bias, no scoring mix.
+		// Goals come from the per-step carStates buffer (no obs-builder offset needed).
 		bool useCarCritic = false;
 		// World-frame "GOALSHORT" ball-goal critic (the default contrastiveGoalLearner). It is action-INERT
 		// far-field (edge ~0.04, successor-feature asymptote) and its batch-normed edge reinflates to
 		// unit-std noise (~30% of the GCRL nudge). Set false to DROP it from training + coupling (CAR-only
 		// governs the advantage); it stays constructed+checkpoint-loadable, just untrained/unscored.
 		bool useGoalCritic = true;
+		// Goal POTENTIAL shaping (positioning). Re-uses the goal critic but consumes it as a state-POTENTIAL
+		// Phi(s) = action-marginalized reachability of the per-state SCORING goal, NOT as the action-edge above
+		// (the edge is action-inert far-field, hence useGoalCritic coupling stays off). The shaping term
+		// F = gamma*Phi(s') - Phi(s) telescopes, so it densely rewards moving toward scoreable states
+		// (positioning -- the thing the egocentric CAR critic structurally can't teach) WITHOUT being
+		// farmable by loitering. When on, the goal critic is TRAINED (for Phi) even if useGoalCritic is false.
+		// A longer herMaxOffset is now SAFE+desirable here: Phi is a value, not the one-step action edge.
+		bool useGoalPotential = false;
+		float gcrlGoalPotentialScale = 0.3f; // magnitude of the (normalized) potential advantage term
 		int carHerMinOffset = 1;
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2.f;
@@ -58,8 +67,14 @@ namespace GGL {
 		float gcrlSepClamp = 3.f;
 
 		int representationSize = 128;
-		// TRIAD-NATIVE: per-critic goal input dim (de-hardcodes MakePsiConfig(6)). CAR=6, GOALSHORT=6, ANTI=8.
+		// TRIAD-NATIVE: per-critic goal input dim (de-hardcodes MakePsiConfig(6)). GOALSHORT/world-ball=6, ANTI=8.
 		int goalInputSize = 6;
+		// CAR critic goal dim. The CAR critic is now BALL-AGNOSTIC: its goal is the car's OWN future kinematic
+		// + mechanic state -- velocity(3) + forward(3) + up(3) + angVel(3) + air-control flags(3) = 15 --
+		// built by AppendCarStateGoal. MUST match that builder's float layout (a mismatch fails the carStates
+		// row-size guard and safely benches the car critic). This is car CONTROL (speedflips/wavedashes/
+		// aerials), not ball control. Flags = isOnGround, HasFlipOrJump, isFlipping (the air-maneuver state).
+		int carGoalInputSize = 15;
 		// Hidden layers of the phi tail (action-fusion network on top of the shared_head embedding).
 		// Input = shared_head output size + numActions; output = representationSize.
 		std::vector<int> phiTailLayerSizes = { 256, 256 };

@@ -195,23 +195,28 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	// GCRL magnitude-blend with two isolated critics (goal + car). Per critic the
-	// policy-gradient contribution is (taken - baseline)/spread -- NOT unit-renormalized --
-	// so a critic that can't yet discriminate the action self-attenuates to ~0 (no noise
-	// injection, no gate). The CAR critic (egocentric ball, short HER window) carries early
-	// action-attributable controllability signal; the GOAL critic (HER achieved ball, not
-	// the synthetic net) firms up later. gcrlLambda ramps in over a short warmup, then holds.
-	// Watch GCRL/Car Separation (should climb first) vs GCRL/Goal Separation.
+	// GCRL magnitude-blend, per-critic policy-gradient contribution is (taken - baseline)/spread -- NOT
+	// unit-renormalized -- so a critic that can't yet discriminate the action self-attenuates to ~0 (no
+	// noise injection, no gate). The CAR critic is now BALL-AGNOSTIC: its goal is the car's OWN future
+	// kinematic + mechanic state (velocity + orientation + angular velocity + air-control flags), so it learns
+	// car CONTROL -- speedflips, wavedashes, aerial control, recoveries -- with no reason to drive at the ball (the old
+	// egocentric-ball goal made it a ball magnet). Approach is left to VelocityPlayerToBall + the reward
+	// stack; positioning to the goal-potential critic. Watch GCRL/Car Separation + GCRL/Car Edge Mean.
 	cfg.ppo.contrastiveGoal.enabled = true;
 	cfg.ppo.contrastiveGoal.useCarCritic = true;
-	// Run1: DROP the world-frame GOALSHORT critic from training + coupling. It is action-INERT far-field
-	// (edge ~0.04, SF asymptote) and was injecting ~30% unit-std NOISE into the policy gradient (the edge
-	// batch-norm reinflated its ~0 action-edge; w floored at ~0.27 not 0). GCRL is now CAR-only. The critic
-	// stays constructed + checkpoint-loadable (resume from 2fkzih10 works), just untrained/unscored/uncoupled.
+	cfg.ppo.contrastiveGoal.carGoalInputSize = 15; // car self-state goal: vel(3)+fwd(3)+up(3)+angVel(3)+airflags(3: onGround,hasFlipOrJump,isFlipping)
+	// Keep the goal critic's ACTION-EDGE coupling OFF -- it is action-INERT far-field (edge ~0.04) and its
+	// batch-normed ~0 edge reinflates to ~30% unit-std NOISE. But re-introduce the goal critic as a POSITIONING
+	// signal via its POTENTIAL: useGoalPotential consumes Phi(s) = action-marginalized reachability of the net
+	// as a telescoping shaping term gamma*Phi(s')-Phi(s). This is the dense positioning gradient the egocentric
+	// CAR critic structurally can't provide (and the mirror-chase plateau needs), without the noise OR a
+	// farmable raw positioning reward. The critic is trained for Phi (useGoalPotential), just not edge-coupled.
 	cfg.ppo.contrastiveGoal.useGoalCritic = false;
+	cfg.ppo.contrastiveGoal.useGoalPotential = true;
+	cfg.ppo.contrastiveGoal.gcrlGoalPotentialScale = 0.3f;
 	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
 	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
-	cfg.ppo.contrastiveGoal.carHerMaxOffset = 20;               // car critic: short, near-term controllability window
+	cfg.ppo.contrastiveGoal.carHerMaxOffset = 30;               // car critic: ~2s self-state window (covers flips/wavedashes/short aerials)
 	cfg.ppo.contrastiveGoal.criticLR = 3e-4f;
 	cfg.ppo.contrastiveGoal.criticEpochs = 1;
 	// THE consumption lever: the InfoNCE critic train was 2.17s = 81% of "PPO Learn" at bs=256 (~960 serial
@@ -231,9 +236,11 @@ int main(int argc, char* argv[]) {
 	// ~17-pass counterfactual-baseline scoring loop. 4096->32768 collapses ~50 chunks/pass to ~6. Tiny
 	// activations (psi/phi are small) so it fits easily; push higher if Consumption/GCRL Score Time is still high.
 	cfg.ppo.contrastiveGoal.policyScoreBatchSize = 32768;
-	// TRIAD-NATIVE: GOALSHORT = world-ball REACH, HER window CAPPED short (long horizons re-enter the
-	// 0.055 state-dominated, action-invalid regime); drop the off-policy goalward HER bias.
-	cfg.ppo.contrastiveGoal.herMaxOffset = 15;
+	// Goal critic HER window. The old short cap (15) existed because the action-EDGE went action-invalid at
+	// long horizons -- but we now consume the goal critic as a VALUE/potential (Phi), not the edge, so a
+	// LONGER horizon is correct: it makes Phi a genuine "can I score from here soon" reachability over a
+	// full play (~4s at tickSkip 8), which is what teaches positioning. Keep the goalward bias off.
+	cfg.ppo.contrastiveGoal.herMaxOffset = 60;
 	cfg.ppo.contrastiveGoal.herGoalwardBias = 0.f;
 	// xddib2kd fix: lower GCRL's target share of the policy gradient (was 1:1) so the egocentric
 	// CONTROL critic's continuous ball-HOLD pull stops dominating the strike action and the reward
@@ -255,12 +262,20 @@ int main(int argc, char* argv[]) {
 	// rows are excluded from the TD bootstrap). Populates real near-net states + the scoring-goal manifold.
 	cfg.ppo.contrastiveGoal.scoringGoalMixFrac = 0.5f;
 
-	// TRIAD-NATIVE self-play (fork 10): 0.15 vs a rolling frozen-checkpoint pool (no ES; BC-seeded once the
+	// TRIAD-NATIVE self-play (fork 10): vs a rolling frozen-checkpoint pool (no ES; BC-seeded once the
 	// offline warmstart lands -- until then version 0 is the initial policy). Breaks mutual-idle equilibria.
+	// 0.15->0.35: the mirror-chase plateau (run 04zisffz ~rating 300) needs more non-self exposure to make
+	// chasing stop being near-optimal; pool DIVERSITY is the bigger lever, hence the anchor set below.
 	cfg.trainAgainstOldVersions = true;
-	cfg.trainAgainstOldChance = 0.15f;
+	cfg.trainAgainstOldChance = 0.35f;
 	cfg.maxOldVersions = 20;
 	cfg.tsPerVersion = 25'000'000;
+	// "Gold anchor" opponents: keep a few strong, temporally-spaced past selves around permanently so the
+	// pool isn't just 20 near-identical recent chasers. Half of old-version games face an anchor.
+	cfg.maxAnchorVersions = 3;
+	cfg.anchorSelectChance = 0.5f;
+	cfg.anchorPromoteMargin = 25.0f;
+	cfg.anchorMinTsSpacing = 100'000'000;
 
 	// SimBa RSNorm (running observation normalization), default-off. When enabled it
 	// standardizes obs as the first op of the actor & critic (one shared normalizer),

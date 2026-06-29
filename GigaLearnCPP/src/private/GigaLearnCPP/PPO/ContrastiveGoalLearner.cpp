@@ -54,7 +54,7 @@ namespace GGL {
 			MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
 			device
 		),
-		goalEncoder(psiName.c_str(), MakePsiConfig(config.goalInputSize, config.representationSize, config.psiLayerSizes), device),
+		goalEncoder(psiName.c_str(), MakePsiConfig(useCarGoals ? config.carGoalInputSize : config.goalInputSize, config.representationSize, config.psiLayerSizes), device),
 		sharedHead(sharedHead), obsNorm(obsNorm),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
 		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
@@ -72,7 +72,7 @@ namespace GGL {
 				MakePhiTailConfig(sharedHead->config.numOutputs, actionRepresentationSize, config.representationSize, config.phiTailLayerSizes),
 				device);
 			goalEncoderTarget = new Model(psiTgtName.c_str(),
-				MakePsiConfig(config.goalInputSize, config.representationSize, config.psiLayerSizes), device);
+				MakePsiConfig(useCarGoals ? config.carGoalInputSize : config.goalInputSize, config.representationSize, config.psiLayerSizes), device);
 			if (config.tdEmaTrunk)
 				sharedHeadTarget = new Model(trunkTgtName.c_str(), sharedHead->config, device);
 		}

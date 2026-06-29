@@ -98,6 +98,37 @@ static void AppendScoringGoal(FList& out, const GameState& state, const Player& 
 	AppendNormalizedGoal(out, targetPos, targetVel, cfg);
 }
 
+// Ball-AGNOSTIC car-CONTROL goal: the car's own kinematic + mechanic state = 15 floats --
+// velocity(3) + forward(3) + up(3) + angVel(3) + air-control flags(3) -- team-canonicalized so +y is always
+// the attacking direction. This makes the CAR critic an empowerment/motor-skill signal (speedflips,
+// wavedashes, aerial orientation, recoveries): it learns which actions reach diverse, controllable SELF
+// states, with zero reason to drive at the ball. forward+up fully encode attitude (yaw/pitch/roll) and angVel
+// the rotation RATES, so no Euler angles are needed; the air-control flags add the jump/flip mechanic state
+// that kinematics can't express. Deliberately EXCLUDES world position (positioning is the goal critic's job;
+// including it would re-add a location magnet AND bind the skill to a spot instead of generalizing the
+// motion) and boost (a boost-in-goal term invites hoarding). Layout MUST match carGoalInputSize.
+static void AppendCarStateGoal(FList& out, const Player& player, const GGL::ContrastiveGoalConfig& cfg) {
+	PhysState car = InvertPhys(player, player.team == Team::ORANGE);
+	out += car.vel.x / CommonValues::CAR_MAX_SPEED;
+	out += car.vel.y / CommonValues::CAR_MAX_SPEED;
+	out += car.vel.z / CommonValues::CAR_MAX_SPEED;
+	out += car.rotMat.forward.x;
+	out += car.rotMat.forward.y;
+	out += car.rotMat.forward.z;
+	out += car.rotMat.up.x;
+	out += car.rotMat.up.y;
+	out += car.rotMat.up.z;
+	out += car.angVel.x / CommonValues::CAR_MAX_ANG_VEL;
+	out += car.angVel.y / CommonValues::CAR_MAX_ANG_VEL;
+	out += car.angVel.z / CommonValues::CAR_MAX_ANG_VEL;
+	// Air-control / mechanic state -- frame-invariant booleans, read from the un-canonicalized player.
+	// These are the jump/flip resources that govern aerials, wavedashes and flip resets (not derivable
+	// from pos/vel/orientation), so the critic can learn to reach "airborne with my flip still available".
+	out += player.isOnGround ? 1.f : 0.f;
+	out += player.HasFlipOrJump() ? 1.f : 0.f; // a flip / double-jump is still available
+	out += player.isFlipping ? 1.f : 0.f;      // currently mid-dodge/flip
+}
+
 static bool CanMoveTensorToDevice(at::Device device) {
 	try {
 		torch::Tensor t = torch::tensor(0);
@@ -294,6 +325,10 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 			config.checkpointFolder / "policy_versions", config.maxOldVersions, config.tsPerVersion,
 			config.skillTracker, envSet->config
 		);
+		versionMgr->maxAnchors = config.maxAnchorVersions;
+		versionMgr->anchorSelectChance = config.anchorSelectChance;
+		versionMgr->anchorPromoteMargin = config.anchorPromoteMargin;
+		versionMgr->anchorMinTsSpacing = config.anchorMinTsSpacing;
 	} else {
 		versionMgr = NULL;
 	}
@@ -715,6 +750,7 @@ void GGL::Learner::Start() {
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
 			FList achievedGoals, herGoals, carHerGoals, scoringGoals;
+			FList carStates; // per-step car self-state (12 floats); the CAR critic's HER goal source
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<uint8_t> gcrlScoringMask; // FORK2 Part C: 1 = this row's herGoal is a SYNTHETIC scoring goal (excluded from TD bootstrap)
@@ -735,6 +771,7 @@ void GGL::Learner::Start() {
 				herGoals += other.herGoals;
 				carHerGoals += other.carHerGoals;
 				scoringGoals += other.scoringGoals;
+				carStates += other.carStates;
 				gcrlTrainMask += other.gcrlTrainMask;
 				gcrlScoringMask += other.gcrlScoringMask;
 				actionMasks += other.actionMasks;
@@ -790,10 +827,11 @@ void GGL::Learner::Start() {
 				if (shouldTrainAgainstOld) {
 					// Set up training against old versions
 
-					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-					oldVersion = &versionMgr->versions[oldVersionIdx];
+					// Anchor-aware draw: with probability anchorSelectChance this returns a "gold" anchor
+					// (a strong, spaced past self) rather than a near-duplicate rolling-recent snapshot.
+					oldVersion = versionMgr->PickOldVersion();
 
-					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2)); 
+					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2));
 					
 					newPlayerIndices.clear();
 					oldVersionPlayerMask.resize(numPlayers);
@@ -843,22 +881,9 @@ void GGL::Learner::Start() {
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
 
-				// Car-local ball obs offset for the car critic (-1 if this obs builder
-				// doesn't expose it, in which case the car critic is skipped).
-				int carLocalBallOffset = -1;
-				if (config.ppo.contrastiveGoal.useCarCritic && !envSet->obsBuilders.empty() && envSet->obsBuilders[0])
-					carLocalBallOffset = envSet->obsBuilders[0]->GetCarLocalBallOffset();
-				// Guard the 6-float car-local ball read against the obs layout; disable safely if it
-				// wouldn't fit (prevents a silent out-of-bounds states[] read for an unexpected builder).
-				if (carLocalBallOffset >= 0 && obsSize < carLocalBallOffset + 6)
-					carLocalBallOffset = -1;
-				if (config.ppo.contrastiveGoal.useCarCritic && carLocalBallOffset < 0) {
-					static bool warnedCarCritic = false;
-					if (!warnedCarCritic) {
-						RG_LOG("WARNING: GCRL car critic requested (useCarCritic=true) but the obs builder exposes no valid car-local ball offset; the car critic will be benched (watch GCRL/Car Active=0).");
-						warnedCarCritic = true;
-					}
-				}
+				// The CAR critic is now ball-agnostic (its goal is the car's own future kinematic state,
+				// collected per-step into traj.carStates via AppendCarStateGoal), so it no longer needs a
+				// car-local ball offset from the obs builder.
 
 				auto relabelHERGoals = [&](Trajectory& traj) {
 					if (!config.ppo.contrastiveGoal.enabled)
@@ -949,17 +974,18 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					// Car critic: its OWN short, near-term HER window (no goalward bias).
-					// The goal is the car-local (egocentric) ball pos+vel at a near-future
-					// step, read straight from the stored obs at carLocalBallOffset.
-					// Controllability is local, so it samples short offsets independent of
-					// the ball goal's long/goalward window.
-					if (config.ppo.contrastiveGoal.useCarCritic && carLocalBallOffset >= 0
-						&& (int)traj.states.size() == n * obsSize) {
+					// Car-CONTROL critic: its OWN short, near-term HER window over the car's own future
+					// kinematic SELF-state (carStates: velocity + orientation + angular velocity), sampled
+					// short because car control plays out on a ~1-3s horizon. Ball-agnostic, so -- unlike the
+					// ball goal -- there is no goalward bias and no synthetic scoring-goal mix; the target is
+					// always a genuine achieved future self-state (a valid InfoNCE positive).
+					const int carGoalSize = config.ppo.contrastiveGoal.carGoalInputSize;
+					if (config.ppo.contrastiveGoal.useCarCritic && carGoalSize > 0
+						&& (int)traj.carStates.size() == n * carGoalSize) {
 						int carMin = RS_MAX(1, config.ppo.contrastiveGoal.carHerMinOffset);
 						int carMaxCfg = RS_MAX(carMin, config.ppo.contrastiveGoal.carHerMaxOffset);
 						float carShortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.carHerShortBiasPower);
-						traj.carHerGoals.resize((size_t)n * 6);
+						traj.carHerGoals.resize((size_t)n * carGoalSize);
 						for (int t = 0; t < n; t++) {
 							int remaining = n - t - 1;
 							int carOffset = 0;
@@ -975,8 +1001,8 @@ void GGL::Learner::Start() {
 								}
 							}
 							int carTarget = t + carOffset;
-							for (int d = 0; d < 6; d++)
-								traj.carHerGoals[(size_t)t * 6 + d] = traj.states[(size_t)carTarget * obsSize + carLocalBallOffset + d];
+							for (int d = 0; d < carGoalSize; d++)
+								traj.carHerGoals[(size_t)t * carGoalSize + d] = traj.carStates[(size_t)carTarget * carGoalSize + d];
 						}
 					}
 				};
@@ -1141,6 +1167,8 @@ void GGL::Learner::Start() {
 								const GameState& state = envSet->state.gameStates[arenaIdx];
 								const Player& player = state.players[localPlayerIdx];
 								AppendAchievedGoal(trajectories[newPlayerIdx].achievedGoals, state, player, config.ppo.contrastiveGoal);
+								if (config.ppo.contrastiveGoal.useCarCritic)
+									AppendCarStateGoal(trajectories[newPlayerIdx].carStates, player, config.ppo.contrastiveGoal);
 							}
 						});
 
@@ -1220,7 +1248,7 @@ void GGL::Learner::Start() {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
 						if (config.ppo.contrastiveGoal.useCarCritic && !combinedTraj.carHerGoals.empty())
-							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
+							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, config.ppo.contrastiveGoal.carGoalInputSize });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tGcrlScoringMask = torch::tensor(combinedTraj.gcrlScoringMask, torch::TensorOptions().dtype(torch::kUInt8));
