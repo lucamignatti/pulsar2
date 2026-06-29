@@ -49,7 +49,13 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ teamMixed(new TouchBallReward()), 15.f },          // any contact (touch-volume engine, trimmed floor)
 		{ teamMixed(new AerialTouchReward()), 12.f },        // genuine aerial touch (the reward-stream aerial mechanism)
 		// The ONLY sustained LEVEL term: absolute approach velocity, UNWRAPPED (cannot telescope-hug-farm).
-		{ new VelocityPlayerToBallReward(), 0.5f },
+		// 0.5 -> 6.0: this is now the COLD-START APPROACH BOOTSTRAP. It used to be small because the egocentric
+		// -ball CAR critic drove approach ("CONTROL leads cold-start approach, edge ~1.0"); making the car critic
+		// BALL-AGNOSTIC removed that, and 0.5 alone is too weak (instantaneous momentum, ~97% value-absorbed) to
+		// bootstrap a cold policy -> run bsx969sr froze at touch ratio ~0.0003 / rating ~46. 6.0 is the proven
+		// bootstrap value (g7jf6cwc/ryp4gxwv reached 560); VPB->0 as the car reaches the ball, so it can't be
+		// stall-farmed. The positioning push past the chase plateau now comes from the goal potential + anchors.
+		{ new VelocityPlayerToBallReward(), 6.0f },
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -213,7 +219,13 @@ int main(int argc, char* argv[]) {
 	// farmable raw positioning reward. The critic is trained for Phi (useGoalPotential), just not edge-coupled.
 	cfg.ppo.contrastiveGoal.useGoalCritic = false;
 	cfg.ppo.contrastiveGoal.useGoalPotential = true;
-	cfg.ppo.contrastiveGoal.gcrlGoalPotentialScale = 0.3f;
+	// 0.3 -> 0.1: at 0.3 the potential was ~26% of the policy-gradient magnitude, but the goal critic is
+	// near-chance (categorical accuracy ~0.15) for a COLD bot -- the ball barely moves, so its reachability
+	// manifold is degenerate -> that 26% was mostly NOISE (the documented freeze mechanism, cf 0hd1s2ne).
+	// Positioning shaping is premature before the bot can touch the ball; 0.1 bounds the cold-phase noise.
+	// It self-heals as VPB bootstraps ball contact (the goal critic then gets real data); re-raise once
+	// GCRL Categorical Accuracy climbs and touch ratio is off the floor.
+	cfg.ppo.contrastiveGoal.gcrlGoalPotentialScale = 0.1f;
 	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
 	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 30;               // car critic: ~2s self-state window (covers flips/wavedashes/short aerials)
