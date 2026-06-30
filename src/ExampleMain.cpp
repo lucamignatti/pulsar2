@@ -7,6 +7,8 @@
 #include <RLGymCPP/ObsBuilders/DefaultObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
+#include <RLGymCPP/StateSetters/CombinedState.h>
+#include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
@@ -72,7 +74,17 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	result.stateSetter = new KickoffState();
+	// ISOLATION TEST (state-setter only; rewards/GCRL/entropy unchanged): our prior setter was bare
+	// KickoffState -- 5 fixed far-from-ball states, so a cold policy almost never reaches the ball and the
+	// touch reward fires at ~0.0003 (the freeze). Place the car NEAR the ball 70% of resets so the
+	// impulse-on-touch reward actually fires; keep 30% real kickoffs for kickoff competence. DECISIVE METRIC:
+	// "Player/Ball Touch Ratio" must jump from ~0.0003 to >0.05 cold. If it does, the freeze was the state
+	// distribution all along, and the full Necto reward stack + GCRL-off follow. If not, debug the geometry
+	// BEFORE any long run. (BallNearCarState radius 300-900uu; a near->far curriculum comes in stage 2.)
+	result.stateSetter = new CombinedState({
+		{ new BallNearCarState(300.f, 900.f), 0.7f },
+		{ new KickoffState(), 0.3f },
+	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 
