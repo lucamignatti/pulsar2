@@ -386,8 +386,9 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		// critic still injected ~30% noise). Linear ramp to 0 as spread->0, complementing the soft sigmoid w.
 		// =1 for any healthy critic (spread >= sigmaMin), so CAR is unaffected.
 		torch::Tensor spreadGate = torch::clamp(spread / RS_MAX(cfg.gcrlVarWeightSigmaMin, 1e-6f), 0.f, 1.f);
-		torch::Tensor sep = torch::clamp(w * spreadGate * edgeBN, -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
-		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread));
+		torch::Tensor wGate = w * spreadGate; // per-row controllability in [0,1] (can the action move reachability-of-goal here) -- this is L(s)
+		torch::Tensor sep = torch::clamp(wGate * edgeBN, -cfg.gcrlSepClamp, cfg.gcrlSepClamp);
+		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread), wGate);
 	};
 
 	// Competence gate g in [0,1] from the touch-ratio EMA: g~0 cold => the APPROACH bootstrap dominates and
@@ -415,11 +416,14 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 
 	// APPROACH critic (egocentric ball) -- the cold-start BOOTSTRAP. Weight = (1-g)+approachFloor: dominant
 	// cold, annealed to a residual once competent (the reward stack then self-sustains ball contact).
+	torch::Tensor ballControllability; // L(s) for the product: the approach (ball) critic's per-row controllability
 	bool approachActive = cfg.useApproachCritic && learner->approachContrastiveLearner
 		&& experience.data.approachHerGoals.defined()
 		&& experience.data.approachHerGoals.size(0) == rawStates.size(0);
 	if (approachActive) {
 		auto apRes = criticSep(learner->approachContrastiveLearner, experience.data.approachHerGoals.to(device));
+		ballControllability = std::get<3>(apRes);
+		report["GCRL/Ball Controllability Mean"] = TensorMean(ballControllability);
 		float apWeight = (1.f - g) + cfg.approachFloor;
 		report["GCRL/Approach Edge Mean"] = std::get<1>(apRes);
 		report["GCRL/Approach Baseline Spread"] = std::get<2>(apRes);
@@ -440,7 +444,17 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		report["GCRL/Car Edge Mean"] = std::get<1>(carRes);
 		report["GCRL/Car Baseline Spread"] = std::get<2>(carRes);
 		report["GCRL/Car Separation"] = TensorMean(std::get<0>(carRes).abs());
-		torch::Tensor carSep = g * std::get<0>(carRes);
+		torch::Tensor carSep;
+		if (cfg.useProductControl && ballControllability.defined()) {
+			// PRODUCT: execute a good car maneuver (selfControlEdge) WHERE that maneuver moves the ball
+			// (L(s) = ball controllability), ramped by competence g. Gating the mechanic credit by ball-
+			// leverage resolves the self-state critic's orthogonality WITHOUT a proximity magnet -- L gates
+			// the credit, it is never maximized, so near-ball-with-sloppy-control pays ~0.
+			carSep = g * ballControllability * std::get<0>(carRes);
+			report["GCRL/Control Product Mean"] = TensorMean(carSep.abs());
+		} else {
+			carSep = g * std::get<0>(carRes);
+		}
 		sepSum = sepSum.defined() ? sepSum + carSep : carSep;
 	}
 	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;

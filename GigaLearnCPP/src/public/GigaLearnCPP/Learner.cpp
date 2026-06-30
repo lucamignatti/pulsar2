@@ -757,6 +757,7 @@ void GGL::Learner::Start() {
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<uint8_t> gcrlScoringMask; // FORK2 Part C: 1 = this row's herGoal is a SYNTHETIC scoring goal (excluded from TD bootstrap)
+			std::vector<uint8_t> carTouched; // per-step: 1 = THIS player touched the ball this step (self-caused-outcome relabel source)
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
 			std::vector<int64_t> segmentIds, segmentSteps;
@@ -778,6 +779,7 @@ void GGL::Learner::Start() {
 				carStates += other.carStates;
 				gcrlTrainMask += other.gcrlTrainMask;
 				gcrlScoringMask += other.gcrlScoringMask;
+				carTouched += other.carTouched;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
 				actions += other.actions;
@@ -884,6 +886,7 @@ void GGL::Learner::Start() {
 				auto combinedTraj = Trajectory();
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
+				int apUsefulRelabels = 0, apTotalRelabels = 0;
 
 				// The CONTROL car critic is ball-agnostic (goal = car self-state in traj.carStates). The
 				// APPROACH critic (the cold-start bootstrap) instead needs the egocentric car-local ball,
@@ -1031,6 +1034,8 @@ void GGL::Learner::Start() {
 						int apMin = RS_MAX(1, config.ppo.contrastiveGoal.approachHerMinOffset);
 						int apMaxCfg = RS_MAX(apMin, config.ppo.contrastiveGoal.approachHerMaxOffset);
 						float apShortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.approachHerShortBiasPower);
+						bool apUseful = config.ppo.contrastiveGoal.useApproachUsefulGoals && (int)traj.carTouched.size() == n;
+						float apUsefulProb = RS_CLAMP(config.ppo.contrastiveGoal.approachUsefulProb, 0.f, 1.f);
 						traj.approachHerGoals.resize((size_t)n * 6);
 						for (int t = 0; t < n; t++) {
 							int remaining = n - t - 1;
@@ -1038,10 +1043,26 @@ void GGL::Learner::Start() {
 							if (remaining > 0) {
 								int apMax = RS_MIN(apMaxCfg, remaining);
 								if (apMax >= apMin) {
-									float u = RocketSim::Math::RandFloat();
-									float biased = powf(u, apShortBiasPower);
-									int span = apMax - apMin + 1;
-									apOffset = apMin + RS_MIN(span - 1, (int)floorf(biased * span));
+									apTotalRelabels++;
+									// Self-caused-outcome upweight: with prob apUsefulProb, relabel to the NEAREST future SELF-touch
+									// frame's egocentric ball (do(a)-attributable + useful), so the critic's POSITIVE manifold is
+									// self-caused contacts. Else fall back to the dense short-biased draw (keeps cold near-field
+									// coverage -> the bootstrap is unaffected). Empty cold (no touches) => always the fallback.
+									int touchOffset = -1;
+									if (apUseful && RocketSim::Math::RandFloat() < apUsefulProb) {
+										for (int o = apMin; o <= apMax; o++) {
+											if (traj.carTouched[(size_t)(t + o)]) { touchOffset = o; break; }
+										}
+									}
+									if (touchOffset >= 0) {
+										apOffset = touchOffset;
+										apUsefulRelabels++;
+									} else {
+										float u = RocketSim::Math::RandFloat();
+										float biased = powf(u, apShortBiasPower);
+										int span = apMax - apMin + 1;
+										apOffset = apMin + RS_MIN(span - 1, (int)floorf(biased * span));
+									}
 								} else {
 									apOffset = remaining;
 								}
@@ -1213,6 +1234,9 @@ void GGL::Learner::Start() {
 								const GameState& state = envSet->state.gameStates[arenaIdx];
 								const Player& player = state.players[localPlayerIdx];
 								AppendAchievedGoal(trajectories[newPlayerIdx].achievedGoals, state, player, config.ppo.contrastiveGoal);
+								// Per-step self-caused-touch flag (aligned with achievedGoals/actions/carStates), consumed by
+								// the approach critic's self-caused-outcome relabel. Known only post-step (post StepSecondHalf).
+								trajectories[newPlayerIdx].carTouched.push_back(player.ballTouchedStep ? 1 : 0);
 								if (config.ppo.contrastiveGoal.useCarCritic)
 									AppendCarStateGoal(trajectories[newPlayerIdx].carStates, player, config.ppo.contrastiveGoal);
 							}
@@ -1312,6 +1336,7 @@ void GGL::Learner::Start() {
 							report["HER Valid Relabel Count"] = (float)herSelectedOffsets.size();
 						}
 						report["HER Total Relabel Rows"] = (float)herTotalRows;
+						report["GCRL/Approach Useful Relabel Frac"] = apTotalRelabels > 0 ? (float)apUsefulRelabels / (float)apTotalRelabels : 0.f;
 					}
 
 					// States we truncated at (there could be none)

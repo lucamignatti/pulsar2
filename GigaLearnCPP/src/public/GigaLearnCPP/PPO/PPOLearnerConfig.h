@@ -64,6 +64,14 @@ namespace GGL {
 		int approachHerMinOffset = 1;
 		int approachHerMaxOffset = 15;        // short tactical window
 		float approachHerShortBiasPower = 2.f;
+		// Self-caused-outcome relabel (de-confound the ball critic's POSITIVE distribution toward MY contacts):
+		// with prob approachUsefulProb, relabel the approach goal to the NEAREST future SELF-touch frame's
+		// egocentric ball (player.ballTouchedStep) instead of a uniform short-biased future. The fallback keeps
+		// dense near-field coverage (so the cold bootstrap is unaffected) and the manifold tilts to self-caused
+		// contacts as touches accumulate. UPWEIGHT, not restrict -- restricting deletes the near-field coverage
+		// that the bootstrap depends on. Empty cold (no touches) => degrades cleanly to the uniform draw.
+		bool useApproachUsefulGoals = false;
+		float approachUsefulProb = 0.5f;
 
 		// ── Competence gate g (touch-ratio EMA) ─────────────────────────────────
 		// g = smoothstep((touchCompetenceEMA - competenceLo)/(competenceHi - competenceLo)), clamped [0,1].
@@ -74,6 +82,16 @@ namespace GGL {
 		float competenceHi = 0.012f;          // ~the working-run touch level
 		float approachFloor = 0.15f;          // residual approach pull kept after handoff (anti-relapse)
 		float competenceEmaDecay = 0.99f;     // per-iteration EMA decay for touchCompetenceEMA
+
+		// ── Product factorization: "control the car well IN A USEFUL WAY" ───────────
+		// When true, the CONTROL (self-state) critic's contribution becomes g * L(s) * selfControlEdge(s,a),
+		// where L(s) in [0,1] is the APPROACH (ball) critic's per-row controllability (w*spreadGate) -- i.e.
+		// "execute a good car maneuver WHERE that maneuver can actually move the ball." This resolves the
+		// self-state critic's task-orthogonality (summed alone it froze: a clean flip in the corner scored like
+		// one at the ball) WITHOUT a proximity magnet -- L gates the credit, it is never maximized, so being
+		// near the ball with sloppy control pays ~0. Requires the approach critic active (its spread IS L);
+		// otherwise falls back to the legacy gated sum g*sep.
+		bool useProductControl = false;
 
 		// ── Magnitude-blend advantage (replaces unit-renorm + the separation gate) ──
 		// Per critic, per-row advantage = (taken_score - mean_baseline)/(baseline_spread

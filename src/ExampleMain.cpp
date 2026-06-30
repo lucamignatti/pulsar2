@@ -214,6 +214,18 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.contrastiveGoal.approachHerMaxOffset = 15;         // short tactical approach window
 	cfg.ppo.contrastiveGoal.useCarCritic = true;               // CONTROL critic (gated in by competence)
 	cfg.ppo.contrastiveGoal.carGoalInputSize = 15; // car self-state goal: vel(3)+fwd(3)+up(3)+angVel(3)+airflags(3: onGround,hasFlipOrJump,isFlipping)
+	// PRODUCT factorization ("control the car well IN A USEFUL WAY"): the CONTROL (self-state) critic enters as
+	// g * L(s) * selfControlEdge, where L(s) in [0,1] is the APPROACH (ball) critic's per-row controllability
+	// (w*spreadGate). The self-state mechanic credit is GATED by ball-leverage -- "execute a good maneuver WHERE
+	// that maneuver can move the ball." Fixes the self-state critic's orthogonality (it froze when summed alone)
+	// without a proximity magnet: L gates the credit, it is never maximized, so near-ball-with-sloppy-control ~0.
+	cfg.ppo.contrastiveGoal.useProductControl = true;
+	// Self-caused-outcome relabel: bias the APPROACH critic's POSITIVES toward MY actual contacts (ballTouchedStep),
+	// so its learned reachability density -- and therefore L(s) -- is self-CAUSED, not opponent/physics-confounded
+	// ("learn from your actions when they DO affect the ball"). Upweight, not restrict (keeps the dense cold
+	// near-field coverage that bootstraps); ~no-op until the first touches exist, then tilts the manifold in.
+	cfg.ppo.contrastiveGoal.useApproachUsefulGoals = true;
+	cfg.ppo.contrastiveGoal.approachUsefulProb = 0.5f;
 	// Competence gate g = smoothstep over touch-ratio EMA in [competenceLo, competenceHi].
 	cfg.ppo.contrastiveGoal.competenceLo = 0.002f;             // frozen-policy touch floor
 	cfg.ppo.contrastiveGoal.competenceHi = 0.012f;             // ~the working-run touch level
