@@ -142,6 +142,14 @@ namespace GGL {
 		float gcrlLambdaMin = 0.0f;
 		float gcrlLambdaMax = 2.0f;
 		float gcrlRatioTarget = 1.0f;   // target std(gcrl)/std(base) ~ 1:1 (the working-run signature)
+		// Cold-start ratio target, used at competence g=0. The cold bootstrap is a marginal stochastic race
+		// (the policy must snowball random touches before exploration decays); at the warm-tuned ratio 0.5 the
+		// approach signal is only half the value-absorbed reward noise, so commitment-to-ball is luck-dependent
+		// (04zisffz barely cleared it at ~30M ts; the redesign runs missed it and froze). Gate the target from
+		// gcrlRatioTargetCold (cold: strong approach => reliable bootstrap) to gcrlRatioTarget (warm: the
+		// annealed approach WEIGHT then suppresses the ballchase magnet). Effective = (1-g)*cold + g*warm.
+		// Default == gcrlRatioTarget's default => no gating unless the warm value is lowered below this.
+		float gcrlRatioTargetCold = 1.0f;
 		float gcrlRatioEmaDecay = 0.9f;
 		float gcrlRenormStdEma = 0.7f;  // RenormToStd EMA (the inner z533fbde explosion guard, KEPT)
 		// always-on smooth variance-weight w=sigmoid((crossActionSpread - sigmaMin)/scale) (replaces the dead gate)

@@ -184,6 +184,12 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.targetEntropy = 0.70f;
 	cfg.ppo.maxEntropyScale = 5.0f;        // high sanity bound; the pin is uncapped in practice
 	cfg.ppo.entropyScaleAdjustRate = 0.2f; // log-space (multiplicative) gain
+	// Floor the exploration bonus at the level 04zisffz bootstrapped under (~0.024). A cold policy whose
+	// entropy sits above target makes the adaptive controller drive the bonus toward 0 (it collapsed to
+	// ~4e-4 in the frozen runs), killing the exploration the slow bootstrap needs to snowball random touches.
+	// The floor only binds in that pathological regime -- a learning run sits at scale ~0.5 (warm 04zisffz
+	// rose to 0.57), well above the floor -- so it cannot suppress commitment, only prevent the collapse.
+	cfg.ppo.minEntropyScale = 0.02f;
 
 	// Rate of reward decay
 	// 0.995 (~200-step horizon) so the terminal goal propagates back across the
@@ -270,11 +276,15 @@ int main(int argc, char* argv[]) {
 	// full play (~4s at tickSkip 8), which is what teaches positioning. Keep the goalward bias off.
 	cfg.ppo.contrastiveGoal.herMaxOffset = 60;
 	cfg.ppo.contrastiveGoal.herGoalwardBias = 0.f;
-	// xddib2kd fix: lower GCRL's target share of the policy gradient (was 1:1) so the egocentric
-	// CONTROL critic's continuous ball-HOLD pull stops dominating the strike action and the reward
-	// (now with the goalward-strike impulse) gets more relative weight. CONTROL still leads cold-start
-	// approach (it climbed to edge ~1.0). If approach-then-idle persists, lower further toward 0.3.
-	cfg.ppo.contrastiveGoal.gcrlRatioTarget = 0.5f;
+	// GCRL's target share of the policy gradient. The WARM target is low (0.5) so the egocentric approach's
+	// ball-HOLD pull stops dominating the strike once competent (the ballchase magnet). But that warm value
+	// makes the COLD bootstrap fragile: at ratio 0.5 the approach signal is half the value-absorbed reward
+	// NOISE, so commitment-to-ball is luck-dependent -- 04zisffz barely cleared it (~30M ts), the redesign
+	// runs missed it and froze. So COMPETENCE-GATE the target: strong cold (1.0, the working-run 1:1
+	// signature) for a reliable bootstrap, annealing to 0.5 warm as g rises (the annealed approach WEIGHT
+	// then suppresses the magnet). Effective target = (1-g)*cold + g*warm; watch GCRL/Ratio Target Eff.
+	cfg.ppo.contrastiveGoal.gcrlRatioTarget = 0.5f;        // warm (competent): low to kill the chase magnet
+	cfg.ppo.contrastiveGoal.gcrlRatioTargetCold = 1.0f;    // cold (g~0): strong approach -> reliable bootstrap
 	// tau 0.05, VICReg, masked-random K16 baseline, the always-on variance-weight + ratio-pinned lambda
 	// controller + RenormToStd are config defaults (PPOLearnerConfig.h). ANTI critic still flagged off.
 	// FORK2 TD-contrastive on GOALSHORT: TESTED in run 2fkzih10 and REVERTED. It FAILED its falsification

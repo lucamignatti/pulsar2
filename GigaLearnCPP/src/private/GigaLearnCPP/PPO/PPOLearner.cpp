@@ -489,8 +489,14 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 	float ratioObs = stdGcrl / (stdBase + 1e-6f);
 	if (std::isfinite(ratioObs))
 		learner->gcrlRatioEma = cfg.gcrlRatioEmaDecay * learner->gcrlRatioEma + (1.f - cfg.gcrlRatioEmaDecay) * ratioObs;
+	// Competence-gate the ratio target: strong (gcrlRatioTargetCold) cold so the approach signal reliably
+	// drives commitment to the ball (otherwise the cold bootstrap is a marginal stochastic race that the
+	// redesign runs lost), annealing to the warm-tuned gcrlRatioTarget as competence rises (the annealed
+	// approach WEIGHT then handles the warm ballchase magnet -- the reason the warm target is low).
+	float ratioTargetEff = (1.f - g) * cfg.gcrlRatioTargetCold + g * cfg.gcrlRatioTarget;
+	report["GCRL/Ratio Target Eff"] = ratioTargetEff;
 	learner->gcrlLambdaEff = RS_CLAMP(
-		controlledLambda * std::exp(cfg.gcrlLambdaCtrlGain * (cfg.gcrlRatioTarget - learner->gcrlRatioEma)),
+		controlledLambda * std::exp(cfg.gcrlLambdaCtrlGain * (ratioTargetEff - learner->gcrlRatioEma)),
 		cfg.gcrlLambdaMin, cfg.gcrlLambdaMax);
 
 	// Goal POTENTIAL shaping (positioning). Consume the goal critic as a state-potential Phi(s) =

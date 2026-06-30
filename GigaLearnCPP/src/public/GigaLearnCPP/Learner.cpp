@@ -1377,8 +1377,12 @@ void GGL::Learner::Start() {
 						}
 					}
 
+					// NOTE: this is 1 / (fraction of steps that are NORMAL=goal-scoring terminals) = the inverse
+					// SCORING rate, NOT physical episode length (physical episodes are capped at maxEpisodeLength /
+					// NoTouchCondition). A non-scoring policy makes it balloon to tens of thousands -- it is a pure
+					// symptom of not-scoring. Named accordingly so it stops masquerading as a rollout length.
 					float normalTerminalRate = (tTerminals == RLGC::TerminalType::NORMAL).to(torch::kFloat32).mean().item<float>();
-					report["Episode Length"] = normalTerminalRate > 0 ? 1.f / normalTerminalRate : 0;
+					report["Inverse Scoring Rate"] = normalTerminalRate > 0 ? 1.f / normalTerminalRate : 0;
 
 					// Build advantages + training batch: GAE, the goal-tensor alignment check, and buffer
 					// packing now live in one pure, tested unit (BuildTrainingBatch). The critic

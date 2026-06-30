@@ -11,7 +11,7 @@ static bool ShouldSendMetricToWandB(const std::string& key) {
 		"Total Iterations",
 		"Collected Timesteps",
 		"Average Step Reward",
-		"Episode Length",
+		"Inverse Scoring Rate",
 		"Clipped Reward Portion",
 
 		"Policy Entropy",
