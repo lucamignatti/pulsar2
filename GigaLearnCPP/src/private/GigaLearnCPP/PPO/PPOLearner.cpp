@@ -64,9 +64,15 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		contrastiveGoalLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, sh, obsNorm);
 		RG_LOG("GCRL scoring auxiliary enabled (phi = shared_head + phi_tail)");
 		if (config.contrastiveGoal.useCarCritic) {
-			// Egocentric car-local ball goal; trains on all rows (ignores the ball-moved mask).
+			// CONTROL critic: ball-agnostic car self-state goal; trains on all rows (ignores the ball-moved mask).
 			carContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, sh, obsNorm, "gcrl_car", true, false);
-			RG_LOG("GCRL car critic enabled (egocentric controllability)");
+			RG_LOG("GCRL control critic enabled (ball-agnostic car self-state)");
+		}
+		if (config.contrastiveGoal.useApproachCritic) {
+			// APPROACH critic (bootstrap): egocentric car-local ball goal (6d); trains on all rows.
+			// useCarGoals=false (=> goalInputSize=6), applyTrainMask=false, useApproachGoals=true.
+			approachContrastiveLearner = new ContrastiveGoalLearner(obsSize, numActions, config.contrastiveGoal, device, sh, obsNorm, "gcrl_approach", false, false, true);
+			RG_LOG("GCRL approach critic enabled (egocentric ball -- cold-start bootstrap)");
 		}
 	}
 
@@ -92,6 +98,7 @@ GGL::PPOLearner::~PPOLearner() {
 	guidingPolicyModels.Free();
 	delete contrastiveGoalLearner;
 	delete carContrastiveLearner;
+	delete approachContrastiveLearner;
 	delete obsNorm;
 }
 
@@ -383,8 +390,16 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		return std::make_tuple(sep, TensorMean(edge.abs()), TensorMean(spread));
 	};
 
-	// Goal (world-frame GOALSHORT) critic: action-INERT far-field. DROPPED from the advantage when
-	// useGoalCritic=false (CAR-only governs coupling); kept logged at 0 so downstream/Display is stable.
+	// Competence gate g in [0,1] from the touch-ratio EMA: g~0 cold => the APPROACH bootstrap dominates and
+	// CONTROL + POSITIONING are ~off; g~1 once the bot reliably touches the ball => hand off to CONTROL +
+	// POSITIONING (+ opponent diversity). smoothstep for a gentle ramp.
+	float gLo = cfg.competenceLo, gHi = RS_MAX(cfg.competenceHi, cfg.competenceLo + 1e-6f);
+	float gx = RS_CLAMP((learner->touchCompetenceEMA - gLo) / (gHi - gLo), 0.f, 1.f);
+	float g = gx * gx * (3.f - 2.f * gx);
+	report["GCRL/Competence g"] = g;
+
+	// Goal (world-frame) action-EDGE: action-inert far-field; OFF in production (useGoalCritic=false). Its
+	// positioning signal is consumed as the POTENTIAL below, not this edge.
 	torch::Tensor sepSum;
 	if (cfg.useGoalCritic) {
 		auto goalRes = criticSep(learner->contrastiveGoalLearner, experience.data.herGoals.to(device));
@@ -398,20 +413,39 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		report["GCRL/Goal Separation"] = 0.f;
 	}
 
+	// APPROACH critic (egocentric ball) -- the cold-start BOOTSTRAP. Weight = (1-g)+approachFloor: dominant
+	// cold, annealed to a residual once competent (the reward stack then self-sustains ball contact).
+	bool approachActive = cfg.useApproachCritic && learner->approachContrastiveLearner
+		&& experience.data.approachHerGoals.defined()
+		&& experience.data.approachHerGoals.size(0) == rawStates.size(0);
+	if (approachActive) {
+		auto apRes = criticSep(learner->approachContrastiveLearner, experience.data.approachHerGoals.to(device));
+		float apWeight = (1.f - g) + cfg.approachFloor;
+		report["GCRL/Approach Edge Mean"] = std::get<1>(apRes);
+		report["GCRL/Approach Baseline Spread"] = std::get<2>(apRes);
+		report["GCRL/Approach Separation"] = TensorMean(std::get<0>(apRes).abs());
+		report["GCRL/Approach Weight"] = apWeight;
+		torch::Tensor apSep = apWeight * std::get<0>(apRes);
+		sepSum = sepSum.defined() ? sepSum + apSep : apSep;
+	}
+	report["GCRL/Approach Active"] = approachActive ? 1.f : 0.f;
+
+	// CONTROL critic (ball-agnostic self-state) -- mechanics. Weight = g: ~0 cold (cannot derail the
+	// bootstrap), ramps in post-bootstrap.
 	bool carActive = cfg.useCarCritic && learner->carContrastiveLearner
 		&& experience.data.carHerGoals.defined()
 		&& experience.data.carHerGoals.size(0) == rawStates.size(0);
 	if (carActive) {
-		// Car critic: egocentric car-local ball (controllability), short-horizon goals.
 		auto carRes = criticSep(learner->carContrastiveLearner, experience.data.carHerGoals.to(device));
 		report["GCRL/Car Edge Mean"] = std::get<1>(carRes);
 		report["GCRL/Car Baseline Spread"] = std::get<2>(carRes);
 		report["GCRL/Car Separation"] = TensorMean(std::get<0>(carRes).abs());
-		sepSum = sepSum.defined() ? sepSum + std::get<0>(carRes) : std::get<0>(carRes);
+		torch::Tensor carSep = g * std::get<0>(carRes);
+		sepSum = sepSum.defined() ? sepSum + carSep : carSep;
 	}
 	report["GCRL/Car Active"] = carActive ? 1.f : 0.f;
 
-	// No active GCRL critic (both off): contribute zero so the policy uses the base advantage alone.
+	// No active GCRL critic: contribute zero so the policy uses the base advantage alone.
 	if (!sepSum.defined())
 		sepSum = torch::zeros_like(baseAdvRaw);
 
@@ -488,7 +522,9 @@ static void PrepareGCRLPolicyAdvantages(GGL::PPOLearner* learner, GGL::Experienc
 		// that continues next buffer -- 1 row of ~1.3M, then normalized, so negligible.
 		float potGamma = learner->config.gaeGamma;
 		torch::Tensor F = potGamma * phiNext * sameSeg - phi;
-		goalPotentialAdv = NormalizeAdvantage(F, cfg.sigmaFloor) * cfg.gcrlGoalPotentialScale;
+		// Competence-gated: scale by g so positioning shaping is ~0 cold (when Phi is degenerate noise on the
+		// never-moving ball) and ramps to full once the bot moves the ball and Phi becomes informative.
+		goalPotentialAdv = NormalizeAdvantage(F, cfg.sigmaFloor) * (g * cfg.gcrlGoalPotentialScale);
 		report["GCRL/Goal Potential Mean"] = TensorMean(phi);
 		report["GCRL/Goal Potential Shaping Std"] = TensorStd(goalPotentialAdv);
 	} else {
@@ -593,6 +629,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["GCRL/Car Critic Loss"] = carStats.loss;
 			report["GCRL/Car Categorical Accuracy"] = carStats.categoricalAccuracy;
 			report["GCRL/Car Train Samples Used"] = (float)carStats.trainSamplesUsed;
+		}
+
+		if (approachContrastiveLearner && experience.data.approachHerGoals.defined()) {
+			ContrastiveGoalStats apStats = approachContrastiveLearner->Train(experience.data, experience.rng, totalTimesteps, {});
+			report["GCRL/Approach Critic Loss"] = apStats.loss;
+			report["GCRL/Approach Categorical Accuracy"] = apStats.categoricalAccuracy;
+			report["GCRL/Approach Train Samples Used"] = (float)apStats.trainSamplesUsed;
 		}
 
 		if (device.is_cuda()) torch::cuda::synchronize();
@@ -923,6 +966,8 @@ void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 		contrastiveGoalLearner->Save(folderPath);
 	if (carContrastiveLearner)
 		carContrastiveLearner->Save(folderPath);
+	if (approachContrastiveLearner)
+		approachContrastiveLearner->Save(folderPath);
 }
 
 void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
@@ -935,6 +980,9 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 	}
 	if (carContrastiveLearner) {
 		carContrastiveLearner->Load(folderPath, true, true);
+	}
+	if (approachContrastiveLearner) {
+		approachContrastiveLearner->Load(folderPath, true, true);
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);
@@ -954,6 +1002,8 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 		contrastiveGoalLearner->SetLearningRate(config.contrastiveGoal.criticLR);
 	if (carContrastiveLearner)
 		carContrastiveLearner->SetLearningRate(config.contrastiveGoal.criticLR);
+	if (approachContrastiveLearner)
+		approachContrastiveLearner->SetLearningRate(config.contrastiveGoal.criticLR);
 
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }

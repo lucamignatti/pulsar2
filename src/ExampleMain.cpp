@@ -49,13 +49,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 		{ teamMixed(new TouchBallReward()), 15.f },          // any contact (touch-volume engine, trimmed floor)
 		{ teamMixed(new AerialTouchReward()), 12.f },        // genuine aerial touch (the reward-stream aerial mechanism)
 		// The ONLY sustained LEVEL term: absolute approach velocity, UNWRAPPED (cannot telescope-hug-farm).
-		// 0.5 -> 6.0: this is now the COLD-START APPROACH BOOTSTRAP. It used to be small because the egocentric
-		// -ball CAR critic drove approach ("CONTROL leads cold-start approach, edge ~1.0"); making the car critic
-		// BALL-AGNOSTIC removed that, and 0.5 alone is too weak (instantaneous momentum, ~97% value-absorbed) to
-		// bootstrap a cold policy -> run bsx969sr froze at touch ratio ~0.0003 / rating ~46. 6.0 is the proven
-		// bootstrap value (g7jf6cwc/ryp4gxwv reached 560); VPB->0 as the car reaches the ball, so it can't be
-		// stall-farmed. The positioning push past the chase plateau now comes from the goal potential + anchors.
-		{ new VelocityPlayerToBallReward(), 6.0f },
+		// Back to 0.5 (the working-run value): VPB is instantaneous momentum, ~97% value-absorbed, so its
+		// weight is a NON-lever for bootstrap (proven: 0.5->6.0 changed nothing, runs bsx969sr/imxnksl9 stayed
+		// frozen). The cold-start APPROACH gradient comes from the egocentric-ball APPROACH CRITIC below, whose
+		// counterfactual-baseline advantage bypasses the value baseline.
+		{ new VelocityPlayerToBallReward(), 0.5f },
 	};
 
 	std::vector<TerminalCondition*> terminalConditions = {
@@ -203,14 +201,23 @@ int main(int argc, char* argv[]) {
 
 	// GCRL magnitude-blend, per-critic policy-gradient contribution is (taken - baseline)/spread -- NOT
 	// unit-renormalized -- so a critic that can't yet discriminate the action self-attenuates to ~0 (no
-	// noise injection, no gate). The CAR critic is now BALL-AGNOSTIC: its goal is the car's OWN future
-	// kinematic + mechanic state (velocity + orientation + angular velocity + air-control flags), so it learns
-	// car CONTROL -- speedflips, wavedashes, aerial control, recoveries -- with no reason to drive at the ball (the old
-	// egocentric-ball goal made it a ball magnet). Approach is left to VelocityPlayerToBall + the reward
-	// stack; positioning to the goal-potential critic. Watch GCRL/Car Separation + GCRL/Car Edge Mean.
+	// noise injection, no gate). UNIFIED COMPETENCE-GATED STACK (3 GCRL signals blended by g = touch-ratio EMA):
+	//   APPROACH critic (egocentric ball, 6d) -- the cold-start BOOTSTRAP; its counterfactual-baseline advantage
+	//     is the ONLY action-attributable approach gradient (VPB momentum is value-absorbed; the self-state
+	//     critic is task-orthogonal empowerment). Weight (1-g)+approachFloor: dominant cold, anneals to a floor.
+	//   CONTROL critic (ball-agnostic self-state, 15d) -- mechanics (speedflips/wavedashes/aerials). Weight g.
+	//   POSITIONING potential (goal critic as gamma*Phi(s')-Phi(s)) -- positioning. Scale g*gcrlGoalPotentialScale.
+	// Cold (g~0): APPROACH bootstraps ball contact, CONTROL+POSITIONING ~off (no orthogonal/degenerate noise).
+	// Competent (g~1): reward stack self-sustains contact; CONTROL+POSITIONING+anchors push past the chase plateau.
 	cfg.ppo.contrastiveGoal.enabled = true;
-	cfg.ppo.contrastiveGoal.useCarCritic = true;
+	cfg.ppo.contrastiveGoal.useApproachCritic = true;          // cold-start bootstrap (egocentric ball)
+	cfg.ppo.contrastiveGoal.approachHerMaxOffset = 15;         // short tactical approach window
+	cfg.ppo.contrastiveGoal.useCarCritic = true;               // CONTROL critic (gated in by competence)
 	cfg.ppo.contrastiveGoal.carGoalInputSize = 15; // car self-state goal: vel(3)+fwd(3)+up(3)+angVel(3)+airflags(3: onGround,hasFlipOrJump,isFlipping)
+	// Competence gate g = smoothstep over touch-ratio EMA in [competenceLo, competenceHi].
+	cfg.ppo.contrastiveGoal.competenceLo = 0.002f;             // frozen-policy touch floor
+	cfg.ppo.contrastiveGoal.competenceHi = 0.012f;             // ~the working-run touch level
+	cfg.ppo.contrastiveGoal.approachFloor = 0.15f;             // residual approach pull kept after handoff
 	// Keep the goal critic's ACTION-EDGE coupling OFF -- it is action-INERT far-field (edge ~0.04) and its
 	// batch-normed ~0 edge reinflates to ~30% unit-std NOISE. But re-introduce the goal critic as a POSITIONING
 	// signal via its POTENTIAL: useGoalPotential consumes Phi(s) = action-marginalized reachability of the net
@@ -219,13 +226,10 @@ int main(int argc, char* argv[]) {
 	// farmable raw positioning reward. The critic is trained for Phi (useGoalPotential), just not edge-coupled.
 	cfg.ppo.contrastiveGoal.useGoalCritic = false;
 	cfg.ppo.contrastiveGoal.useGoalPotential = true;
-	// 0.3 -> 0.1: at 0.3 the potential was ~26% of the policy-gradient magnitude, but the goal critic is
-	// near-chance (categorical accuracy ~0.15) for a COLD bot -- the ball barely moves, so its reachability
-	// manifold is degenerate -> that 26% was mostly NOISE (the documented freeze mechanism, cf 0hd1s2ne).
-	// Positioning shaping is premature before the bot can touch the ball; 0.1 bounds the cold-phase noise.
-	// It self-heals as VPB bootstraps ball contact (the goal critic then gets real data); re-raise once
-	// GCRL Categorical Accuracy climbs and touch ratio is off the floor.
-	cfg.ppo.contrastiveGoal.gcrlGoalPotentialScale = 0.1f;
+	// Target scale 0.3 (back up from the 0.1 stopgap): the COMPETENCE GATE now multiplies this by g, so the
+	// potential is ~0 cold (when Phi is degenerate noise on the never-moving ball -- the old freeze mechanism)
+	// and ramps to full 0.3 only once the bot moves the ball and Phi becomes informative. No manual re-raise.
+	cfg.ppo.contrastiveGoal.gcrlGoalPotentialScale = 0.3f;
 	cfg.ppo.contrastiveGoal.gcrlLambda = 0.3f;                  // GCRL-vs-reward blend weight (held after warmup)
 	cfg.ppo.contrastiveGoal.gcrlLambdaWarmupSteps = 30'000'000; // short bootstrap ramp, then hold
 	cfg.ppo.contrastiveGoal.carHerMaxOffset = 30;               // car critic: ~2s self-state window (covers flips/wavedashes/short aerials)

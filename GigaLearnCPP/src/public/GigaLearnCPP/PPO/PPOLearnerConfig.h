@@ -53,6 +53,28 @@ namespace GGL {
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2.f;
 
+		// ── APPROACH critic (cold-start BOOTSTRAP) ──────────────────────────────
+		// A third contrastive critic whose goal is the 6-d EGOCENTRIC car-local ball (pos+vel), read from the
+		// obs at GetCarLocalBallOffset(). Its counterfactual-baseline advantage is the ONLY action-attributable
+		// approach gradient a cold policy can follow (the ball-agnostic CONTROL critic is task-orthogonal
+		// empowerment; VPB momentum is value-absorbed). This is the signal that bootstrapped the working runs.
+		// It is a ball-magnet (caps at chase ~300), so its advantage weight anneals DOWN as touch competence
+		// rises (competence gate below), handing off to CONTROL + POSITIONING + opponent diversity.
+		bool useApproachCritic = false;
+		int approachHerMinOffset = 1;
+		int approachHerMaxOffset = 15;        // short tactical window
+		float approachHerShortBiasPower = 2.f;
+
+		// ── Competence gate g (touch-ratio EMA) ─────────────────────────────────
+		// g = smoothstep((touchCompetenceEMA - competenceLo)/(competenceHi - competenceLo)), clamped [0,1].
+		// APPROACH sep weight = (1-g)+approachFloor; CONTROL sep weight = g; goal-potential scale *= g.
+		// So cold (g~0) the bootstrap dominates and the noisy/orthogonal asymptote signals are ~off; once the
+		// bot reliably touches the ball (g~1) the reward stack self-sustains contact and the asymptote takes over.
+		float competenceLo = 0.002f;          // frozen-policy touch floor
+		float competenceHi = 0.012f;          // ~the working-run touch level
+		float approachFloor = 0.15f;          // residual approach pull kept after handoff (anti-relapse)
+		float competenceEmaDecay = 0.99f;     // per-iteration EMA decay for touchCompetenceEMA
+
 		// ── Magnitude-blend advantage (replaces unit-renorm + the separation gate) ──
 		// Per critic, per-row advantage = (taken_score - mean_baseline)/(baseline_spread
 		// + sigmaFloor), clamped to +-gcrlSepClamp; NOT renormalized to unit std (that

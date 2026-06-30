@@ -390,6 +390,7 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["gcrl_lambda_eff"] = ppo->gcrlLambdaEff;
 		j["gcrl_ratio_ema"] = ppo->gcrlRatioEma;
 		j["gcrl_renorm_std"] = ppo->gcrlRenormStd;
+		j["touch_competence_ema"] = ppo->touchCompetenceEMA; // competence-gate state (resume keeps the handoff position)
 	}
 
 	if (versionMgr)
@@ -434,6 +435,7 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		if (j.contains("gcrl_lambda_eff")) ppo->gcrlLambdaEff = j["gcrl_lambda_eff"];
 		if (j.contains("gcrl_ratio_ema")) ppo->gcrlRatioEma = j["gcrl_ratio_ema"];
 		if (j.contains("gcrl_renorm_std")) ppo->gcrlRenormStd = j["gcrl_renorm_std"];
+		if (j.contains("touch_competence_ema")) ppo->touchCompetenceEMA = RS_MAX(0.f, (float)j["touch_competence_ema"]);
 	}
 
 	if (versionMgr)
@@ -749,8 +751,9 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
-			FList achievedGoals, herGoals, carHerGoals, scoringGoals;
-			FList carStates; // per-step car self-state (12 floats); the CAR critic's HER goal source
+			FList achievedGoals, herGoals, carHerGoals, approachHerGoals, scoringGoals;
+			FList carStates; // per-step car self-state (15 floats); the CONTROL critic's HER goal source
+			// approachHerGoals (egocentric car-local ball, 6 floats) is relabeled straight from the stored obs.
 			std::vector<uint8_t> actionMasks;
 			std::vector<uint8_t> gcrlTrainMask; // (2B) per-row: 1 = use this row to train the contrastive critic
 			std::vector<uint8_t> gcrlScoringMask; // FORK2 Part C: 1 = this row's herGoal is a SYNTHETIC scoring goal (excluded from TD bootstrap)
@@ -770,6 +773,7 @@ void GGL::Learner::Start() {
 				achievedGoals += other.achievedGoals;
 				herGoals += other.herGoals;
 				carHerGoals += other.carHerGoals;
+				approachHerGoals += other.approachHerGoals;
 				scoringGoals += other.scoringGoals;
 				carStates += other.carStates;
 				gcrlTrainMask += other.gcrlTrainMask;
@@ -881,9 +885,21 @@ void GGL::Learner::Start() {
 				FList herSelectedOffsets;
 				int herTotalRows = 0;
 
-				// The CAR critic is now ball-agnostic (its goal is the car's own future kinematic state,
-				// collected per-step into traj.carStates via AppendCarStateGoal), so it no longer needs a
-				// car-local ball offset from the obs builder.
+				// The CONTROL car critic is ball-agnostic (goal = car self-state in traj.carStates). The
+				// APPROACH critic (the cold-start bootstrap) instead needs the egocentric car-local ball,
+				// which it reads straight from the stored obs at this offset (-1 disables it safely).
+				int carLocalBallOffset = -1;
+				if (config.ppo.contrastiveGoal.useApproachCritic && !envSet->obsBuilders.empty() && envSet->obsBuilders[0])
+					carLocalBallOffset = envSet->obsBuilders[0]->GetCarLocalBallOffset();
+				if (carLocalBallOffset >= 0 && obsSize < carLocalBallOffset + 6)
+					carLocalBallOffset = -1;
+				if (config.ppo.contrastiveGoal.useApproachCritic && carLocalBallOffset < 0) {
+					static bool warnedApproach = false;
+					if (!warnedApproach) {
+						RG_LOG("WARNING: GCRL approach critic requested (useApproachCritic=true) but the obs builder exposes no valid car-local ball offset; the approach BOOTSTRAP will be benched (watch GCRL/Approach Active=0).");
+						warnedApproach = true;
+					}
+				}
 
 				auto relabelHERGoals = [&](Trajectory& traj) {
 					if (!config.ppo.contrastiveGoal.enabled)
@@ -1003,6 +1019,36 @@ void GGL::Learner::Start() {
 							int carTarget = t + carOffset;
 							for (int d = 0; d < carGoalSize; d++)
 								traj.carHerGoals[(size_t)t * carGoalSize + d] = traj.carStates[(size_t)carTarget * carGoalSize + d];
+						}
+					}
+
+					// APPROACH critic (cold-start bootstrap): the egocentric (car-local) ball pos+vel (6 floats)
+					// a short window ahead, read straight from the stored obs at carLocalBallOffset. This is the
+					// ONLY action-attributable approach gradient -- "did this action make the car-local ball more
+					// reachable" -- so it must be a BALL goal, not the self-state. Trains on all rows (no mask).
+					if (config.ppo.contrastiveGoal.useApproachCritic && carLocalBallOffset >= 0
+						&& (int)traj.states.size() == n * obsSize) {
+						int apMin = RS_MAX(1, config.ppo.contrastiveGoal.approachHerMinOffset);
+						int apMaxCfg = RS_MAX(apMin, config.ppo.contrastiveGoal.approachHerMaxOffset);
+						float apShortBiasPower = RS_MAX(1e-3f, config.ppo.contrastiveGoal.approachHerShortBiasPower);
+						traj.approachHerGoals.resize((size_t)n * 6);
+						for (int t = 0; t < n; t++) {
+							int remaining = n - t - 1;
+							int apOffset = 0;
+							if (remaining > 0) {
+								int apMax = RS_MIN(apMaxCfg, remaining);
+								if (apMax >= apMin) {
+									float u = RocketSim::Math::RandFloat();
+									float biased = powf(u, apShortBiasPower);
+									int span = apMax - apMin + 1;
+									apOffset = apMin + RS_MIN(span - 1, (int)floorf(biased * span));
+								} else {
+									apOffset = remaining;
+								}
+							}
+							int apTarget = t + apOffset;
+							for (int d = 0; d < 6; d++)
+								traj.approachHerGoals[(size_t)t * 6 + d] = traj.states[(size_t)apTarget * obsSize + carLocalBallOffset + d];
 						}
 					}
 				};
@@ -1243,12 +1289,14 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
 					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
 					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
-					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tScoringGoals, tGcrlTrainMask, tGcrlScoringMask, tSegmentIds, tSegmentSteps;
+					torch::Tensor tAchievedGoals, tHERGoals, tCarHERGoals, tApproachHERGoals, tScoringGoals, tGcrlTrainMask, tGcrlScoringMask, tSegmentIds, tSegmentSteps;
 					if (config.ppo.contrastiveGoal.enabled) {
 						tAchievedGoals = torch::tensor(combinedTraj.achievedGoals).reshape({ -1, 6 });
 						tHERGoals = torch::tensor(combinedTraj.herGoals).reshape({ -1, 6 });
 						if (config.ppo.contrastiveGoal.useCarCritic && !combinedTraj.carHerGoals.empty())
 							tCarHERGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, config.ppo.contrastiveGoal.carGoalInputSize });
+						if (config.ppo.contrastiveGoal.useApproachCritic && !combinedTraj.approachHerGoals.empty())
+							tApproachHERGoals = torch::tensor(combinedTraj.approachHerGoals).reshape({ -1, 6 });
 						tScoringGoals = torch::tensor(combinedTraj.scoringGoals).reshape({ -1, 6 });
 						tGcrlTrainMask = torch::tensor(combinedTraj.gcrlTrainMask, torch::TensorOptions().dtype(torch::kUInt8));
 						tGcrlScoringMask = torch::tensor(combinedTraj.gcrlScoringMask, torch::TensorOptions().dtype(torch::kUInt8));
@@ -1326,6 +1374,8 @@ void GGL::Learner::Start() {
 						batchIn.herGoals = tHERGoals;
 						if (tCarHERGoals.defined())
 							batchIn.carHerGoals = tCarHERGoals;
+						if (tApproachHERGoals.defined())
+							batchIn.approachHerGoals = tApproachHERGoals;
 						batchIn.scoringGoals = tScoringGoals;
 						batchIn.gcrlTrainMask = tGcrlTrainMask;
 						batchIn.gcrlScoringMask = tGcrlScoringMask;
@@ -1392,6 +1442,17 @@ void GGL::Learner::Start() {
 				if (ppo->device.is_cuda())
 					c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
+
+				// Competence gate: update the touch-ratio EMA that the GCRL advantage blend uses to anneal
+				// the APPROACH (bootstrap) critic out and ramp the CONTROL critic + goal POTENTIAL in. The
+				// touch ratio is aggregated into `report` by the user StepCallback during collection above; if
+				// absent the EMA holds at 0 (g=0 -> bootstrap-only, a safe degradation, no handoff).
+				if (report.Has("Player/Ball Touch Ratio")) {
+					float tr = report["Player/Ball Touch Ratio"];
+					float decay = RS_CLAMP(config.ppo.contrastiveGoal.competenceEmaDecay, 0.f, 0.999999f);
+					ppo->touchCompetenceEMA = decay * ppo->touchCompetenceEMA + (1.f - decay) * tr;
+				}
+				report["GCRL/Touch Competence EMA"] = ppo->touchCompetenceEMA;
 
 				// Learn
 				Timer learnTimer = {};

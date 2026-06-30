@@ -46,7 +46,7 @@ namespace GGL {
 
 	ContrastiveGoalLearner::ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
 		Model* sharedHead, const RSNorm* obsNorm,
-		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask) :
+		const std::string& namePrefix, bool useCarGoals, bool applyTrainMask, bool useApproachGoals) :
 		phiTailName(namePrefix + "_phi_tail"),
 		psiName(namePrefix + "_psi"),
 		phiTail(
@@ -57,13 +57,13 @@ namespace GGL {
 		goalEncoder(psiName.c_str(), MakePsiConfig(useCarGoals ? config.carGoalInputSize : config.goalInputSize, config.representationSize, config.psiLayerSizes), device),
 		sharedHead(sharedHead), obsNorm(obsNorm),
 		config(config), device(device), obsSize(obsSize), actionRepresentationSize(actionRepresentationSize),
-		useCarGoals(useCarGoals), applyTrainMask(applyTrainMask) {
+		useCarGoals(useCarGoals), useApproachGoals(useApproachGoals), applyTrainMask(applyTrainMask) {
 		SetLearningRate(config.criticLR);
 
 		// FORK2: TD-contrastive is GOALSHORT/REACH-only (CAR stays pure MC). Build the EMA target nets
 		// (phi tail + goal encoder, + the trunk when tdEmaTrunk) with DISTINCT names so Save never collides.
 		// Params are lazily synced live->target on the first Train (handles fresh + resume identically).
-		useTD = config.useTDContrastive && !useCarGoals;
+		useTD = config.useTDContrastive && !useCarGoals && !useApproachGoals; // TD is GOAL-critic only
 		if (useTD) {
 			phiTailTgtName = namePrefix + "_phi_tail_tgt";
 			psiTgtName = namePrefix + "_psi_tgt";
@@ -108,7 +108,9 @@ namespace GGL {
 		uint64_t totalTimesteps, torch::Tensor nextPolicyProbs) {
 		ContrastiveGoalStats stats;
 
-		torch::Tensor goalsAll = useCarGoals ? data.carHerGoals : data.herGoals;
+		torch::Tensor goalsAll = useApproachGoals ? data.approachHerGoals
+			: useCarGoals ? data.carHerGoals
+			: data.herGoals;
 
 		if (
 			!data.states.defined() ||

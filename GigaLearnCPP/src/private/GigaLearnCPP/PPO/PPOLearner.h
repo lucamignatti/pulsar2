@@ -23,7 +23,7 @@ namespace GGL {
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
 		ContrastiveGoalLearner* contrastiveGoalLearner = NULL;
-		// Optional second isolated critic: egocentric car-local ball goal (controllability).
+		// Optional CONTROL critic: ball-agnostic car self-state goal (mechanics; gated in by competence).
 		ContrastiveGoalLearner* carContrastiveLearner = NULL;
 		// SimBa RSNorm (running obs normalization). NULL unless config.rsNorm.enabled.
 		// One shared normalizer for actor & critic; "canonical stats everywhere"
@@ -49,6 +49,13 @@ namespace GGL {
 		float gcrlLambdaEff = 0.3f;
 		float gcrlRatioEma = 1.f;
 		float gcrlRenormStd = 1.f;
+
+		// Competence gate state (persisted): EMA of Player/Ball Touch Ratio, set by the Learner each
+		// iteration before Learn(). Drives g = smoothstep over [competenceLo, competenceHi], which anneals
+		// the APPROACH (bootstrap) critic down and ramps the CONTROL critic + goal POTENTIAL up.
+		float touchCompetenceEMA = 0.f;
+		// Optional second isolated critic: egocentric car-local ball goal -- the cold-start APPROACH bootstrap.
+		ContrastiveGoalLearner* approachContrastiveLearner = NULL;
 
 		PPOLearner(
 			int obsSize, int numActions,

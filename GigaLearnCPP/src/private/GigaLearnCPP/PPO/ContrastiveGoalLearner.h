@@ -50,7 +50,8 @@ namespace GGL {
 		int obsSize;
 		int actionRepresentationSize;
 
-		bool useCarGoals = false;
+		bool useCarGoals = false;      // goal = ball-agnostic self-state (carHerGoals, carGoalInputSize)
+		bool useApproachGoals = false; // goal = egocentric car-local ball (approachHerGoals, goalInputSize=6)
 		bool applyTrainMask = true;
 
 		// FORK2 TD-contrastive EMA targets (constructed only when useTD = useTDContrastive && !useCarGoals;
@@ -70,7 +71,8 @@ namespace GGL {
 		// obsNorm:    optional running normalizer applied before sharedHead (may be null).
 		ContrastiveGoalLearner(int obsSize, int actionRepresentationSize, const ContrastiveGoalConfig& config, torch::Device device,
 			Model* sharedHead, const RSNorm* obsNorm = nullptr,
-			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true);
+			const std::string& namePrefix = "gcrl", bool useCarGoals = false, bool applyTrainMask = true,
+			bool useApproachGoals = false);
 		~ContrastiveGoalLearner();
 
 		// embeddings: output of shared_head(obs).detach() — [N, embeddingDim]
