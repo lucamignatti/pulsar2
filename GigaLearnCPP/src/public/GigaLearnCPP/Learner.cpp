@@ -576,6 +576,32 @@ void GGL::Learner::Start() {
 		std::vector<int> playerArenaIdx(numPlayers), playerSlotIdx(numPlayers), playerPartnerIdx(numPlayers, -1);
 		// Per-arena "did team X touch this step" scratch, indexed [team][arena] (hoisted out of the step loop)
 		std::vector<uint8_t> arenaTeamTouched[2];
+
+		// Chunked parallel-for over [0, n) on the global pool, blocking until done. Used for the
+		// per-player prep/record loops, whose serial cost dominates collection at high player
+		// counts; each body writes only its own player's trajectory, so the work is race-free by
+		// construction. INVARIANT: the pool must be quiescent when this is called (WaitUntilDone
+		// is pool-global) — only call from the main collection thread, never while async arena
+		// jobs are in flight.
+		auto fnParallelFor = [](int n, const std::function<void(int)>& body) {
+			if (n <= 0)
+				return;
+
+			int numChunks = RS_MIN(n, RS_MAX(1, RLGC::g_ThreadPool.GetNumThreads() * 4));
+			int chunkSize = (n + numChunks - 1) / numChunks;
+			RLGC::g_ThreadPool.StartBatchedJobs(
+				[&body, n, chunkSize](int chunk) {
+					int start = chunk * chunkSize;
+					int stop = RS_MIN(start + chunkSize, n);
+					for (int i = start; i < stop; i++)
+						body(i);
+				},
+				numChunks, false
+			);
+		};
+
+		// Terminal types decided by the parallel per-player pass, consumed by the serial finalize
+		std::vector<int8_t> finalTerminals(numPlayers, 0);
 		if (reachOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
@@ -792,6 +818,8 @@ void GGL::Learner::Start() {
 
 					float inferTime = 0;
 					float envStepTime = 0;
+					float prepTime = 0;
+					float recordTime = 0;
 
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
@@ -832,7 +860,10 @@ void GGL::Learner::Start() {
 						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
 
 						if (!render) {
-							for (int newPlayerIdx : newPlayerIndices) {
+							// Parallel per-player: each body writes only trajectories[newPlayerIdx]
+							Timer prepTimer = {};
+							fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+								int newPlayerIdx = newPlayerIndices[k];
 								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
 								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
 
@@ -849,7 +880,8 @@ void GGL::Learner::Start() {
 									auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
 									fnAppendAchieved(traj, gs, gs.players[playerSlotIdx[newPlayerIdx]]);
 								}
-							}
+							});
+							prepTime += prepTimer.Elapsed();
 						}
 
 						envSet->StepFirstHalf(true);
@@ -915,7 +947,10 @@ void GGL::Learner::Start() {
 								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
 						}
 
-						// Per-arena, per-team touch flags for this step (avoids an O(players^2) scan)
+						Timer recordTimer = {};
+
+						// Per-arena, per-team touch flags for this step (avoids an O(players^2) scan);
+						// serial: writes shared vectors, and it's O(players) cheap
 						if (reachOn) {
 							arenaTeamTouched[0].assign(envSet->arenas.size(), 0);
 							arenaTeamTouched[1].assign(envSet->arenas.size(), 0);
@@ -925,12 +960,14 @@ void GGL::Learner::Start() {
 										arenaTeamTouched[(int)player.team][arenaIdx] = 1;
 						}
 
-						// Now that we've inferred and stepped the env, we can add that stuff to the trajectories
-						int i = 0;
-						for (int newPlayerIdx : newPlayerIndices) {
+						// Now that we've inferred and stepped the env, we can add that stuff to the
+						// trajectories. Parallel per-player; logProbs is indexed by the ordinal k
+						// (its rows follow newPlayerIndices order, not global player order).
+						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+							int newPlayerIdx = newPlayerIndices[k];
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-							trajectories[newPlayerIdx].logProbs += newLogProbs[i];
+							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
 
 							if (reachOn) {
 								auto& traj = trajectories[newPlayerIdx];
@@ -942,9 +979,7 @@ void GGL::Learner::Start() {
 								traj.touched.push_back(player.ballTouchedStep);
 								traj.oppTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 1 : 0][arenaIdx]);
 							}
-
-							i++;
-						}
+						});
 
 						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
@@ -958,7 +993,11 @@ void GGL::Learner::Start() {
 								curTerminals[playerStartIdx + i] = terminalType;
 						}
 
-						for (int newPlayerIdx : newPlayerIndices) {
+						// Parallel per-player: decide the terminal type, record it, store the
+						// truncation next-state. Finalization stays serial below — the HER relabel
+						// draws from the shared RNG and combinedTraj is shared.
+						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
+							int newPlayerIdx = newPlayerIndices[k];
 							int8_t terminalType = curTerminals[newPlayerIdx];
 							auto& traj = trajectories[newPlayerIdx];
 
@@ -969,22 +1008,33 @@ void GGL::Learner::Start() {
 							}
 
 							traj.terminals.push_back(terminalType);
-							if (terminalType) {
-
-								if (terminalType == RLGC::TerminalType::TRUNCATED) {
-									// Truncation requires an additional next state for the critic
-									traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
-								}
-
-								fnRelabelReachGoals(traj, newPlayerIdx);
-								combinedTraj.Append(traj);
-								traj.Clear();
+							if (terminalType == RLGC::TerminalType::TRUNCATED) {
+								// Truncation requires an additional next state for the critic
+								traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
 							}
+
+							finalTerminals[newPlayerIdx] = terminalType;
+						});
+
+						// Serial finalize, in the original player order (deterministic episode
+						// order in combinedTraj, same as the old fully-serial loop)
+						for (int newPlayerIdx : newPlayerIndices) {
+							if (!finalTerminals[newPlayerIdx])
+								continue;
+
+							auto& traj = trajectories[newPlayerIdx];
+							fnRelabelReachGoals(traj, newPlayerIdx);
+							combinedTraj.Append(traj);
+							traj.Clear();
 						}
+
+						recordTime += recordTimer.Elapsed();
 					}
 
 					report["Inference Time"] = inferTime;
 					report["Env Step Time"] = envStepTime;
+					report["Prep Time"] = prepTime;
+					report["Record Time"] = recordTime;
 				}
 				float collectionTime = collectionTimer.Elapsed();
 
@@ -1345,6 +1395,8 @@ void GGL::Learner::Start() {
 						"Collection Time",
 						"-Inference Time",
 						"-Env Step Time",
+						"-Prep Time",
+						"-Record Time",
 						"Consumption Time",
 						"-GAE Time",
 						"-PPO Learn Time"
