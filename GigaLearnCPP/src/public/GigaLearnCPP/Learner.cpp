@@ -798,9 +798,12 @@ void GGL::Learner::Start() {
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
-						for (float f : envSet->state.obs.data)
-							if (isnan(f) || isinf(f))
+						{ // Vectorized: the old per-float scalar loop cost a measurable slice of collection
+							torch::Tensor tObsCheck = torch::from_blob(
+								envSet->state.obs.data.data(), { (int64_t)envSet->state.obs.data.size() }, torch::kFloat32);
+							if (!torch::isfinite(tObsCheck).all().item<bool>())
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
+						}
 
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too

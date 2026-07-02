@@ -111,16 +111,23 @@ int main(int argc, char* argv[]) {
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
 	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	cfg.numGames = 256;
+	// 1024 sized for a 7900X (24 threads) + 5080: at 256 the per-step policy forward was a
+	// 512-row batch — pure launch overhead on this GPU. 2048 rows/step keeps it fed.
+	cfg.numGames = 1024;
 
 	// Leave this empty to use a random seed each run
 	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 123;
 
-	int tsPerItr = 50'000;
+	int tsPerItr = 100'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 50'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 100'000; // Lower this if too much VRAM is being allocated
+
+	// BF16 inference for collection + GAE value preds (Blackwell tensor cores). The
+	// reachability paths are unaffected: rho/gate evals request fp32 explicitly and
+	// grad-enabled forwards (InfoNCE training) always run fp32.
+	cfg.ppo.useHalfPrecision = true;
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
@@ -148,12 +155,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
 
-	auto optim = ModelOptimType::ADAM;
+	// Muon's RMS-matched scaling makes Adam-tuned LRs transfer as-is.
+	// (The reachability heads deliberately stay on Adam — see ReachabilityConfig.)
+	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
 
-	auto activation = ModelActivationType::RELU;
+	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;

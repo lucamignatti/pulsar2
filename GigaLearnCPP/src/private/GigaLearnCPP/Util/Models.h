@@ -12,6 +12,7 @@
 #include <torch/optim/sgd.h>
 
 #include "MagSGD.h"
+#include "Muon.h"
 
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
 #include <GigaLearnCPP/Util/ModelConfig.h>
@@ -49,6 +50,8 @@ namespace GGL {
 			return new torch::optim::RMSprop(parameters, lr);
 		case ModelOptimType::MAGSGD:
 			return new MagSGD(parameters, lr);
+		case ModelOptimType::MUON:
+			return new Muon(parameters, MuonOptions(lr).momentum(0.95).nesterov(true));
 		}
 
 		RG_ERR_CLOSE("Unknown optimizer type: " << (int)type);
@@ -72,6 +75,9 @@ namespace GGL {
 				break;
 			case ModelOptimType::MAGSGD:
 				static_cast<MagSGDOptions&>(group.options()).lr(lr);
+				break;
+			case ModelOptimType::MUON:
+				static_cast<MuonOptions&>(group.options()).lr(lr);
 				break;
 			default:
 				RG_ERR_CLOSE("Unknown optimizer type: " << (int)type);

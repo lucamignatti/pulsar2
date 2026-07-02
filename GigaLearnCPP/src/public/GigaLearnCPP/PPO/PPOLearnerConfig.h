@@ -78,10 +78,14 @@ namespace GGL {
 		float betaOverride = -1; // >= 0 forces beta (smoke tests); < 0 uses the EMAs
 
 		ReachabilityConfig() {
+			// Optimizer stays ADAM for both heads: contrastive InfoNCE embeddings train
+			// poorly under orthogonalized updates (phi/psi = Adam, not Muon)
 			phi = {};
 			phi.layerSizes = { 256, 256 };
+			phi.activationType = ModelActivationType::LEAKY_RELU;
 			psi = {};
 			psi.layerSizes = { 256, 256 };
+			psi.activationType = ModelActivationType::LEAKY_RELU;
 		}
 	};
 
