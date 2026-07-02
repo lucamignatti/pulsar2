@@ -7,6 +7,14 @@ project("GigaLearnBot")
 # code (macOS is PIC by default, so this only bites on Linux)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Default to Release: a typeless `cmake ..` builds -O0 with libstdc++ assertions armed,
+# which is unusably slow for training AND aborts on the vendored thread pool's benign
+# binary-semaphore over-release. Debug must be chosen deliberately.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	message(STATUS "No build type specified; defaulting to Release")
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp")
 add_executable(GigaLearnBot ${FILES_SRC})
 

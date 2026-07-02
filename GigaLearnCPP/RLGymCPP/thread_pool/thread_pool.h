@@ -2,12 +2,14 @@
 
 #include <atomic>
 #include <concepts>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <future>
 #include <memory>
 #include <semaphore>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #ifdef __has_include
 #    if __has_include(<version>)
