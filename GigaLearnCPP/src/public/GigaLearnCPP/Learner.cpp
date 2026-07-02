@@ -527,6 +527,48 @@ void GGL::Learner::Start() {
 				*this = Trajectory();
 			}
 
+			// For the long-lived combinedTraj: drop contents but KEEP allocations, so the
+			// ~100MB of per-iteration append targets aren't re-allocated every iteration
+			void ClearKeepCapacity() {
+				states.clear();
+				nextStates.clear();
+				rewards.clear();
+				logProbs.clear();
+				actionMasks.clear();
+				terminals.clear();
+				actions.clear();
+				oppStates.clear();
+				oppActionMasks.clear();
+				achievedBall.clear();
+				achievedCarBall.clear();
+				touched.clear();
+				oppTouched.clear();
+				gatedPos.clear();
+				carHerGoals.clear();
+				ballHerGoals.clear();
+				ballMoved.clear();
+			}
+
+			void Reserve(size_t rows, int obsSize, int numActions, bool reach) {
+				states.reserve(rows * obsSize);
+				actionMasks.reserve(rows * numActions);
+				rewards.reserve(rows);
+				logProbs.reserve(rows);
+				terminals.reserve(rows);
+				actions.reserve(rows);
+
+				if (reach) {
+					oppStates.reserve(rows * obsSize);
+					oppActionMasks.reserve(rows * numActions);
+					touched.reserve(rows);
+					oppTouched.reserve(rows);
+					gatedPos.reserve(rows);
+					carHerGoals.reserve(rows * 6);
+					ballHerGoals.reserve(rows * 6);
+					ballMoved.reserve(rows);
+				}
+			}
+
 			void Append(const Trajectory& other) {
 				other.AssertAligned();
 
@@ -602,6 +644,12 @@ void GGL::Learner::Start() {
 
 		// Terminal types decided by the parallel per-player pass, consumed by the serial finalize
 		std::vector<int8_t> finalTerminals(numPlayers, 0);
+
+		// Long-lived across iterations (capacity reused); only contains complete episodes.
+		// Slack covers overbatching: collection finishes the step (and its whole episodes)
+		// after crossing tsPerItr.
+		auto combinedTraj = Trajectory();
+		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn);
 		if (reachOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
@@ -790,8 +838,7 @@ void GGL::Learner::Start() {
 			int stepsCollected = 0;
 			{ // Generate experience
 
-				// Only contains complete episodes
-				auto combinedTraj = Trajectory();
+				combinedTraj.ClearKeepCapacity();
 
 				// Players handed to an old version stop being collected this iteration; their
 				// in-flight partial episodes would otherwise silently SPLICE with a later
@@ -826,7 +873,10 @@ void GGL::Learner::Start() {
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
-						{ // Vectorized: the old per-float scalar loop cost a measurable slice of collection
+						// Sampled every 4th step: this is a hard-stop debug guard, and any obs-NaN
+						// source persists across steps, so sampling keeps the guarantee while
+						// dropping ~75% of its (measurable) cost
+						if ((step & 3) == 0) {
 							torch::Tensor tObsCheck = torch::from_blob(
 								envSet->state.obs.data.data(), { (int64_t)envSet->state.obs.data.size() }, torch::kFloat32);
 							if (!torch::isfinite(tObsCheck).all().item<bool>())
@@ -855,9 +905,18 @@ void GGL::Learner::Start() {
 							}
 						}
 
+						// Zero-copy views over the env's storage (safe: they're consumed within this
+						// step — device transfer / index_select materialize immediately, and the
+						// underlying buffers only mutate on the next env step)
 						torch::Tensor tActions, tLogProbs;
-						torch::Tensor tStates = DIMLIST2_TO_TENSOR<float>(envSet->state.obs);
-						torch::Tensor tActionMasks = DIMLIST2_TO_TENSOR<uint8_t>(envSet->state.actionMasks);
+						torch::Tensor tStates = torch::from_blob(
+							envSet->state.obs.data.data(),
+							{ (int64_t)envSet->state.obs.size[0], (int64_t)envSet->state.obs.size[1] },
+							torch::kFloat32);
+						torch::Tensor tActionMasks = torch::from_blob(
+							envSet->state.actionMasks.data.data(),
+							{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] },
+							torch::kUInt8);
 
 						if (!render) {
 							// Parallel per-player: each body writes only trajectories[newPlayerIdx]
