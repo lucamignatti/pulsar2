@@ -2,6 +2,11 @@ cmake_minimum_required (VERSION 3.8)
 
 project("GigaLearnBot")
 
+# Enable -fPIC for all targets: the static libs (RLGymCPP, RocketSim) get folded into
+# the shared libGigaLearnCPP, which Linux linkers reject without position-independent
+# code (macOS is PIC by default, so this only bites on Linux)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp")
 add_executable(GigaLearnBot ${FILES_SRC})
 
