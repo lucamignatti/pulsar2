@@ -36,6 +36,10 @@ namespace GGL {
 			totalTimesteps = 0,
 			totalIterations = 0;
 
+		// Reachability gate anneal state: EMAs of the heads' InfoNCE accuracy and of the
+		// touch-prediction agreement (persisted in the checkpoint stats)
+		float reachAccEMA = 0, reachAgreeEMA = 0;
+
 		StepCallbackFn stepCallback = NULL;
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);

@@ -74,10 +74,19 @@ void GGL::GAE::Compute(
 			if (truncCount >= numTruncs)
 				RG_ERR_CLOSE("GAE encountered too many truncated terminals, not enough val preds (max: " << numTruncs << ")")
 
-			nextValPred = _truncValPreds[truncCount];
+			// truncValPreds is populated in forward (chronological) order, but we're iterating
+			// backwards here, so we have to consume it back-to-front to match truncations to
+			// the right trajectory. Otherwise, whenever more than one trajectory truncates in
+			// the same batch, they get bootstrapped with each other's values.
+			nextValPred = _truncValPreds[numTruncs - 1 - truncCount];
 			truncCount++;
-		} else {
+		} else if (step + 1 < numReturns) {
 			nextValPred = _valPreds[step + 1];
+		} else {
+			// This is the last entry in the whole buffer, which is always a terminal step
+			// (see above); since it's not a truncation, done=1 here so this value is multiplied
+			// by zero below. There's no step+1 to read, so just use 0 instead of reading OOB.
+			nextValPred = 0;
 		}
 
 		float predReturn = curReward + gamma * nextValPred * (1 - done);

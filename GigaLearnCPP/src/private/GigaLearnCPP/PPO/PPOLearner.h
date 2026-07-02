@@ -6,6 +6,7 @@
 #include <GigaLearnCPP/PPO/TransferLearnConfig.h>
 
 #include "../Util/Models.h"
+#include "Reachability.h"
 
 #include <torch/optim/adam.h>
 #include <torch/nn/modules/loss.h>
@@ -20,6 +21,16 @@ namespace GGL {
 	public:
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
+
+		// Reachability aux heads (null unless config.reachability.enabled);
+		// its models live inside `models` and save/load/step with everything else
+		ReachabilityModule* reach = NULL;
+		// InfoNCE categorical accuracy of the last Learn() call (min of the two heads),
+		// read by the Learner to drive the gate's accuracy EMA. lastReachTrained guards the
+		// EMA update: false until the heads have actually trained this process (so a fresh
+		// process resuming a checkpoint doesn't blend a meaningless 0 into a healthy EMA).
+		float lastReachAccuracy = 0;
+		bool lastReachTrained = false;
 
 		PPOLearnerConfig config;
 		torch::Device device;

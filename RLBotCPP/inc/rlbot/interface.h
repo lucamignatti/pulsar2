@@ -17,7 +17,14 @@
 #endif
 
 #ifdef OS_DL_LINUX
-#define DLLNAME "libRLBotInterface.so" 
+#define DLLNAME "libRLBotInterface.so"
+#endif
+
+// Non-Windows/Linux platforms (macOS) have no RLBot core interface library; define a
+// sentinel so training-only builds compile. If a bot-deployment path ever tries to load
+// this, the failure message names the real problem instead of a phantom missing .so.
+#ifndef DLLNAME
+#define DLLNAME "RLBotInterface_UNSUPPORTED_PLATFORM"
 #endif
 
 namespace rlbot {

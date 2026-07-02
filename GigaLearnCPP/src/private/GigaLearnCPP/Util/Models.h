@@ -190,7 +190,7 @@ namespace GGL {
 				model->Load(folder, allowNotExist, loadOptims);
 		}
 
-		class ModelIterator : public std::iterator<std::forward_iterator_tag, typename Model*> {
+		class ModelIterator : public std::iterator<std::forward_iterator_tag, Model*> {
 		public:
 			using MapItr = std::map<std::string, Model*>::iterator;
 			MapItr _mapItr;
@@ -202,7 +202,7 @@ namespace GGL {
 			bool operator==(const ModelIterator& other) const { return _mapItr == other._mapItr; }
 			bool operator!=(const ModelIterator& other) const { return _mapItr != other._mapItr; }
 
-			typename Model*& operator*() const { return _mapItr->second; }
+			Model*& operator*() const { return _mapItr->second; }
 		};
 
 		ModelIterator begin() {

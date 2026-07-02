@@ -61,8 +61,11 @@ namespace RLGC {
 	struct WeightedReward {
 		Reward* reward;
 		float weight;
+		// Gated rewards can be scaled down by the learner's reachability gate (when enabled);
+		// ungated rewards always pay in full
+		bool gated;
 
-		WeightedReward(Reward* reward, float scale) : reward(reward), weight(scale) {}
-		WeightedReward(Reward* reward, int scale) : reward(reward), weight(scale) {}
+		WeightedReward(Reward* reward, float scale, bool gated = false) : reward(reward), weight(scale), gated(gated) {}
+		WeightedReward(Reward* reward, int scale, bool gated = false) : reward(reward), weight((float)scale), gated(gated) {}
 	};
 }

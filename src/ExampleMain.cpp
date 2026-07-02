@@ -8,6 +8,7 @@
 #include <RLGymCPP/OBSBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
+#include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
@@ -16,22 +17,25 @@ using namespace RLGC; // RLGymCPP
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
 	// These are ok rewards that will produce a scoring bot in ~100m steps
+	// The third field marks the farmable dense rewards as GATED: when the reachability gate is
+	// enabled, their positive parts get scaled by it. Bootstrap/objective rewards
+	// (StrongTouch, Goal, Bump, Demo) always pay in full.
 	std::vector<WeightedReward> rewards = {
 
 		// Movement
-		{ new AirReward(), 0.25f },
+		{ new AirReward(), 0.25f, true },
 
 		// Player-ball
-		{ new FaceBallReward(), 0.25f },
-		{ new VelocityPlayerToBallReward(), 4.f },
+		{ new FaceBallReward(), 0.25f, true },
+		{ new VelocityPlayerToBallReward(), 4.f, true },
 		{ new StrongTouchReward(20, 100), 60 },
 
 		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f },
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f, true },
 
 		// Boost
-		{ new PickupBoostReward(), 10.f },
-		{ new SaveBoostReward(), 0.2f },
+		{ new PickupBoostReward(), 10.f, true },
+		{ new SaveBoostReward(), 0.2f, true },
 
 		// Game events
 		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
@@ -55,7 +59,7 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	result.stateSetter = new KickoffState();
+	result.stateSetter = new BallNearCarState(600, 900);
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 
@@ -125,6 +129,12 @@ int main(int argc, char* argv[]) {
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
+
+	// Reachability (aux InfoNCE heads on the shared trunk + reward gate).
+	// Experiment arms: A = both off (pure baseline), B = enabled only (aux representation
+	// effect), C = both on (the full gate). The gate anneals in on its own measured validity.
+	cfg.ppo.reachability.enabled = false;
+	cfg.ppo.reachability.gateEnabled = false;
 
 	// Rate of reward decay
 	// Starting low tends to work out

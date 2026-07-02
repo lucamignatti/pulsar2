@@ -89,7 +89,12 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 
 	state.Resize(arenas);
-	
+
+	for (auto& arenaRewards : rewards)
+		for (auto& weighted : arenaRewards)
+			if (weighted.gated)
+				anyGatedRewards = true;
+
 	// Determine obs size and action amount, initialize arrays accordingly
 	{
 		stateSetters[0]->ResetArena(arenas[0]);
@@ -195,12 +200,24 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 
 		// Update rewards
 		{
+			bool doGatedBuckets = config.collectGatedBuckets && anyGatedRewards;
+
 			FList allRewards = FList(gs.players.size(), 0);
+			FList gatedPos;
+			if (doGatedBuckets)
+				gatedPos = FList(gs.players.size(), 0);
 			for (int rewardIdx = 0; rewardIdx < rewards[arenaIdx].size(); rewardIdx++) {
 				auto& weightedReward = rewards[arenaIdx][rewardIdx];
 				FList output = weightedReward.reward->GetAllRewards(gs, terminalType);
-				for (int i = 0; i < gs.players.size(); i++)
-					allRewards[i] += output[i] * weightedReward.weight;
+				for (int i = 0; i < gs.players.size(); i++) {
+					float weighted = output[i] * weightedReward.weight;
+					allRewards[i] += weighted;
+
+					// Only the POSITIVE part is bucketed for gating; negative parts always
+					// pass through in full (a low gate must not mute penalties)
+					if (doGatedBuckets && weightedReward.gated && weighted > 0)
+						gatedPos[i] += weighted;
+				}
 
 				// Save the reward
 				if (config.saveRewards) {
@@ -234,8 +251,11 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 				}
 			}
 
-			for (int i = 0; i < gs.players.size(); i++)
+			for (int i = 0; i < gs.players.size(); i++) {
 				state.rewards[playerStartIdx + i] = allRewards[i];
+				if (doGatedBuckets)
+					state.gatedPosRewards[playerStartIdx + i] = gatedPos[i];
+			}
 		}
 
 		// Update observations

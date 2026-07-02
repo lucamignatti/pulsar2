@@ -4,8 +4,14 @@
 namespace GGL {
 
 	struct ExperienceTensors {
+		// NOTE: _GetSamples and any field-zipping code iterate these POSITIONALLY via
+		// begin()/end() below — new fields must go between `states` and `advantages`
+		// (`advantages` must stay last), and undefined means "feature disabled".
 		torch::Tensor
-			states, actions, logProbs, targetValues, actionMasks, advantages;
+			states, actions, logProbs, targetValues, actionMasks,
+			// Reachability aux-training data (undefined when reachability is disabled)
+			carHerGoals, ballHerGoals, ballMovedMask,
+			advantages;
 
 		auto begin() { return &states; }
 		auto end() { return &advantages + 1; }

@@ -17,6 +17,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
+	if (config.reachability.enabled) {
+		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
+		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models);
+	}
+
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	// Print param counts
@@ -152,7 +157,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgCriticLoss,
 		avgGuidingLoss,
 		avgRatio,
-		avgClip;
+		avgClip,
+		avgReachCarAcc,
+		avgReachBallAcc,
+		avgReachLoss;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
@@ -245,6 +253,59 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					avgCriticLoss += criticLoss.detach().cpu().item<float>();
 				}
 
+				// Reachability aux losses (InfoNCE on a subsample; gradient flows into the shared head)
+				torch::Tensor reachLoss;
+				if (reach && batch.carHerGoals.defined()) {
+					int64_t mbRows = stop - start;
+					int64_t sub = RS_MIN((int64_t)config.reachability.infoSubSample, mbRows);
+					if (sub > 1) {
+						torch::Tensor subIdx = torch::randperm(mbRows, TensorOptions().dtype(kLong)).slice(0, 0, sub);
+						torch::Tensor subIdxDev = subIdx.to(device);
+
+						torch::Tensor subObs = obs.index_select(0, subIdxDev);
+						torch::Tensor subActs = acts.index_select(0, subIdxDev);
+						torch::Tensor subCarGoals = batch.carHerGoals.slice(0, start, stop)
+							.index_select(0, subIdx).to(device, true, true);
+
+						torch::Tensor trunkOut = models["shared_head"]
+							? models["shared_head"]->Forward(subObs, false)
+							: subObs;
+						torch::Tensor sa = reach->EncodeStateAction(trunkOut, subActs);
+
+						auto carRes = reach->ComputeInfoNCELoss(reach->psiCar, sa, subCarGoals);
+						if (carRes.loss.defined()) {
+							reachLoss = carRes.loss;
+							avgReachCarAcc += carRes.categoricalAccuracy;
+						}
+
+						// The ball head only trains on rows from episodes where the ball moved
+						if (batch.ballHerGoals.defined() && batch.ballMovedMask.defined()) {
+							torch::Tensor subMoved = batch.ballMovedMask.slice(0, start, stop).index_select(0, subIdx);
+							torch::Tensor movedIdx = subMoved.nonzero().flatten();
+							if (movedIdx.size(0) > 1) {
+								torch::Tensor subBallGoals = batch.ballHerGoals.slice(0, start, stop)
+									.index_select(0, subIdx).index_select(0, movedIdx).to(device, true, true);
+								auto ballRes = reach->ComputeInfoNCELoss(
+									reach->psiBall, sa.index_select(0, movedIdx.to(device)), subBallGoals);
+								if (ballRes.loss.defined()) {
+									reachLoss = reachLoss.defined() ? reachLoss + ballRes.loss : ballRes.loss;
+
+									// Tiny subsets give chance-inflated accuracy (chance = 1/rows,
+									// e.g. 50% at 2 rows); don't let them feed the gate anneal
+									if (movedIdx.size(0) >= 32)
+										avgReachBallAcc += ballRes.categoricalAccuracy;
+								}
+							}
+						}
+
+						if (reachLoss.defined()) {
+							reachLoss = (reachLoss + reach->StateActionVarPenalty(sa))
+								* config.reachability.auxLossWeight * batchSizeRatio;
+							avgReachLoss += reachLoss.detach().cpu().item<float>();
+						}
+					}
+				}
+
 				if (trainPolicy) {
 					// Compute KL divergence & clip fraction using SB3 method for reporting;
 					{
@@ -259,15 +320,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 				}
 
-				if (trainPolicy && trainCritic) {
-					auto combinedLoss = ppoLoss + criticLoss;
-					combinedLoss.backward();
-				} else {
-					if (trainPolicy)
-						ppoLoss.backward();
-					if (trainCritic)
-						criticLoss.backward();
-				}
+				// One combined backward so policy, critic and reachability gradients
+				// accumulate into the shared head together
+				torch::Tensor totalLoss;
+				if (trainPolicy)
+					totalLoss = ppoLoss;
+				if (trainCritic)
+					totalLoss = totalLoss.defined() ? totalLoss + criticLoss : criticLoss;
+				if (reachLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + reachLoss : reachLoss;
+
+				if (totalLoss.defined())
+					totalLoss.backward();
 			};
 
 			
@@ -290,6 +354,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			if (trainSharedHead)
 				nn::utils::clip_grad_norm_(models["shared_head"]->parameters(), 0.5f);
 
+			if (reach) {
+				nn::utils::clip_grad_norm_(reach->phi->parameters(), 0.5f);
+				nn::utils::clip_grad_norm_(reach->psiCar->parameters(), 0.5f);
+				nn::utils::clip_grad_norm_(reach->psiBall->parameters(), 0.5f);
+			}
+
 			models.StepOptims();
 		}
 	}
@@ -300,6 +370,19 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
+
+	if (reach) {
+		float carAcc = avgReachCarAcc.Get();
+		float ballAcc = avgReachBallAcc.Get();
+		// The ball head may not have trained at all (no ball movement yet); use the car head alone then
+		lastReachAccuracy = (avgReachBallAcc.count > 0) ? RS_MIN(carAcc, ballAcc) : carAcc;
+		if (avgReachCarAcc.count > 0)
+			lastReachTrained = true;
+
+		report["Reach/Car Accuracy"] = carAcc;
+		report["Reach/Ball Accuracy"] = ballAcc;
+		report["Reach/Aux Loss"] = avgReachLoss.Get();
+	}
 
 	// Assemble and return report
 	report["Policy Entropy"] = avgEntropy.Get();
@@ -405,9 +488,14 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 	ModelSet result = {};
 	for (Model* model : models) {
-		if (model->modelName == "critic")
+		std::string name = model->modelName;
+		if (name == "critic")
 			continue;
-		
+
+		// Reachability heads are training-time-only; old policy versions don't carry them
+		if (name.rfind("reach_", 0) == 0)
+			continue;
+
 		result.Add(model);
 	}
 	return result;
