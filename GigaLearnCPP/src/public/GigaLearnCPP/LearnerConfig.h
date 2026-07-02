@@ -38,6 +38,11 @@ namespace GGL {
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
 		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto will use your CUDA GPU if available
 
+		// Allow TF32 tensor-core matmuls on CUDA (Ampere+/Blackwell). libtorch defaults cuBLAS
+		// TF32 to OFF, so without this the dense MLPs run strict fp32 and never touch the
+		// tensor-core path. Set false for strict-fp32 reproducibility.
+		bool allowTF32 = true;
+
 		// Standardize the obs values (doesn't seem to help much from my testing)
 		bool standardizeObs = false;
 		float minObsSTD = 1 / 10.f;

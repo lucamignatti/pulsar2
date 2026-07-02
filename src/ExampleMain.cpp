@@ -98,9 +98,9 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 }
 
 int main(int argc, char* argv[]) {
-	// Initialize RocketSim with collision meshes
-	// Change this path to point to your meshes!
-	RocketSim::Init("C:\\Users\\admin\\source\\repos\\RLArenaCollisionDumper\\collision_meshes");
+	// Initialize RocketSim with collision meshes (run from the repo/build dir;
+	// provision them with tools/get_collision_meshes.sh if missing)
+	RocketSim::Init("collision_meshes");
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};

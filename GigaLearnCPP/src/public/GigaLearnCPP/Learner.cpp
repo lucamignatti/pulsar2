@@ -74,6 +74,14 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		device = at::Device(at::kCPU);
 	}
 
+	// Apply the TF32 matmul policy on CUDA (inert elsewhere) — without this the dense MLPs
+	// run strict fp32 and never touch the Ampere+/Blackwell tensor-core path
+	if (device.is_cuda()) {
+		at::globalContext().setAllowTF32CuBLAS(config.allowTF32);
+		at::globalContext().setAllowTF32CuDNN(config.allowTF32);
+		RG_LOG("\tTF32 matmuls (CUDA tensor cores): " << (config.allowTF32 ? "enabled" : "disabled"));
+	}
+
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
 		RG_LOG("\tInitializing RocketSim...");
 		RocketSim::Init("collision_meshes", true);
@@ -277,8 +285,15 @@ void GGL::Learner::Load() {
 	}
 }
 
-void GGL::Learner::StartQuitKeyThread(bool& quitPressed, std::thread& outThread) {
+void GGL::Learner::StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread) {
 	quitPressed = false;
+
+	// Detached runs (run_trainer.sh points stdin at /dev/null) have no terminal: the raw-mode
+	// reader would spin on EOF and spam termios errors. Stop via the runner or SIGTERM instead.
+	if (!KeyPressDetector::HasTerminalInput()) {
+		RG_LOG("No interactive stdin; Q-to-save key listener disabled. Use the runner stop command or SIGTERM to stop.");
+		return;
+	}
 
 	RG_LOG("Press 'Q' to save and quit!");
 	outThread = std::thread(
@@ -341,7 +356,7 @@ void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 	}
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued = false;
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
@@ -480,7 +495,7 @@ void GGL::Learner::Start() {
 		RG_LOG("\t(Render mode enabled)");
 
 	try {
-		bool saveQueued;
+		std::atomic<bool> saveQueued = false;
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 

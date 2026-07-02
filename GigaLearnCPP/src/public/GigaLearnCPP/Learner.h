@@ -2,6 +2,7 @@
 
 #include <RLGymCPP/EnvSet/EnvSet.h>
 #include "Util/MetricSender.h"
+#include <atomic>
 #include "Util/RenderSender.h"
 #include "LearnerConfig.h"
 #include "PPO/TransferLearnConfig.h"
@@ -47,7 +48,7 @@ namespace GGL {
 
 		void StartTransferLearn(const TransferLearnConfig& transferLearnConfig);
 
-		void StartQuitKeyThread(bool& quitPressed, std::thread& outThread);
+		void StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread);
 
 		void Save();
 		void Load();
