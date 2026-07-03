@@ -13,9 +13,11 @@ void RLGC::RandomState::ResetArena(Arena* arena) {
 	// Reset boost pads and everything
 	arena->ResetToRandomKickoff();
 
+	// Wide enough that corner/goal-line states (saves, clears, goalmouth scrambles) occur;
+	// ball radius still clears the walls (3900+93 < 4096 side, 4800+93 < 5120 back)
 	constexpr float
-		X_MAX = 3500,
-		Y_MAX = 4000,
+		X_MAX = 3900,
+		Y_MAX = 4800,
 		Z_MAX = 1820,
 		CAR_Z_MIN = 150,
 		PITCH_MAX = M_PI / 2,

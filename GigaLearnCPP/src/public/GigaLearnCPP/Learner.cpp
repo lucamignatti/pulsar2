@@ -1293,6 +1293,7 @@ void GGL::Learner::Start() {
 						FList mult(n);
 						float alpha = RS_CLAMP(reachCfg.gateAlpha, 0.f, 1.f);
 						double multSum = 0, levelSum = 0, controlSum = 0, scoringSum = 0;
+						double rhoUsSum = 0, rhoOppSum = 0, rhoScoreSum = 0;
 						double dRelMean = 0, dRelVar = 0;
 						for (int64_t i = 0; i < n; i++)
 							dRelMean += deltaRel[i];
@@ -1310,10 +1311,16 @@ void GGL::Learner::Start() {
 							levelSum += level;
 							controlSum += control;
 							scoringSum += scoring;
+							rhoUsSum += rhoCarUs[i];
+							rhoOppSum += rhoCarOpp[i];
+							rhoScoreSum += rhoScore[i];
 							dRelVar += (deltaRel[i] - dRelMean) * (deltaRel[i] - dRelMean);
 						}
 
 						report["Reach/Beta"] = beta;
+						report["Reach/Rho Car Us Mean"] = (float)(rhoUsSum / n);
+						report["Reach/Rho Car Opp Mean"] = (float)(rhoOppSum / n);
+						report["Reach/Rho Score Mean"] = (float)(rhoScoreSum / n);
 						report["Reach/Gate Mult Mean"] = (float)(multSum / n);
 						report["Reach/Level Mean"] = (float)(levelSum / n);
 						report["Reach/Control Mean"] = (float)(controlSum / n);

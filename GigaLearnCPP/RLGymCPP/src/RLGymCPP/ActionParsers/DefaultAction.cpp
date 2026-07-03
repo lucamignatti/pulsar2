@@ -75,7 +75,7 @@ RLGC::DefaultAction::DefaultAction() {
 		if (i < numGroundActions)
 			groundMask[i] = true;
 
-		if (i > numGroundActions && !action.jump)
+		if (i >= numGroundActions && !action.jump)
 			airMask[i] = true;
 
 		// Add additional yaw-only actions to air mask

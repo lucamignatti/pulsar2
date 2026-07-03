@@ -17,43 +17,49 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	// Rebalanced to Nexto-era ratios (Rolv-Arild/Necto training/reward.py @ b030656,
-	// scaled x15 so Goal stays at 150). Design rule: dense shaping must integrate to a
-	// small fraction of a goal over a play, so the return is dominated by the sparse
-	// objective. The old weights paid ~50/sec of ambient shaping (avg step reward ~3.4),
-	// so one ballchase approach + strong touch out-earned a goal — chasing WAS optimal.
-	// The third field marks the farmable dense rewards as GATED: when the reachability gate is
-	// enabled, their positive parts get scaled by it. Bootstrap/objective rewards
-	// (TouchAccel, Goal, Bump, Demo) always pay in full.
+	// SURGICAL-7: potentials + impulse-scaled touch height (Nexto ratios x15, Goal=150).
+	// Design rules:
+	// (1) every continuous term is an EXACT potential (gamma*Phi(s') - Phi(s)) -> all
+	//     movement cycles, whack-and-chase loops, and truncation harvests telescope to 0
+	//     by construction, not by weight-tuning;
+	// (2) every touch term pays for IMPULSE (delta ball-vel), never contact-time -> no
+	//     dribble/wall-pin/ceiling-carry annuity can exist;
+	// (3) events (touch, demo, goal) are ungated and zero-sum; nothing pays per-step for
+	//     existing (no Air, no SaveBoost) -> ambient do-nothing income is exactly 0.
+	// The gamma inside the potential classes must match cfg.ppo.gaeGamma (0.99).
 	std::vector<WeightedReward> rewards = {
 
-		// Movement: tiny seed so jumping/aerials don't die out (was 0.25 = 3.75/sec for hopping)
-		{ new AirReward(), 0.05f, true },
+		// Player->ball proximity potential (Nexto liu_dist, dist_w=0.5 x15). Replaces
+		// VelocityPlayerToBallReward: the potential charges the full Phi drop when the
+		// ball is whacked away, so the 7.5/sec chase annuity nets ~0 per cycle. Its 3D
+		// distance also pays climbing toward an overhead ball and refunds whiffs.
+		{ new BallProximityPotentialReward(), 7.5f },
 
-		// Player-ball: quasi-potential (integrates to ~ +7 per half-field approach, refunded
-		// on retreat). Was 4.0 -> ~120 per approach, the main ballchase driver.
-		// FaceBallReward removed entirely: paid 3.75/sec for staring at the ball and
-		// punished turning away, which fights shadowing/rotation. Nexto had no such term.
-		{ new VelocityPlayerToBallReward(), 0.5f, true },
+		// Ball->goal potential (Nexto state_quality). Replaces ZeroSum(VelocityBallToGoal):
+		// antisymmetric between teams, so it is ALREADY zero-sum — no wrapper (the wrapper
+		// was a silent 2x). exp() concentrates credit at the goal mouth: a corner spray
+		// pockets ~3, not ~60, and rolls back for a full refund. ~+25 integrated midfield->net.
+		{ new BallToGoalPotentialReward(), 75.f },
 
-		// Touch quality: pays only for ADDING ball speed (Nexto touch_accel), ~10 total to
-		// take the ball 0->110kph, and zero-sum so both bots can't co-farm touches.
-		// Replaces StrongTouchReward(60/touch), which paid for hitting hard in ANY direction
-		// and refilled itself: whack ball away -> chase -> whack again.
+		// Touch quality: unchanged proven bootstrap (Nexto touch_accel). Pays only for
+		// adding ball speed, ~10 total 0->110kph, zero-sum so touches can't be co-farmed.
 		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
 
-		// Ball-goal: derivative of Nexto's goal-dist potential (~38 integrated midfield->net,
-		// matching Nexto's goal_dist_w=10 x15 scale)
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 3.0f, true },
+		// Touch HEIGHT (Nexto touch_height x15), impulse-scaled: carries pay ~0, a real
+		// strike pays the full height credit, airborne strikes pay double. The only term
+		// where a high touch is worth more than a low one — the aerial gradient.
+		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f },
 
-		// Boost: PickupBoost is the sqrt-gain event (Nexto boost_gain_w=1 -> 15 at this scale).
-		// SaveBoost cut hard: it pays per-step for HOLDING boost (was 3/sec at full tank).
-		{ new PickupBoostReward(), 8.f, true },
-		{ new SaveBoostReward(), 0.05f, true },
+		// Boost pickup, halved (big pad from empty = 4 = 2.7% of a goal). SaveBoost removed:
+		// per-step income for holding a full tank taxed spending boost on aerials.
+		{ new PickupBoostReward(), 4.f },
 
-		// Game events (Nexto: demo = goal/2)
-		{ new ZeroSumReward(new BumpReward(), 0.5f), 10 },
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 75 },
+		// Demo halved so the zero-sum pair swing is 75 = goal/2. Bump removed entirely:
+		// its 0.25s re-fire push-grind paid up to 40/sec; Nexto had no bump term.
+		{ new ZeroSumReward(new DemoReward(), 0.5f), 37.5f },
+
+		// The objective. All dense income per scoring possession sums to ~35-40 (~25% of
+		// a goal), none of it collectible without moving the ball toward scoring.
 		{ new GoalReward(), 150 }
 	};
 
@@ -73,13 +79,21 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	// Spawning the ball next to the car every episode is itself a chase curriculum:
-	// the bot never starts in a state where retreating/defending/kickoffs are the right
-	// move. Keep BallNearCar as the majority bootstrap, mix in variety.
+	// Effective near-ball share is 0.55 (0.35 ground + 0.20 aerial drill, cars <= 1200
+	// from the ball), preserving the anti-freeze touch bootstrap margin while finally
+	// posing aerial and defensive states.
 	result.stateSetter = new CombinedState({
-		{ new BallNearCarState(600, 900), 0.5f },
-		{ new KickoffState(), 0.25f },
-		{ new RandomState(true, true, false), 0.25f },
+		// Ground touch bootstrap — unchanged behavior, the proven anti-freeze state
+		{ new BallNearCarState(600, 900), 0.35f },
+		// Aerial drill: ball hangs at 500-1500uu drifting down, BOTH cars on a 300-1200
+		// ring with >=40 boost, facing it. Symmetric, so there is no lucky-car windfall:
+		// the race to meet the falling ball IS the zero-sum challenge. From 1000uu the
+		// ball takes ~1.6-2.2s to land — a real window for jump/double-jump/boost-climb.
+		{ new BallNearCarState(300, 1200, 500, 1500, 400, 40), 0.20f },
+		{ new KickoffState(), 0.15f },
+		// Sole source of chaotic/defensive/air-recovery states (bounds widened to reach
+		// corners and goal lines)
+		{ new RandomState(true, true, false), 0.30f },
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
@@ -110,6 +124,11 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 
 				if (player.ballTouchedStep)
 					report.AddAvg("Player/Touch Height", state.ball.pos.z);
+
+				// Tripwires for the reward stack: aerials emerging / demo farming
+				report.AddAvg("Player/Aerial Touch Ratio",
+					player.ballTouchedStep && !player.isOnGround && state.ball.pos.z > 400);
+				report.AddAvg("Player/Demo Rate", (float)player.eventState.demo);
 			}
 		}
 
@@ -140,10 +159,10 @@ int main(int argc, char* argv[]) {
 	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 123;
 
-	int tsPerItr = 100'000;
+	int tsPerItr = 200'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 100'000; // Lower this if too much VRAM is being allocated
+	cfg.ppo.miniBatchSize = 200'000; // Lower this if too much VRAM is being allocated
 
 	// BF16 inference for collection + GAE value preds (Blackwell tensor cores). The
 	// reachability paths are unaffected: rho/gate evals request fp32 explicitly and
@@ -152,7 +171,7 @@ int main(int argc, char* argv[]) {
 
 	// Using 2 epochs seems pretty optimal when comparing time training to skill
 	// Perhaps 1 or 3 is better for you, test and find out!
-	cfg.ppo.epochs = 1;
+	cfg.ppo.epochs = 2;
 
 	// This scales differently than "ent_coef" in other frameworks
 	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
@@ -160,9 +179,17 @@ int main(int argc, char* argv[]) {
 
 	// Reachability (aux InfoNCE heads on the shared trunk + reward gate).
 	// Experiment arms: A = both off (pure baseline), B = enabled only (aux representation
-	// effect), C = both on (the full gate). The gate anneals in on its own measured validity.
-	cfg.ppo.reachability.enabled = false;
+	// effect), C = both on (the full gate). Arm B for the SURGICAL-7 stack: no reward is
+	// marked gated (potentials are non-farmable by construction and positive-part gating
+	// would break their telescoping), so the heads train and log but the gate stays off.
+	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = false;
+
+	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
+	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
+	// would let a first goal land as an unclipped 40+ sigma value-target spike under the
+	// lifetime Welford sigma. 50 releases the full 150 once sigma >= 3 and bounds the tail.
+	cfg.ppo.rewardClipRange = 50;
 
 	// Rate of reward decay
 	// Starting low tends to work out
@@ -175,9 +202,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.layerSizes = { 256, 256 };
 	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
 	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
+	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
+	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
+	cfg.ppo.reachability.lr = 3e-4f;
 
 	// Muon's RMS-matched scaling makes Adam-tuned LRs transfer as-is.
-	// (The reachability heads deliberately stay on Adam — see ReachabilityConfig.)
+	// The reachability heads deliberately stay on Adam: contrastive InfoNCE embeddings
+	// train poorly under orthogonalized updates (see ReachabilityConfig).
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
@@ -187,11 +218,19 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.policy.activationType = activation;
 	cfg.ppo.critic.activationType = activation;
 	cfg.ppo.sharedHead.activationType = activation;
+	cfg.ppo.reachability.phi.activationType = activation;
+	cfg.ppo.reachability.psi.activationType = activation;
 
 	bool addLayerNorm = true;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
+	cfg.ppo.reachability.phi.addLayerNorm = addLayerNorm;
+	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
+
+	// Skill rating: Elo-style eval matches against saved policy versions, logged to
+	// wandb as Rating/<mode> (e.g. Rating/1v1). Also turns on savePolicyVersions.
+	cfg.skillTracker.enabled = true;
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render

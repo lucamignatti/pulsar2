@@ -81,6 +81,58 @@ namespace RLGC {
 		}
 	};
 
+	// True-potential form of player->ball proximity (Nexto's liu_dist player quality):
+	// r = gamma*Phi(s') - Phi(s), Phi = exp(-dist/LIU_DIST_SCALE). Exact PBRS, so movement
+	// cycles and whack-and-chase loops telescope to ~0 and episode truncation can't be
+	// harvested — unlike VelocityPlayerToBallReward, the Phi drop when the ball is knocked
+	// away is charged immediately. gamma must match the learner's gaeGamma.
+	class BallProximityPotentialReward : public Reward {
+	public:
+		constexpr static float LIU_DIST_SCALE = 1410; // Nexto: max driving speed without boost
+		float gamma;
+		BallProximityPotentialReward(float gamma = 0.99f) : gamma(gamma) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.prev)
+				return 0; // First step of the episode: nothing to diff against
+
+			// A demo/respawn teleport is not the player's action; don't charge/pay the jump
+			if (player.isDemoed || player.prev->isDemoed)
+				return 0;
+
+			float cur = expf(-(state.ball.pos - player.pos).Length() / LIU_DIST_SCALE);
+			float prev = expf(-(state.prev->ball.pos - player.prev->pos).Length() / LIU_DIST_SCALE);
+			return gamma * cur - prev;
+		}
+	};
+
+	// True-potential form of ball->goal progress (Nexto's goal-dist state quality):
+	// Phi = 0.5*(exp(-dOpp/CAR_MAX_SPEED) - exp(-dOwn/CAR_MAX_SPEED)), r = gamma*Phi(s') - Phi(s).
+	// Blue's Phi is the exact negative of orange's, so this is already zero-sum — do NOT
+	// wrap it in ZeroSumReward (that silently doubles it). The exp shape is near-flat at
+	// midfield and steep at the goal mouth, so credit concentrates on finishing positions
+	// and rolled-back balls refund in full. gamma must match the learner's gaeGamma.
+	class BallToGoalPotentialReward : public Reward {
+	public:
+		float gamma;
+		BallToGoalPotentialReward(float gamma = 0.99f) : gamma(gamma) {}
+
+		static float Phi(const Vec& ballPos, Team team) {
+			Vec oppGoal = (team == Team::BLUE) ? CommonValues::ORANGE_GOAL_BACK : CommonValues::BLUE_GOAL_BACK;
+			Vec ownGoal = (team == Team::BLUE) ? CommonValues::BLUE_GOAL_BACK : CommonValues::ORANGE_GOAL_BACK;
+			return 0.5f * (
+				expf(-(ballPos - oppGoal).Length() / CommonValues::CAR_MAX_SPEED) -
+				expf(-(ballPos - ownGoal).Length() / CommonValues::CAR_MAX_SPEED));
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev)
+				return 0;
+
+			return gamma * Phi(state.ball.pos, player.team) - Phi(state.prev->ball.pos, player.team);
+		}
+	};
+
 	// https://github.com/AechPro/rocket-league-gym-sim/blob/main/rlgym_sim/utils/reward_functions/common_rewards/player_ball_rewards.py
 	class FaceBallReward : public Reward {
 	public:
@@ -175,6 +227,27 @@ namespace RLGC {
 			} else {
 				return 0;
 			}
+		}
+	};
+
+	// Touch height (Nexto's touch_height), impulse-scaled: on touch, pays
+	// (2 - onGround) * avg(ballZ, carZ)/CEILING_Z * min(1, |delta ballVel|/FULL_CREDIT_DELTA_V).
+	// ballTouchedStep fires EVERY step of sustained contact, so without the impulse factor
+	// this would be a carry annuity (wall pins / ceiling carries out-earn goals). A carry
+	// only adds ~67 uu/s of ball speed per step (impulse factor ~0.07 -> pays ~0); a real
+	// strike gets the full height credit. Airborne touches pay double.
+	class TouchHeightReward : public Reward {
+	public:
+		constexpr static float FULL_CREDIT_DELTA_V = 1000; // uu/s of ball delta-v for full credit
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.ballTouchedStep)
+				return 0;
+
+			float heightFrac = 0.5f * (state.ball.pos.z + player.pos.z) / CommonValues::CEILING_Z;
+			float airMult = player.isOnGround ? 1.0f : 2.0f;
+			float impulseFrac = RS_MIN(1.0f, (state.ball.vel - state.prev->ball.vel).Length() / FULL_CREDIT_DELTA_V);
+			return airMult * heightFrac * impulseFrac;
 		}
 	};
 
