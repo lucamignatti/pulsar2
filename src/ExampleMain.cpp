@@ -9,6 +9,7 @@
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
+#include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
@@ -16,30 +17,43 @@ using namespace RLGC; // RLGymCPP
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	// These are ok rewards that will produce a scoring bot in ~100m steps
+	// Rebalanced to Nexto-era ratios (Rolv-Arild/Necto training/reward.py @ b030656,
+	// scaled x15 so Goal stays at 150). Design rule: dense shaping must integrate to a
+	// small fraction of a goal over a play, so the return is dominated by the sparse
+	// objective. The old weights paid ~50/sec of ambient shaping (avg step reward ~3.4),
+	// so one ballchase approach + strong touch out-earned a goal — chasing WAS optimal.
 	// The third field marks the farmable dense rewards as GATED: when the reachability gate is
 	// enabled, their positive parts get scaled by it. Bootstrap/objective rewards
-	// (StrongTouch, Goal, Bump, Demo) always pay in full.
+	// (TouchAccel, Goal, Bump, Demo) always pay in full.
 	std::vector<WeightedReward> rewards = {
 
-		// Movement
-		{ new AirReward(), 0.25f, true },
+		// Movement: tiny seed so jumping/aerials don't die out (was 0.25 = 3.75/sec for hopping)
+		{ new AirReward(), 0.05f, true },
 
-		// Player-ball
-		{ new FaceBallReward(), 0.25f, true },
-		{ new VelocityPlayerToBallReward(), 4.f, true },
-		{ new StrongTouchReward(20, 100), 60 },
+		// Player-ball: quasi-potential (integrates to ~ +7 per half-field approach, refunded
+		// on retreat). Was 4.0 -> ~120 per approach, the main ballchase driver.
+		// FaceBallReward removed entirely: paid 3.75/sec for staring at the ball and
+		// punished turning away, which fights shadowing/rotation. Nexto had no such term.
+		{ new VelocityPlayerToBallReward(), 0.5f, true },
 
-		// Ball-goal
-		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 2.0f, true },
+		// Touch quality: pays only for ADDING ball speed (Nexto touch_accel), ~10 total to
+		// take the ball 0->110kph, and zero-sum so both bots can't co-farm touches.
+		// Replaces StrongTouchReward(60/touch), which paid for hitting hard in ANY direction
+		// and refilled itself: whack ball away -> chase -> whack again.
+		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
 
-		// Boost
-		{ new PickupBoostReward(), 10.f, true },
-		{ new SaveBoostReward(), 0.2f, true },
+		// Ball-goal: derivative of Nexto's goal-dist potential (~38 integrated midfield->net,
+		// matching Nexto's goal_dist_w=10 x15 scale)
+		{ new ZeroSumReward(new VelocityBallToGoalReward(), 1), 3.0f, true },
 
-		// Game events
-		{ new ZeroSumReward(new BumpReward(), 0.5f), 20 },
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 80 },
+		// Boost: PickupBoost is the sqrt-gain event (Nexto boost_gain_w=1 -> 15 at this scale).
+		// SaveBoost cut hard: it pays per-step for HOLDING boost (was 3/sec at full tank).
+		{ new PickupBoostReward(), 8.f, true },
+		{ new SaveBoostReward(), 0.05f, true },
+
+		// Game events (Nexto: demo = goal/2)
+		{ new ZeroSumReward(new BumpReward(), 0.5f), 10 },
+		{ new ZeroSumReward(new DemoReward(), 0.5f), 75 },
 		{ new GoalReward(), 150 }
 	};
 
@@ -59,7 +73,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	result.stateSetter = new BallNearCarState(600, 900);
+	// Spawning the ball next to the car every episode is itself a chase curriculum:
+	// the bot never starts in a state where retreating/defending/kickoffs are the right
+	// move. Keep BallNearCar as the majority bootstrap, mix in variety.
+	result.stateSetter = new CombinedState({
+		{ new BallNearCarState(600, 900), 0.5f },
+		{ new KickoffState(), 0.25f },
+		{ new RandomState(true, true, false), 0.25f },
+	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
 
