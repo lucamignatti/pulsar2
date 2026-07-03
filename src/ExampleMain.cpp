@@ -48,11 +48,17 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Touch HEIGHT (Nexto touch_height x15), impulse-scaled: carries pay ~0, a real
 		// strike pays the full height credit, airborne strikes pay double. The only term
 		// where a high touch is worth more than a low one — the aerial gradient.
-		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f },
+		// GATED: the impulse factor already kills contact-time carries; the reachability
+		// gate additionally mutes the aerial juggle self-rally (a contested pop at height
+		// pays 10-15/sec) in states that don't matter. Beta anneals from 0 and the 0.2
+		// floor keep cold aerial learning intact (mult ~0.78 at the live run's beta~0.44).
+		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f, true },
 
 		// Boost pickup, halved (big pad from empty = 4 = 2.7% of a goal). SaveBoost removed:
 		// per-step income for holding a full tank taxed spending boost on aerials.
-		{ new PickupBoostReward(), 4.f },
+		// GATED (as in the proven old stack): don't pay for a boost-collection circuit in
+		// states where we can't win the ball or score.
+		{ new PickupBoostReward(), 4.f, true },
 
 		// Demo halved so the zero-sum pair swing is 75 = goal/2. Bump removed entirely:
 		// its 0.25s re-fire push-grind paid up to 40/sec; Nexto had no bump term.
@@ -179,11 +185,13 @@ int main(int argc, char* argv[]) {
 
 	// Reachability (aux InfoNCE heads on the shared trunk + reward gate).
 	// Experiment arms: A = both off (pure baseline), B = enabled only (aux representation
-	// effect), C = both on (the full gate). Arm B for the SURGICAL-7 stack: no reward is
-	// marked gated (potentials are non-farmable by construction and positive-part gating
-	// would break their telescoping), so the heads train and log but the gate stays off.
+	// effect), C = both on (the full gate). Arm C for the SURGICAL-7 stack: the gate and
+	// the potentials are COMPLEMENTARY on DISJOINT terms. Potentials stay ungated (positive-
+	// part gating breaks their telescoping); the gate takes the residual farmable surface —
+	// TouchHeight (aerial juggle rally) + PickupBoost (boost circuit) — the two rewards
+	// marked gated above. Beta anneals in on measured head validity, floored at 0.2.
 	cfg.ppo.reachability.enabled = true;
-	cfg.ppo.reachability.gateEnabled = false;
+	cfg.ppo.reachability.gateEnabled = true;
 
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
 	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
