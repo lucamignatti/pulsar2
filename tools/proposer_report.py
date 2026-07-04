@@ -145,6 +145,44 @@ def separability(rows):
         print("     the weighting isn't biting (raise aspirationPercentile / lower belowAspirationWeight).")
 
 
+def rho_report(rows, squash_temp=10.0):
+    """Calibrate the Stage-3 Phi-drop drill detector to the live rho distribution.
+
+    Drills are banked when Phi = sigmoid(rho / phiSquashTemp) rises to phiHighThresh then falls
+    by phiDropThresh. The shipped 0.7/0.3 assume rho spanning ~0..+10; on the real run rho is
+    strongly negative, so the sigmoid sits in its flat tail and the detector never fires. This
+    prints the rho percentiles and the Phi they map to, then suggests thresholds that actually
+    bank drills (phiHigh near the p85 moment, phiDrop ~= a p85->p40 fall).
+    """
+    def sig(x):
+        return 1.0 / (1.0 + math.exp(-x))
+
+    rhos = sorted(r["rho"] for r in rows)
+    if not rhos:
+        return
+    n = len(rhos)
+
+    def pct(p):
+        return rhos[min(n - 1, int(p / 100.0 * n))]
+
+    print(f"\n=== Rho distribution (Stage-3 detector calibration; phiSquashTemp={squash_temp:g}) ===")
+    print("  pctile    rho     Phi=sigmoid(rho/T)")
+    marks = [5, 25, 40, 50, 75, 85, 95]
+    phis = {}
+    for p in marks:
+        r = pct(p)
+        phi = sig(r / squash_temp)
+        phis[p] = phi
+        print(f"    p{p:<3d}   {r:+7.2f}      {phi:.3f}")
+
+    high_suggest = round(phis[85], 2)
+    drop_suggest = round(phis[85] - phis[40], 2)
+    print(f"  -> suggested: phiHighThresh ~= {high_suggest:.2f} (p85 moment),"
+          f" phiDropThresh ~= {max(0.03, drop_suggest):.2f} (p85->p40 fall)")
+    print("     If Proposer/Drill Bank Size stays ~0, lower phiHighThresh; if it fills instantly"
+          " with junk, raise it / raise phiDropThresh.")
+
+
 def tilt_report(rows):
     """THE aspiration check, in displacement space (immune to the group-variance confound).
 
@@ -285,6 +323,7 @@ def main():
     pooled_rows = [r for itr in itrs[-5:] for r in by_itr[itr]]
     separability(pooled_rows)
     tilt_ok = tilt_report(pooled_rows)
+    rho_report(pooled_rows)
 
     print(f"\n  Stage-2 go/no-go = TRACKING + SANITY gates above + the TILT verdict."
           f" Currently: {'GO' if (passed == len(checks) and tilt_ok) else 'NO-GO'}.")

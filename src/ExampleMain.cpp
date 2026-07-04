@@ -105,9 +105,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to reach
 		// corners and goal lines)
 		{ new RandomState(true, true, false), 0.30f },
-		// Deliberate-practice drills (Stage 3): weight 0.0 until cfg.ppo.proposer.practiceEnabled
-		// is turned on - CombinedState never selects a 0-weight setter, so this is a no-op today.
-		// Falls back to the ground-touch setter when the bank is empty.
+		// Deliberate-practice drills (Stage 3): weight 0.0 = DETECTION-ONLY. With practiceEnabled=true
+		// the bank still fills from Phi-drop detection, but CombinedState never selects a 0-weight
+		// setter, so drills are never replayed and the reset distribution is untouched. Bump to ~0.1
+		// to actually replay banked drills (the one non-cheaply-reversible knob - it perturbs the
+		// collected data the critic trains on). Falls back to the ground-touch setter if the bank is empty.
 		{ new DrillSetter(&g_DrillBank, index, new BallNearCarState(600, 900)), 0.0f },
 	});
 	result.terminalConditions = terminalConditions;
@@ -203,13 +205,28 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.gateEnabled = true;
 
 	// Deliberate-practice goal proposer (advantage-weighted-hindsight goal proposal, in the same
-	// reachability BALL-head goal space). Stage 1 (passive: trains + logs, never touches the
-	// training signal) SHIPS ENABLED here. Stage 2 (shapingBeta) and Stage 3 (practiceEnabled) are
-	// code-complete but left OFF - flip them on only after reviewing Stage 1's calibration dumps.
+	// reachability BALL-head goal space). Stage 1 validated on the live run (tools/proposer_report.py:
+	// tracking 2.4x better than no-op, aspiration tilt +0.75 on vy, clamp 0%).
 	cfg.ppo.proposer.enabled = true;
-	cfg.ppo.proposer.shapingBeta = 0.0f;      // Stage 2 off
-	cfg.ppo.proposer.practiceEnabled = false; // Stage 3 off
-	cfg.ppo.proposer.drillBank = &g_DrillBank; // harmless while practiceEnabled is false
+
+	// Stage 2 ON: additive, advantage-only shaping at 5% of the extrinsic advantage std. Conservative
+	// first step (design range is 0.10-0.20); bump toward 0.10 once confirmed non-destructive. Revert
+	// is this one line back to 0.0 - the term only ever touches advantages, never value targets.
+	cfg.ppo.proposer.shapingBeta = 0.05f;
+
+	// Stage 3 in DETECTION-ONLY mode: practiceEnabled runs Phi-drop detection (banks near-miss
+	// snapshots, logs Proposer/Drill Bank Size + Drills Added), but the DrillSetter stays at weight
+	// 0.0 in EnvCreateFunc, so NO arena ever resets into a drill and NO practice window ever arms.
+	// That means zero reset-distribution perturbation and zero training-signal effect - this is the
+	// observable, fully-reversible half of Stage 3. Once the bank grows with sane drills, bump the
+	// DrillSetter weight to ~0.1 to actually replay them (that's the one irreversible knob).
+	// Thresholds calibrated for the live rho (~-4 mean): the shipped 0.7/0.3 sit deep in the flat
+	// tail of sigmoid(rho/10) and would essentially never fire; 0.42/0.08 operate in the live regime.
+	// Refine from proposer_report.py's rho-distribution readout.
+	cfg.ppo.proposer.practiceEnabled = true;
+	cfg.ppo.proposer.phiHighThresh = 0.42f;
+	cfg.ppo.proposer.phiDropThresh = 0.08f;
+	cfg.ppo.proposer.drillBank = &g_DrillBank;
 
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
 	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
