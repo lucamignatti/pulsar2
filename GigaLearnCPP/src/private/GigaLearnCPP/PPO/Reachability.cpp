@@ -127,3 +127,50 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 
 	return rhos;
 }
+
+std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRhoRowwise(
+	Model* sharedHead, Model* psiHead, const std::vector<torch::Tensor>& goalRows,
+	torch::Tensor obs, torch::Tensor actionMasks, c10::optional<torch::Generator> gen) {
+
+	RG_NO_GRAD;
+
+	int64_t n = obs.size(0);
+	for (auto& g : goalRows)
+		RG_ASSERT(g.size(0) == n);
+
+	int64_t k = RS_MAX(1, config.numActionSamples);
+	int64_t chunkSize = (config.scoreChunkSize > 0) ? config.scoreChunkSize : n;
+	float tau = RS_MAX(1e-6f, config.tau);
+
+	std::vector<Tensor> rhos;
+	for (size_t q = 0; q < goalRows.size(); q++)
+		rhos.push_back(torch::zeros({ n }, TensorOptions().dtype(kFloat32)));
+
+	for (int64_t start = 0; start < n; start += chunkSize) {
+		int64_t stop = RS_MIN(start + chunkSize, n);
+		int64_t m = stop - start;
+
+		Tensor obsChunk = obs.slice(0, start, stop).to(device, true);
+		Tensor trunkOut = sharedHead ? sharedHead->Forward(obsChunk, false) : obsChunk;
+
+		// Uniform over valid actions; the tiny epsilon guards a (never-expected) all-zero mask row
+		Tensor maskChunk = actionMasks.slice(0, start, stop).to(device).to(kFloat32) + 1e-6f;
+		Tensor sampled = gen.has_value() ?
+			torch::multinomial(maskChunk, k, true, *gen) :
+			torch::multinomial(maskChunk, k, true); // [m, k]
+
+		// One batched phi forward over all (row, sample) pairs instead of k sequential ones
+		Tensor trunkRep = trunkOut.repeat_interleave(k, 0);              // [m*k, trunkOut]
+		Tensor sa = EncodeStateAction(trunkRep, sampled.reshape({ -1 })); // [m*k, repr]
+
+		for (size_t q = 0; q < goalRows.size(); q++) {
+			Tensor goalChunk = goalRows[q].slice(0, start, stop).to(kFloat32).to(device); // [m, 6]
+			Tensor g = L2Normalize(psiHead->Forward(goalChunk, false));                   // [m, repr]
+			Tensor gRep = g.repeat_interleave(k, 0);                                       // [m*k, repr]
+			Tensor scores = (sa * gRep).sum(-1) / tau;                                     // [m*k]
+			rhos[q].slice(0, start, stop).copy_(scores.view({ m, k }).mean(1).cpu());
+		}
+	}
+
+	return rhos;
+}

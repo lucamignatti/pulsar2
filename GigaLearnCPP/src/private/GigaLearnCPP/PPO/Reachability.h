@@ -48,5 +48,18 @@ namespace GGL {
 		// matmul each). Returns one [n] float32 CPU tensor per query, in query order.
 		// sharedHead may be null (raw obs feed phi directly).
 		std::vector<torch::Tensor> EvalRho(Model* sharedHead, const std::vector<GoalQuery>& queries, torch::Tensor obs, torch::Tensor actionMasks);
+
+		// Row-matched variant of EvalRho: for each obs row i and each entry in goalRows, computes
+		// rho(s_i -> goalRows[q][i]) — i.e. a per-row goal instead of one fixed goal for the whole
+		// call. All entries share the same psiHead (they live in the same goal space) and the same
+		// sampled actions per row (reduces sampling noise when comparing e.g. rho(s,g) vs
+		// rho(s,g_prev) for the same s). goalRows[q] must be [n, 6], row-aligned with obs.
+		// If `gen` is provided, action sampling uses it instead of the global torch RNG (so calling
+		// this does not perturb any other module's RNG-derived stream, e.g. reach's own randperm).
+		// Returns one [n] float32 CPU tensor per entry in goalRows, in order.
+		std::vector<torch::Tensor> EvalRhoRowwise(
+			Model* sharedHead, Model* psiHead, const std::vector<torch::Tensor>& goalRows,
+			torch::Tensor obs, torch::Tensor actionMasks,
+			c10::optional<torch::Generator> gen = c10::nullopt);
 	};
 }

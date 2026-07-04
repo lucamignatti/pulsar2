@@ -3,6 +3,10 @@
 
 #include "../Util/ModelConfig.h"
 
+namespace RLGC {
+	class DrillBank;
+}
+
 namespace GGL {
 
 	// Learned goal-reachability (InfoNCE + HER), used ONLY as:
@@ -89,6 +93,63 @@ namespace GGL {
 		}
 	};
 
+	// Deliberate-practice goal proposer: g_t = clamp(g_{t-1} + Delta(detached_trunk_feat_t, g_{t-1})),
+	// goals living in the SAME 6D canonical-ball space as the reachability BALL head. Trained by
+	// advantage-weighted hindsight (targets = achieved ball state N steps ahead; CRR-binary weights
+	// from an N-step-advantage aspiration percentile). Requires reachability.enabled (reuses phi/psiBall).
+	//
+	// Stage 1 (enabled by default) is PASSIVE: it trains the proposer and logs calibration metrics,
+	// but never touches rewards/advantages/returns/values.
+	// Stage 2 (shapingBeta, default 0) adds a centered, advantage-only shaping term built from the
+	// SAME proposed goal on both sides of the potential difference (gamma*rho(s',g) - rho(s,g)) so
+	// goal-motion never gets charged to the policy — only its progress toward a goal that stood.
+	// Stage 3 (practiceEnabled, default off) detects reachability "drop" events (a committed mistake),
+	// banks a restorable snapshot + the goal that was in play, and periodically replays that snapshot
+	// under an amplified beta so the policy gets repeated at-bats on its own near-misses.
+	struct ProposerConfig {
+		// ---- Stage 1 (ships ENABLED; passive) ----
+		bool enabled = true;              // requires reachability.enabled (validated in PPOLearner ctor)
+		PartialModelConfig delta;         // proposer_delta net; Muon (like policy/critic, not Adam like reach)
+		float lr = 1e-4f;
+		int horizonSteps = 45;            // N ~ 3s at tickSkip 8
+		float goalClamp = 1.5f;           // box the unrolled goal is kept within, normalized units
+		float aspirationPercentile = 0.75f;  // top (1-p) of A^(N) get weight 1
+		float belowAspirationWeight = 0.05f; // CRR-binary low arm; NEVER 0 (dilution, not repulsion)
+		int trainMinibatchSize = 4096;
+		int trainEpochs = 1;
+		int64_t featureChunkSize = 4096;  // shared-head feature pass chunk size (mirrors reach.scoreChunkSize)
+		int dumpEveryNItrs = 25;          // JSONL calibration dump cadence to disk; 0 = never
+		int dumpMaxRows = 512;
+
+		// ---- Stage 2 (code-complete; DISABLED by default) ----
+		float shapingBeta = 0.0f;         // 0 => stage-2 path fully skipped (bit-identical to stage-1-only)
+
+		// ---- Stage 3 (code-complete; DISABLED by default) ----
+		bool practiceEnabled = false;
+		RLGC::DrillBank* drillBank = NULL; // owned by user code (e.g. ExampleMain); required when practiceEnabled
+		int snapshotEveryK = 8;           // per-arena snapshot cadence, in collection steps
+		float phiSquashTemp = 10;         // Phi = sigmoid(rho / T) for drop detection
+		float phiHighThresh = 0.7f;       // Phi was "high" if it reached at least this
+		float phiDropThresh = 0.3f;       // ...then a drop of at least this within the window is a "mistake"
+		int phiDropWindow = 30;           // steps
+		int maxNewDrillsPerItr = 16;
+		int practiceWindowSteps = 90;     // tagged window length after a drill reset (~6s at tickSkip 8)
+		float practiceBetaScale = 3.0f;   // shaping amplification on practice-tagged rows
+		float drillJitterPos = 100, drillJitterVel = 150;
+		float successProximity = 0.15f;   // normalized canonical ball-pos distance counted as a "recovery"
+		int drillMaxTries = 20;
+		int drillMinTriesForRetire = 5;
+		float drillRetireSuccessRate = 0.7f;
+		int maxDrillBankSize = 512;
+
+		ProposerConfig() {
+			delta = {};
+			delta.layerSizes = { 256, 256 };
+			delta.activationType = ModelActivationType::LEAKY_RELU;
+			delta.optimType = ModelOptimType::MUON;
+		}
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
 
@@ -141,6 +202,7 @@ namespace GGL {
 		float guidingStrength = 0.03f;
 
 		ReachabilityConfig reachability;
+		ProposerConfig proposer;
 
 		PPOLearnerConfig() {
 			policy = {};

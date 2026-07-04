@@ -17,6 +17,7 @@
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 #include "Util/AvgTracker.h"
+#include <RLGymCPP/StateSetters/DrillBank.h>
 
 using namespace RLGC;
 
@@ -523,6 +524,23 @@ void GGL::Learner::Start() {
 			FList carHerGoals, ballHerGoals;
 			std::vector<uint8_t> ballMoved;
 
+			// Deliberate-practice proposer extras (only filled when config.ppo.proposer.enabled):
+			// achieved ball at row t and at row t+horizonSteps (clamped to the episode's terminal
+			// outcome row), 6/row each - the (current, hindsight-target) pair the proposer trains
+			// on. Unlike achievedBall/achievedCarBall these ARE carried through Append(), since
+			// they're per-row training data, not per-episode scratch.
+			FList proposerCurBall, proposerTargetBall;
+
+			// Deliberate-practice DRILL extras (only filled when propCfg.practiceEnabled and a
+			// bank is configured): whether row t falls inside an active practice window, the
+			// committed goal for that window (zeros if not practicing), which bank drill it came
+			// from, and provenance (which trajectories[] slot / local step) so the learn-prep pass
+			// can look up that step's banked ArenaSnapshot for a fresh Phi-drop detection.
+			std::vector<uint8_t> practiceMask;
+			FList practiceGoals;
+			std::vector<int64_t> drillIds;
+			std::vector<int32_t> srcPlayer, srcStep;
+
 			void Clear() {
 				*this = Trajectory();
 			}
@@ -547,9 +565,16 @@ void GGL::Learner::Start() {
 				carHerGoals.clear();
 				ballHerGoals.clear();
 				ballMoved.clear();
+				proposerCurBall.clear();
+				proposerTargetBall.clear();
+				practiceMask.clear();
+				practiceGoals.clear();
+				drillIds.clear();
+				srcPlayer.clear();
+				srcStep.clear();
 			}
 
-			void Reserve(size_t rows, int obsSize, int numActions, bool reach) {
+			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
 				states.reserve(rows * obsSize);
 				actionMasks.reserve(rows * numActions);
 				rewards.reserve(rows);
@@ -566,6 +591,19 @@ void GGL::Learner::Start() {
 					carHerGoals.reserve(rows * 6);
 					ballHerGoals.reserve(rows * 6);
 					ballMoved.reserve(rows);
+				}
+
+				if (proposer) {
+					proposerCurBall.reserve(rows * 6);
+					proposerTargetBall.reserve(rows * 6);
+				}
+
+				if (practice) {
+					practiceMask.reserve(rows);
+					practiceGoals.reserve(rows * 6);
+					drillIds.reserve(rows);
+					srcPlayer.reserve(rows);
+					srcStep.reserve(rows);
 				}
 			}
 
@@ -588,6 +626,15 @@ void GGL::Learner::Start() {
 				carHerGoals += other.carHerGoals;
 				ballHerGoals += other.ballHerGoals;
 				ballMoved += other.ballMoved;
+
+				proposerCurBall += other.proposerCurBall;
+				proposerTargetBall += other.proposerTargetBall;
+
+				practiceMask += other.practiceMask;
+				practiceGoals += other.practiceGoals;
+				drillIds += other.drillIds;
+				srcPlayer += other.srcPlayer;
+				srcStep += other.srcStep;
 			}
 
 			// Every per-row column must have exactly one entry per action row; a missed append
@@ -598,6 +645,12 @@ void GGL::Learner::Start() {
 				if (!touched.empty()) {
 					RG_ASSERT(touched.size() == n && oppTouched.size() == n && gatedPos.size() == n);
 					RG_ASSERT(carHerGoals.size() == n * 6 && ballHerGoals.size() == n * 6 && ballMoved.size() == n);
+				}
+				if (!proposerCurBall.empty())
+					RG_ASSERT(proposerCurBall.size() == n * 6 && proposerTargetBall.size() == n * 6);
+				if (!practiceMask.empty()) {
+					RG_ASSERT(practiceMask.size() == n && practiceGoals.size() == n * 6 && drillIds.size() == n);
+					RG_ASSERT(srcPlayer.size() == n && srcStep.size() == n);
 				}
 			}
 
@@ -612,6 +665,18 @@ void GGL::Learner::Start() {
 		// Reachability collection extras
 		const auto& reachCfg = config.ppo.reachability;
 		const bool reachOn = reachCfg.enabled && !render;
+
+		// Deliberate-practice proposer collection extras (requires reach's achieved-ball buffers)
+		const auto& propCfg = config.ppo.proposer;
+		const bool proposerOn = propCfg.enabled && reachOn;
+
+		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
+		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
+		if (practiceOn) {
+			propCfg.drillBank->Configure(
+				(int)envSet->arenas.size(), propCfg.practiceWindowSteps, propCfg.maxDrillBankSize,
+				propCfg.drillMaxTries, propCfg.drillMinTriesForRetire, propCfg.drillRetireSuccessRate);
+		}
 
 		// Static per-player maps: owning arena, slot within it, and the first opposing player
 		// (whose obs row supplies rho_opp for the control read); teams never change mid-run
@@ -649,7 +714,13 @@ void GGL::Learner::Start() {
 		// Slack covers overbatching: collection finishes the step (and its whole episodes)
 		// after crossing tsPerItr.
 		auto combinedTraj = Trajectory();
-		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn);
+		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, proposerOn, practiceOn);
+
+		// Deliberate-practice DRILL snapshot scratch (Stage 3): one entry per (step, arena) this
+		// iteration where a snapshot was captured, keyed by step*numArenas+arenaIdx. Cleared with
+		// combinedTraj each iteration (step always restarts at 0) - the learn-prep Phi-drop pass
+		// looks these up via each row's srcStep/srcPlayer provenance before they're dropped.
+		std::unordered_map<int64_t, RLGC::ArenaSnapshot> stepSnapshots;
 		if (reachOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
@@ -783,6 +854,33 @@ void GGL::Learner::Start() {
 			}
 		};
 
+		// Deliberate-practice proposer training targets: for each row t, records the achieved ball
+		// at t (proposerCurBall) and at t+horizonSteps, clamped to the episode's terminal outcome
+		// row (proposerTargetBall) - the (current, hindsight-target) pair the proposer regresses
+		// onto. Must run AFTER fnRelabelReachGoals (needs the n+1-row achievedBall it just built,
+		// before that scratch is dropped for the next episode).
+		auto fnAppendProposerTargets = [&](Trajectory& traj) {
+			if (!proposerOn)
+				return;
+
+			int n = (int)traj.Length();
+			if (n <= 0)
+				return;
+
+			RG_ASSERT((int)traj.achievedBall.size() == (n + 1) * 6);
+
+			int horizon = RS_MAX(1, propCfg.horizonSteps);
+			traj.proposerCurBall.resize((size_t)n * 6);
+			traj.proposerTargetBall.resize((size_t)n * 6);
+			for (int t = 0; t < n; t++) {
+				int targetRow = RS_MIN(t + horizon, n);
+				for (int d = 0; d < 6; d++) {
+					traj.proposerCurBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)t * 6 + d];
+					traj.proposerTargetBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)targetRow * 6 + d];
+				}
+			}
+		};
+
 		while (true) {
 			Report report = {};
 
@@ -839,6 +937,7 @@ void GGL::Learner::Start() {
 			{ // Generate experience
 
 				combinedTraj.ClearKeepCapacity();
+				stepSnapshots.clear();
 
 				// Players handed to an old version stop being collected this iteration; their
 				// in-flight partial episodes would otherwise silently SPLICE with a later
@@ -854,6 +953,7 @@ void GGL::Learner::Start() {
 						traj.terminals.back() = RLGC::TerminalType::TRUNCATED;
 						traj.nextStates += envSet->state.obs.GetRow(oldPlayerIdx);
 						fnRelabelReachGoals(traj, oldPlayerIdx);
+						fnAppendProposerTargets(traj);
 						combinedTraj.Append(traj);
 						traj.Clear();
 					}
@@ -870,6 +970,11 @@ void GGL::Learner::Start() {
 
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
+						// Drop any practice window whose arena is about to reset for a reason
+						// OTHER than the drill itself (terminals still hold the PREVIOUS step's
+						// flags here - Reset() only zeroes them for arenas that actually reset)
+						if (practiceOn)
+							propCfg.drillBank->ClearWindowsForResets(envSet->state.terminals);
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
@@ -1019,6 +1124,28 @@ void GGL::Learner::Start() {
 										arenaTeamTouched[(int)player.team][arenaIdx] = 1;
 						}
 
+						// Deliberate-practice DRILL snapshot capture (Stage 3): every snapshotEveryK
+						// steps, record enough of each arena's physics state to restore play from
+						// exactly here later. Serial - O(numArenas * playersPerArena), same order
+						// as the arenaTeamTouched scan just above.
+						if (practiceOn && (step % RS_MAX(1, propCfg.snapshotEveryK)) == 0) {
+							for (int arenaIdx = 0; arenaIdx < (int)envSet->arenas.size(); arenaIdx++) {
+								RLGC::ArenaSnapshot snap;
+								auto& gs = envSet->state.gameStates[arenaIdx];
+								snap.ball = gs.ball;
+								for (auto& player : gs.players) {
+									RLGC::ArenaSnapshot::CarSnap cs;
+									cs.team = player.team;
+									cs.state = (CarState)player;
+									snap.cars.push_back(cs);
+								}
+								for (BoostPad* pad : envSet->arenas[arenaIdx]->GetBoostPads())
+									snap.pads.push_back(pad->GetState());
+
+								stepSnapshots[(int64_t)step * (int64_t)envSet->arenas.size() + (int64_t)arenaIdx] = std::move(snap);
+							}
+						}
+
 						// Now that we've inferred and stepped the env, we can add that stuff to the
 						// trajectories. Parallel per-player; logProbs is indexed by the ordinal k
 						// (its rows follow newPlayerIndices order, not global player order).
@@ -1037,8 +1164,24 @@ void GGL::Learner::Start() {
 								auto& player = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[newPlayerIdx]];
 								traj.touched.push_back(player.ballTouchedStep);
 								traj.oppTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 1 : 0][arenaIdx]);
+
+								// Deliberate-practice DRILL per-row tagging (Stage 3): only the
+								// PRACTICING team's rows get tagged - the opponent trains normally
+								if (practiceOn) {
+									auto win = propCfg.drillBank->GetWindow(arenaIdx);
+									bool practicing = win.active && player.team == win.sourceTeam;
+									traj.practiceMask.push_back(practicing ? 1 : 0);
+									for (int d = 0; d < 6; d++)
+										traj.practiceGoals.push_back(practicing ? win.goal[d] : 0.f);
+									traj.drillIds.push_back(practicing ? (int64_t)win.drillId : 0);
+									traj.srcPlayer.push_back(newPlayerIdx);
+									traj.srcStep.push_back(step);
+								}
 							}
 						});
+
+						if (practiceOn)
+							propCfg.drillBank->DecrementWindows();
 
 						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
@@ -1083,6 +1226,7 @@ void GGL::Learner::Start() {
 
 							auto& traj = trajectories[newPlayerIdx];
 							fnRelabelReachGoals(traj, newPlayerIdx);
+							fnAppendProposerTargets(traj);
 							combinedTraj.Append(traj);
 							traj.Clear();
 						}
@@ -1098,6 +1242,14 @@ void GGL::Learner::Start() {
 				float collectionTime = collectionTimer.Elapsed();
 
 				Timer consumptionTimer = {};
+
+				// Deliberate-practice proposer: Train() needs gradients, but the whole "Process
+				// timesteps" block below runs under RG_NO_GRAD (like the reachability gate's own
+				// no-grad rho reads) - so its inputs are captured here and Train() is called AFTER
+				// the block closes, mirroring how ppo->Learn() itself (which also needs gradients)
+				// is deferred to after this block.
+				torch::Tensor tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights;
+
 				{ // Process timesteps
 					RG_NO_GRAD;
 
@@ -1349,6 +1501,256 @@ void GGL::Learner::Start() {
 						}
 					}
 
+					// Deliberate-practice proposer: advantage-weighted-hindsight goal proposal +
+					// (Stage 2, off by default) advantage-only shaping. Stage 1 is PASSIVE - this
+					// block only READS tRewards/tValPreds/tTerminals (which are already gate-mutated
+					// above, i.e. the SAME rewards the policy is actually trained on) and never
+					// writes to them; tPropAInt (if shapingBeta > 0) is the only thing it hands to
+					// GAE's advantages below, and it's centered + explicitly zeroed at terminals.
+					torch::Tensor tPropAInt; // Stage 2 shaping term, added into tAdvantages after GAE
+					if (proposerOn && combinedTraj.Length() > 0 && ppo->proposer) {
+						Timer propTimer = {};
+						int64_t n = (int64_t)combinedTraj.Length();
+
+						std::vector<int64_t> epStart, epEnd;
+						ProposerModule::SegmentEpisodes(combinedTraj.terminals, epStart, epEnd);
+
+						Model* sharedHead = ppo->models["shared_head"];
+						torch::Tensor tFeatures = ppo->proposer->ComputeFeatures(sharedHead, tStates, propCfg.featureChunkSize);
+
+						torch::Tensor tCurBall = torch::tensor(combinedTraj.proposerCurBall).reshape({ -1, 6 });
+						torch::Tensor tTargetBall = torch::tensor(combinedTraj.proposerTargetBall).reshape({ -1, 6 });
+
+						auto unroll = ppo->proposer->Unroll(tFeatures, tCurBall, epStart, epEnd);
+						torch::Tensor tGoals = unroll.goals;         // [n,6] CPU
+						torch::Tensor tPrevGoals = unroll.prevGoals; // [n,6] CPU
+
+						// Stage 3: committed-goal override - a row inside an active practice window
+						// uses the FIXED goal that was in play when the drill was banked, not the
+						// freshly unrolled one (the point of a drill is repeated attempts at the
+						// SAME target). Done before goalQueries/tGoalsShift below are built from
+						// tGoals, so both the shaping term and the logging reflect the committed goal.
+						if (practiceOn && !combinedTraj.practiceMask.empty()) {
+							torch::Tensor tPracticeMask = torch::tensor(combinedTraj.practiceMask).to(torch::kBool);
+							torch::Tensor tPracticeGoals = torch::tensor(combinedTraj.practiceGoals).reshape({ -1, 6 });
+							tGoals = torch::where(tPracticeMask.unsqueeze(-1), tPracticeGoals, tGoals);
+						}
+
+						// N-step advantage (in GAE's own standardized/clipped reward units) drives
+						// the CRR-binary aspiration weight: rows beating the batch's aspiration
+						// percentile get weight 1, the rest get a small nonzero floor - diluted,
+						// never repelled, so a costly-but-aggressive miss never gets trained AWAY
+						// from, only outweighed by the better outcomes.
+						torch::Tensor tAN = ProposerModule::ComputeNStepAdvantages(
+							tRewards, combinedTraj.terminals, tValPreds, tTruncValPreds,
+							epStart, epEnd, propCfg.horizonSteps, config.ppo.gaeGamma,
+							returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange);
+
+						float aspirationThresh;
+						{
+							FList anSorted = TENSOR_TO_VEC<float>(tAN);
+							int64_t rank = RS_CLAMP(
+								(int64_t)(anSorted.size() * RS_CLAMP(propCfg.aspirationPercentile, 0.f, 1.f)),
+								(int64_t)0, (int64_t)anSorted.size() - 1);
+							std::nth_element(anSorted.begin(), anSorted.begin() + rank, anSorted.end());
+							aspirationThresh = anSorted[rank];
+						}
+						torch::Tensor tWeights = torch::where(
+							tAN >= aspirationThresh,
+							torch::ones_like(tAN),
+							torch::full_like(tAN, propCfg.belowAspirationWeight));
+
+						// rho(s_t -> g_t); with shaping on, also rho(s_t -> g_{t-1}) via each row's
+						// goal shifted one step forward within its episode, so ONE EvalRhoRowwise
+						// call (shared sampled actions) answers both rho(s,g) and rho(s',g) terms.
+						bool shapingOn = propCfg.shapingBeta > 0;
+						std::vector<torch::Tensor> goalQueries = { tGoals };
+						torch::Tensor tGoalsShift;
+						if (shapingOn) {
+							tGoalsShift = tGoals.clone();
+							for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
+								int64_t s = epStart[e], en = epEnd[e];
+								if (en > s)
+									tGoalsShift.slice(0, s + 1, en + 1).copy_(tGoals.slice(0, s, en));
+								// Row s keeps its cloned value (tGoals[s]) - there's no g_{t-1} to
+								// shift in at an episode's first row, and the corresponding rhoNext
+								// read (at row s-1, a different episode or out of bounds) is zeroed
+								// by the terminal mask below regardless.
+							}
+							goalQueries.push_back(tGoalsShift);
+						}
+
+						auto rhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiBall, goalQueries, tStates, tActionMasks);
+						torch::Tensor tRhoGoal = rhos[0]; // rho(s_t, g_t)
+
+						if (shapingOn) {
+							torch::Tensor tRhoGoalPrev = rhos[1]; // rho(s_t, g_{t-1})
+							// rhoNext[t] = rho(s_{t+1}, g_t) = tRhoGoalPrev[t+1] (tGoalsShift[t+1] == tGoals[t])
+							torch::Tensor tRhoNext = torch::zeros_like(tRhoGoal);
+							if (n > 1)
+								tRhoNext.slice(0, 0, n - 1).copy_(tRhoGoalPrev.slice(0, 1, n));
+
+							// gamma*rho(s',g) - rho(s,g), using the SAME g on both sides: the
+							// goal-motion component is excluded BY CONSTRUCTION (no difference is
+							// ever taken across the goal update), so this only ever charges the
+							// policy for progress toward a goal that stood.
+							torch::Tensor tAIntRaw = config.ppo.gaeGamma * tRhoNext - tRhoGoal;
+
+							// Zero at terminal rows: no real s_{t+1} to credit, and it happens to
+							// also absorb the cross-episode boundary noise in tRhoNext above
+							torch::Tensor tTerminalMask = (tTerminals == 0).to(torch::kFloat32);
+							tPropAInt = tAIntRaw * tTerminalMask;
+
+							// Stage 3: amplify shaping on practice-tagged rows (repeated at-bats
+							// should count for more while the policy is drilling a specific miss)
+							if (practiceOn && !combinedTraj.practiceMask.empty()) {
+								FList betaScaleVec(n, 1.f);
+								for (int64_t t = 0; t < n; t++)
+									if (combinedTraj.practiceMask[t])
+										betaScaleVec[t] = propCfg.practiceBetaScale;
+								tPropAInt = tPropAInt * torch::tensor(betaScaleVec);
+							}
+						}
+
+						// Stage 3: Phi-drop detection (banks new drills from non-practice
+						// near-misses) + drill success evaluation (retires solved practice
+						// windows). Both read tRhoGoal, which already reflects any committed-goal
+						// override above.
+						if (practiceOn && n > 0) {
+							torch::Tensor tPhi = torch::sigmoid(tRhoGoal / RS_MAX(1e-3f, propCfg.phiSquashTemp));
+							FList phi = TENSOR_TO_VEC<float>(tPhi);
+							int numArenas = (int)envSet->arenas.size();
+							int dropWindow = RS_MAX(1, propCfg.phiDropWindow);
+							int snapK = RS_MAX(1, propCfg.snapshotEveryK);
+							int newDrills = 0;
+
+							// New drills: scan each episode's NON-practice rows for a Phi high -> drop
+							for (int64_t e = 0; e < (int64_t)epStart.size() && newDrills < propCfg.maxNewDrillsPerItr; e++) {
+								int64_t s = epStart[e], en = epEnd[e];
+								float runningHigh = phi[s];
+								int64_t highRow = s;
+								for (int64_t t = s + 1; t <= en && newDrills < propCfg.maxNewDrillsPerItr; t++) {
+									if (!combinedTraj.practiceMask.empty() && combinedTraj.practiceMask[t])
+										continue; // mid-drill mistakes aren't fresh near-misses to bank
+
+									if (phi[t] > runningHigh) {
+										runningHigh = phi[t];
+										highRow = t;
+										continue;
+									}
+
+									if (runningHigh >= propCfg.phiHighThresh &&
+										(runningHigh - phi[t]) >= propCfg.phiDropThresh &&
+										(t - highRow) <= dropWindow) {
+
+										int player = combinedTraj.srcPlayer[highRow];
+										int localStep = combinedTraj.srcStep[highRow];
+										int snapStep = (localStep / snapK) * snapK;
+										int arenaIdx = playerArenaIdx[player];
+
+										auto it = stepSnapshots.find((int64_t)snapStep * numArenas + arenaIdx);
+										if (it != stepSnapshots.end()) {
+											FList goalVec = TENSOR_TO_VEC<float>(tGoals[highRow]);
+											float goal6[6];
+											for (int d = 0; d < 6; d++)
+												goal6[d] = goalVec[d];
+											Team sourceTeam = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[player]].team;
+											propCfg.drillBank->AddDrill(it->second, goal6, sourceTeam);
+											newDrills++;
+										}
+
+										// Don't re-trigger repeatedly on the same decline
+										runningHigh = phi[t];
+										highRow = t;
+									}
+								}
+							}
+							report["Proposer/Drills Added"] = (float)newDrills;
+
+							// Drill success: a practice-tagged drillId succeeds if Phi recovered to
+							// the high threshold anywhere within its tagged rows
+							if (!combinedTraj.practiceMask.empty()) {
+								std::unordered_map<int64_t, bool> drillSuccess;
+								for (int64_t t = 0; t < n; t++) {
+									if (!combinedTraj.practiceMask[t])
+										continue;
+									int64_t drillId = combinedTraj.drillIds[t];
+									bool success = phi[t] >= propCfg.phiHighThresh;
+									auto res = drillSuccess.emplace(drillId, success);
+									if (!res.second && success)
+										res.first->second = true;
+								}
+								for (auto& pair : drillSuccess)
+									propCfg.drillBank->ReportResult((uint64_t)pair.first, pair.second);
+
+								int64_t practiceCount = 0;
+								for (uint8_t m : combinedTraj.practiceMask)
+									practiceCount += m;
+								report["Proposer/Practice Step Fraction"] = (float)practiceCount / (float)RS_MAX((int64_t)1, n);
+							}
+
+							report["Proposer/Drill Bank Size"] = (float)propCfg.drillBank->Size();
+							report["Proposer/Drill Success Rate"] = propCfg.drillBank->AvgSuccessRate();
+						}
+
+						// Hand off to the deferred (gradient-requiring) Train() call after this
+						// no-grad block closes
+						tPropFeatures = tFeatures;
+						tPropPrevGoals = tPrevGoals;
+						tPropTargets = tTargetBall;
+						tPropWeights = tWeights;
+
+						report["Proposer/Aspiration Threshold"] = aspirationThresh;
+						report["Proposer/AN Mean"] = tAN.mean().item<float>();
+						report["Proposer/AN Std"] = tAN.std().item<float>();
+						report["Proposer/Weight Fraction"] = (tWeights >= 1.f).to(torch::kFloat32).mean().item<float>();
+						report["Proposer/Goal Target Dist"] = (tGoals - tTargetBall).norm(2, -1).mean().item<float>();
+						report["Proposer/Goal Drift"] = unroll.meanDeltaNorm;
+						report["Proposer/Rho Goal Mean"] = tRhoGoal.mean().item<float>();
+						if (shapingOn) {
+							report["Proposer/A Int Mean"] = tPropAInt.mean().item<float>();
+							report["Proposer/A Int Std"] = tPropAInt.std().item<float>();
+						}
+
+						// JSONL calibration dump (local disk only - metrics are scalars-only to
+						// wandb): sampled (current, proposed goal, hindsight target, A^(N), weight,
+						// rho) rows, so proposals can be sanity-checked (e.g. against a known setup
+						// like a backboard save) without any live-run risk.
+						if (propCfg.dumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
+							(totalIterations % propCfg.dumpEveryNItrs == 0) && n > 0) {
+
+							std::filesystem::path dumpDir = config.checkpointFolder / "proposer_dumps";
+							std::filesystem::create_directories(dumpDir);
+							std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
+							std::ofstream dumpOut(dumpPath);
+							if (dumpOut.good()) {
+								int64_t numRows = RS_MIN((int64_t)RS_MAX(0, propCfg.dumpMaxRows), n);
+								torch::Tensor sampleIdx = torch::randperm(n, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, numRows);
+								auto _sampleIdx = sampleIdx.const_data_ptr<int64_t>();
+								for (int64_t i = 0; i < numRows; i++) {
+									int64_t row = _sampleIdx[i];
+									using namespace nlohmann;
+									json j = {};
+									j["itr"] = totalIterations;
+									j["ts"] = totalTimesteps;
+									j["row"] = row;
+									j["cur"] = std::vector<float>(
+										combinedTraj.proposerCurBall.begin() + row * 6, combinedTraj.proposerCurBall.begin() + row * 6 + 6);
+									j["goal"] = TENSOR_TO_VEC<float>(tGoals[row]);
+									j["ach"] = std::vector<float>(
+										combinedTraj.proposerTargetBall.begin() + row * 6, combinedTraj.proposerTargetBall.begin() + row * 6 + 6);
+									j["aN"] = tAN[row].item<float>();
+									j["w"] = tWeights[row].item<float>();
+									j["rho"] = tRhoGoal[row].item<float>();
+									j["practice"] = 0;
+									dumpOut << j.dump() << "\n";
+								}
+							}
+						}
+
+						report["Proposer/Time"] = propTimer.Elapsed();
+					}
+
 					Timer gaeTimer = {};
 					// Run GAE
 					torch::Tensor tAdvantages, tTargetVals, tReturns;
@@ -1374,6 +1776,22 @@ void GGL::Learner::Start() {
 					report["GAE/Avg Advantage"] = tAdvantages.abs().mean().item<float>();
 					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
 
+					// Stage 2 (deliberate-practice shaping): added AFTER GAE has already derived
+					// tTargetVals from the UNshaped advantages (GAE.cpp: targetValues = valPreds +
+					// advantages) - so the critic's targets never see this term, only the policy's
+					// advantages do. Centered (pushes toward above-average-progress goals, not just
+					// "more"), scaled so its std matches shapingBeta fraction of the extrinsic std,
+					// then added in. shapingBeta == 0 (the default) makes this exactly a no-op.
+					if (tPropAInt.defined() && config.ppo.proposer.shapingBeta > 0) {
+						tPropAInt = tPropAInt - tPropAInt.mean();
+						float stdExt = tAdvantages.std().item<float>();
+						float stdInt = RS_MAX(1e-6f, tPropAInt.std().item<float>());
+						float betaEff = config.ppo.proposer.shapingBeta * stdExt / stdInt;
+						tAdvantages = tAdvantages + betaEff * tPropAInt;
+						report["Proposer/Shaping BetaEff"] = betaEff;
+						report["Proposer/Shaping Injected Abs Mean"] = (betaEff * tPropAInt).abs().mean().item<float>();
+					}
+
 					// Set experience buffer
 					experience.data.actions = tActions;
 					experience.data.logProbs = tLogProbs;
@@ -1394,6 +1812,18 @@ void GGL::Learner::Start() {
 				if (ppo->device.is_cuda())
 					c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
+
+				// Deliberate-practice proposer training: deferred until here (outside the
+				// RG_NO_GRAD "Process timesteps" block above, same reason ppo->Learn() itself is
+				// deferred) so Delta's own backward pass can actually build a graph. Uses the
+				// pre-update goals/rho computed above for this iteration's shaping/logging, then
+				// updates - so what got logged/shaped this iteration reflects the OLD proposer.
+				if (proposerOn && ppo->proposer && tPropFeatures.defined()) {
+					Timer propTrainTimer = {};
+					auto propTrainResult = ppo->proposer->Train(tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights);
+					report["Proposer/Loss"] = propTrainResult.loss;
+					report["Proposer/Train Time"] = propTrainTimer.Elapsed();
+				}
 
 				// Learn
 				Timer learnTimer = {};
@@ -1449,6 +1879,14 @@ void GGL::Learner::Start() {
 						"Reach/Car Accuracy",
 						"Reach/Ball Accuracy",
 						"Reach/Touch Pred Agreement",
+						"",
+						"Proposer/Loss",
+						"Proposer/Rho Goal Mean",
+						"Proposer/Weight Fraction",
+						"Proposer/Shaping BetaEff",
+						"Proposer/Drill Bank Size",
+						"Proposer/Drills Added",
+						"Proposer/Practice Step Fraction",
 						"",
 						"Policy Update Magnitude",
 						"Critic Update Magnitude",

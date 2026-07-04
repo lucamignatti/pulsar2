@@ -7,6 +7,7 @@
 
 #include "../Util/Models.h"
 #include "Reachability.h"
+#include "Proposer.h"
 
 #include <torch/optim/adam.h>
 #include <torch/nn/modules/loss.h>
@@ -31,6 +32,11 @@ namespace GGL {
 		// process resuming a checkpoint doesn't blend a meaningless 0 into a healthy EMA).
 		float lastReachAccuracy = 0;
 		bool lastReachTrained = false;
+
+		// Deliberate-practice goal proposer (null unless config.proposer.enabled); its model lives
+		// inside `models` and saves/loads with everything else, but is EXCLUDED from GetPolicyModels()
+		// (old policy versions predate it) and is groupStepExempt (steps itself, never via the PPO loop)
+		ProposerModule* proposer = NULL;
 
 		PPOLearnerConfig config;
 		torch::Device device;

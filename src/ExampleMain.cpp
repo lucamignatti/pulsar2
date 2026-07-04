@@ -10,10 +10,15 @@
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
+#include <RLGymCPP/StateSetters/DrillSetter.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
+
+// Deliberate-practice drill bank (Stage 3, off by default - see cfg.ppo.proposer below): shared
+// across every arena's DrillSetter and the Learner's collection/learn-prep code.
+static RLGC::DrillBank g_DrillBank;
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
@@ -100,6 +105,10 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to reach
 		// corners and goal lines)
 		{ new RandomState(true, true, false), 0.30f },
+		// Deliberate-practice drills (Stage 3): weight 0.0 until cfg.ppo.proposer.practiceEnabled
+		// is turned on - CombinedState never selects a 0-weight setter, so this is a no-op today.
+		// Falls back to the ground-touch setter when the bank is empty.
+		{ new DrillSetter(&g_DrillBank, index, new BallNearCarState(600, 900)), 0.0f },
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
@@ -193,6 +202,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = true;
 
+	// Deliberate-practice goal proposer (advantage-weighted-hindsight goal proposal, in the same
+	// reachability BALL-head goal space). Stage 1 (passive: trains + logs, never touches the
+	// training signal) SHIPS ENABLED here. Stage 2 (shapingBeta) and Stage 3 (practiceEnabled) are
+	// code-complete but left OFF - flip them on only after reviewing Stage 1's calibration dumps.
+	cfg.ppo.proposer.enabled = true;
+	cfg.ppo.proposer.shapingBeta = 0.0f;      // Stage 2 off
+	cfg.ppo.proposer.practiceEnabled = false; // Stage 3 off
+	cfg.ppo.proposer.drillBank = &g_DrillBank; // harmless while practiceEnabled is false
+
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
 	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
 	// would let a first goal land as an unclipped 40+ sigma value-target spike under the
@@ -213,6 +231,8 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.lr = 3e-4f;
+	cfg.ppo.proposer.delta.layerSizes = { 256, 256 };
+	cfg.ppo.proposer.lr = 1e-4f;
 
 	// Muon's RMS-matched scaling makes Adam-tuned LRs transfer as-is.
 	// The reachability heads deliberately stay on Adam: contrastive InfoNCE embeddings

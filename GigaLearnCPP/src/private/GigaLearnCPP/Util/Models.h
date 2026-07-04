@@ -97,6 +97,10 @@ namespace GGL {
 
 		torch::optim::Optimizer* optim;
 
+		// When true, ModelSet::StepOptims() skips this model — it is stepped
+		// independently by its owning module (e.g. ProposerModule::Train()).
+		bool groupStepExempt = false;
+
 		Model() : config(PartialModelConfig{}), device({}), modelName(NULL) {} // Uninitialized init
 
 		Model(
@@ -182,6 +186,8 @@ namespace GGL {
 		// NOTE: Automatically zeros grad after
 		void StepOptims() {
 			for (Model* model : *this) {
+				if (model->groupStepExempt)
+					continue;
 				model->StepOptim();
 			}
 		}

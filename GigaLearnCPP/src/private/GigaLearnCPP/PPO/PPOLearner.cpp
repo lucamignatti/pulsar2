@@ -22,6 +22,13 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models);
 	}
 
+	if (config.proposer.enabled) {
+		if (!config.reachability.enabled)
+			RG_ERR_CLOSE("PPOLearner: config.proposer.enabled requires config.reachability.enabled (the proposer reuses the reachability phi/psiBall goal space)");
+		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
+		proposer = new ProposerModule(trunkOutSize, config.proposer, device, models);
+	}
+
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	// Print param counts
@@ -494,6 +501,11 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 
 		// Reachability heads are training-time-only; old policy versions don't carry them
 		if (name.rfind("reach_", 0) == 0)
+			continue;
+
+		// Same for the deliberate-practice proposer - it's training-time-only and old policy
+		// versions are loaded with allowNotExist=false, which would hard-fail on it
+		if (name.rfind("proposer", 0) == 0)
 			continue;
 
 		result.Add(model);
