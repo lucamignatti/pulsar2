@@ -214,18 +214,17 @@ int main(int argc, char* argv[]) {
 	// is this one line back to 0.0 - the term only ever touches advantages, never value targets.
 	cfg.ppo.proposer.shapingBeta = 0.05f;
 
-	// Stage 3 in DETECTION-ONLY mode: practiceEnabled runs Phi-drop detection (banks near-miss
-	// snapshots, logs Proposer/Drill Bank Size + Drills Added), but the DrillSetter stays at weight
-	// 0.0 in EnvCreateFunc, so NO arena ever resets into a drill and NO practice window ever arms.
-	// That means zero reset-distribution perturbation and zero training-signal effect - this is the
-	// observable, fully-reversible half of Stage 3. Once the bank grows with sane drills, bump the
-	// DrillSetter weight to ~0.1 to actually replay them (that's the one irreversible knob).
-	// Thresholds calibrated for the live rho (~-4 mean): the shipped 0.7/0.3 sit deep in the flat
-	// tail of sigmoid(rho/10) and would essentially never fire; 0.42/0.08 operate in the live regime.
-	// Refine from proposer_report.py's rho-distribution readout.
+	// Stage 3 in DETECTION-ONLY mode: practiceEnabled runs Phi-drop detection (banks the worst
+	// near-miss snapshots, logs Proposer/Drill Bank Size + Drills Added + Drill Candidates, and
+	// dumps the bank's contents to <ckpt>/drill_dumps/ for eyeballing), but the DrillSetter stays
+	// at weight 0.0 in EnvCreateFunc, so NO arena ever resets into a drill and NO practice window
+	// ever arms. That means zero reset-distribution perturbation and zero training-signal effect -
+	// the observable, fully-reversible half of Stage 3. The detector self-calibrates its thresholds
+	// from each batch's own Phi distribution (phiCalibratePerIter, default on), so no rho-dependent
+	// hand-tuning is needed, and banks the largest-drop candidates rather than the first found.
+	// Once the drill dumps look like real near-misses (aerial whiffs / blown saves, not kickoff
+	// chaos), bump the DrillSetter weight to ~0.1 to actually replay them (the one irreversible knob).
 	cfg.ppo.proposer.practiceEnabled = true;
-	cfg.ppo.proposer.phiHighThresh = 0.42f;
-	cfg.ppo.proposer.phiDropThresh = 0.08f;
 	cfg.ppo.proposer.drillBank = &g_DrillBank;
 
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the

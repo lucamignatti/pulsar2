@@ -42,6 +42,17 @@ namespace RLGC {
 			float goal[6] = {};
 			Team sourceTeam = Team::BLUE;
 			int tries = 0, successes = 0;
+			float drop = 0; // Phi-drop magnitude at banking time (severity of the near-miss)
+		};
+
+		// Lightweight view of a banked drill for offline eyeballing (no full snapshot copy).
+		struct DrillDumpRow {
+			uint64_t id;
+			float ballPos[3], ballVel[3];
+			float goal[6];
+			int sourceTeam;
+			float drop;
+			int tries, successes;
 		};
 
 		struct PracticeWindow {
@@ -115,16 +126,40 @@ namespace RLGC {
 			}
 		}
 
-		void AddDrill(const ArenaSnapshot& snap, const float goal[6], Team sourceTeam) {
+		void AddDrill(const ArenaSnapshot& snap, const float goal[6], Team sourceTeam, float drop = 0) {
 			std::lock_guard<std::mutex> lock(mtx);
 			Drill d;
 			d.id = nextId++;
 			d.snap = snap;
 			memcpy(d.goal, goal, sizeof(d.goal));
 			d.sourceTeam = sourceTeam;
+			d.drop = drop;
 			drills.push_back(std::move(d));
 			if ((int)drills.size() > maxSizeCfg)
 				drills.erase(drills.begin()); // drop oldest
+		}
+
+		// Snapshot the bank's contents (up to maxRows, most-recent first) for a JSONL dump. Copies
+		// out only the lightweight fields under the lock, so the caller can write to disk unlocked.
+		std::vector<DrillDumpRow> SnapshotForDump(int maxRows) const {
+			std::lock_guard<std::mutex> lock(mtx);
+			std::vector<DrillDumpRow> out;
+			int count = (int)drills.size();
+			int start = (maxRows > 0 && count > maxRows) ? count - maxRows : 0;
+			for (int i = count - 1; i >= start; i--) {
+				const Drill& d = drills[i];
+				DrillDumpRow r = {};
+				r.id = d.id;
+				r.ballPos[0] = d.snap.ball.pos.x; r.ballPos[1] = d.snap.ball.pos.y; r.ballPos[2] = d.snap.ball.pos.z;
+				r.ballVel[0] = d.snap.ball.vel.x; r.ballVel[1] = d.snap.ball.vel.y; r.ballVel[2] = d.snap.ball.vel.z;
+				memcpy(r.goal, d.goal, sizeof(r.goal));
+				r.sourceTeam = (int)d.sourceTeam;
+				r.drop = d.drop;
+				r.tries = d.tries;
+				r.successes = d.successes;
+				out.push_back(r);
+			}
+			return out;
 		}
 
 		// Retires a drill once it's been tried enough AND is either reliably solved (success rate

@@ -129,10 +129,22 @@ namespace GGL {
 		RLGC::DrillBank* drillBank = NULL; // owned by user code (e.g. ExampleMain); required when practiceEnabled
 		int snapshotEveryK = 8;           // per-arena snapshot cadence, in collection steps
 		float phiSquashTemp = 10;         // Phi = sigmoid(rho / T) for drop detection
-		float phiHighThresh = 0.7f;       // Phi was "high" if it reached at least this
-		float phiDropThresh = 0.3f;       // ...then a drop of at least this within the window is a "mistake"
+		// Phi-drop detector thresholds. Phi is a squashed InfoNCE logit - uncalibrated and NON-
+		// stationary (the rho distribution drifts as the reach critic + policy improve), so absolute
+		// thresholds silently flood or starve. Default = self-calibrate each iteration from the
+		// batch's own Phi distribution over non-practice rows: "high" = the phiHighPercentile-th Phi,
+		// "drop" = that minus the phiDropPercentile-th Phi. Scale-free, tracks the drift automatically
+		// (same dimensionless-dial pattern as aspirationPercentile). Set phiCalibratePerIter=false to
+		// fall back to the fixed phiHighThresh/phiDropThresh below.
+		bool phiCalibratePerIter = true;
+		float phiHighPercentile = 0.85f;  // batch percentile that counts as a "high" (reachable) moment
+		float phiDropPercentile = 0.40f;  // low anchor; drop-magnitude bar = Phi(pHigh) - Phi(pDrop)
+		float phiHighThresh = 0.7f;       // absolute fallback: Phi was "high" if it reached at least this
+		float phiDropThresh = 0.3f;       // absolute fallback: a drop of at least this = a "mistake"
 		int phiDropWindow = 30;           // steps
-		int maxNewDrillsPerItr = 16;
+		int maxNewDrillsPerItr = 16;      // bank at most this many per iter, the LARGEST-drop candidates
+		int drillDumpEveryNItrs = 25;     // JSONL dump of the bank's contents for eyeballing; 0 = never
+		int drillDumpMaxRows = 128;
 		int practiceWindowSteps = 90;     // tagged window length after a drill reset (~6s at tickSkip 8)
 		float practiceBetaScale = 3.0f;   // shaping amplification on practice-tagged rows
 		float drillJitterPos = 100, drillJitterVel = 150;

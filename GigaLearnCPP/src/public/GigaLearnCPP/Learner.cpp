@@ -1622,14 +1622,44 @@ void GGL::Learner::Start() {
 							int numArenas = (int)envSet->arenas.size();
 							int dropWindow = RS_MAX(1, propCfg.phiDropWindow);
 							int snapK = RS_MAX(1, propCfg.snapshotEveryK);
-							int newDrills = 0;
 
-							// New drills: scan each episode's NON-practice rows for a Phi high -> drop
-							for (int64_t e = 0; e < (int64_t)epStart.size() && newDrills < propCfg.maxNewDrillsPerItr; e++) {
+							// Detector thresholds: self-calibrated from THIS batch's non-practice Phi
+							// distribution (default; tracks the drifting rho scale so the detector
+							// neither floods nor starves) or the fixed absolutes as a fallback.
+							float phiHigh = propCfg.phiHighThresh;
+							float phiDropMag = propCfg.phiDropThresh;
+							if (propCfg.phiCalibratePerIter) {
+								FList phiSorted;
+								phiSorted.reserve(n);
+								for (int64_t t = 0; t < n; t++)
+									if (combinedTraj.practiceMask.empty() || !combinedTraj.practiceMask[t])
+										phiSorted.push_back(phi[t]);
+								if (phiSorted.size() >= 8) {
+									auto pctl = [&](float p) {
+										int64_t k = RS_CLAMP((int64_t)(phiSorted.size() * RS_CLAMP(p, 0.f, 1.f)),
+											(int64_t)0, (int64_t)phiSorted.size() - 1);
+										std::nth_element(phiSorted.begin(), phiSorted.begin() + k, phiSorted.end());
+										return phiSorted[k];
+									};
+									float pHigh = pctl(propCfg.phiHighPercentile);
+									float pLow = pctl(propCfg.phiDropPercentile);
+									phiHigh = pHigh;
+									phiDropMag = RS_MAX(1e-4f, pHigh - pLow);
+								}
+							}
+							report["Proposer/Phi High Thresh"] = phiHigh;
+							report["Proposer/Phi Drop Mag"] = phiDropMag;
+
+							// Collect ALL drop candidates first, then bank the LARGEST-drop
+							// maxNewDrillsPerItr - "the worst misses this iteration", not the
+							// first-in-scan-order (which biased toward early-in-the-batch episodes).
+							struct DrillCand { float drop; int64_t highRow; };
+							std::vector<DrillCand> cands;
+							for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
 								int64_t s = epStart[e], en = epEnd[e];
 								float runningHigh = phi[s];
 								int64_t highRow = s;
-								for (int64_t t = s + 1; t <= en && newDrills < propCfg.maxNewDrillsPerItr; t++) {
+								for (int64_t t = s + 1; t <= en; t++) {
 									if (!combinedTraj.practiceMask.empty() && combinedTraj.practiceMask[t])
 										continue; // mid-drill mistakes aren't fresh near-misses to bank
 
@@ -1639,33 +1669,40 @@ void GGL::Learner::Start() {
 										continue;
 									}
 
-									if (runningHigh >= propCfg.phiHighThresh &&
-										(runningHigh - phi[t]) >= propCfg.phiDropThresh &&
-										(t - highRow) <= dropWindow) {
-
-										int player = combinedTraj.srcPlayer[highRow];
-										int localStep = combinedTraj.srcStep[highRow];
-										int snapStep = (localStep / snapK) * snapK;
-										int arenaIdx = playerArenaIdx[player];
-
-										auto it = stepSnapshots.find((int64_t)snapStep * numArenas + arenaIdx);
-										if (it != stepSnapshots.end()) {
-											FList goalVec = TENSOR_TO_VEC<float>(tGoals[highRow]);
-											float goal6[6];
-											for (int d = 0; d < 6; d++)
-												goal6[d] = goalVec[d];
-											Team sourceTeam = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[player]].team;
-											propCfg.drillBank->AddDrill(it->second, goal6, sourceTeam);
-											newDrills++;
-										}
-
+									float drop = runningHigh - phi[t];
+									if (runningHigh >= phiHigh && drop >= phiDropMag && (t - highRow) <= dropWindow) {
+										cands.push_back({ drop, highRow });
 										// Don't re-trigger repeatedly on the same decline
 										runningHigh = phi[t];
 										highRow = t;
 									}
 								}
 							}
+
+							std::sort(cands.begin(), cands.end(),
+								[](const DrillCand& a, const DrillCand& b) { return a.drop > b.drop; });
+							int newDrills = 0;
+							for (const DrillCand& c : cands) {
+								if (newDrills >= propCfg.maxNewDrillsPerItr)
+									break;
+								int player = combinedTraj.srcPlayer[c.highRow];
+								int localStep = combinedTraj.srcStep[c.highRow];
+								int snapStep = (localStep / snapK) * snapK;
+								int arenaIdx = playerArenaIdx[player];
+
+								auto it = stepSnapshots.find((int64_t)snapStep * numArenas + arenaIdx);
+								if (it != stepSnapshots.end()) {
+									FList goalVec = TENSOR_TO_VEC<float>(tGoals[c.highRow]);
+									float goal6[6];
+									for (int d = 0; d < 6; d++)
+										goal6[d] = goalVec[d];
+									Team sourceTeam = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[player]].team;
+									propCfg.drillBank->AddDrill(it->second, goal6, sourceTeam, c.drop);
+									newDrills++;
+								}
+							}
 							report["Proposer/Drills Added"] = (float)newDrills;
+							report["Proposer/Drill Candidates"] = (float)cands.size();
 
 							// Drill success: a practice-tagged drillId succeeds if Phi recovered to
 							// the high threshold anywhere within its tagged rows
@@ -1675,7 +1712,7 @@ void GGL::Learner::Start() {
 									if (!combinedTraj.practiceMask[t])
 										continue;
 									int64_t drillId = combinedTraj.drillIds[t];
-									bool success = phi[t] >= propCfg.phiHighThresh;
+									bool success = phi[t] >= phiHigh;
 									auto res = drillSuccess.emplace(drillId, success);
 									if (!res.second && success)
 										res.first->second = true;
@@ -1691,6 +1728,36 @@ void GGL::Learner::Start() {
 
 							report["Proposer/Drill Bank Size"] = (float)propCfg.drillBank->Size();
 							report["Proposer/Drill Success Rate"] = propCfg.drillBank->AvgSuccessRate();
+
+							// JSONL dump of the bank's current contents for offline eyeballing -
+							// the "are these real near-misses (aerial whiffs, blown saves) or junk
+							// (kickoff chaos, opponent bounces)?" check before replay is ever enabled.
+							if (propCfg.drillDumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
+								(totalIterations % propCfg.drillDumpEveryNItrs == 0)) {
+								auto dumpRows = propCfg.drillBank->SnapshotForDump(propCfg.drillDumpMaxRows);
+								if (!dumpRows.empty()) {
+									std::filesystem::path dumpDir = config.checkpointFolder / "drill_dumps";
+									std::filesystem::create_directories(dumpDir);
+									std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
+									std::ofstream dumpOut(dumpPath);
+									if (dumpOut.good()) {
+										for (auto& dr : dumpRows) {
+											using namespace nlohmann;
+											json j = {};
+											j["itr"] = totalIterations;
+											j["id"] = dr.id;
+											j["ball_pos"] = { dr.ballPos[0], dr.ballPos[1], dr.ballPos[2] };
+											j["ball_vel"] = { dr.ballVel[0], dr.ballVel[1], dr.ballVel[2] };
+											j["goal"] = std::vector<float>(dr.goal, dr.goal + 6);
+											j["team"] = dr.sourceTeam;
+											j["drop"] = dr.drop;
+											j["tries"] = dr.tries;
+											j["successes"] = dr.successes;
+											dumpOut << j.dump() << "\n";
+										}
+									}
+								}
+							}
 						}
 
 						// Hand off to the deferred (gradient-requiring) Train() call after this
