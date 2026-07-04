@@ -81,13 +81,11 @@ def verdicts(s):
          f"{s['weight_frac']:.3f}"),
         ("TRACKING: beats no-op", s["goal_ach_dist"] < s["noop_ach_dist"],
          f"goal->ach {s['goal_ach_dist']:.3f} vs cur->ach {s['noop_ach_dist']:.3f}"),
-        ("ASPIRATION: fits w=1 best", s["goal_ach_dist_hi"] < s["goal_ach_dist_lo"],
-         f"hi {s['goal_ach_dist_hi']:.3f} vs lo {s['goal_ach_dist_lo']:.3f}"),
-        ("ASPIRATION: goalward tilt", s["goal_y"] > s["ach_y"],
-         f"cur_y {s['cur_y']:.3f} goal_y {s['goal_y']:.3f} ach_y {s['ach_y']:.3f}"
-         f" ach_y_hi {s['ach_y_hi']:.3f} (weak signal: advantage-aspiration is state-relative, not globally goalward)"),
         ("SANITY: clamp not saturated", s["clamp_frac"] < 0.20,
          f"{s['clamp_frac']:.1%} of goals touch the clamp box"),
+        # NOTE: the old "fits w=1 best" error comparison was variance-confounded (aspirational
+        # futures are intrinsically noisier, so even a perfect tilt can show higher error on
+        # them) - the real aspiration check is the TILT section below, in displacement space.
     ]
     return checks
 
@@ -147,6 +145,57 @@ def separability(rows):
         print("     the weighting isn't biting (raise aspirationPercentile / lower belowAspirationWeight).")
 
 
+def tilt_report(rows):
+    """THE aspiration check, in displacement space (immune to the group-variance confound).
+
+    For each separable dimension (|Cohen d| >= 0.15 between w=1 and low-w future displacements),
+    places the proposer's mean displacement on the [ordinary ... aspirational] axis:
+        tilt = (goal_disp - lo_disp) / (hi_disp - lo_disp)
+    0.0  = proposes ordinary futures; 0.25 = exactly an UNWEIGHTED forecast (hi rows are 25%
+    of data); ~0.87 = matches the training gradient mass on w=1 rows; >= 0.5 = the weighting
+    is biting and proposals are majority-aspirational -> PASS.
+    Returns True/False, or None if no dimension is separable (see the separability section).
+    """
+    dims = ["x", "y", "z", "vx", "vy", "vz"]
+    hi = [r for r in rows if r["w"] >= 1.0]
+    lo = [r for r in rows if r["w"] < 1.0]
+    if len(hi) < 30 or len(lo) < 30:
+        print("\n=== Aspiration tilt === (too few rows)")
+        return None
+
+    entries = []
+    for i in range(6):
+        dh = [r["ach"][i] - r["cur"][i] for r in hi]
+        dl = [r["ach"][i] - r["cur"][i] for r in lo]
+        dg = [r["goal"][i] - r["cur"][i] for r in rows]
+        mh, ml, mg = mean(dh), mean(dl), mean(dg)
+        vh = mean((v - mh) ** 2 for v in dh)
+        vl = mean((v - ml) ** 2 for v in dl)
+        pooled = math.sqrt((vh * (len(dh) - 1) + vl * (len(dl) - 1)) /
+                           max(1, len(dh) + len(dl) - 2))
+        d = (mh - ml) / pooled if pooled > 1e-9 else 0.0
+        if abs(d) < 0.15 or abs(mh - ml) < 1e-6:
+            continue
+        entries.append((abs(d), dims[i], mg, mh, ml, (mg - ml) / (mh - ml)))
+
+    print("\n=== Aspiration tilt (pooled dumps; 0=ordinary, 0.25=unweighted forecast, 1=aspirational) ===")
+    if not entries:
+        print("  No separable dimension (max |d| < 0.15) - tilt is unmeasurable at this horizon;")
+        print("  see the separability verdict for the fix.")
+        return None
+
+    entries.sort(reverse=True)
+    for absd, name, mg, mh, ml, tilt in entries:
+        print(f"  dim {name:3s} |d|={absd:.2f}   goal-disp {mg:+.4f}   aspir. {mh:+.4f}   ordinary {ml:+.4f}"
+              f"   -> tilt = {tilt:+.2f}")
+
+    top_tilt = entries[0][5]
+    ok = top_tilt >= 0.5
+    print(f"  [{'PASS' if ok else 'FAIL'}] TILT: proposals are majority-aspirational on the most"
+          f" separable dim ({entries[0][1]}: {top_tilt:+.2f}, need >= 0.5)")
+    return ok
+
+
 def plot(by_itr, out_path):
     try:
         import matplotlib
@@ -175,7 +224,7 @@ def plot(by_itr, out_path):
     ax = axes[0][1]
     ax.plot(itrs, series["goal_ach_dist_hi"], label="error on w=1 (aspirational) rows")
     ax.plot(itrs, series["goal_ach_dist_lo"], label="error on low-w rows", ls="--")
-    ax.set_title("Aspiration: weighted fit should favor w=1")
+    ax.set_title("Per-group error (variance-confounded; see TILT section for the real check)")
     ax.set_xlabel("iteration"); ax.legend(); ax.grid(alpha=0.3)
 
     ax = axes[1][0]
@@ -231,12 +280,14 @@ def main():
     for name, ok, detail in checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:32s} {detail}")
         passed += ok
-    print(f"\n  {passed}/{len(checks)} gates passed."
-          f" Stage 2 wants ALL of: tracking, aspiration (both), sanity.")
 
-    # Separability over a decent sample: pool the last few dumps (~2.5k rows)
+    # Separability + tilt over a decent sample: pool the last few dumps (~2.5k rows)
     pooled_rows = [r for itr in itrs[-5:] for r in by_itr[itr]]
     separability(pooled_rows)
+    tilt_ok = tilt_report(pooled_rows)
+
+    print(f"\n  Stage-2 go/no-go = TRACKING + SANITY gates above + the TILT verdict."
+          f" Currently: {'GO' if (passed == len(checks) and tilt_ok) else 'NO-GO'}.")
 
     # Trend over the loaded window (is it improving or plateaued?)
     if len(itrs) >= 4:
