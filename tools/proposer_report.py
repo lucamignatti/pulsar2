@@ -84,11 +84,67 @@ def verdicts(s):
         ("ASPIRATION: fits w=1 best", s["goal_ach_dist_hi"] < s["goal_ach_dist_lo"],
          f"hi {s['goal_ach_dist_hi']:.3f} vs lo {s['goal_ach_dist_lo']:.3f}"),
         ("ASPIRATION: goalward tilt", s["goal_y"] > s["ach_y"],
-         f"goal_y {s['goal_y']:.3f} vs ach_y {s['ach_y']:.3f} (aspir. futures ach_y_hi {s['ach_y_hi']:.3f})"),
+         f"cur_y {s['cur_y']:.3f} goal_y {s['goal_y']:.3f} ach_y {s['ach_y']:.3f}"
+         f" ach_y_hi {s['ach_y_hi']:.3f} (weak signal: advantage-aspiration is state-relative, not globally goalward)"),
         ("SANITY: clamp not saturated", s["clamp_frac"] < 0.20,
          f"{s['clamp_frac']:.1%} of goals touch the clamp box"),
     ]
     return checks
+
+
+def separability(rows):
+    """Can the 'fits w=1 best' gate EVER pass at this horizon?
+
+    Compares the future-displacement (achieved - current, 6D) distributions of w=1 vs low-w
+    rows via Cohen's d per dimension, bucketed by field half (defensive/offensive cur_y) so
+    state-dependent effects don't cancel in the aggregate. If aspirational and ordinary
+    futures are statistically identical in ball space (all |d| tiny), no amount of further
+    training can separate them - the fix is the horizon/label (shorten horizonSteps, raise
+    aspirationPercentile), not more updates. If some |d| is substantial, the signal exists
+    and the tilt is learnable: wait for loss plateau or sharpen the weighting.
+    """
+    dims = ["x", "y", "z", "vx", "vy", "vz"]
+    buckets = {
+        "all rows": rows,
+        "defensive half (cur_y < 0)": [r for r in rows if r["cur"][1] < 0],
+        "offensive half (cur_y >= 0)": [r for r in rows if r["cur"][1] >= 0],
+    }
+
+    print("\n=== Label separability (is gate 4 winnable at this horizon?) ===")
+    max_d_overall = 0.0
+    for name, bucket in buckets.items():
+        hi = [r for r in bucket if r["w"] >= 1.0]
+        lo = [r for r in bucket if r["w"] < 1.0]
+        if len(hi) < 30 or len(lo) < 30:
+            print(f"  {name:28s} (too few rows: hi={len(hi)} lo={len(lo)})")
+            continue
+
+        ds = []
+        for i in range(6):
+            dh = [r["ach"][i] - r["cur"][i] for r in hi]
+            dl = [r["ach"][i] - r["cur"][i] for r in lo]
+            mh, ml = mean(dh), mean(dl)
+            vh = mean((v - mh) ** 2 for v in dh)
+            vl = mean((v - ml) ** 2 for v in dl)
+            pooled = math.sqrt((vh * (len(dh) - 1) + vl * (len(dl) - 1)) /
+                               max(1, len(dh) + len(dl) - 2))
+            ds.append((mh - ml) / pooled if pooled > 1e-9 else 0.0)
+
+        worst = max(range(6), key=lambda i: abs(ds[i]))
+        max_d_overall = max(max_d_overall, abs(ds[worst]))
+        detail = " ".join(f"{dims[i]}:{ds[i]:+.2f}" for i in range(6))
+        print(f"  {name:28s} max |d| = {abs(ds[worst]):.2f} ({dims[worst]})   [{detail}]")
+
+    if max_d_overall < 0.08:
+        print("  -> VERDICT: aspirational and ordinary futures look IDENTICAL in ball space at this")
+        print("     horizon. More training cannot make gate 4 pass; shorten horizonSteps and/or raise")
+        print("     aspirationPercentile, then re-collect.")
+    elif max_d_overall < 0.20:
+        print("  -> VERDICT: weak but real signal. Tilt is learnable but slow/small - wait for loss")
+        print("     plateau, and consider aspirationPercentile 0.75 -> 0.90 to sharpen the label.")
+    else:
+        print("  -> VERDICT: labels are clearly separable - if gate 4 still fails at loss plateau,")
+        print("     the weighting isn't biting (raise aspirationPercentile / lower belowAspirationWeight).")
 
 
 def plot(by_itr, out_path):
@@ -177,6 +233,10 @@ def main():
         passed += ok
     print(f"\n  {passed}/{len(checks)} gates passed."
           f" Stage 2 wants ALL of: tracking, aspiration (both), sanity.")
+
+    # Separability over a decent sample: pool the last few dumps (~2.5k rows)
+    pooled_rows = [r for itr in itrs[-5:] for r in by_itr[itr]]
+    separability(pooled_rows)
 
     # Trend over the loaded window (is it improving or plateaued?)
     if len(itrs) >= 4:
