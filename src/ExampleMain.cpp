@@ -105,12 +105,13 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to reach
 		// corners and goal lines)
 		{ new RandomState(true, true, false), 0.30f },
-		// Deliberate-practice drills (Stage 3): weight 0.0 = DETECTION-ONLY. With practiceEnabled=true
-		// the bank still fills from Phi-drop detection, but CombinedState never selects a 0-weight
-		// setter, so drills are never replayed and the reset distribution is untouched. Bump to ~0.1
-		// to actually replay banked drills (the one non-cheaply-reversible knob - it perturbs the
-		// collected data the critic trains on). Falls back to the ground-touch setter if the bank is empty.
-		{ new DrillSetter(&g_DrillBank, index, new BallNearCarState(600, 900)), 0.0f },
+		// Deliberate-practice drills (Stage 3, REPLAY ON): ~9% of resets (0.1/1.1 of the mix) restore
+		// a banked near-miss snapshot with jitter and arm a practice window for the source team.
+		// Gate passed 2026-07-04 (tools/drill_report.py on the live bank): 52% clearly-good near-misses
+		// (28% saves/clears near net, 24% aerial), 7% suspect, drop-severity floor 0.160 under the
+		// percentile-calibrated top-K detector. Set back to 0.0f for detection-only.
+		// Falls back to the ground-touch setter if the bank is empty.
+		{ new DrillSetter(&g_DrillBank, index, new BallNearCarState(600, 900)), 0.1f },
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = rewards;
