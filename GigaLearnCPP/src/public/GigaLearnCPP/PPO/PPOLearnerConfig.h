@@ -124,6 +124,14 @@ namespace GGL {
 		// ---- Stage 2 (code-complete; DISABLED by default) ----
 		float shapingBeta = 0.0f;         // 0 => stage-2 path fully skipped (bit-identical to stage-1-only)
 
+		// ---- Car proposer head (canonical CAR-state goals, not ball-relative; DISABLED by default) ----
+		// A second proposer head proposing where the CAR should go, delivered as its own potential
+		// shaping term. Reuses the SAME A^(N) aspiration weights + trunk features as the ball head
+		// (aspiration is goal-space-agnostic); adds a psi_carstate reach head + a second delta net.
+		// Passive when carEnabled && carShapingBeta==0 (trains + logs car-space tilt, no shaping).
+		bool carEnabled = false;          // build + train the car head (requires enabled)
+		float carShapingBeta = 0.0f;      // 0 => car shaping skipped (car head stays passive)
+
 		// ---- Stage 3 (code-complete; DISABLED by default) ----
 		bool practiceEnabled = false;
 		RLGC::DrillBank* drillBank = NULL; // owned by user code (e.g. ExampleMain); required when practiceEnabled

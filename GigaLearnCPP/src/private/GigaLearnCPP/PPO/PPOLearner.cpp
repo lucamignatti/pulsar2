@@ -19,7 +19,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
-		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models);
+		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
+			/*makeCarStateHead=*/config.proposer.enabled && config.proposer.carEnabled);
 	}
 
 	if (config.proposer.enabled) {
@@ -27,6 +28,11 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			RG_ERR_CLOSE("PPOLearner: config.proposer.enabled requires config.reachability.enabled (the proposer reuses the reachability phi/psiBall goal space)");
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		proposer = new ProposerModule(trunkOutSize, config.proposer, device, models);
+
+		// Car proposer = a SECOND ProposerModule instance (same 6D goal space, same A^(N) weights,
+		// same unroll/train machinery) with its own delta net, proposing canonical car states.
+		if (config.proposer.carEnabled)
+			proposerCar = new ProposerModule(trunkOutSize, config.proposer, device, models, "proposer_car_delta");
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);
@@ -167,6 +173,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgClip,
 		avgReachCarAcc,
 		avgReachBallAcc,
+		avgReachCarStateAcc,
 		avgReachLoss;
 
 	// Save parameters first
@@ -305,6 +312,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							}
 						}
 
+						// Car-state head (car proposer): same InfoNCE on canonical car-state HER goals.
+						// Trained on ALL rows (no move-mask - the car always has a state).
+						if (reach->psiCarState && batch.carStateHerGoals.defined()) {
+							torch::Tensor subCarStateGoals = batch.carStateHerGoals.slice(0, start, stop)
+								.index_select(0, subIdx).to(device, true, true);
+							auto carStateRes = reach->ComputeInfoNCELoss(reach->psiCarState, sa, subCarStateGoals);
+							if (carStateRes.loss.defined()) {
+								reachLoss = reachLoss.defined() ? reachLoss + carStateRes.loss : carStateRes.loss;
+								avgReachCarStateAcc += carStateRes.categoricalAccuracy;
+							}
+						}
+
 						if (reachLoss.defined()) {
 							reachLoss = (reachLoss + reach->StateActionVarPenalty(sa))
 								* config.reachability.auxLossWeight * batchSizeRatio;
@@ -365,6 +384,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				nn::utils::clip_grad_norm_(reach->phi->parameters(), 0.5f);
 				nn::utils::clip_grad_norm_(reach->psiCar->parameters(), 0.5f);
 				nn::utils::clip_grad_norm_(reach->psiBall->parameters(), 0.5f);
+				if (reach->psiCarState)
+					nn::utils::clip_grad_norm_(reach->psiCarState->parameters(), 0.5f);
 			}
 
 			models.StepOptims();
@@ -388,6 +409,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 		report["Reach/Car Accuracy"] = carAcc;
 		report["Reach/Ball Accuracy"] = ballAcc;
+		if (avgReachCarStateAcc.count > 0)
+			report["Reach/Car State Accuracy"] = avgReachCarStateAcc.Get();
 		report["Reach/Aux Loss"] = avgReachLoss.Get();
 	}
 

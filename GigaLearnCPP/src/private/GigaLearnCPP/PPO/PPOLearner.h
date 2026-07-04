@@ -37,6 +37,8 @@ namespace GGL {
 		// inside `models` and saves/loads with everything else, but is EXCLUDED from GetPolicyModels()
 		// (old policy versions predate it) and is groupStepExempt (steps itself, never via the PPO loop)
 		ProposerModule* proposer = NULL;
+		// Car proposer: second ProposerModule (canonical car-state goals), null unless proposer.carEnabled
+		ProposerModule* proposerCar = NULL;
 
 		PPOLearnerConfig config;
 		torch::Device device;

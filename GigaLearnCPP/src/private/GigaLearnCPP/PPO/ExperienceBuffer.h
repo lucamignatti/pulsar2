@@ -11,6 +11,8 @@ namespace GGL {
 			states, actions, logProbs, targetValues, actionMasks,
 			// Reachability aux-training data (undefined when reachability is disabled)
 			carHerGoals, ballHerGoals, ballMovedMask,
+			// Car-state HER goals for the car proposer's psi head (undefined unless carEnabled)
+			carStateHerGoals,
 			advantages;
 
 		auto begin() { return &states; }

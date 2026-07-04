@@ -9,7 +9,7 @@ static Tensor L2Normalize(Tensor t) {
 }
 
 GGL::ReachabilityModule::ReachabilityModule(
-	int trunkOutSize, int numActions, const ReachabilityConfig& _config, torch::Device _device, ModelSet& outModels)
+	int trunkOutSize, int numActions, const ReachabilityConfig& _config, torch::Device _device, ModelSet& outModels, bool makeCarStateHead)
 	: config(_config), device(_device), numActions(numActions) {
 
 	ModelConfig phiConfig = config.phi;
@@ -33,6 +33,12 @@ GGL::ReachabilityModule::ReachabilityModule(
 	phi->SetOptimLR(config.lr);
 	psiCar->SetOptimLR(config.lr);
 	psiBall->SetOptimLR(config.lr);
+
+	if (makeCarStateHead) {
+		psiCarState = new Model("reach_psi_carstate", psiConfig, device);
+		outModels.Add(psiCarState);
+		psiCarState->SetOptimLR(config.lr);
+	}
 }
 
 torch::Tensor GGL::ReachabilityModule::EncodeStateAction(torch::Tensor trunkOut, torch::Tensor actions) {

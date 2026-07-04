@@ -20,7 +20,8 @@ namespace GGL {
 		// set so the PPO minibatch loop's models.StepOptims() never steps it — Train() steps it itself.
 		Model* delta;
 
-		ProposerModule(int trunkOutSize, const ProposerConfig& config, torch::Device device, ModelSet& outModels);
+		ProposerModule(int trunkOutSize, const ProposerConfig& config, torch::Device device, ModelSet& outModels,
+			const char* modelName = "proposer_delta");
 
 		// Detached (no-grad) fp32 trunk features for every row, chunked like Reachability's EvalRho.
 		// Returns [n, trunkOutSize] on `device`. Never differentiable -> the proposer's own gradients

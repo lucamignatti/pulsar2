@@ -228,6 +228,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.proposer.practiceEnabled = true;
 	cfg.ppo.proposer.drillBank = &g_DrillBank;
 
+	// Car proposer head (canonical CAR-state goals — fixes the old car-critic's ball-chasing by
+	// proposing where the CAR should go, not the ball). ENABLED = trains its delta net + warms the
+	// psi_carstate reach head (via HER) + logs car-space tilt to proposer_car_dumps/. carShapingBeta
+	// stays 0 (passive) until tools/proposer_report.py confirms car-space aspiration tilt (same
+	// gate the ball head passed) AND the psi head has warmed — then flip carShapingBeta to ~0.03.
+	cfg.ppo.proposer.carEnabled = true;
+	cfg.ppo.proposer.carShapingBeta = 0.0f;
+
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
 	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
 	// would let a first goal land as an unclipped 40+ sigma value-target spike under the

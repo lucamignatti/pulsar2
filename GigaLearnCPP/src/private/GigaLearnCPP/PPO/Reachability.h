@@ -19,6 +19,9 @@ namespace GGL {
 		Model* phi;
 		Model* psiCar;
 		Model* psiBall;
+		// Canonical CAR-state goal encoder for the car proposer (null unless makeCarStateHead).
+		// Same 6D input / InfoNCE training as psiBall, different goal space (car pos+vel).
+		Model* psiCarState = NULL;
 
 		struct InfoNCEResult {
 			torch::Tensor loss; // Undefined if the batch was degenerate (< 2 rows)
@@ -26,7 +29,7 @@ namespace GGL {
 			float rawLoss = 0;
 		};
 
-		ReachabilityModule(int trunkOutSize, int numActions, const ReachabilityConfig& config, torch::Device device, ModelSet& outModels);
+		ReachabilityModule(int trunkOutSize, int numActions, const ReachabilityConfig& config, torch::Device device, ModelSet& outModels, bool makeCarStateHead = false);
 
 		// L2-normalized phi embedding for (trunk output, action index) rows
 		torch::Tensor EncodeStateAction(torch::Tensor trunkOut, torch::Tensor actions);

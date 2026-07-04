@@ -64,12 +64,12 @@ def analyze_itr(rows):
         "goal_y": mean(r["goal"][1] for r in rows),
         "ach_y": mean(r["ach"][1] for r in rows),
         "ach_y_hi": mean(r["ach"][1] for r in hi),
-        # 3. SANITY
-        "rho_mean": mean(r["rho"] for r in rows),
+        # 3. SANITY  (rho absent in car dumps until car shaping warms the psi head)
+        "rho_mean": mean(r.get("rho", 0.0) for r in rows),
         "clamp_frac": mean(any(abs(v) >= 1.49 for v in r["goal"]) for r in rows),
         "practice_frac": mean(r.get("practice", 0) for r in rows),
         "finite": all(all(math.isfinite(v) for v in r["goal"] + r["ach"] + r["cur"]) and
-                      math.isfinite(r["aN"]) and math.isfinite(r["rho"]) for r in rows),
+                      math.isfinite(r["aN"]) for r in rows),
     }
     return stats
 
@@ -107,6 +107,15 @@ def separability(rows):
         "defensive half (cur_y < 0)": [r for r in rows if r["cur"][1] < 0],
         "offensive half (cur_y >= 0)": [r for r in rows if r["cur"][1] >= 0],
     }
+    # Car dumps carry the ball pos too -> bucket by car distance-to-ball to test the
+    # heterogeneous-separability hypothesis (tilt ~0 in cruise near the ball, LARGE far away
+    # where the car "loses intention"). d3() over the first 3 (position) dims, normalized units.
+    if rows and "ball" in rows[0]:
+        def d2ball(r):
+            return dist3(r["cur"], r["ball"])
+        buckets["near ball (<0.25)"] = [r for r in rows if d2ball(r) < 0.25]
+        buckets["mid ball (0.25-0.6)"] = [r for r in rows if 0.25 <= d2ball(r) < 0.6]
+        buckets["far ball (>=0.6)"] = [r for r in rows if d2ball(r) >= 0.6]
 
     print("\n=== Label separability (is gate 4 winnable at this horizon?) ===")
     max_d_overall = 0.0
@@ -323,7 +332,8 @@ def main():
     pooled_rows = [r for itr in itrs[-5:] for r in by_itr[itr]]
     separability(pooled_rows)
     tilt_ok = tilt_report(pooled_rows)
-    rho_report(pooled_rows)
+    if pooled_rows and "rho" in pooled_rows[0]:  # ball dumps only; car dumps have no rho until shaping
+        rho_report(pooled_rows)
 
     print(f"\n  Stage-2 go/no-go = TRACKING + SANITY gates above + the TILT verdict."
           f" Currently: {'GO' if (passed == len(checks) and tilt_ok) else 'NO-GO'}.")

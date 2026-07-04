@@ -518,10 +518,12 @@ void GGL::Learner::Start() {
 			// dead afterwards, so deliberately NOT carried through Append().
 			FList achievedBall;                 // Canonical normalized ball pos+vel, 6/row
 			FList achievedCarBall;              // Car-local normalized ball pos+vel, 6/row
+			FList achievedCarState;             // Canonical normalized CAR pos+vel, 6/row (car proposer)
 			std::vector<uint8_t> touched, oppTouched; // Per-step touch flags (gate validity metric)
 			FList gatedPos;                     // Positive parts of the gated reward components
 			// Built at episode finalize by the HER relabel:
 			FList carHerGoals, ballHerGoals;
+			FList carStateHerGoals;             // future canonical car states (car proposer psi head)
 			std::vector<uint8_t> ballMoved;
 
 			// Deliberate-practice proposer extras (only filled when config.ppo.proposer.enabled):
@@ -530,6 +532,8 @@ void GGL::Learner::Start() {
 			// on. Unlike achievedBall/achievedCarBall these ARE carried through Append(), since
 			// they're per-row training data, not per-episode scratch.
 			FList proposerCurBall, proposerTargetBall;
+			// Car proposer training pairs (canonical car state at t and t+horizonSteps), 6/row each.
+			FList proposerCarCur, proposerCarTarget;
 
 			// Deliberate-practice DRILL extras (only filled when propCfg.practiceEnabled and a
 			// bank is configured): whether row t falls inside an active practice window, the
@@ -559,14 +563,18 @@ void GGL::Learner::Start() {
 				oppActionMasks.clear();
 				achievedBall.clear();
 				achievedCarBall.clear();
+				achievedCarState.clear();
 				touched.clear();
 				oppTouched.clear();
 				gatedPos.clear();
 				carHerGoals.clear();
 				ballHerGoals.clear();
+				carStateHerGoals.clear();
 				ballMoved.clear();
 				proposerCurBall.clear();
 				proposerTargetBall.clear();
+				proposerCarCur.clear();
+				proposerCarTarget.clear();
 				practiceMask.clear();
 				practiceGoals.clear();
 				drillIds.clear();
@@ -596,6 +604,9 @@ void GGL::Learner::Start() {
 				if (proposer) {
 					proposerCurBall.reserve(rows * 6);
 					proposerTargetBall.reserve(rows * 6);
+					proposerCarCur.reserve(rows * 6);
+					proposerCarTarget.reserve(rows * 6);
+					carStateHerGoals.reserve(rows * 6);
 				}
 
 				if (practice) {
@@ -625,10 +636,13 @@ void GGL::Learner::Start() {
 				gatedPos += other.gatedPos;
 				carHerGoals += other.carHerGoals;
 				ballHerGoals += other.ballHerGoals;
+				carStateHerGoals += other.carStateHerGoals;
 				ballMoved += other.ballMoved;
 
 				proposerCurBall += other.proposerCurBall;
 				proposerTargetBall += other.proposerTargetBall;
+				proposerCarCur += other.proposerCarCur;
+				proposerCarTarget += other.proposerCarTarget;
 
 				practiceMask += other.practiceMask;
 				practiceGoals += other.practiceGoals;
@@ -648,6 +662,10 @@ void GGL::Learner::Start() {
 				}
 				if (!proposerCurBall.empty())
 					RG_ASSERT(proposerCurBall.size() == n * 6 && proposerTargetBall.size() == n * 6);
+				if (!proposerCarCur.empty())
+					RG_ASSERT(proposerCarCur.size() == n * 6 && proposerCarTarget.size() == n * 6);
+				if (!carStateHerGoals.empty())
+					RG_ASSERT(carStateHerGoals.size() == n * 6);
 				if (!practiceMask.empty()) {
 					RG_ASSERT(practiceMask.size() == n && practiceGoals.size() == n * 6 && drillIds.size() == n);
 					RG_ASSERT(srcPlayer.size() == n && srcStep.size() == n);
@@ -669,6 +687,7 @@ void GGL::Learner::Start() {
 		// Deliberate-practice proposer collection extras (requires reach's achieved-ball buffers)
 		const auto& propCfg = config.ppo.proposer;
 		const bool proposerOn = propCfg.enabled && reachOn;
+		const bool proposerCarOn = proposerOn && propCfg.carEnabled;
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
 		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
@@ -763,6 +782,16 @@ void GGL::Learner::Start() {
 			traj.achievedCarBall += relVel.Dot(player.rotMat.forward) / reachCfg.carLocalScale;
 			traj.achievedCarBall += relVel.Dot(player.rotMat.right) / reachCfg.carLocalScale;
 			traj.achievedCarBall += relVel.Dot(player.rotMat.up) / reachCfg.carLocalScale;
+
+			// Canonical CAR state (the car proposer's goal space: where the CAR itself goes,
+			// NOT ball-relative — this is what fixes the old car-critic's ball-chasing magnet).
+			// Same y-flipped canonical frame + normalization as achievedBall.
+			traj.achievedCarState += sign * player.pos.x / reachCfg.posScaleX;
+			traj.achievedCarState += sign * player.pos.y / reachCfg.posScaleY;
+			traj.achievedCarState += player.pos.z / reachCfg.posScaleZ;
+			traj.achievedCarState += sign * player.vel.x / reachCfg.velScale;
+			traj.achievedCarState += sign * player.vel.y / reachCfg.velScale;
+			traj.achievedCarState += player.vel.z / reachCfg.velScale;
 		};
 
 		// HER relabeling for the reachability heads, run once per finalized episode.
@@ -826,6 +855,8 @@ void GGL::Learner::Start() {
 
 			traj.ballHerGoals.resize((size_t)n * 6);
 			traj.carHerGoals.resize((size_t)n * 6);
+			if (proposerCarOn)
+				traj.carStateHerGoals.resize((size_t)n * 6);
 			for (int t = 0; t < n; t++) {
 				int ballOff = fnPickOffset(t, reachCfg.ballHerMinOffset, reachCfg.ballHerMaxOffset, ballBiasPow, ballGoalwardBias);
 				// Controllability is local: short window, no goalward bias
@@ -834,6 +865,14 @@ void GGL::Learner::Start() {
 				for (int d = 0; d < 6; d++) {
 					traj.ballHerGoals[(size_t)t * 6 + d] = traj.achievedBall[(size_t)(t + ballOff) * 6 + d];
 					traj.carHerGoals[(size_t)t * 6 + d] = traj.achievedCarBall[(size_t)(t + carOff) * 6 + d];
+				}
+
+				// Car-STATE HER goal (for the car proposer's psi head): future canonical car state,
+				// broad window (~proposer horizon), no goalward bias - car states have no +y analog
+				if (proposerCarOn) {
+					int carStateOff = fnPickOffset(t, reachCfg.ballHerMinOffset, reachCfg.ballHerMaxOffset, ballBiasPow, 0);
+					for (int d = 0; d < 6; d++)
+						traj.carStateHerGoals[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)(t + carStateOff) * 6 + d];
 				}
 			}
 
@@ -872,11 +911,21 @@ void GGL::Learner::Start() {
 			int horizon = RS_MAX(1, propCfg.horizonSteps);
 			traj.proposerCurBall.resize((size_t)n * 6);
 			traj.proposerTargetBall.resize((size_t)n * 6);
+			bool carOn = proposerCarOn;
+			if (carOn) {
+				RG_ASSERT((int)traj.achievedCarState.size() == (n + 1) * 6);
+				traj.proposerCarCur.resize((size_t)n * 6);
+				traj.proposerCarTarget.resize((size_t)n * 6);
+			}
 			for (int t = 0; t < n; t++) {
 				int targetRow = RS_MIN(t + horizon, n);
 				for (int d = 0; d < 6; d++) {
 					traj.proposerCurBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)t * 6 + d];
 					traj.proposerTargetBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)targetRow * 6 + d];
+					if (carOn) {
+						traj.proposerCarCur[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)t * 6 + d];
+						traj.proposerCarTarget[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)targetRow * 6 + d];
+					}
 				}
 			}
 		};
@@ -1249,6 +1298,9 @@ void GGL::Learner::Start() {
 				// the block closes, mirroring how ppo->Learn() itself (which also needs gradients)
 				// is deferred to after this block.
 				torch::Tensor tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights;
+				// Car head shares tPropFeatures + tPropWeights (same trunk features + aspiration
+				// weights); only its regression pair differs.
+				torch::Tensor tPropCarPrevGoals, tPropCarTargets;
 
 				{ // Process timesteps
 					RG_NO_GRAD;
@@ -1508,6 +1560,7 @@ void GGL::Learner::Start() {
 					// writes to them; tPropAInt (if shapingBeta > 0) is the only thing it hands to
 					// GAE's advantages below, and it's centered + explicitly zeroed at terminals.
 					torch::Tensor tPropAInt; // Stage 2 shaping term, added into tAdvantages after GAE
+						torch::Tensor tPropCarAInt; // car shaping term (carShapingBeta), added after GAE
 					if (proposerOn && combinedTraj.Length() > 0 && ppo->proposer) {
 						Timer propTimer = {};
 						int64_t n = (int64_t)combinedTraj.Length();
@@ -1815,6 +1868,80 @@ void GGL::Learner::Start() {
 							}
 						}
 
+						// ---- Car proposer head: second unroll on canonical car-state goals, reusing
+						// the SAME trunk features + A^(N) aspiration weights (aspiration is goal-space
+						// agnostic). Passive unless carShapingBeta > 0. rho_car uses the psiCarState
+						// head. Mirrors the ball block above.
+						if (proposerCarOn && ppo->proposerCar) {
+							torch::Tensor tCarCur = torch::tensor(combinedTraj.proposerCarCur).reshape({ -1, 6 });
+							torch::Tensor tCarTarget = torch::tensor(combinedTraj.proposerCarTarget).reshape({ -1, 6 });
+
+							auto carUnroll = ppo->proposerCar->Unroll(tFeatures, tCarCur, epStart, epEnd);
+							torch::Tensor tCarGoals = carUnroll.goals;
+							torch::Tensor tCarPrevGoals = carUnroll.prevGoals;
+
+							bool carShapingOn = propCfg.carShapingBeta > 0 && ppo->reach->psiCarState;
+							torch::Tensor tRhoCarGoal;
+							if (carShapingOn) {
+								std::vector<torch::Tensor> carQ = { tCarGoals };
+								torch::Tensor tCarGoalsShift = tCarGoals.clone();
+								for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
+									int64_t s = epStart[e], en = epEnd[e];
+									if (en > s)
+										tCarGoalsShift.slice(0, s + 1, en + 1).copy_(tCarGoals.slice(0, s, en));
+								}
+								carQ.push_back(tCarGoalsShift);
+								auto carRhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiCarState, carQ, tStates, tActionMasks);
+								tRhoCarGoal = carRhos[0];
+								torch::Tensor tRhoCarNext = torch::zeros_like(tRhoCarGoal);
+								if (n > 1)
+									tRhoCarNext.slice(0, 0, n - 1).copy_(carRhos[1].slice(0, 1, n));
+								torch::Tensor tCarAIntRaw = config.ppo.gaeGamma * tRhoCarNext - tRhoCarGoal;
+								torch::Tensor tTerminalMask = (tTerminals == 0).to(torch::kFloat32);
+								tPropCarAInt = tCarAIntRaw * tTerminalMask;
+							}
+
+							tPropCarPrevGoals = tCarPrevGoals;
+							tPropCarTargets = tCarTarget;
+
+							report["Proposer/Car Goal Target Dist"] = (tCarGoals - tCarTarget).norm(2, -1).mean().item<float>();
+							report["Proposer/Car Goal Drift"] = carUnroll.meanDeltaNorm;
+							if (carShapingOn)
+								report["Proposer/Car Rho Goal Mean"] = tRhoCarGoal.mean().item<float>();
+
+							// Car JSONL dump for the tilt/separability report (same cadence as ball)
+							if (propCfg.dumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
+								(totalIterations % propCfg.dumpEveryNItrs == 0) && n > 0) {
+								std::filesystem::path dumpDir = config.checkpointFolder / "proposer_car_dumps";
+								std::filesystem::create_directories(dumpDir);
+								std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
+								std::ofstream dumpOut(dumpPath);
+								if (dumpOut.good()) {
+									int64_t numRows = RS_MIN((int64_t)RS_MAX(0, propCfg.dumpMaxRows), n);
+									torch::Tensor sampleIdx = torch::randperm(n, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, numRows);
+									auto _sampleIdx = sampleIdx.const_data_ptr<int64_t>();
+									for (int64_t i = 0; i < numRows; i++) {
+										int64_t row = _sampleIdx[i];
+										using namespace nlohmann;
+										json j = {};
+										j["itr"] = totalIterations;
+										j["row"] = row;
+										j["cur"] = std::vector<float>(
+											combinedTraj.proposerCarCur.begin() + row * 6, combinedTraj.proposerCarCur.begin() + row * 6 + 6);
+										j["goal"] = TENSOR_TO_VEC<float>(tCarGoals[row]);
+										j["ach"] = std::vector<float>(
+											combinedTraj.proposerCarTarget.begin() + row * 6, combinedTraj.proposerCarTarget.begin() + row * 6 + 6);
+										// ball pos at this row (for the distance-to-ball separability bucket)
+										j["ball"] = std::vector<float>(
+											combinedTraj.proposerCurBall.begin() + row * 6, combinedTraj.proposerCurBall.begin() + row * 6 + 6);
+										j["aN"] = tAN[row].item<float>();
+										j["w"] = tWeights[row].item<float>();
+										dumpOut << j.dump() << "\n";
+									}
+								}
+							}
+						}
+
 						report["Proposer/Time"] = propTimer.Elapsed();
 					}
 
@@ -1859,6 +1986,19 @@ void GGL::Learner::Start() {
 						report["Proposer/Shaping Injected Abs Mean"] = (betaEff * tPropAInt).abs().mean().item<float>();
 					}
 
+					// Car shaping term: identical centered/std-matched injection, own beta. stdExt
+					// is recomputed against the (possibly ball-shaped) advantages so the two terms
+					// compose to roughly shapingBeta + carShapingBeta of the extrinsic std.
+					if (tPropCarAInt.defined() && config.ppo.proposer.carShapingBeta > 0) {
+						tPropCarAInt = tPropCarAInt - tPropCarAInt.mean();
+						float stdExt = tAdvantages.std().item<float>();
+						float stdInt = RS_MAX(1e-6f, tPropCarAInt.std().item<float>());
+						float betaEff = config.ppo.proposer.carShapingBeta * stdExt / stdInt;
+						tAdvantages = tAdvantages + betaEff * tPropCarAInt;
+						report["Proposer/Car Shaping BetaEff"] = betaEff;
+						report["Proposer/Car Shaping Injected Abs Mean"] = (betaEff * tPropCarAInt).abs().mean().item<float>();
+					}
+
 					// Set experience buffer
 					experience.data.actions = tActions;
 					experience.data.logProbs = tLogProbs;
@@ -1871,6 +2011,8 @@ void GGL::Learner::Start() {
 						experience.data.carHerGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
 						experience.data.ballHerGoals = torch::tensor(combinedTraj.ballHerGoals).reshape({ -1, 6 });
 						experience.data.ballMovedMask = torch::tensor(combinedTraj.ballMoved);
+						if (proposerCarOn && !combinedTraj.carStateHerGoals.empty())
+							experience.data.carStateHerGoals = torch::tensor(combinedTraj.carStateHerGoals).reshape({ -1, 6 });
 					}
 				}
 
@@ -1890,6 +2032,12 @@ void GGL::Learner::Start() {
 					auto propTrainResult = ppo->proposer->Train(tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights);
 					report["Proposer/Loss"] = propTrainResult.loss;
 					report["Proposer/Train Time"] = propTrainTimer.Elapsed();
+
+					// Car head trains on the SAME features + weights, its own regression pair
+					if (proposerCarOn && ppo->proposerCar && tPropCarTargets.defined()) {
+						auto carTrainResult = ppo->proposerCar->Train(tPropFeatures, tPropCarPrevGoals, tPropCarTargets, tPropWeights);
+						report["Proposer/Car Loss"] = carTrainResult.loss;
+					}
 				}
 
 				// Learn
@@ -1954,6 +2102,9 @@ void GGL::Learner::Start() {
 						"Proposer/Drill Bank Size",
 						"Proposer/Drills Added",
 						"Proposer/Practice Step Fraction",
+						"Proposer/Car Loss",
+						"Proposer/Car Goal Drift",
+						"Proposer/Car Shaping BetaEff",
 						"",
 						"Policy Update Magnitude",
 						"Critic Update Magnitude",

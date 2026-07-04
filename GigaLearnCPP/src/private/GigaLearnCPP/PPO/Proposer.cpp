@@ -6,7 +6,8 @@
 using namespace torch;
 
 GGL::ProposerModule::ProposerModule(
-	int trunkOutSize, const ProposerConfig& _config, torch::Device _device, ModelSet& outModels)
+	int trunkOutSize, const ProposerConfig& _config, torch::Device _device, ModelSet& outModels,
+	const char* modelName)
 	: config(_config), device(_device) {
 
 	ModelConfig deltaConfig = config.delta;
@@ -14,7 +15,7 @@ GGL::ProposerModule::ProposerModule(
 	deltaConfig.numOutputs = 6;
 	deltaConfig.addOutputLayer = true;
 
-	delta = new Model("proposer_delta", deltaConfig, device);
+	delta = new Model(modelName, deltaConfig, device);
 	// The PPO minibatch loop's models.StepOptims() must never step this model - Train() steps
 	// it independently, so its optimizer's momentum state can't be perturbed by PPO gradients
 	// (which are never even computed for it, since it isn't part of the PPO/critic backward).
