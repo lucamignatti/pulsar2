@@ -32,5 +32,5 @@ void GGL::Report::Display(std::vector<std::string> keyRows) const {
 
 	stream << std::string(4, '\n');
 
-	std::cout << stream.str();
+	std::cout << stream.str() << std::flush;
 }

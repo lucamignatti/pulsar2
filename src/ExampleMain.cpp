@@ -156,6 +156,14 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 }
 
 int main(int argc, char* argv[]) {
+	// Keep stdout live when it isn't a terminal. Under tools/run_trainer.sh the
+	// trainer's stdout is a log file, so glibc switches from line- to block-
+	// buffering and the per-iteration report only surfaces once an 8 KB buffer
+	// fills -- making `--follow` look frozen. unitbuf flushes after every insertion
+	// (output volume is trivial next to training), matching the always-flushing
+	// RG_LOG idiom so a terminal run and a logged run behave identically.
+	std::cout << std::unitbuf;
+
 	// Initialize RocketSim with collision meshes (run from the repo/build dir;
 	// provision them with tools/get_collision_meshes.sh if missing)
 	RocketSim::Init("collision_meshes");
