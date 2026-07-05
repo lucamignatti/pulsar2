@@ -541,6 +541,14 @@ void GGL::Learner::Start() {
 			// Car proposer training pairs (canonical car state at t and t+horizonSteps), 6/row each.
 			FList proposerCarCur, proposerCarTarget;
 
+			// 2.2 goal-conditioned worker (only filled when propCfg.goalCondition): the ONLINE proposer
+			// goal the policy was actually conditioned on at row t (g_t) and the anchor it stepped from
+			// (g_{t-1}), per head. 6/row each. Carried through Append() — per-row policy-input + shaping
+			// + proposer-train-anchor data, not per-episode scratch. Car fields stay empty unless the
+			// car goal is part of the conditioning (carEnabled).
+			FList goalBall, prevGoalBall;
+			FList goalCar, prevGoalCar;
+
 			// Deliberate-practice DRILL extras (only filled when propCfg.practiceEnabled and a
 			// bank is configured): whether row t falls inside an active practice window, the
 			// committed goal for that window (zeros if not practicing), which bank drill it came
@@ -581,6 +589,10 @@ void GGL::Learner::Start() {
 				proposerTargetBall.clear();
 				proposerCarCur.clear();
 				proposerCarTarget.clear();
+				goalBall.clear();
+				prevGoalBall.clear();
+				goalCar.clear();
+				prevGoalCar.clear();
 				practiceMask.clear();
 				practiceGoals.clear();
 				drillIds.clear();
@@ -588,7 +600,7 @@ void GGL::Learner::Start() {
 				srcStep.clear();
 			}
 
-			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
+			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice, bool goalCond) {
 				states.reserve(rows * obsSize);
 				actionMasks.reserve(rows * numActions);
 				rewards.reserve(rows);
@@ -613,6 +625,13 @@ void GGL::Learner::Start() {
 					proposerCarCur.reserve(rows * 6);
 					proposerCarTarget.reserve(rows * 6);
 					carStateHerGoals.reserve(rows * 6);
+				}
+
+				if (goalCond) {
+					goalBall.reserve(rows * 6);
+					prevGoalBall.reserve(rows * 6);
+					goalCar.reserve(rows * 6);
+					prevGoalCar.reserve(rows * 6);
 				}
 
 				if (practice) {
@@ -650,6 +669,11 @@ void GGL::Learner::Start() {
 				proposerCarCur += other.proposerCarCur;
 				proposerCarTarget += other.proposerCarTarget;
 
+				goalBall += other.goalBall;
+				prevGoalBall += other.prevGoalBall;
+				goalCar += other.goalCar;
+				prevGoalCar += other.prevGoalCar;
+
 				practiceMask += other.practiceMask;
 				practiceGoals += other.practiceGoals;
 				drillIds += other.drillIds;
@@ -670,6 +694,10 @@ void GGL::Learner::Start() {
 					RG_ASSERT(proposerCurBall.size() == n * 6 && proposerTargetBall.size() == n * 6);
 				if (!proposerCarCur.empty())
 					RG_ASSERT(proposerCarCur.size() == n * 6 && proposerCarTarget.size() == n * 6);
+				if (!goalBall.empty())
+					RG_ASSERT(goalBall.size() == n * 6 && prevGoalBall.size() == n * 6);
+				if (!goalCar.empty())
+					RG_ASSERT(goalCar.size() == n * 6 && prevGoalCar.size() == n * 6);
 				if (!carStateHerGoals.empty())
 					RG_ASSERT(carStateHerGoals.size() == n * 6);
 				if (!practiceMask.empty()) {
@@ -694,6 +722,23 @@ void GGL::Learner::Start() {
 		const auto& propCfg = config.ppo.proposer;
 		const bool proposerOn = propCfg.enabled && reachOn;
 		const bool proposerCarOn = proposerOn && propCfg.carEnabled;
+
+		// 2.2 goal-conditioned worker: goalModel = the policy head expects a goal input (built by
+		// PPOLearner from goalDim); goalCondOn = actually run the online per-step proposer walk +
+		// record goals (training only — proposerOn is false in render); goalCarOn = the car-state
+		// goal is part of the conditioning. goalDim = 6 + (car ? 6 : 0), matching PPOLearner.
+		const bool goalModel = ppo->goalDim > 0;
+		const bool goalCondOn = goalModel && proposerOn;
+		const bool goalCarOn = goalCondOn && proposerCarOn;
+		const int goalDim = ppo->goalDim;
+
+		// 2.2 online recurrent goal state, persistent across iterations & collection steps: the
+		// current goal g_{t-1} per player (6/player each head) and whether a player is at an episode
+		// start (=> reseed g_{-1} from the achieved state, "propose staying put"). All players are
+		// carried (incl. old-version self-play opponents, which act on the live proposer's goal).
+		std::vector<float> curGoalBall(goalModel ? numPlayers * 6 : 0, 0.f);
+		std::vector<float> curGoalCar(goalCarOn ? numPlayers * 6 : 0, 0.f);
+		std::vector<uint8_t> goalAtEpStart(goalModel ? numPlayers : 0, 1);
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
 		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
@@ -739,7 +784,7 @@ void GGL::Learner::Start() {
 		// Slack covers overbatching: collection finishes the step (and its whole episodes)
 		// after crossing tsPerItr.
 		auto combinedTraj = Trajectory();
-		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, proposerOn, practiceOn);
+		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, proposerOn, practiceOn, goalCondOn);
 
 		// Deliberate-practice DRILL snapshot scratch (Stage 3): one entry per (step, arena) this
 		// iteration where a snapshot was captured, keyed by step*numArenas+arenaIdx. Cleared with
@@ -798,6 +843,36 @@ void GGL::Learner::Start() {
 			traj.achievedCarState += sign * player.vel.x / reachCfg.velScale;
 			traj.achievedCarState += sign * player.vel.y / reachCfg.velScale;
 			traj.achievedCarState += player.vel.z / reachCfg.velScale;
+		};
+
+		// 2.2: seed a player's recurrent goal g_{-1} = current achieved state (canonical ball, and
+		// canonical car state when the car goal is conditioned) at an episode start — the same
+		// "propose staying put" neutral origin ProposerModule::Unroll uses. Same canonical frame +
+		// normalization as fnAppendAchieved above, but written straight into the per-player goal
+		// buffers instead of the trajectory (available even in render, where reachOn is off).
+		auto fnSeedGoal = [&](int p) {
+			int arenaIdx = playerArenaIdx[p];
+			const auto& gs = envSet->state.gameStates[arenaIdx];
+			const auto& player = gs.players[playerSlotIdx[p]];
+			float sign = (player.team == Team::ORANGE) ? -1.f : 1.f;
+
+			float* b = &curGoalBall[(size_t)p * 6];
+			b[0] = sign * gs.ball.pos.x / reachCfg.posScaleX;
+			b[1] = sign * gs.ball.pos.y / reachCfg.posScaleY;
+			b[2] = gs.ball.pos.z / reachCfg.posScaleZ;
+			b[3] = sign * gs.ball.vel.x / reachCfg.velScale;
+			b[4] = sign * gs.ball.vel.y / reachCfg.velScale;
+			b[5] = gs.ball.vel.z / reachCfg.velScale;
+
+			if (goalCarOn) {
+				float* c = &curGoalCar[(size_t)p * 6];
+				c[0] = sign * player.pos.x / reachCfg.posScaleX;
+				c[1] = sign * player.pos.y / reachCfg.posScaleY;
+				c[2] = player.pos.z / reachCfg.posScaleZ;
+				c[3] = sign * player.vel.x / reachCfg.velScale;
+				c[4] = sign * player.vel.y / reachCfg.velScale;
+				c[5] = player.vel.z / reachCfg.velScale;
+			}
 		};
 
 		// HER relabeling for the reachability heads, run once per finalized episode.
@@ -1107,7 +1182,70 @@ void GGL::Learner::Start() {
 
 						Timer inferTimer = {};
 
-						if (oldVersion) {
+						// 2.2: g_t per player (host, global-indexed), captured for storage + curGoal
+						// advance below. Empty unless goalCondOn (render walks with zeros, records nothing).
+						std::vector<float> stepGoalBall, stepGoalCar;
+
+						if (goalModel) {
+							// Goal-conditioned worker: one fp32 trunk forward over ALL players, reused for
+							// the per-step proposer goal step AND the policy. Old-version opponents act on
+							// the same live goals. Critic path (InferCritic, learn-prep) stays goal-blind.
+							torch::Tensor tdStatesAll = tStates.to(ppo->device, true);
+							torch::Tensor liveTrunk = ppo->models["shared_head"]
+								? ppo->models["shared_head"]->Forward(tdStatesAll, false)
+								: tdStatesAll;
+
+							torch::Tensor gBall, gCar;
+							if (goalCondOn) {
+								for (int p = 0; p < numPlayers; p++)
+									if (goalAtEpStart[p])
+										fnSeedGoal(p);
+								torch::Tensor tPrevBall = torch::from_blob(
+									curGoalBall.data(), { (int64_t)numPlayers, 6 }, torch::kFloat32).to(ppo->device, true);
+								gBall = ppo->proposer->StepGoal(liveTrunk, tPrevBall);
+								if (goalCarOn) {
+									torch::Tensor tPrevCar = torch::from_blob(
+										curGoalCar.data(), { (int64_t)numPlayers, 6 }, torch::kFloat32).to(ppo->device, true);
+									gCar = ppo->proposerCar->StepGoal(liveTrunk, tPrevCar);
+								}
+							} else {
+								// Render edge (goalModel && !goalCondOn): neutral zero goal keeps dims valid
+								auto zOpts = torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device);
+								gBall = torch::zeros({ (int64_t)numPlayers, 6 }, zOpts);
+								if (goalCarOn)
+									gCar = torch::zeros({ (int64_t)numPlayers, 6 }, zOpts);
+							}
+							torch::Tensor goalCat = goalCarOn ? torch::cat({ gBall, gCar }, -1) : gBall;
+
+							if (goalCondOn) {
+								stepGoalBall = TENSOR_TO_VEC<float>(gBall.reshape({ -1 }).cpu());
+								if (goalCarOn)
+									stepGoalCar = TENSOR_TO_VEC<float>(gCar.reshape({ -1 }).cpu());
+							}
+
+							if (oldVersion) {
+								torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+								torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
+								torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+								torch::Tensor tdNewIdx = tNewPlayerIndices.to(ppo->device, true);
+								torch::Tensor tdOldIdx = tOldPlayerIndices.to(ppo->device, true);
+
+								torch::Tensor tNewActions, tOldActions;
+								// New: reuse the live trunk. Old: its own trunk (obs), live goal.
+								ppo->InferActionsGoalConditioned(ppo->models, torch::Tensor(), tdNewActionMasks,
+									goalCat.index_select(0, tdNewIdx), liveTrunk.index_select(0, tdNewIdx), &tNewActions, &tLogProbs);
+								ppo->InferActionsGoalConditioned(oldVersion->models, tdOldStates, tdOldActionMasks,
+									goalCat.index_select(0, tdOldIdx), torch::Tensor(), &tOldActions, NULL);
+
+								tActions = torch::zeros(numPlayers, tNewActions.dtype());
+								tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
+								tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
+							} else {
+								torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
+								ppo->InferActionsGoalConditioned(ppo->models, torch::Tensor(), tdActionMasks, goalCat, liveTrunk, &tActions, &tLogProbs);
+								tActions = tActions.cpu();
+							}
+						} else if (oldVersion) {
 							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
@@ -1210,6 +1348,22 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
 
+							// 2.2: record the goal the policy was conditioned on this step. curGoalBall
+							// still holds g_{t-1} (advanced only after this block); stepGoalBall is g_t.
+							if (goalCondOn) {
+								auto& traj = trajectories[newPlayerIdx];
+								for (int d = 0; d < 6; d++) {
+									traj.prevGoalBall.push_back(curGoalBall[(size_t)newPlayerIdx * 6 + d]);
+									traj.goalBall.push_back(stepGoalBall[(size_t)newPlayerIdx * 6 + d]);
+								}
+								if (goalCarOn) {
+									for (int d = 0; d < 6; d++) {
+										traj.prevGoalCar.push_back(curGoalCar[(size_t)newPlayerIdx * 6 + d]);
+										traj.goalCar.push_back(stepGoalCar[(size_t)newPlayerIdx * 6 + d]);
+									}
+								}
+							}
+
 							if (reachOn) {
 								auto& traj = trajectories[newPlayerIdx];
 								traj.gatedPos += envSet->state.gatedPosRewards[newPlayerIdx];
@@ -1284,6 +1438,19 @@ void GGL::Learner::Start() {
 							fnAppendProposerTargets(traj);
 							combinedTraj.Append(traj);
 							traj.Clear();
+						}
+
+						// 2.2: advance the recurrent goal (g_{t-1} <- g_t) for the next step and flag
+						// episode-boundary players to reseed g_{-1}. New players use their finalized
+						// terminal (includes truncation); old-version players use only the arena reset.
+						if (goalCondOn) {
+							curGoalBall = stepGoalBall;
+							if (goalCarOn)
+								curGoalCar = stepGoalCar;
+							for (int p = 0; p < numPlayers; p++)
+								goalAtEpStart[p] = curTerminals[p] != 0;
+							for (int newPlayerIdx : newPlayerIndices)
+								goalAtEpStart[newPlayerIdx] = finalTerminals[newPlayerIdx] != 0;
 						}
 
 						recordTime += recordTimer.Elapsed();
@@ -1615,9 +1782,23 @@ void GGL::Learner::Start() {
 						torch::Tensor tCurBall = torch::tensor(combinedTraj.proposerCurBall).reshape({ -1, 6 });
 						torch::Tensor tTargetBall = torch::tensor(combinedTraj.proposerTargetBall).reshape({ -1, 6 });
 
-						auto unroll = ppo->proposer->Unroll(tFeatures, tCurBall, epStart, epEnd);
-						torch::Tensor tGoals = unroll.goals;         // [n,6] CPU
-						torch::Tensor tPrevGoals = unroll.prevGoals; // [n,6] CPU
+						// 2.2 goal-conditioned worker: when the policy was conditioned on the ONLINE goal
+						// walk during collection, reuse exactly those stored goals here (g_t as the shaping
+						// goal + logging, g_{t-1} as the proposer Train() anchor) instead of re-unrolling
+						// post-hoc — so what the policy saw, what shaping charges it for, and what the
+						// proposer regresses from are all the same walk. Otherwise (2.1 path) unroll now.
+						torch::Tensor tGoals, tPrevGoals;
+						float ballGoalDrift;
+						if (goalCondOn && !combinedTraj.goalBall.empty()) {
+							tGoals = torch::tensor(combinedTraj.goalBall).reshape({ -1, 6 });
+							tPrevGoals = torch::tensor(combinedTraj.prevGoalBall).reshape({ -1, 6 });
+							ballGoalDrift = (tGoals - tPrevGoals).norm(2, -1).mean().item<float>();
+						} else {
+							auto unroll = ppo->proposer->Unroll(tFeatures, tCurBall, epStart, epEnd);
+							tGoals = unroll.goals;         // [n,6] CPU
+							tPrevGoals = unroll.prevGoals; // [n,6] CPU
+							ballGoalDrift = unroll.meanDeltaNorm;
+						}
 
 						// Stage 3: committed-goal override - a row inside an active practice window
 						// uses the FIXED goal that was in play when the drill was banked, not the
@@ -1875,7 +2056,7 @@ void GGL::Learner::Start() {
 						report["Proposer/AN Std"] = tAN.std().item<float>();
 						report["Proposer/Weight Fraction"] = (tWeights >= 1.f).to(torch::kFloat32).mean().item<float>();
 						report["Proposer/Goal Target Dist"] = (tGoals - tTargetBall).norm(2, -1).mean().item<float>();
-						report["Proposer/Goal Drift"] = unroll.meanDeltaNorm;
+						report["Proposer/Goal Drift"] = ballGoalDrift;
 						report["Proposer/Rho Goal Mean"] = tRhoGoal.mean().item<float>();
 						if (shapingOn) {
 							report["Proposer/A Int Mean"] = tPropAInt.mean().item<float>();
@@ -1926,9 +2107,19 @@ void GGL::Learner::Start() {
 							torch::Tensor tCarCur = torch::tensor(combinedTraj.proposerCarCur).reshape({ -1, 6 });
 							torch::Tensor tCarTarget = torch::tensor(combinedTraj.proposerCarTarget).reshape({ -1, 6 });
 
-							auto carUnroll = ppo->proposerCar->Unroll(tFeatures, tCarCur, epStart, epEnd);
-							torch::Tensor tCarGoals = carUnroll.goals;
-							torch::Tensor tCarPrevGoals = carUnroll.prevGoals;
+							// 2.2: reuse the stored online car goals when the policy was conditioned on them
+							torch::Tensor tCarGoals, tCarPrevGoals;
+							float carGoalDrift;
+							if (goalCarOn && !combinedTraj.goalCar.empty()) {
+								tCarGoals = torch::tensor(combinedTraj.goalCar).reshape({ -1, 6 });
+								tCarPrevGoals = torch::tensor(combinedTraj.prevGoalCar).reshape({ -1, 6 });
+								carGoalDrift = (tCarGoals - tCarPrevGoals).norm(2, -1).mean().item<float>();
+							} else {
+								auto carUnroll = ppo->proposerCar->Unroll(tFeatures, tCarCur, epStart, epEnd);
+								tCarGoals = carUnroll.goals;
+								tCarPrevGoals = carUnroll.prevGoals;
+								carGoalDrift = carUnroll.meanDeltaNorm;
+							}
 
 							bool carShapingOn = propCfg.carShapingBeta > 0 && ppo->reach->psiCarState;
 							torch::Tensor tRhoCarGoal;
@@ -1955,7 +2146,7 @@ void GGL::Learner::Start() {
 							tPropCarTargets = tCarTarget;
 
 							report["Proposer/Car Goal Target Dist"] = (tCarGoals - tCarTarget).norm(2, -1).mean().item<float>();
-							report["Proposer/Car Goal Drift"] = carUnroll.meanDeltaNorm;
+							report["Proposer/Car Goal Drift"] = carGoalDrift;
 							if (carShapingOn)
 								report["Proposer/Car Rho Goal Mean"] = tRhoCarGoal.mean().item<float>();
 
@@ -2056,6 +2247,20 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+
+					// 2.2 goal-conditioned worker: the online goal [ball(6) | car(6)] the policy saw,
+					// consumed by the goal-conditioned policy head in ppo->Learn() (critic goal-blind).
+					if (goalCondOn && !combinedTraj.goalBall.empty()) {
+						torch::Tensor tGoalBallOnline = torch::tensor(combinedTraj.goalBall).reshape({ -1, 6 });
+						if (goalCarOn && !combinedTraj.goalCar.empty()) {
+							torch::Tensor tGoalCarOnline = torch::tensor(combinedTraj.goalCar).reshape({ -1, 6 });
+							experience.data.goals = torch::cat({ tGoalBallOnline, tGoalCarOnline }, -1);
+						} else {
+							experience.data.goals = tGoalBallOnline;
+						}
+						// The assembled goal width must match the policy head PPOLearner built from goalDim
+						RG_ASSERT(experience.data.goals.size(1) == goalDim);
+					}
 
 					if (reachOn) {
 						experience.data.carHerGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });

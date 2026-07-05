@@ -13,6 +13,9 @@ namespace GGL {
 			carHerGoals, ballHerGoals, ballMovedMask,
 			// Car-state HER goals for the car proposer's psi head (undefined unless carEnabled)
 			carStateHerGoals,
+			// 2.2 goal-conditioned worker: the online proposer goal [ball(6) | car(6)] the policy was
+			// conditioned on at each row (undefined unless proposer.goalCondition). [n, goalDim].
+			goals,
 			advantages;
 
 		auto begin() { return &states; }

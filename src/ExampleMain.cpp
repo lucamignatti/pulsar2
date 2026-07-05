@@ -210,10 +210,20 @@ int main(int argc, char* argv[]) {
 	// tracking 2.4x better than no-op, aspiration tilt +0.75 on vy, clamp 0%).
 	cfg.ppo.proposer.enabled = true;
 
-	// Stage 2 ON: additive, advantage-only shaping at 5% of the extrinsic advantage std. Conservative
-	// first step (design range is 0.10-0.20); bump toward 0.10 once confirmed non-destructive. Revert
-	// is this one line back to 0.0 - the term only ever touches advantages, never value targets.
-	cfg.ppo.proposer.shapingBeta = 0.05f;
+	// 2.2 GOAL-CONDITIONED WORKER (proposer-driven HRL). The proposer is now the MANAGER: its goal is
+	// unrolled online every collection step (per-step recurrent walk, seeded each episode with the
+	// achieved state) and fed onto the policy head, so the policy acts conditioned on the live goal.
+	// The critic stays goal-blind (V(s)) — the proposer's aspiration weights come from its advantage,
+	// so a goal-conditioned critic would be circular (an explicit area for later exploration). Goal
+	// scope: car-state + ball (carEnabled below); goals live in the reachability psi spaces.
+	cfg.ppo.proposer.goalCondition = true;
+
+	// With the policy now SEEING the goal, the advantage-only shaping stops being a nudge and becomes
+	// the PRIMARY goal-pursuit signal: gamma*rho(s',g) - rho(s,g) at these betas is what teaches the
+	// goal-conditioned behavior. Raised from the 2.1 0.05 nudge to ~0.30 of the extrinsic advantage
+	// std per head (extrinsic SURGICAL-7 still dominates). Tune 0.2-0.5; back to 0.0 disables pursuit
+	// (the policy would then just carry an unused goal input). Still advantage-only — never value targets.
+	cfg.ppo.proposer.shapingBeta = 0.30f;
 
 	// Stage 3 in DETECTION-ONLY mode: practiceEnabled runs Phi-drop detection (banks the worst
 	// near-miss snapshots, logs Proposer/Drill Bank Size + Drills Added + Drill Candidates, and
@@ -234,7 +244,10 @@ int main(int argc, char* argv[]) {
 	// stays 0 (passive) until tools/proposer_report.py confirms car-space aspiration tilt (same
 	// gate the ball head passed) AND the psi head has warmed — then flip carShapingBeta to ~0.03.
 	cfg.ppo.proposer.carEnabled = true;
-	cfg.ppo.proposer.carShapingBeta = 0.0f;
+	// 2.2: the car-state goal is part of the worker's conditioning, so its goal-reaching shaping is
+	// now active at the primary magnitude too (the car goal is what restores the defensive signal the
+	// old ball-only car critic starved). Composes with shapingBeta above.
+	cfg.ppo.proposer.carShapingBeta = 0.30f;
 
 	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
 	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0

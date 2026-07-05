@@ -43,35 +43,55 @@ namespace GGL {
 		PPOLearnerConfig config;
 		torch::Device device;
 
+		// 2.2 goal-conditioned worker: extra width appended to the POLICY head's input for the online
+		// proposer goal (0 unless proposer.goalCondition). = 6 + (carEnabled ? 6 : 0). The critic head
+		// is NOT widened (it stays goal-blind). Computed in the ctor before MakeModels.
+		int goalDim = 0;
+
 		PPOLearner(
 			int obsSize, int numActions,
 			PPOLearnerConfig config, torch::Device device
 		);
 
 		static void MakeModels(
-			bool makeCritic, 
-			int obsSize, int numActions, 
+			bool makeCritic,
+			int obsSize, int numActions,
 			PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
 			torch::Device device,
-			ModelSet& outModels
+			ModelSet& outModels,
+			int goalDim = 0
 		);
-		
+
 		// If models is null, this->models will be used
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
 
+		// Goal-conditioned action inference (2.2). policyIn = cat(trunk, goal), where trunk is
+		// precomputedTrunk if defined (reused from the caller's own forward) else shared_head(obs).
+		// Runs fp32. The critic path is unaffected (goal-blind). obs may be undefined when
+		// precomputedTrunk is supplied.
+		void InferActionsGoalConditioned(
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor goal, torch::Tensor precomputedTrunk,
+			torch::Tensor* outActions, torch::Tensor* outLogProbs);
+
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
+		// goal (optional): concatenated onto the trunk output before the policy head (2.2 goal
+		// conditioning). precomputedTrunk (optional): trunk reused verbatim instead of re-forwarding
+		// shared_head over obs.
 		static torch::Tensor InferPolicyProbsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
-			bool halfPrec
+			bool halfPrec,
+			torch::Tensor goal = {}, torch::Tensor precomputedTrunk = {}
 		);
 		static void InferActionsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
-			torch::Tensor* outActions, torch::Tensor* outLogProbs
+			torch::Tensor* outActions, torch::Tensor* outLogProbs,
+			torch::Tensor goal = {}, torch::Tensor precomputedTrunk = {}
 		);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);

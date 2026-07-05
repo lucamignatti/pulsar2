@@ -132,6 +132,31 @@ namespace GGL {
 		bool carEnabled = false;          // build + train the car head (requires enabled)
 		float carShapingBeta = 0.0f;      // 0 => car shaping skipped (car head stays passive)
 
+		// ---- 2.2 goal-conditioned worker (proposer-driven HRL; DISABLED by default) ----
+		// When true, the proposer goal(s) are unrolled ONLINE during collection (per-step recurrent
+		// walk, g_t = clamp(g_{t-1} + Delta), seeded at each episode start with the achieved state)
+		// and concatenated onto the POLICY head's input, so the policy acts conditioned on the live
+		// proposed goal — a real goal-conditioned worker, not just advantage shaping. The manager is
+		// the proposer; the goal is dynamic every step.
+		//
+		// The CRITIC deliberately stays goal-blind (V(s), unchanged): the proposer's aspiration
+		// weights are derived from the goal-blind critic's advantage, so goal-conditioning the critic
+		// would make that grounding circular. Goal-reaching therefore enters ONLY through the existing
+		// advantage-only shaping (shapingBeta / carShapingBeta) — which here stops being a nudge and
+		// becomes the primary goal-pursuit signal (raise the betas accordingly). Because the policy now
+		// SEES g, PPO can attribute that per-step reachability-progress advantage to a goal-conditioned
+		// behavior. (This keeps 2.2 on the safe side of the V(s,g) boundary the 2.1 comments call "the
+		// coupling that froze prior designs"; full V(s,g) is a future exploration.)
+		//
+		// Goal vector fed to the policy = ball goal (6D, always) concatenated with the canonical
+		// car-state goal (6D, only when carEnabled). Goal dim = 6 + (carEnabled ? 6 : 0). The goal
+		// space is intentionally an opaque fixed-width tensor at the concat seam, so swapping in a
+		// latent (reachability-embedding) goal later is a localized change, not a rewrite.
+		//
+		// Off => bit-identical to the 2.1 post-hoc-shaping path (goalDim 0, no online walk).
+		// Requires enabled (and thus reachability.enabled). Incompatible with useGuidingPolicy.
+		bool goalCondition = false;
+
 		// ---- Stage 3 (code-complete; DISABLED by default) ----
 		bool practiceEnabled = false;
 		RLGC::DrillBank* drillBank = NULL; // owned by user code (e.g. ExampleMain); required when practiceEnabled

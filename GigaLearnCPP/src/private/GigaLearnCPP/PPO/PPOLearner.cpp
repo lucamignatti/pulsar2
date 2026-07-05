@@ -15,7 +15,17 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.batchSize % config.miniBatchSize != 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
 
-	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
+	// 2.2 goal-conditioned worker: widen ONLY the policy head by the online goal's width. Ball goal
+	// (6D) is always present when goal conditioning; the car-state goal (6D) is added when carEnabled.
+	if (config.proposer.goalCondition) {
+		if (!config.proposer.enabled)
+			RG_ERR_CLOSE("PPOLearner: config.proposer.goalCondition requires config.proposer.enabled");
+		if (config.useGuidingPolicy)
+			RG_ERR_CLOSE("PPOLearner: config.proposer.goalCondition is incompatible with useGuidingPolicy (the guiding policy is forwarded without a goal)");
+		goalDim = 6 + (config.proposer.carEnabled ? 6 : 0);
+	}
+
+	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models, goalDim);
 
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
@@ -58,8 +68,9 @@ void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
 	int obsSize, int numActions, 
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
-	torch::Device device, 
-	ModelSet& outModels) {
+	torch::Device device,
+	ModelSet& outModels,
+	int goalDim) {
 
 	ModelConfig fullPolicyConfig = policyConfig;
 	fullPolicyConfig.numInputs = obsSize;
@@ -83,6 +94,10 @@ void GGL::PPOLearner::MakeModels(
 		outModels.Add(new Model("shared_head", fullSharedHeadConfig, device));
 	}
 
+	// 2.2 goal conditioning: the online proposer goal is concatenated onto the policy head's input
+	// (after the trunk). The critic head is intentionally left goal-blind, so only this is widened.
+	fullPolicyConfig.numInputs += goalDim;
+
 	outModels.Add(new Model("policy", fullPolicyConfig, device));
 
 	if (makeCritic)
@@ -92,17 +107,29 @@ void GGL::PPOLearner::MakeModels(
 torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
-	float temperature, bool halfPrec) {
+	float temperature, bool halfPrec,
+	torch::Tensor goal, torch::Tensor precomputedTrunk) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
 	constexpr float ACTION_MIN_PROB = 1e-11f;
 	constexpr float ACTION_DISABLED_LOGIT = -1e10f;
 
-	if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, halfPrec);
+	// Trunk: reuse a caller-supplied one (2.2 goal walk shares its trunk forward) or compute it.
+	torch::Tensor feat;
+	if (precomputedTrunk.defined())
+		feat = precomputedTrunk;
+	else if (models["shared_head"])
+		feat = models["shared_head"]->Forward(obs, halfPrec);
+	else
+		feat = obs;
 
-	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
+	// 2.2 goal conditioning: append the goal to the policy head's input (trunk stays goal-free,
+	// so the reachability phi/critic paths that also read the trunk are unaffected).
+	if (goal.defined())
+		feat = torch::cat({ feat, goal }, -1);
+
+	auto logits = models["policy"]->Forward(feat, halfPrec) / temperature;
 
 	auto result = torch::softmax(logits + ACTION_DISABLED_LOGIT * actionMasks.logical_not(), -1);
 	return result.view({ -1, models["policy"]->config.numOutputs }).clamp(ACTION_MIN_PROB, 1);
@@ -110,11 +137,12 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 
 void GGL::PPOLearner::InferActionsFromModels(
 	ModelSet& models,
-	torch::Tensor obs, torch::Tensor actionMasks, 
+	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
-	torch::Tensor* outActions, torch::Tensor* outLogProbs) {
+	torch::Tensor* outActions, torch::Tensor* outLogProbs,
+	torch::Tensor goal, torch::Tensor precomputedTrunk) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec);
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, goal, precomputedTrunk);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -133,6 +161,17 @@ void GGL::PPOLearner::InferActionsFromModels(
 
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
 	InferActionsFromModels(models ? *models : this->models, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs);
+}
+
+void GGL::PPOLearner::InferActionsGoalConditioned(
+	ModelSet& models,
+	torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor goal, torch::Tensor precomputedTrunk,
+	torch::Tensor* outActions, torch::Tensor* outLogProbs) {
+	// fp32 (halfPrec=false): the goal walk's trunk + the proposer's training features are fp32, and
+	// the concatenated goal is fp32 — keep the whole goal-conditioned forward in fp32 for consistency.
+	InferActionsFromModels(
+		models, obs, actionMasks, config.deterministic, config.policyTemperature, false,
+		outActions, outLogProbs, goal, precomputedTrunk);
 }
 
 torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
@@ -184,6 +223,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	bool trainCritic = config.criticLR != 0;
 	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
 
+	// 2.2 goal-conditioned worker: feed the stored online goal onto the policy head (critic stays
+	// goal-blind). Runs the policy forward in fp32 to match the goal's precision.
+	bool goalCondOn = config.proposer.goalCondition && proposer;
+
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
@@ -210,13 +253,17 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
 
+				torch::Tensor goals; // 2.2: online proposer goal for the goal-conditioned policy head
+				if (goalCondOn && batch.goals.defined())
+					goals = batch.goals.slice(0, start, stop).to(device, true, true);
+
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy
 					float curEntropy;
 					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
+						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false, goals);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						curEntropy = entropy.detach().cpu().item<float>();

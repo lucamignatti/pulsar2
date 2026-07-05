@@ -150,6 +150,18 @@ GGL::ProposerModule::UnrollResult GGL::ProposerModule::Unroll(
 	return result;
 }
 
+torch::Tensor GGL::ProposerModule::StepGoal(torch::Tensor feat, torch::Tensor gPrev) {
+	RG_NO_GRAD;
+
+	// Same arithmetic as one iteration of Unroll's ragged loop (prevGoal + Delta, clamp), but for a
+	// single online step over all live rows at once. fp32 to match the proposer's training features.
+	float clampVal = RS_MAX(1e-3f, config.goalClamp);
+	Tensor prev = gPrev.to(kFloat32);
+	Tensor deltaIn = torch::cat({ feat.to(kFloat32), prev }, -1);
+	Tensor deltaOut = delta->Forward(deltaIn, false).to(kFloat32);
+	return (prev + deltaOut).clamp(-clampVal, clampVal);
+}
+
 torch::Tensor GGL::ProposerModule::ComputeNStepAdvantages(
 	torch::Tensor rews, const std::vector<int8_t>& terminals,
 	torch::Tensor valPreds, torch::Tensor truncValPreds,

@@ -50,6 +50,13 @@ namespace GGL {
 			torch::Tensor features, torch::Tensor curBall,
 			const std::vector<int64_t>& epStart, const std::vector<int64_t>& epEnd);
 
+		// Single ONLINE recurrent step (2.2 goal-conditioned worker): g_t = clamp(g_{t-1} + Delta(feat,
+		// g_{t-1})). feat is the detached fp32 trunk [n, trunkOut] on `device`, gPrev is g_{t-1} [n,6]
+		// on `device`. Returns g_t [n,6] on `device`. No-grad (called under the collection RG_NO_GRAD);
+		// the goal walk carried across collection steps is what the policy is conditioned on, and its
+		// prev/curr pair is stored per-row and reused verbatim as the Train() anchor + shaping goal.
+		torch::Tensor StepGoal(torch::Tensor feat, torch::Tensor gPrev);
+
 		// N-step advantage, in the SAME standardized/clipped units GAE trains the critic against
 		// (rHat = clip(r/returnStd, +-clipRange) when returnStd != 0, else raw r), so it's comparable
 		// to V. Window clamps at episode end; bootstraps gamma^N * V[t+N] when the window stays inside
