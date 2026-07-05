@@ -319,6 +319,11 @@ void GGL::Learner::StartQuitKeyThread(std::atomic<bool>& quitPressed, std::threa
 }
 void GGL::Learner::StartTransferLearn(const TransferLearnConfig& tlConfig) {
 
+	// 2.2: transfer learning drives the (goal-conditioned) policy without a goal, which would shape-
+	// mismatch the widened head. Fail fast rather than crash mid-run — TL isn't part of the 2.2 path.
+	if (ppo->goalDim > 0)
+		RG_ERR_CLOSE("StartTransferLearn is not supported with proposer.goalCondition (goal-conditioned policy head)");
+
 	RG_LOG("Starting transfer learning...");
 
 	// TODO: Lots of manual obs builder stuff going on which is quite volatile
@@ -731,6 +736,10 @@ void GGL::Learner::Start() {
 		const bool goalCondOn = goalModel && proposerOn;
 		const bool goalCarOn = goalCondOn && proposerCarOn;
 		const int goalDim = ppo->goalDim;
+		// Whether the policy head carries a car goal by GEOMETRY (goalDim), not by whether the live
+		// walk runs — in render goalCarOn is false but the head is still goalDim-wide, so the neutral
+		// zero goal must keep the car half to match. In training goalHasCar == goalCarOn.
+		const bool goalHasCar = goalDim > 6;
 
 		// 2.2 online recurrent goal state, persistent across iterations & collection steps: the
 		// current goal g_{t-1} per player (6/player each head) and whether a player is at an episode
@@ -1212,10 +1221,10 @@ void GGL::Learner::Start() {
 								// Render edge (goalModel && !goalCondOn): neutral zero goal keeps dims valid
 								auto zOpts = torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device);
 								gBall = torch::zeros({ (int64_t)numPlayers, 6 }, zOpts);
-								if (goalCarOn)
+								if (goalHasCar)
 									gCar = torch::zeros({ (int64_t)numPlayers, 6 }, zOpts);
 							}
-							torch::Tensor goalCat = goalCarOn ? torch::cat({ gBall, gCar }, -1) : gBall;
+							torch::Tensor goalCat = goalHasCar ? torch::cat({ gBall, gCar }, -1) : gBall;
 
 							if (goalCondOn) {
 								stepGoalBall = TENSOR_TO_VEC<float>(gBall.reshape({ -1 }).cpu());

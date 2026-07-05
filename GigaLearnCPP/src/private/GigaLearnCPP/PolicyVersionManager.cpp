@@ -205,6 +205,43 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 		tNewPlayers = torch::tensor(newPlayers),
 		tOldPlayers = torch::tensor(oldPlayers);
 
+	// 2.2 goal-conditioned worker: the banked policies were saved with a goalDim-widened policy head,
+	// so the skill matches must run the SAME live per-step proposer goal walk and feed each side its
+	// goal (else the head is forwarded goalless -> shape crash). Uses the LIVE proposer (versions
+	// don't carry it) + live trunk, exactly like collection; both new and old policy consume the same
+	// per-player goal. goalDim==0 (2.1) => all skipped, original goalless path.
+	const bool goalModel = ppo->goalDim > 0;
+	const bool goalHasCar = ppo->goalDim > 6;
+	const auto& reachCfg = ppo->config.reachability;
+	const int numSkillPlayers = skill.envSet->state.numPlayers;
+	std::vector<float> skillGoalBall(goalModel ? numSkillPlayers * 6 : 0, 0.f);
+	std::vector<float> skillGoalCar(goalHasCar ? numSkillPlayers * 6 : 0, 0.f);
+	std::vector<uint8_t> skillGoalAtEpStart(goalModel ? numSkillPlayers : 0, 1);
+
+	// Seed g_{-1} = current achieved state (canonical ball + car), same frame/normalization as the
+	// Learner's fnSeedGoal, written straight into the per-player goal buffers by global player index.
+	auto fnSeedSkillGoal = [&](int arenaIdx, int slot, int globalIdx) {
+		const auto& gs = skill.envSet->state.gameStates[arenaIdx];
+		const auto& player = gs.players[slot];
+		float sign = (player.team == Team::ORANGE) ? -1.f : 1.f;
+		float* b = &skillGoalBall[(size_t)globalIdx * 6];
+		b[0] = sign * gs.ball.pos.x / reachCfg.posScaleX;
+		b[1] = sign * gs.ball.pos.y / reachCfg.posScaleY;
+		b[2] = gs.ball.pos.z / reachCfg.posScaleZ;
+		b[3] = sign * gs.ball.vel.x / reachCfg.velScale;
+		b[4] = sign * gs.ball.vel.y / reachCfg.velScale;
+		b[5] = gs.ball.vel.z / reachCfg.velScale;
+		if (goalHasCar) {
+			float* c = &skillGoalCar[(size_t)globalIdx * 6];
+			c[0] = sign * player.pos.x / reachCfg.posScaleX;
+			c[1] = sign * player.pos.y / reachCfg.posScaleY;
+			c[2] = player.pos.z / reachCfg.posScaleZ;
+			c[3] = sign * player.vel.x / reachCfg.velScale;
+			c[4] = sign * player.vel.y / reachCfg.velScale;
+			c[5] = player.vel.z / reachCfg.velScale;
+		}
+	};
+
 	int newGoals = 0, oldGoals = 0;
 
 	RG_LOG("Running skill matches (simTime=" << skill.config.simTime << ")...");
@@ -229,17 +266,50 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 
 		skill.envSet->StepFirstHalf(true);
 
+		// 2.2: step the live proposer goal for every player, split to the two sides. Both policies
+		// consume the same live goal (the old version's own trunk feeds its head; the goal is shared).
+		torch::Tensor goalCatNew, goalCatOld;
+		if (goalModel) {
+			for (int a = 0; a < skill.envSet->arenas.size(); a++) {
+				auto& gs = skill.envSet->state.gameStates[a];
+				for (int j = 0; j < (int)gs.players.size(); j++) {
+					int gidx = skill.envSet->state.arenaPlayerStartIdx[a] + j;
+					if (skillGoalAtEpStart[gidx])
+						fnSeedSkillGoal(a, j, gidx);
+				}
+			}
+			torch::Tensor liveTrunk = ppo->models["shared_head"]
+				? ppo->models["shared_head"]->Forward(tStates.to(ppo->device, true), false)
+				: tStates.to(ppo->device, true);
+			torch::Tensor gBall = ppo->proposer->StepGoal(liveTrunk,
+				torch::from_blob(skillGoalBall.data(), { (int64_t)numSkillPlayers, 6 }, torch::kFloat32).to(ppo->device, true));
+			torch::Tensor gCar;
+			if (goalHasCar)
+				gCar = ppo->proposerCar->StepGoal(liveTrunk,
+					torch::from_blob(skillGoalCar.data(), { (int64_t)numSkillPlayers, 6 }, torch::kFloat32).to(ppo->device, true));
+			torch::Tensor goalCat = goalHasCar ? torch::cat({ gBall, gCar }, -1) : gBall;
+			goalCatNew = goalCat.index_select(0, tNewPlayers.to(ppo->device, true));
+			goalCatOld = goalCat.index_select(0, tOldPlayers.to(ppo->device, true));
+
+			// Advance the recurrence (g_{t-1} <- g_t) for the next step
+			skillGoalBall = TENSOR_TO_VEC<float>(gBall.reshape({ -1 }).cpu());
+			if (goalHasCar)
+				skillGoalCar = TENSOR_TO_VEC<float>(gCar.reshape({ -1 }).cpu());
+		}
+
 		torch::Tensor tNewActions, tOldActions;
 		torch::Tensor _tLogProbs;
 
+		// fp32 when goal-conditioned (goalCat is fp32); else keep the configured half precision.
+		bool skillHalfPrec = goalModel ? false : ppo->config.useHalfPrecision;
 		PPOLearner::InferActionsFromModels(
-			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true), 
-			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision, 
-			&tNewActions, &_tLogProbs);
+			ppo->models, tNewStates.to(ppo->device, true), tNewActionMasks.to(ppo->device, true),
+			skill.config.deterministic, ppo->config.policyTemperature, skillHalfPrec,
+			&tNewActions, &_tLogProbs, goalCatNew);
 		PPOLearner::InferActionsFromModels(
-			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true), 
-			skill.config.deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
-			&tOldActions, &_tLogProbs);
+			oldVersion.models, tOldStates.to(ppo->device, true), tOldActionMasks.to(ppo->device, true),
+			skill.config.deterministic, ppo->config.policyTemperature, skillHalfPrec,
+			&tOldActions, &_tLogProbs, goalCatOld);
 
 		auto newActions = TENSOR_TO_VEC<int>(tNewActions);
 		auto oldActions = TENSOR_TO_VEC<int>(tOldActions);
@@ -267,6 +337,16 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 				skill.curGoals++;
 			}
 		}
+
+		// 2.2: flag players whose arena ended so they reseed g_{-1} after the next-iteration Reset()
+		if (goalModel)
+			for (int a = 0; a < skill.envSet->arenas.size(); a++) {
+				uint8_t term = skill.envSet->state.terminals[a];
+				int start = skill.envSet->state.arenaPlayerStartIdx[a];
+				int n = (int)skill.envSet->state.gameStates[a].players.size();
+				for (int j = 0; j < n; j++)
+					skillGoalAtEpStart[start + j] = term != 0;
+			}
 
 		if (renderSender)
 			renderSender->Send(skill.envSet->state.gameStates[0]);
