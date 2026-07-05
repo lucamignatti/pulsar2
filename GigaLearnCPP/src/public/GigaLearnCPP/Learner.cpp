@@ -1148,7 +1148,7 @@ void GGL::Learner::Start() {
 							std::unordered_map<std::string, AvgTracker> avgRewards = {};
 							for (int i = 0; i < numSamples; i++) {
 								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
-								auto& prevRewards = envSet->state.lastRewards[i];
+								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
 
 								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
 									std::string rewardName = envSet->rewards[arenaIdx][j].reward->GetName();
@@ -1351,7 +1351,12 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					report["Episode Length"] = 1.f / (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
+					// Only report when at least one NORMAL terminal occurred; an all-truncated
+					// iteration (every episode hit maxEpisodeLength / handoff) makes the fraction
+					// 0 and the reciprocal +inf, which poisons the logged series.
+					float normalTermFrac = (tTerminals == 1).to(torch::kFloat32).mean().item<float>();
+					if (normalTermFrac > 0)
+						report["Episode Length"] = 1.f / normalTermFrac;
 
 					// Reachability: rho reads -> level x delta gate multiplier + validity metrics.
 					// The gate scales REWARDS only (never advantages/values); with beta=0 or
@@ -1706,7 +1711,7 @@ void GGL::Learner::Start() {
 							// Collect ALL drop candidates first, then bank the LARGEST-drop
 							// maxNewDrillsPerItr - "the worst misses this iteration", not the
 							// first-in-scan-order (which biased toward early-in-the-batch episodes).
-							struct DrillCand { float drop; int64_t highRow; };
+							struct DrillCand { float drop; int64_t highRow; int64_t epStartRow; };
 							std::vector<DrillCand> cands;
 							for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
 								int64_t s = epStart[e], en = epEnd[e];
@@ -1724,7 +1729,7 @@ void GGL::Learner::Start() {
 
 									float drop = runningHigh - phi[t];
 									if (runningHigh >= phiHigh && drop >= phiDropMag && (t - highRow) <= dropWindow) {
-										cands.push_back({ drop, highRow });
+										cands.push_back({ drop, highRow, s });
 										// Don't re-trigger repeatedly on the same decline
 										runningHigh = phi[t];
 										highRow = t;
@@ -1741,6 +1746,15 @@ void GGL::Learner::Start() {
 								int player = combinedTraj.srcPlayer[c.highRow];
 								int localStep = combinedTraj.srcStep[c.highRow];
 								int snapStep = (localStep / snapK) * snapK;
+									// snapStep rounds the near-miss step DOWN to the nearest snapshot
+									// multiple. Episode resets land at arbitrary steps (not multiples),
+									// so for a peak early in its episode snapStep can fall before the
+									// episode began - pointing at a stale prior-episode snapshot of the
+									// same arena. Bank only when snapStep is still inside this episode;
+									// otherwise no valid in-episode snapshot exists at/before the peak.
+									int epStartStep = combinedTraj.srcStep[c.epStartRow];
+									if (snapStep < epStartStep)
+										continue;
 								int arenaIdx = playerArenaIdx[player];
 
 								auto it = stepSnapshots.find((int64_t)snapStep * numArenas + arenaIdx);

@@ -27,7 +27,7 @@ namespace RLGC {
 
 			ArenaSnapshot snap;
 			DrillBank::PracticeWindow win;
-			if (!bank || !bank->TryBeginDrill(arenaIdx, snap, win)) {
+			if (!bank || !bank->TrySampleDrill(arenaIdx, snap, win)) {
 				fallback->ResetArena(arena);
 				return;
 			}
@@ -59,8 +59,24 @@ namespace RLGC {
 					RandFloat(-jitterVel, jitterVel), RandFloat(-jitterVel, jitterVel), RandFloat(-jitterVel, jitterVel) * 0.25f);
 			};
 
+			// Field-bounds guard: banked near-miss snapshots are captured right where the action
+			// is - often against the back wall or in a goalmouth scramble (saves/clears near net).
+			// The position jitter above has no clamp, and RocketSim's SetState does NO bounds check
+			// (it writes the pose straight into the rigid body), so a car banked near a wall gets
+			// shoved clean through it and spawns outside the field. Clamp the jittered x/y back into
+			// the same interior box BallNearCarState treats as safe; RS_CLAMP only touches states
+			// that are actually within WALL_MARGIN of a wall, leaving interior drills untouched.
+			constexpr float WALL_MARGIN = 300;
+			const float clampX = CommonValues::SIDE_WALL_X - WALL_MARGIN;
+			const float clampY = CommonValues::BACK_WALL_Y - WALL_MARGIN;
+			auto fnClampToField = [&](Vec p) {
+				p.x = RS_CLAMP(p.x, -clampX, clampX);
+				p.y = RS_CLAMP(p.y, -clampY, clampY);
+				return p;
+			};
+
 			BallState bs = snap.ball;
-			bs.pos = fnJitteredPos(bs.pos);
+			bs.pos = fnClampToField(fnJitteredPos(bs.pos));
 			bs.vel = fnJitteredVel(bs.vel);
 			arena->ball->SetState(bs);
 
@@ -80,7 +96,7 @@ namespace RLGC {
 				CarState cs = snap.cars[teamCarIdx[t][cursor[t]]].state;
 				cursor[t]++;
 
-				cs.pos = fnJitteredPos(cs.pos);
+				cs.pos = fnClampToField(fnJitteredPos(cs.pos));
 				cs.vel = fnJitteredVel(cs.vel);
 				car->SetState(cs);
 			}
@@ -97,6 +113,12 @@ namespace RLGC {
 					pads[i]->SetState(ps);
 				}
 			}
+
+			// The snapshot is now live in the arena; only NOW arm the practice window. If the
+			// team-count guard above had rejected this drill we'd have fallen back and returned
+			// without committing, so a rejected drill never tags fallback-kickoff steps with its
+			// goal (nor charges a try - tries are counted in DrillBank::ReportResult).
+			bank->CommitDrill(arenaIdx, win);
 		}
 	};
 }

@@ -57,7 +57,11 @@ namespace RLGC {
 		}
 
 		const auto& GetBoostPadTimers(bool inverted) const {
-			return inverted ? boostPadTimers : boostPadTimersInv;
+			// Must mirror GetBoostPads' frame exactly: boostPads[i] and boostPadTimers[i]
+			// describe the SAME physical pad, and the *Inv arrays the point-reflected pad.
+			// Returning the opposite frame here (the original typo) fed AdvancedObs a pad's
+			// availability bit alongside the diametrically-opposite pad's refill timer.
+			return inverted ? boostPadTimersInv : boostPadTimers;
 		}
 
 		// Called before updating to reset the per-step state

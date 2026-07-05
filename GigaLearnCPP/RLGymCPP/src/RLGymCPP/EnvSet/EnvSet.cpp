@@ -72,8 +72,10 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 				tracker->SetGoalCallback(_GoalEventCallback, userInfo);
 				tracker->SetSaveCallback(_SaveEventCallback, userInfo);
 			} else {
+				// eventCallbackInfos already got this arena's userInfo above (one per arena);
+				// heatseeker just has no GameEventTracker. Pushing again here would desync the
+				// vector from arenas/eventTrackers.
 				eventTrackers.push_back(NULL);
-				eventCallbackInfos.push_back(NULL);
 			}
 
 			userInfos.push_back(createResult.userInfo);

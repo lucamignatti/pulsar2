@@ -25,8 +25,8 @@ namespace RLGC {
 	// snapshots + the committed goal that was in play when the mistake happened. One bank is
 	// shared by all per-arena DrillSetters AND the Learner's collection/learn-prep code.
 	//
-	// Thread-safety is by PHASE DISCIPLINE, not just the mutex: DrillSetters call TryBeginDrill()
-	// from inside EnvSet::ResetArena(), which runs on the thread pool but is fenced (WaitUntilDone)
+	// Thread-safety is by PHASE DISCIPLINE, not just the mutex: DrillSetters call TrySampleDrill()
+	// then CommitDrill() from inside EnvSet::ResetArena(), which runs on the thread pool but is fenced (WaitUntilDone)
 	// before the Learner's serial record/learn-prep code runs; the Learner only reads/writes
 	// (ClearWindowsForResets/GetWindow/DecrementWindows/AddDrill/ReportResult) from its own serial
 	// collection loop. The mutex exists to protect the bank's own containers, not to serialize
@@ -74,17 +74,19 @@ namespace RLGC {
 		}
 
 		// Setter side (called from a thread-pool worker, inside EnvSet::ResetArena): samples a
-		// drill uniformly, copies its snapshot out, increments its try count, and arms this
-		// arena's practice window. Returns false (bank empty, or arenaIdx not configured) so the
-		// caller can fall back to its normal setter.
-		bool TryBeginDrill(int arenaIdx, ArenaSnapshot& outSnap, PracticeWindow& outWin) {
+		// drill uniformly and copies its snapshot + a candidate practice window OUT. It does NOT
+		// arm the arena's window and does NOT charge a try - the caller commits (CommitDrill) only
+		// after its own compatibility guards pass and the snapshot is actually applied, so a
+		// rejected drill never leaves a stale window armed over the fallback state. Tries are
+		// counted at result time (ReportResult), keeping tries paired with reported outcomes.
+		// Returns false (bank empty, or arenaIdx not configured) so the caller can fall back.
+		bool TrySampleDrill(int arenaIdx, ArenaSnapshot& outSnap, PracticeWindow& outWin) {
 			std::lock_guard<std::mutex> lock(mtx);
 			if (drills.empty() || arenaIdx < 0 || arenaIdx >= (int)windows.size())
 				return false;
 
 			int idx = RocketSim::Math::RandInt(0, (int)drills.size());
-			Drill& d = drills[idx];
-			d.tries++;
+			const Drill& d = drills[idx];
 
 			outSnap = d.snap;
 			outWin = PracticeWindow{};
@@ -93,16 +95,24 @@ namespace RLGC {
 			memcpy(outWin.goal, d.goal, sizeof(outWin.goal));
 			outWin.sourceTeam = d.sourceTeam;
 			outWin.stepsLeft = windowStepsCfg;
-
-			windows[arenaIdx] = outWin;
 			return true;
+		}
+
+		// Arms the arena's practice window with a window previously produced by TrySampleDrill.
+		// Called by the setter only after it has confirmed the sampled snapshot is applied to the
+		// arena. Runs in the same fenced ResetArena phase, so the mutex alone is sufficient.
+		void CommitDrill(int arenaIdx, const PracticeWindow& win) {
+			std::lock_guard<std::mutex> lock(mtx);
+			if (arenaIdx < 0 || arenaIdx >= (int)windows.size())
+				return;
+			windows[arenaIdx] = win;
 		}
 
 		// Learner side, called BEFORE envSet->Reset(): terminals still hold the PREVIOUS step's
 		// flags (Reset() only zeroes them for arenas that actually reset this step), so this drops
 		// any window whose arena is about to reset for a reason OTHER than the drill itself (a
 		// goal, a timeout, an old-version handoff) - a drill-triggered reset re-arms its own
-		// window from inside TryBeginDrill() right after this runs.
+		// window via CommitDrill() at the end of ResetArena, right after this runs.
 		void ClearWindowsForResets(const std::vector<uint8_t>& terminals) {
 			std::lock_guard<std::mutex> lock(mtx);
 			for (int i = 0; i < (int)terminals.size() && i < (int)windows.size(); i++)
@@ -162,13 +172,15 @@ namespace RLGC {
 			return out;
 		}
 
-		// Retires a drill once it's been tried enough AND is either reliably solved (success rate
-		// at/above the retire threshold) or has exhausted its try budget (a drill nobody ever
-		// solves shouldn't occupy the bank forever either).
+		// Counts one try (paired with this outcome, so tries can never outrun reported results the
+		// way a sample-time counter did) and retires a drill once it's been tried enough AND is
+		// either reliably solved (success rate at/above the retire threshold) or has exhausted its
+		// try budget (a drill nobody ever solves shouldn't occupy the bank forever either).
 		void ReportResult(uint64_t drillId, bool success) {
 			std::lock_guard<std::mutex> lock(mtx);
 			for (auto it = drills.begin(); it != drills.end(); ++it) {
 				if (it->id == drillId) {
+					it->tries++;
 					if (success)
 						it->successes++;
 					if (it->tries >= minTriesForRetireCfg) {
