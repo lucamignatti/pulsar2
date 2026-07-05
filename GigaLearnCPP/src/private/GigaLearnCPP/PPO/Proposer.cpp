@@ -72,19 +72,32 @@ GGL::ProposerModule::UnrollResult GGL::ProposerModule::Unroll(
 
 	int64_t n = features.size(0);
 	UnrollResult result;
-	result.goals = torch::zeros({ n, 6 }, TensorOptions().dtype(kFloat32));
-	result.prevGoals = torch::zeros({ n, 6 }, TensorOptions().dtype(kFloat32));
+
+	// Run the whole recurrent unroll on the feature device and copy back to CPU exactly once at
+	// the end. The previous version did a device->host .cpu() plus an .item() norm sync inside
+	// the per-local-step loop, i.e. ~two GPU round-trips per timestep of the longest episode
+	// (hundreds per iteration, times two heads). The goal arithmetic (prevGoal+delta, clamp) is
+	// elementwise float32, so on-device results are bit-identical to the old on-CPU compute; the
+	// drift-norm accumulator stays in float64, so its logged value is unchanged too.
+	torch::Device dev = features.device();
+	Tensor goalsDev = torch::zeros({ n, 6 }, TensorOptions().dtype(kFloat32).device(dev));
+	Tensor prevGoalsDev = torch::zeros({ n, 6 }, TensorOptions().dtype(kFloat32).device(dev));
 
 	int64_t numEp = (int64_t)epStart.size();
-	if (numEp == 0)
+	if (numEp == 0) {
+		result.goals = goalsDev.cpu();
+		result.prevGoals = prevGoalsDev.cpu();
+		result.meanDeltaNorm = 0.f;
 		return result;
+	}
 
 	RG_ASSERT(curBall.size(0) == n);
 
 	// g_{-1} for each episode = the current (pre-first-action) achieved ball - i.e. "propose
 	// staying where we already are" as the neutral, zero-drift starting point
-	Tensor epStartIdx = torch::tensor(epStart, TensorOptions().dtype(kLong));
-	Tensor curGoal = curBall.to(kFloat32).index_select(0, epStartIdx).clone(); // [numEp,6] CPU, owns storage
+	Tensor curBallDev = curBall.to(kFloat32).to(dev);
+	Tensor epStartIdx = torch::tensor(epStart, TensorOptions().dtype(kLong)).to(dev);
+	Tensor curGoal = curBallDev.index_select(0, epStartIdx).clone(); // [numEp,6] device, owns storage
 
 	std::vector<int64_t> epLen(numEp);
 	int64_t maxLen = 0;
@@ -93,10 +106,9 @@ GGL::ProposerModule::UnrollResult GGL::ProposerModule::Unroll(
 		maxLen = RS_MAX(maxLen, epLen[e]);
 	}
 
-	double deltaNormSum = 0;
+	Tensor deltaNormSum = torch::zeros({}, TensorOptions().dtype(kFloat64).device(dev));
 	int64_t deltaNormCount = 0;
 	float clampVal = RS_MAX(1e-3f, config.goalClamp);
-	torch::Device featDevice = features.device();
 
 	// Ragged-batched by local step L: one batched Delta forward per L, over whichever episodes
 	// are still alive at that L (shrinks as shorter episodes finish) - cost is one forward per
@@ -114,25 +126,27 @@ GGL::ProposerModule::UnrollResult GGL::ProposerModule::Unroll(
 		if (aliveEp.empty())
 			continue;
 
-		Tensor epIdx = torch::tensor(aliveEp, TensorOptions().dtype(kLong));
-		Tensor rowIdx = torch::tensor(aliveRow, TensorOptions().dtype(kLong));
+		Tensor epIdx = torch::tensor(aliveEp, TensorOptions().dtype(kLong)).to(dev);
+		Tensor rowIdx = torch::tensor(aliveRow, TensorOptions().dtype(kLong)).to(dev);
 
-		Tensor prevGoalAlive = curGoal.index_select(0, epIdx); // [m,6] CPU
-		result.prevGoals.index_copy_(0, rowIdx, prevGoalAlive);
+		Tensor prevGoalAlive = curGoal.index_select(0, epIdx); // [m,6] device
+		prevGoalsDev.index_copy_(0, rowIdx, prevGoalAlive);
 
-		Tensor featAlive = features.index_select(0, rowIdx.to(featDevice)); // [m,trunk]
-		Tensor deltaIn = torch::cat({ featAlive, prevGoalAlive.to(featDevice) }, -1);
-		Tensor deltaOut = delta->Forward(deltaIn, false).to(kFloat32).cpu(); // [m,6]
+		Tensor featAlive = features.index_select(0, rowIdx); // [m,trunk] device
+		Tensor deltaIn = torch::cat({ featAlive, prevGoalAlive }, -1);
+		Tensor deltaOut = delta->Forward(deltaIn, false).to(kFloat32); // [m,6] device
 
-		deltaNormSum += deltaOut.norm(2, -1).sum().item<double>();
+		deltaNormSum += deltaOut.norm(2, -1).sum().to(kFloat64);
 		deltaNormCount += (int64_t)aliveEp.size();
 
 		Tensor newGoal = (prevGoalAlive + deltaOut).clamp(-clampVal, clampVal);
-		result.goals.index_copy_(0, rowIdx, newGoal);
+		goalsDev.index_copy_(0, rowIdx, newGoal);
 		curGoal.index_copy_(0, epIdx, newGoal);
 	}
 
-	result.meanDeltaNorm = deltaNormCount > 0 ? (float)(deltaNormSum / deltaNormCount) : 0.f;
+	result.goals = goalsDev.cpu();
+	result.prevGoals = prevGoalsDev.cpu();
+	result.meanDeltaNorm = deltaNormCount > 0 ? (float)(deltaNormSum.item<double>() / deltaNormCount) : 0.f;
 	return result;
 }
 

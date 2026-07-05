@@ -24,6 +24,13 @@ void RLGC::AdvancedObs::AddPlayerToObs(FList& obs, const Player& player, bool in
 
 RLGC::FList RLGC::AdvancedObs::BuildObs(const Player& player, const GameState& state) {
 	FList obs = {};
+	// Reserve the exact final length so the chain of += appends never reallocates. Header is
+	// ball(9) + prevAction + boost pads; each player (self + others) contributes 29 via
+	// AddPlayerToObs. If AddPlayerToObs's element count changes, the worst case here is a
+	// single realloc, never a correctness issue.
+	constexpr int PLAYER_OBS_ELEMS = 29;
+	obs.reserve(9 + player.prevAction.ELEM_AMOUNT + CommonValues::BOOST_LOCATIONS_AMOUNT
+		+ PLAYER_OBS_ELEMS * (int)state.players.size());
 
 	bool inv = player.team == Team::ORANGE;
 

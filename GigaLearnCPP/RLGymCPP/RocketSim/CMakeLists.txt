@@ -12,3 +12,11 @@ add_library(RocketSim ${FILES_ROCKETSIM} ${FILES_BULLET})
 
 set_target_properties(RocketSim PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(RocketSim PROPERTIES CXX_STANDARD 20)
+
+# The physics/collision inner loops are the collection hot path but were building at plain
+# -O3 while the learner lib got arch-specific vectorization. Mirror GigaLearnCPP's flags
+# exactly: -fno-finite-math-only keeps NaN/Inf semantics intact under -ffast-math so the
+# obs finiteness guards still work.
+if(NOT MSVC)
+    target_compile_options(RocketSim PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+endif()

@@ -91,7 +91,8 @@ torch::Tensor GGL::ReachabilityModule::StateActionVarPenalty(torch::Tensor sa) {
 }
 
 std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
-	Model* sharedHead, const std::vector<GoalQuery>& queries, torch::Tensor obs, torch::Tensor actionMasks) {
+	Model* sharedHead, const std::vector<GoalQuery>& queries, torch::Tensor obs, torch::Tensor actionMasks,
+	torch::Tensor precomputedTrunk) {
 
 	RG_NO_GRAD;
 
@@ -99,6 +100,11 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 	int64_t k = RS_MAX(1, config.numActionSamples);
 	int64_t chunkSize = (config.scoreChunkSize > 0) ? config.scoreChunkSize : n;
 	float tau = RS_MAX(1e-6f, config.tau);
+
+	// When the caller already has the shared trunk over these exact obs (computed once for the
+	// whole consumption pass), reuse it instead of re-forwarding sharedHead here. The slice is
+	// bit-identical to sharedHead->Forward(obsChunk, false), so rho is unchanged.
+	RG_ASSERT(!precomputedTrunk.defined() || precomputedTrunk.size(0) == n);
 
 	// Goals are fixed for the whole call, encode each psi once
 	std::vector<Tensor> goalEmbeds;
@@ -114,8 +120,13 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 		int64_t stop = RS_MIN(start + chunkSize, n);
 		int64_t m = stop - start;
 
-		Tensor obsChunk = obs.slice(0, start, stop).to(device, true);
-		Tensor trunkOut = sharedHead ? sharedHead->Forward(obsChunk, false) : obsChunk;
+		Tensor trunkOut;
+		if (precomputedTrunk.defined()) {
+			trunkOut = precomputedTrunk.slice(0, start, stop);
+		} else {
+			Tensor obsChunk = obs.slice(0, start, stop).to(device, true);
+			trunkOut = sharedHead ? sharedHead->Forward(obsChunk, false) : obsChunk;
+		}
 
 		// Uniform over valid actions; the tiny epsilon guards a (never-expected) all-zero mask row
 		Tensor maskChunk = actionMasks.slice(0, start, stop).to(device).to(kFloat32) + 1e-6f;
@@ -136,13 +147,16 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 
 std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRhoRowwise(
 	Model* sharedHead, Model* psiHead, const std::vector<torch::Tensor>& goalRows,
-	torch::Tensor obs, torch::Tensor actionMasks, c10::optional<torch::Generator> gen) {
+	torch::Tensor obs, torch::Tensor actionMasks, c10::optional<torch::Generator> gen,
+	torch::Tensor precomputedTrunk) {
 
 	RG_NO_GRAD;
 
 	int64_t n = obs.size(0);
 	for (auto& g : goalRows)
 		RG_ASSERT(g.size(0) == n);
+	// See EvalRho: reuse the caller's shared-trunk-over-obs when supplied (bit-identical).
+	RG_ASSERT(!precomputedTrunk.defined() || precomputedTrunk.size(0) == n);
 
 	int64_t k = RS_MAX(1, config.numActionSamples);
 	int64_t chunkSize = (config.scoreChunkSize > 0) ? config.scoreChunkSize : n;
@@ -156,8 +170,13 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRhoRowwise(
 		int64_t stop = RS_MIN(start + chunkSize, n);
 		int64_t m = stop - start;
 
-		Tensor obsChunk = obs.slice(0, start, stop).to(device, true);
-		Tensor trunkOut = sharedHead ? sharedHead->Forward(obsChunk, false) : obsChunk;
+		Tensor trunkOut;
+		if (precomputedTrunk.defined()) {
+			trunkOut = precomputedTrunk.slice(0, start, stop);
+		} else {
+			Tensor obsChunk = obs.slice(0, start, stop).to(device, true);
+			trunkOut = sharedHead ? sharedHead->Forward(obsChunk, false) : obsChunk;
+		}
 
 		// Uniform over valid actions; the tiny epsilon guards a (never-expected) all-zero mask row
 		Tensor maskChunk = actionMasks.slice(0, start, stop).to(device).to(kFloat32) + 1e-6f;

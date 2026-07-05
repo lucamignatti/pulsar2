@@ -81,6 +81,12 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		at::globalContext().setAllowTF32CuBLAS(config.allowTF32);
 		at::globalContext().setAllowTF32CuDNN(config.allowTF32);
 		RG_LOG("\tTF32 matmuls (CUDA tensor cores): " << (config.allowTF32 ? "enabled" : "disabled"));
+
+		// On the GPU path the heavy math runs on-device; libtorch's default intra-op pool
+		// (one thread per core) otherwise oversubscribes the machine against RLGymCPP's own
+		// collection thread pool for the many small CPU-side tensor ops (index_select, blob
+		// conversions, .cpu() copies) in the consumption phase. Cap it low.
+		at::set_num_threads(2);
 	}
 
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
@@ -1358,6 +1364,32 @@ void GGL::Learner::Start() {
 					if (normalTermFrac > 0)
 						report["Episode Length"] = 1.f / normalTermFrac;
 
+					// Shared FP32 trunk over the batch states, computed ONCE and reused by the
+					// reachability gate reads, the per-row rho reads, and the proposer unroll — each
+					// of which used to re-forward sharedHead over all n rows independently (3-4
+					// full-batch trunk passes per iteration). Detached, on device. The critic is
+					// deliberately NOT folded in: it forwards the trunk at useHalfPrecision, a
+					// different dtype, so its trunk isn't interchangeable with this FP32 one. Left
+					// undefined when there's no shared head (the rho reads then feed raw obs to phi,
+					// exactly as before) or when neither consumer is active.
+					torch::Tensor tTrunkFeatures;
+					if ((reachOn || proposerOn) && combinedTraj.Length() > 0) {
+						Model* trunkModel = ppo->models["shared_head"];
+						if (trunkModel) {
+							int64_t nRows = (int64_t)combinedTraj.Length();
+							int64_t chunk = proposerOn ? (int64_t)propCfg.featureChunkSize : (int64_t)reachCfg.scoreChunkSize;
+							if (chunk <= 0)
+								chunk = nRows;
+							std::vector<torch::Tensor> parts;
+							for (int64_t s = 0; s < nRows; s += chunk) {
+								int64_t e = RS_MIN(s + chunk, nRows);
+								torch::Tensor obsChunk = tStates.slice(0, s, e).to(ppo->device, true);
+								parts.push_back(trunkModel->Forward(obsChunk, false).detach());
+							}
+							tTrunkFeatures = parts.size() == 1 ? parts[0] : torch::cat(parts, 0);
+						}
+					}
+
 					// Reachability: rho reads -> level x delta gate multiplier + validity metrics.
 					// The gate scales REWARDS only (never advantages/values); with beta=0 or
 					// gateEnabled=false the rewards are untouched.
@@ -1383,7 +1415,7 @@ void GGL::Learner::Start() {
 						Model* sharedHead = ppo->models["shared_head"];
 						auto rhoOwn = ppo->reach->EvalRho(sharedHead,
 							{ { ppo->reach->psiCar, contactGoal }, { ppo->reach->psiBall, scoringGoal } },
-							tStates, tActionMasks);
+							tStates, tActionMasks, tTrunkFeatures);
 						auto rhoOpp = ppo->reach->EvalRho(sharedHead,
 							{ { ppo->reach->psiCar, contactGoal } },
 							tOppStates, tOppMasks);
@@ -1574,7 +1606,11 @@ void GGL::Learner::Start() {
 						ProposerModule::SegmentEpisodes(combinedTraj.terminals, epStart, epEnd);
 
 						Model* sharedHead = ppo->models["shared_head"];
-						torch::Tensor tFeatures = ppo->proposer->ComputeFeatures(sharedHead, tStates, propCfg.featureChunkSize);
+						// Reuse the trunk features computed once above; only recompute in the (config
+						// edge) case where no shared head exists so nothing precomputed them.
+						torch::Tensor tFeatures = tTrunkFeatures.defined()
+							? tTrunkFeatures
+							: ppo->proposer->ComputeFeatures(sharedHead, tStates, propCfg.featureChunkSize);
 
 						torch::Tensor tCurBall = torch::tensor(combinedTraj.proposerCurBall).reshape({ -1, 6 });
 						torch::Tensor tTargetBall = torch::tensor(combinedTraj.proposerTargetBall).reshape({ -1, 6 });
@@ -1638,7 +1674,7 @@ void GGL::Learner::Start() {
 							goalQueries.push_back(tGoalsShift);
 						}
 
-						auto rhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiBall, goalQueries, tStates, tActionMasks);
+						auto rhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiBall, goalQueries, tStates, tActionMasks, c10::nullopt, tTrunkFeatures);
 						torch::Tensor tRhoGoal = rhos[0]; // rho(s_t, g_t)
 
 						if (shapingOn) {
@@ -1905,7 +1941,7 @@ void GGL::Learner::Start() {
 										tCarGoalsShift.slice(0, s + 1, en + 1).copy_(tCarGoals.slice(0, s, en));
 								}
 								carQ.push_back(tCarGoalsShift);
-								auto carRhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiCarState, carQ, tStates, tActionMasks);
+								auto carRhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiCarState, carQ, tStates, tActionMasks, c10::nullopt, tTrunkFeatures);
 								tRhoCarGoal = carRhos[0];
 								torch::Tensor tRhoCarNext = torch::zeros_like(tRhoCarGoal);
 								if (n > 1)

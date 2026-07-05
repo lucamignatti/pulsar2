@@ -93,9 +93,12 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 	state.Resize(arenas);
 
 	for (auto& arenaRewards : rewards)
-		for (auto& weighted : arenaRewards)
+		for (auto& weighted : arenaRewards) {
 			if (weighted.gated)
 				anyGatedRewards = true;
+			// Resolve the ZeroSum downcast once here instead of per-step in the logging path
+			weighted.zeroSumPtr = dynamic_cast<ZeroSumReward*>(weighted.reward);
+		}
 
 	// Determine obs size and action amount, initialize arrays accordingly
 	{
@@ -134,7 +137,7 @@ void RLGC::EnvSet::StepFirstHalf(bool async) {
 		arena->Step(config.actionDelay);
 	};
 
-	g_ThreadPool.StartBatchedJobs(fnStepArena, arenas.size(), async);
+	g_ThreadPool.StartBatchedJobsChunked(fnStepArena, arenas.size(), async);
 }
 
 void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
@@ -241,8 +244,8 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 					// We will only take the reward from a random player
 					float rewardToSave = output[playerSampleIndex];
 						
-					// If zero-sum, use the inner reward
-					if (ZeroSumReward* zeroSum = dynamic_cast<ZeroSumReward*>(weightedReward.reward))
+					// If zero-sum, use the inner reward (cast cached at construction)
+					if (ZeroSumReward* zeroSum = weightedReward.zeroSumPtr)
 						rewardToSave = zeroSum->_lastRewards[playerSampleIndex];
 
 					// If needed, initialize last rewards
@@ -273,7 +276,7 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 		}
 	};
 
-	g_ThreadPool.StartBatchedJobs(fnStepArenas, arenas.size(), async);
+	g_ThreadPool.StartBatchedJobsChunked(fnStepArenas, arenas.size(), async);
 }
 
 void RLGC::EnvSet::ResetArena(int index) {
