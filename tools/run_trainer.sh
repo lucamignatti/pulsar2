@@ -234,6 +234,11 @@ case "$MODE" in
 			echo "no log found in $LOG_DIR" >&2
 			exit 1
 		fi
+		# Resolve latest.log's symlink before tailing: Ubuntu's Rust coreutils
+		# (uutils 0.8.0) tail -f on a symlink prints the initial contents and
+		# then never emits appends. GNU tail resolves the link at open anyway,
+		# so this is behavior-neutral on Fedora/GNU systems.
+		log_path="$(readlink -f "$log_path")"
 		echo "tailing $log_path"
 		exec tail -f "$log_path"
 		;;
