@@ -259,6 +259,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.proposer.delta.layerSizes = { 256, 256 };
 	cfg.ppo.proposer.lr = 1e-4f;
 
+	// The rho reads (gate + proposer) and the shared-trunk feature pass process the batch in
+	// chunks of this many rows. Each chunk's phi forward is chunk*numActionSamples rows, so at
+	// 4096*16 the kernels were too small to fill the 5080 and there were ~49 chunks/pass — a
+	// launch-bound pattern that left the GPU idle. 16384 -> ~12 chunks, 4x bigger kernels, 4x
+	// fewer per-pass launches; peak transient is one chunk's worth (~a few hundred MB). Watch
+	// VRAM on the first iteration and dial back toward 8192 if it's tight.
+	cfg.ppo.reachability.scoreChunkSize = 16384;
+	cfg.ppo.proposer.featureChunkSize = 16384;
+
 	// Muon's RMS-matched scaling makes Adam-tuned LRs transfer as-is.
 	// The reachability heads deliberately stay on Adam: contrastive InfoNCE embeddings
 	// train poorly under orthogonalized updates (see ReachabilityConfig).

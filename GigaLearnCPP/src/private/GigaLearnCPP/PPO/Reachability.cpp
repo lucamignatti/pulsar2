@@ -112,9 +112,13 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 		goalEmbeds.push_back(L2Normalize(
 			query.psiHead->Forward(query.goal6.to(kFloat32).to(device).view({ 1, 6 }), false))); // [1, repr]
 
+	// Accumulate rho on-device and copy to host ONCE per query at the end. Writing the chunk
+	// result with a per-chunk .cpu() would block the stream every chunk (n/chunkSize times, per
+	// query), draining the GPU pipeline between chunks — the main reason this launch-bound pass
+	// leaves the GPU idle. Device-to-device chunk copies don't sync.
 	std::vector<Tensor> rhos;
 	for (size_t q = 0; q < queries.size(); q++)
-		rhos.push_back(torch::zeros({ n }, TensorOptions().dtype(kFloat32)));
+		rhos.push_back(torch::zeros({ n }, TensorOptions().dtype(kFloat32).device(device)));
 
 	for (int64_t start = 0; start < n; start += chunkSize) {
 		int64_t stop = RS_MIN(start + chunkSize, n);
@@ -138,10 +142,13 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRho(
 
 		for (size_t q = 0; q < queries.size(); q++) {
 			Tensor scores = torch::matmul(sa, goalEmbeds[q].transpose(0, 1)).view({ m, k }) / tau;
-			rhos[q].slice(0, start, stop).copy_(scores.mean(1).cpu());
+			rhos[q].slice(0, start, stop).copy_(scores.mean(1));
 		}
 	}
 
+	// Contract is unchanged: one [n] float32 CPU tensor per query
+	for (auto& r : rhos)
+		r = r.cpu();
 	return rhos;
 }
 
@@ -162,9 +169,10 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRhoRowwise(
 	int64_t chunkSize = (config.scoreChunkSize > 0) ? config.scoreChunkSize : n;
 	float tau = RS_MAX(1e-6f, config.tau);
 
+	// Same on-device accumulation as EvalRho: one host copy per query at the end, not per chunk.
 	std::vector<Tensor> rhos;
 	for (size_t q = 0; q < goalRows.size(); q++)
-		rhos.push_back(torch::zeros({ n }, TensorOptions().dtype(kFloat32)));
+		rhos.push_back(torch::zeros({ n }, TensorOptions().dtype(kFloat32).device(device)));
 
 	for (int64_t start = 0; start < n; start += chunkSize) {
 		int64_t stop = RS_MIN(start + chunkSize, n);
@@ -193,9 +201,12 @@ std::vector<torch::Tensor> GGL::ReachabilityModule::EvalRhoRowwise(
 			Tensor g = L2Normalize(psiHead->Forward(goalChunk, false));                   // [m, repr]
 			Tensor gRep = g.repeat_interleave(k, 0);                                       // [m*k, repr]
 			Tensor scores = (sa * gRep).sum(-1) / tau;                                     // [m*k]
-			rhos[q].slice(0, start, stop).copy_(scores.view({ m, k }).mean(1).cpu());
+			rhos[q].slice(0, start, stop).copy_(scores.view({ m, k }).mean(1));
 		}
 	}
 
+	// Contract is unchanged: one [n] float32 CPU tensor per query
+	for (auto& r : rhos)
+		r = r.cpu();
 	return rhos;
 }
