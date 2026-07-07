@@ -283,11 +283,20 @@ void GGL::Learner::Load() {
 
 	if (highest != -1) {
 		std::filesystem::path loadFolder = config.checkpointFolder / std::to_string(highest);
-		RG_LOG(" > Loading checkpoint " << loadFolder << "...");
+		// Absolute path: a relative checkpointFolder resolves against the CWD, so two launches
+		// from different directories can both print a plausible-looking relative path while
+		// loading entirely different checkpoints
+		RG_LOG(" > Loading checkpoint " << std::filesystem::absolute(loadFolder) << "...");
 		LoadStats(loadFolder / STATS_FILE_NAME);
 		ppo->LoadFrom(loadFolder);
-		RG_LOG(" > Done.");
+		RG_LOG(" > Done. (resumed at " << totalTimesteps << " timesteps, " << totalIterations << " iterations)");
 	} else {
+		// Rendering a freshly initialized model is never intended - fail loudly instead of
+		// silently visualizing an untrained policy
+		if (config.renderMode)
+			RG_ERR_CLOSE(
+				"Learner::Load(): render mode, but no checkpoint found in "
+				<< std::filesystem::absolute(config.checkpointFolder));
 		RG_LOG(" > No checkpoints found, starting new model.")
 	}
 }
@@ -1107,6 +1116,13 @@ void GGL::Learner::Start() {
 					float prepTime = 0;
 					float recordTime = 0;
 
+					// Render-only ground-truth telemetry (see the render branch below): the same
+					// competence counters wandb shows for training, measured live on the rendered
+					// arena, so a viz impression can be checked against what THIS process is
+					// actually simulating
+					int64_t renderTouchSteps = 0, renderPlayerSteps = 0, renderGoals = 0;
+					double renderBallDistSum = 0;
+
 					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
 						Timer stepTimer = {};
 						// Drop any practice window whose arena is about to reset for a reason
@@ -1292,6 +1308,32 @@ void GGL::Learner::Start() {
 
 						if (render) {
 							renderSender->Send(envSet->state.gameStates[0]);
+
+							// Ground truth for "what is the sim actually doing": if these counters
+							// show real touches/goals while the viewer shows none, the viewer is
+							// stale/duplicated (e.g. two processes sending to RocketSimVis's UDP
+							// port); if they read ~0, the loaded policy genuinely differs from the
+							// training run and the checkpoint identity is the next suspect
+							auto& gsRender = envSet->state.gameStates[0];
+							for (auto& player : gsRender.players) {
+								renderTouchSteps += player.ballTouchedStep ? 1 : 0;
+								renderGoals += player.eventState.goal ? 1 : 0;
+								renderBallDistSum += (gsRender.ball.pos - player.pos).Length();
+								renderPlayerSteps++;
+							}
+							// ~30s of sim time per window at tickSkip 8
+							int64_t windowPlayerSteps = (int64_t)450 * RS_MAX(1, (int64_t)gsRender.players.size());
+							if (renderPlayerSteps >= windowPlayerSteps) {
+								RG_LOG(
+									"[Render telemetry] last ~30s: touch ratio "
+									<< ((double)renderTouchSteps / renderPlayerSteps)
+									<< " (training run showed ~0.012), goals " << renderGoals
+									<< ", avg car->ball dist " << (renderBallDistSum / renderPlayerSteps) << "uu");
+								renderTouchSteps = 0;
+								renderPlayerSteps = 0;
+								renderGoals = 0;
+								renderBallDistSum = 0;
+							}
 							continue;
 						}
 
