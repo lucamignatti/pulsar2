@@ -746,16 +746,26 @@ void GGL::Learner::Start() {
 		const bool goalCarOn = goalCondOn && proposerCarOn;
 		const int goalDim = ppo->goalDim;
 		// Whether the policy head carries a car goal by GEOMETRY (goalDim), not by whether the live
-		// walk runs — in render goalCarOn is false but the head is still goalDim-wide, so the neutral
-		// zero goal must keep the car half to match. In training goalHasCar == goalCarOn.
+		// walk runs — the head is always goalDim-wide, so whatever drives it must keep the car half
+		// to match. In training goalHasCar == goalCarOn.
 		const bool goalHasCar = goalDim > 6;
+		// 2.2 render fix: the goal WALK must also run in render. The goal-conditioned head is part
+		// of the policy function now — conditioning it on a constant zero goal (as the old "render
+		// edge" did) feeds it an input the worker never saw in training (training goals track the
+		// achieved ball via the episode-start seed and the clamped walk), which degenerated rendered
+		// play into goal-less flailing while training/skill-eval played normally. The walk needs
+		// only the proposer nets (built + checkpoint-loaded regardless of render) and the game
+		// states (fnSeedGoal reads those directly); what stays training-only (goalCondOn/goalCarOn)
+		// is RECORDING goals into trajectories.
+		const bool goalWalkOn = goalModel && propCfg.enabled && reachCfg.enabled;
+		const bool goalWalkCarOn = goalWalkOn && goalHasCar;
 
 		// 2.2 online recurrent goal state, persistent across iterations & collection steps: the
 		// current goal g_{t-1} per player (6/player each head) and whether a player is at an episode
 		// start (=> reseed g_{-1} from the achieved state, "propose staying put"). All players are
 		// carried (incl. old-version self-play opponents, which act on the live proposer's goal).
 		std::vector<float> curGoalBall(goalModel ? numPlayers * 6 : 0, 0.f);
-		std::vector<float> curGoalCar(goalCarOn ? numPlayers * 6 : 0, 0.f);
+		std::vector<float> curGoalCar(goalWalkCarOn ? numPlayers * 6 : 0, 0.f);
 		std::vector<uint8_t> goalAtEpStart(goalModel ? numPlayers : 0, 1);
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
@@ -809,7 +819,10 @@ void GGL::Learner::Start() {
 		// combinedTraj each iteration (step always restarts at 0) - the learn-prep Phi-drop pass
 		// looks these up via each row's srcStep/srcPlayer provenance before they're dropped.
 		std::unordered_map<int64_t, RLGC::ArenaSnapshot> stepSnapshots;
-		if (reachOn) {
+		// goalWalkOn included: fnSeedGoal indexes these maps in render too, where reachOn is off.
+		// Without them every player would seed from slot 0's perspective — the ORANGE car's goal
+		// would carry the BLUE canonical-frame sign.
+		if (reachOn || goalWalkOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
 				auto& players = envSet->state.gameStates[arenaIdx].players;
@@ -882,7 +895,7 @@ void GGL::Learner::Start() {
 			b[4] = sign * gs.ball.vel.y / reachCfg.velScale;
 			b[5] = gs.ball.vel.z / reachCfg.velScale;
 
-			if (goalCarOn) {
+			if (goalWalkCarOn) {
 				float* c = &curGoalCar[(size_t)p * 6];
 				c[0] = sign * player.pos.x / reachCfg.posScaleX;
 				c[1] = sign * player.pos.y / reachCfg.posScaleY;
@@ -1208,7 +1221,8 @@ void GGL::Learner::Start() {
 						Timer inferTimer = {};
 
 						// 2.2: g_t per player (host, global-indexed), captured for storage + curGoal
-						// advance below. Empty unless goalCondOn (render walks with zeros, records nothing).
+						// advance below (training advances after recording; render advances in its
+						// own branch). Empty unless the walk ran (goalWalkOn).
 						std::vector<float> stepGoalBall, stepGoalCar;
 
 						if (goalModel) {
@@ -1221,20 +1235,22 @@ void GGL::Learner::Start() {
 								: tdStatesAll;
 
 							torch::Tensor gBall, gCar;
-							if (goalCondOn) {
+							if (goalWalkOn) {
 								for (int p = 0; p < numPlayers; p++)
 									if (goalAtEpStart[p])
 										fnSeedGoal(p);
 								torch::Tensor tPrevBall = torch::from_blob(
 									curGoalBall.data(), { (int64_t)numPlayers, 6 }, torch::kFloat32).to(ppo->device, true);
 								gBall = ppo->proposer->StepGoal(liveTrunk, tPrevBall);
-								if (goalCarOn) {
+								if (goalWalkCarOn) {
 									torch::Tensor tPrevCar = torch::from_blob(
 										curGoalCar.data(), { (int64_t)numPlayers, 6 }, torch::kFloat32).to(ppo->device, true);
 									gCar = ppo->proposerCar->StepGoal(liveTrunk, tPrevCar);
 								}
 							} else {
-								// Render edge (goalModel && !goalCondOn): neutral zero goal keeps dims valid
+								// Misconfig edge only (goal-conditioned head but proposer/reach disabled in
+								// config): zero goal keeps dims valid. This is NOT the render path anymore —
+								// render runs the real walk above; a zero goal is a never-trained-on input.
 								auto zOpts = torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device);
 								gBall = torch::zeros({ (int64_t)numPlayers, 6 }, zOpts);
 								if (goalHasCar)
@@ -1242,9 +1258,9 @@ void GGL::Learner::Start() {
 							}
 							torch::Tensor goalCat = goalHasCar ? torch::cat({ gBall, gCar }, -1) : gBall;
 
-							if (goalCondOn) {
+							if (goalWalkOn) {
 								stepGoalBall = TENSOR_TO_VEC<float>(gBall.reshape({ -1 }).cpu());
-								if (goalCarOn)
+								if (goalWalkCarOn)
 									stepGoalCar = TENSOR_TO_VEC<float>(gCar.reshape({ -1 }).cpu());
 							}
 
@@ -1308,6 +1324,18 @@ void GGL::Learner::Start() {
 
 						if (render) {
 							renderSender->Send(envSet->state.gameStates[0]);
+
+							// 2.2: advance the recurrent goal walk exactly like the training path does
+							// in its record section (which render never reaches). Per-arena terminals
+							// are the episode-boundary signal here: StepSecondHalf just set this step's
+							// flags, and Reset() consumes them at the top of the next step.
+							if (goalWalkOn) {
+								curGoalBall = stepGoalBall;
+								if (goalWalkCarOn)
+									curGoalCar = stepGoalCar;
+								for (int p = 0; p < numPlayers; p++)
+									goalAtEpStart[p] = envSet->state.terminals[playerArenaIdx[p]] != 0;
+							}
 
 							// Ground truth for "what is the sim actually doing": if these counters
 							// show real touches/goals while the viewer shows none, the viewer is
