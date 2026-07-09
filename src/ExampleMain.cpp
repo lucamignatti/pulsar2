@@ -10,70 +10,74 @@
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
-#include <RLGymCPP/StateSetters/DrillSetter.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
 
-// Deliberate-practice drill bank (Stage 3, off by default - see cfg.ppo.proposer below): shared
-// across every arena's DrillSetter and the Learner's collection/learn-prep code.
-static RLGC::DrillBank g_DrillBank;
+// 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
+// (fast) codebase.
+//
+// The forensics (wandb 9uz761ua + git times): the run climbed hard, 0 -> ~1004 Rating/1v1 in
+// its first ~10B steps, then at wandb step ~54.4k / ~10.9B timesteps (2026-07-04 18:08 UTC) it
+// was resumed from an older checkpoint onto a rebuild that had just ENABLED the proposer + drill
+// machinery (commits db1dd87 "Add drill bank and proposer module" -> bc27a81 "Enable Stage 2 and
+// Stage 3 proposer settings"). From that point Rating improvement decelerated ~10x - it only
+// crept 1004 -> ~1190 over the *next 19B* steps. The last clean commit before that regression is
+// cf993b7 "Enable reachability gating for farmable rewards": pure PBRS + reachability GATING,
+// no proposer, no drill bank, no HRL. This file reproduces cf993b7's exact reward + training
+// config, but on the current codebase so we keep the post-regression SPEED commits (3d344fe/
+// 2211cce ~2x throughput, plus the reachability chunk-size tuning) - "current code, config
+// reverted", as requested.
+//
+// What is deliberately NOT here vs. the current (HEAD) config: the goal proposer, the drill bank
+// / DrillSetter, the car-proposer head, and the recent uncommitted edit that turned on the
+// self-play LEAGUE (trainAgainstOldVersions) and halved tsPerItr to 100k. None of those were in
+// the proven-good era.
+
+// SURGICAL-7 reward stack (Nexto-ratio potentials + impulse-scaled touch height), verbatim from
+// cf993b7 - the reward that got the bot to ~1004 Elo before the proposer was bolted on. NOT
+// touched: the regression was the proposer, not the reward, so re-establishing this as a clean
+// baseline means changing it as little as possible. (ShotReward/SaveReward from 2.5 are a
+// separate, unproven experiment to layer on top AFTER this baseline re-validates, not part of it.)
+std::vector<WeightedReward> BuildRewards() {
+	return {
+		// Player->ball proximity potential (Nexto liu_dist, dist_w=0.5 x15). Exact PBRS, so the
+		// chase annuity telescopes to ~0 per cycle; its 3D distance also pays climbing toward an
+		// overhead ball and refunds whiffs.
+		{ new BallProximityPotentialReward(), 7.5f },
+
+		// Ball->goal potential (Nexto state_quality). Antisymmetric between teams, so ALREADY
+		// zero-sum - no ZeroSum wrapper (that would silently 2x it). exp() concentrates credit at
+		// the goal mouth and refunds rolled-back balls in full.
+		{ new BallToGoalPotentialReward(), 75.f },
+
+		// Touch quality (Nexto touch_accel): pays only for adding ball speed, ~10 total 0->110kph,
+		// zero-sum so touches can't be co-farmed.
+		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
+
+		// Touch HEIGHT (Nexto touch_height x15), impulse-scaled: carries pay ~0, a real strike
+		// pays full height credit, airborne strikes pay double - the aerial gradient.
+		// GATED: the reachability gate mutes the aerial-juggle self-rally in states that don't
+		// matter. Beta anneals from 0, 0.2 floor keeps cold aerial learning intact.
+		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f, true },
+
+		// Boost pickup, halved (big pad from empty = 4 = 2.7% of a goal).
+		// GATED: don't pay for a boost-collection circuit in states where we can't win the ball
+		// or score - the residual farmable surface the gate exists for.
+		{ new PickupBoostReward(), 4.f, true },
+
+		// Demo halved so the zero-sum pair swing is 75 = goal/2. No bump term (Nexto had none).
+		{ new ZeroSumReward(new DemoReward(), 0.5f), 37.5f },
+
+		// The objective. All dense income per scoring possession sums to ~35-40 (~25% of a goal),
+		// none of it collectible without moving the ball toward scoring.
+		{ new GoalReward(), 150 }
+	};
+}
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
-	// SURGICAL-7: potentials + impulse-scaled touch height (Nexto ratios x15, Goal=150).
-	// Design rules:
-	// (1) every continuous term is an EXACT potential (gamma*Phi(s') - Phi(s)) -> all
-	//     movement cycles, whack-and-chase loops, and truncation harvests telescope to 0
-	//     by construction, not by weight-tuning;
-	// (2) every touch term pays for IMPULSE (delta ball-vel), never contact-time -> no
-	//     dribble/wall-pin/ceiling-carry annuity can exist;
-	// (3) events (touch, demo, goal) are ungated and zero-sum; nothing pays per-step for
-	//     existing (no Air, no SaveBoost) -> ambient do-nothing income is exactly 0.
-	// The gamma inside the potential classes must match cfg.ppo.gaeGamma (0.99).
-	std::vector<WeightedReward> rewards = {
-
-		// Player->ball proximity potential (Nexto liu_dist, dist_w=0.5 x15). Replaces
-		// VelocityPlayerToBallReward: the potential charges the full Phi drop when the
-		// ball is whacked away, so the 7.5/sec chase annuity nets ~0 per cycle. Its 3D
-		// distance also pays climbing toward an overhead ball and refunds whiffs.
-		{ new BallProximityPotentialReward(), 7.5f },
-
-		// Ball->goal potential (Nexto state_quality). Replaces ZeroSum(VelocityBallToGoal):
-		// antisymmetric between teams, so it is ALREADY zero-sum — no wrapper (the wrapper
-		// was a silent 2x). exp() concentrates credit at the goal mouth: a corner spray
-		// pockets ~3, not ~60, and rolls back for a full refund. ~+25 integrated midfield->net.
-		{ new BallToGoalPotentialReward(), 75.f },
-
-		// Touch quality: unchanged proven bootstrap (Nexto touch_accel). Pays only for
-		// adding ball speed, ~10 total 0->110kph, zero-sum so touches can't be co-farmed.
-		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
-
-		// Touch HEIGHT (Nexto touch_height x15), impulse-scaled: carries pay ~0, a real
-		// strike pays the full height credit, airborne strikes pay double. The only term
-		// where a high touch is worth more than a low one — the aerial gradient.
-		// GATED: the impulse factor already kills contact-time carries; the reachability
-		// gate additionally mutes the aerial juggle self-rally (a contested pop at height
-		// pays 10-15/sec) in states that don't matter. Beta anneals from 0 and the 0.2
-		// floor keep cold aerial learning intact (mult ~0.78 at the live run's beta~0.44).
-		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f, true },
-
-		// Boost pickup, halved (big pad from empty = 4 = 2.7% of a goal). SaveBoost removed:
-		// per-step income for holding a full tank taxed spending boost on aerials.
-		// GATED (as in the proven old stack): don't pay for a boost-collection circuit in
-		// states where we can't win the ball or score.
-		{ new PickupBoostReward(), 4.f, true },
-
-		// Demo halved so the zero-sum pair swing is 75 = goal/2. Bump removed entirely:
-		// its 0.25s re-fire push-grind paid up to 40/sec; Nexto had no bump term.
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 37.5f },
-
-		// The objective. All dense income per scoring possession sums to ~35-40 (~25% of
-		// a goal), none of it collectible without moving the ball toward scoring.
-		{ new GoalReward(), 150 }
-	};
-
 	std::vector<TerminalCondition*> terminalConditions = {
 		new NoTouchCondition(10),
 		new GoalScoreCondition()
@@ -90,31 +94,21 @@ EnvCreateResult EnvCreateFunc(int index) {
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
 	result.obsBuilder = new AdvancedObs();
-	// Effective near-ball share is 0.55 (0.35 ground + 0.20 aerial drill, cars <= 1200
-	// from the ball), preserving the anti-freeze touch bootstrap margin while finally
-	// posing aerial and defensive states.
+	// The proven cf993b7 reset mix - effective near-ball share 0.55 (0.35 ground + 0.20 aerial
+	// drill), no drill-replay slice (that came with the drill bank in the regression).
 	result.stateSetter = new CombinedState({
-		// Ground touch bootstrap — unchanged behavior, the proven anti-freeze state
+		// Ground touch bootstrap - the proven anti-freeze state
 		{ new BallNearCarState(600, 900), 0.35f },
-		// Aerial drill: ball hangs at 500-1500uu drifting down, BOTH cars on a 300-1200
-		// ring with >=40 boost, facing it. Symmetric, so there is no lucky-car windfall:
-		// the race to meet the falling ball IS the zero-sum challenge. From 1000uu the
-		// ball takes ~1.6-2.2s to land — a real window for jump/double-jump/boost-climb.
+		// Aerial drill: ball hangs at 500-1500uu drifting down, BOTH cars on a 300-1200 ring
+		// with >=40 boost, facing it. Symmetric, so the race to the falling ball IS the zero-sum
+		// challenge.
 		{ new BallNearCarState(300, 1200, 500, 1500, 400, 40), 0.20f },
 		{ new KickoffState(), 0.15f },
-		// Sole source of chaotic/defensive/air-recovery states (bounds widened to reach
-		// corners and goal lines)
+		// Sole source of chaotic/defensive/air-recovery states (bounds widened to corners/goal lines)
 		{ new RandomState(true, true, false), 0.30f },
-		// Deliberate-practice drills (Stage 3, REPLAY ON): ~9% of resets (0.1/1.1 of the mix) restore
-		// a banked near-miss snapshot with jitter and arm a practice window for the source team.
-		// Gate passed 2026-07-04 (tools/drill_report.py on the live bank): 52% clearly-good near-misses
-		// (28% saves/clears near net, 24% aerial), 7% suspect, drop-severity floor 0.160 under the
-		// percentile-calibrated top-K detector. Set back to 0.0f for detection-only.
-		// Falls back to the ground-touch setter if the bank is empty.
-		{ new DrillSetter(&g_DrillBank, index, new BallNearCarState(600, 900)), 0.1f },
 	});
 	result.terminalConditions = terminalConditions;
-	result.rewards = rewards;
+	result.rewards = BuildRewards();
 
 	result.arena = arena;
 
@@ -156,12 +150,9 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 }
 
 int main(int argc, char* argv[]) {
-	// Keep stdout live when it isn't a terminal. Under tools/run_trainer.sh the
-	// trainer's stdout is a log file, so glibc switches from line- to block-
-	// buffering and the per-iteration report only surfaces once an 8 KB buffer
-	// fills -- making `--follow` look frozen. unitbuf flushes after every insertion
-	// (output volume is trivial next to training), matching the always-flushing
-	// RG_LOG idiom so a terminal run and a logged run behave identically.
+	// Keep stdout live when it isn't a terminal (kept from the current codebase - a logging fix,
+	// not part of the regression). Under tools/run_trainer.sh stdout is a log file, so glibc
+	// block-buffers; unitbuf flushes after every insertion so --follow behaves like a terminal.
 	std::cout << std::unitbuf;
 
 	// Initialize RocketSim with collision meshes (run from the repo/build dir;
@@ -176,85 +167,41 @@ int main(int argc, char* argv[]) {
 	cfg.tickSkip = 8;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
-	// Play around with this to see what the optimal is for your machine, more games will consume more RAM
-	// 1024 sized for a 7900X (24 threads) + 5080: at 256 the per-step policy forward was a
-	// 512-row batch — pure launch overhead on this GPU. 2048 rows/step keeps it fed.
 	cfg.numGames = 1024;
 
 	// Leave this empty to use a random seed each run
-	// The random seed can have a strong effect on the outcome of a run
 	cfg.randomSeed = 123;
 
+	// 200k, the proven-good-era value (the recent uncommitted 100k edit was NOT in the good run).
 	int tsPerItr = 200'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
 	cfg.ppo.miniBatchSize = 200'000; // Lower this if too much VRAM is being allocated
 
-	// BF16 inference for collection + GAE value preds (Blackwell tensor cores). The
-	// reachability paths are unaffected: rho/gate evals request fp32 explicitly and
-	// grad-enabled forwards (InfoNCE training) always run fp32.
+	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
+	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
 	cfg.ppo.useHalfPrecision = true;
 
-	// Using 2 epochs seems pretty optimal when comparing time training to skill
-	// Perhaps 1 or 3 is better for you, test and find out!
 	cfg.ppo.epochs = 2;
-
-	// This scales differently than "ent_coef" in other frameworks
-	// This is the scale for normalized entropy, which means you won't have to change it if you add more actions
 	cfg.ppo.entropyScale = 0.035f;
 
-	// Reachability (aux InfoNCE heads on the shared trunk + reward gate).
-	// Experiment arms: A = both off (pure baseline), B = enabled only (aux representation
-	// effect), C = both on (the full gate). Arm C for the SURGICAL-7 stack: the gate and
-	// the potentials are COMPLEMENTARY on DISJOINT terms. Potentials stay ungated (positive-
-	// part gating breaks their telescoping); the gate takes the residual farmable surface —
-	// TouchHeight (aerial juggle rally) + PickupBoost (boost circuit) — the two rewards
-	// marked gated above. Beta anneals in on measured head validity, floored at 0.2.
+	// Reachability: aux InfoNCE heads on the shared trunk + reward GATE on the two farmable terms
+	// (TouchHeight, PickupBoost). This is the ONLY "smart" component - and with the proposer gone,
+	// the heads have exactly one consumer: the gate. This is the arm that was live in the good era.
 	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = true;
 
-	// Deliberate-practice goal proposer (advantage-weighted-hindsight goal proposal, in the same
-	// reachability BALL-head goal space). Stage 1 validated on the live run (tools/proposer_report.py:
-	// tracking 2.4x better than no-op, aspiration tilt +0.75 on vy, clamp 0%).
-	cfg.ppo.proposer.enabled = true;
+	// Explicitly OFF - the regression. ProposerConfig defaults enabled=true upstream, so this
+	// override is what actually keeps the proposer / drill bank / car-proposer / HRL machinery
+	// out of this build (no drill bank is ever constructed or attached, either).
+	cfg.ppo.proposer.enabled = false;
 
-	// Stage 2 ON: additive, advantage-only shaping at 5% of the extrinsic advantage std. Conservative
-	// first step (design range is 0.10-0.20); bump toward 0.10 once confirmed non-destructive. Revert
-	// is this one line back to 0.0 - the term only ever touches advantages, never value targets.
-	cfg.ppo.proposer.shapingBeta = 0.05f;
-
-	// Stage 3 in DETECTION-ONLY mode: practiceEnabled runs Phi-drop detection (banks the worst
-	// near-miss snapshots, logs Proposer/Drill Bank Size + Drills Added + Drill Candidates, and
-	// dumps the bank's contents to <ckpt>/drill_dumps/ for eyeballing), but the DrillSetter stays
-	// at weight 0.0 in EnvCreateFunc, so NO arena ever resets into a drill and NO practice window
-	// ever arms. That means zero reset-distribution perturbation and zero training-signal effect -
-	// the observable, fully-reversible half of Stage 3. The detector self-calibrates its thresholds
-	// from each batch's own Phi distribution (phiCalibratePerIter, default on), so no rho-dependent
-	// hand-tuning is needed, and banks the largest-drop candidates rather than the first found.
-	// Once the drill dumps look like real near-misses (aerial whiffs / blown saves, not kickoff
-	// chaos), bump the DrillSetter weight to ~0.1 to actually replay them (the one irreversible knob).
-	cfg.ppo.proposer.practiceEnabled = true;
-	cfg.ppo.proposer.drillBank = &g_DrillBank;
-
-	// Car proposer head (canonical CAR-state goals — fixes the old car-critic's ball-chasing by
-	// proposing where the CAR should go, not the ball). ENABLED = trains its delta net + warms the
-	// psi_carstate reach head (via HER) + logs car-space tilt to proposer_car_dumps/. carShapingBeta
-	// stays 0 (passive) until tools/proposer_report.py confirms car-space aspiration tilt (same
-	// gate the ball head passed) AND the psi head has warmed — then flip carShapingBeta to ~0.03.
-	cfg.ppo.proposer.carEnabled = true;
-	cfg.ppo.proposer.carShapingBeta = 0.0f;
-
-	// Wide clip, NOT 0: cold return-sigma under this near-sparse stack is ~2-4, so the
-	// default clip of 10 compressed the first goals 2-5x right at goal onset — but 0
-	// would let a first goal land as an unclipped 40+ sigma value-target spike under the
-	// lifetime Welford sigma. 50 releases the full 150 once sigma >= 3 and bounds the tail.
+	// Wide clip (cold return-sigma is ~2-4 under this near-sparse stack; default 10 compressed the
+	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
 	cfg.ppo.rewardClipRange = 50;
 
-	// Rate of reward decay
-	// Starting low tends to work out
 	cfg.ppo.gaeGamma = 0.99;
 
-	// Good learning rate to start
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
 
@@ -264,21 +211,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.lr = 3e-4f;
-	cfg.ppo.proposer.delta.layerSizes = { 256, 256 };
-	cfg.ppo.proposer.lr = 1e-4f;
 
-	// The rho reads (gate + proposer) and the shared-trunk feature pass process the batch in
-	// chunks of this many rows. Each chunk's phi forward is chunk*numActionSamples rows, so at
-	// 4096*16 the kernels were too small to fill the 5080 and there were ~49 chunks/pass — a
-	// launch-bound pattern that left the GPU idle. 16384 -> ~12 chunks, 4x bigger kernels, 4x
-	// fewer per-pass launches; peak transient is one chunk's worth (~a few hundred MB). Watch
-	// VRAM on the first iteration and dial back toward 8192 if it's tight.
+	// Speed knob kept from the post-good-era "speed 2" commit (2211cce): larger rho-read chunks
+	// fill the GPU better. This only changes CHUNKING of the gate's rho reads, never their values,
+	// so it's a pure throughput win with zero behavioral effect on the gate.
 	cfg.ppo.reachability.scoreChunkSize = 16384;
-	cfg.ppo.proposer.featureChunkSize = 16384;
 
-	// Muon's RMS-matched scaling makes Adam-tuned LRs transfer as-is.
-	// The reachability heads deliberately stay on Adam: contrastive InfoNCE embeddings
-	// train poorly under orthogonalized updates (see ReachabilityConfig).
+	// Muon for the dense nets (RMS-matched, Adam LRs transfer). Reachability heads stay Adam:
+	// contrastive InfoNCE embeddings train poorly under orthogonalized updates.
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
@@ -298,9 +238,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.phi.addLayerNorm = addLayerNorm;
 	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
 
-	// Skill rating: Elo-style eval matches against saved policy versions, logged to
-	// wandb as Rating/<mode> (e.g. Rating/1v1). Also turns on savePolicyVersions.
+	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
+	// savePolicyVersions. This was ON in the good era. NOTE: this only EVALUATES against old
+	// versions - it does NOT train against them. The separate trainAgainstOldVersions (self-play
+	// league) is deliberately left OFF: it was not part of the proven-good config (it was a recent
+	// uncommitted addition). Flip it on later as its own experiment if desired.
 	cfg.skillTracker.enabled = true;
+
+	// Distinct wandb run name so this shows up as its own line, not resuming 9uz761ua.
+	cfg.metricsRunName = "2.6-reachgate-pbrs";
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
