@@ -2,6 +2,7 @@
 #include <RLGymCPP/BasicTypes/Lists.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
+#include "PSDConfig.h"
 
 namespace GGL {
 	enum class LearnerDeviceType {
@@ -73,5 +74,10 @@ namespace GGL {
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
 		SkillTrackerConfig skillTracker = {};
+
+		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
+		// unchanged unless psd.enabled / league.enabled are set.
+		PSDConfig psd = {};
+		LeagueConfig league = {};
 	};
 }
