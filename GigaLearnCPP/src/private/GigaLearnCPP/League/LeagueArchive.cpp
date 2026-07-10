@@ -1,0 +1,316 @@
+#include "LeagueArchive.h"
+#include "Operators.h"
+#include "../PPO/PPOLearner.h"
+
+#include <torch/nn/utils/convert_parameters.h>
+#include <torch/csrc/api/include/torch/serialize.h>
+#include <RLGymCPP/StateSetters/FuzzedKickoffState.h>
+#include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
+
+using namespace GGL;
+using namespace torch;
+
+static const char* SCRATCH_MODELS[] = { "shared_head", "policy" };
+
+LeagueArchive::LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::EnvSet* trainEnv,
+	torch::Device device, std::filesystem::path checkpointFolder)
+	: cfg(cfg), device(device), ppo(ppo) {
+
+	// Isolated match arenas (never touches training arenas), goal-terminated like the skill tracker.
+	RLGC::EnvSetConfig mc = trainEnv->config;
+	mc.numArenas = 16;
+	matchEnv = new RLGC::EnvSet(mc);
+	for (int i = 0; i < (int)matchEnv->arenas.size(); i++) {
+		matchEnv->stateSetters[i] = { new RLGC::FuzzedKickoffState() };
+		matchEnv->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
+	}
+
+	// Scratch models to load member weights into (clones of the main policy path).
+	for (const char* name : SCRATCH_MODELS)
+		if (ppo->models[name])
+			scratch.Add(ppo->models[name]->MakeClone());
+
+	if (!checkpointFolder.empty())
+		leagueDir = checkpointFolder / "league";
+}
+
+LeagueArchive::~LeagueArchive() {
+	delete matchEnv;
+	scratch.Free();
+}
+
+std::vector<torch::Tensor> LeagueArchive::SnapshotMain() const {
+	RG_NO_GRAD;
+	std::vector<torch::Tensor> out;
+	for (const char* name : SCRATCH_MODELS)
+		if (ppo->models[name])
+			out.push_back(nn::utils::parameters_to_vector(ppo->models[name]->parameters()).detach().cpu().clone());
+	return out;
+}
+
+void LeagueArchive::LoadInto(ModelSet& set, const std::vector<torch::Tensor>& params) {
+	RG_NO_GRAD;
+	int i = 0;
+	for (const char* name : SCRATCH_MODELS) {
+		if (!set[name]) continue;
+		nn::utils::vector_to_parameters(params[i].to(device), set[name]->parameters());
+		set[name]->_seqHalfOutdated = true;
+		i++;
+	}
+}
+
+long LeagueArchive::CellIndex(const std::vector<float>& bd) const {
+	long idx = 0;
+	for (float v : bd) {
+		int b = std::clamp((int)(v * cfg.binsPerAxis), 0, cfg.binsPerAxis - 1);
+		idx = idx * cfg.binsPerAxis + b;
+	}
+	return idx;
+}
+
+float LeagueArchive::EvaluateMember(const std::vector<torch::Tensor>& memberParams, std::vector<float>& outBD) {
+	RG_NO_GRAD;
+	LoadInto(scratch, memberParams);
+	matchEnv->Reset();
+
+	// Fixed team split (member = team A, main = team B) computed from the initial state.
+	std::vector<int> aPlayers, bPlayers;
+	Team aTeam = Team::BLUE;
+	for (int i = 0; i < (int)matchEnv->arenas.size(); i++) {
+		auto& st = matchEnv->state.gameStates[i];
+		for (int j = 0; j < (int)st.players.size(); j++) {
+			int pIdx = matchEnv->state.arenaPlayerStartIdx[i] + j;
+			(st.players[j].team == aTeam ? aPlayers : bPlayers).push_back(pIdx);
+		}
+	}
+	Tensor tA = torch::tensor(aPlayers), tB = torch::tensor(bPlayers);
+
+	double inAir = 0, fieldY = 0, boost = 0;
+	long samples = 0;
+	int aGoals = 0, bGoals = 0;
+	const int matchSteps = 300;
+	for (int step = 0; step < matchSteps; step++) {
+		matchEnv->Reset();
+		Tensor obs = DIMLIST2_TO_TENSOR<float>(matchEnv->state.obs);
+		Tensor masks = DIMLIST2_TO_TENSOR<uint8_t>(matchEnv->state.actionMasks);
+
+		matchEnv->StepFirstHalf(true);
+
+		Tensor aAct, bAct, lp;
+		PPOLearner::InferActionsFromModels(scratch,
+			obs.index_select(0, tA).to(device, true), masks.index_select(0, tA).to(device, true),
+			false, ppo->config.policyTemperature, ppo->config.useHalfPrecision, &aAct, &lp);
+		PPOLearner::InferActionsFromModels(ppo->models,
+			obs.index_select(0, tB).to(device, true), masks.index_select(0, tB).to(device, true),
+			false, ppo->config.policyTemperature, ppo->config.useHalfPrecision, &bAct, &lp);
+
+		auto av = TENSOR_TO_VEC<int>(aAct), bv = TENSOR_TO_VEC<int>(bAct);
+		std::vector<int> actions(matchEnv->state.numPlayers, 0);
+		for (int i = 0; i < (int)aPlayers.size(); i++) actions[aPlayers[i]] = av[i];
+		for (int i = 0; i < (int)bPlayers.size(); i++) actions[bPlayers[i]] = bv[i];
+
+		matchEnv->Sync();
+		matchEnv->StepSecondHalf(actions, false);
+
+		// Behavior descriptors over team-A cars.
+		for (int i = 0; i < (int)matchEnv->arenas.size(); i++) {
+			auto& st = matchEnv->state.gameStates[i];
+			for (auto& p : st.players) {
+				if (p.team != aTeam) continue;
+				inAir += p.isOnGround ? 0.0 : 1.0;
+				fieldY += std::min(1.0, std::abs((double)p.pos.y) / 5120.0);
+				boost += std::clamp((double)p.boost / 100.0, 0.0, 1.0);
+				samples++;
+			}
+			if (st.goalScored) {
+				if (RS_TEAM_FROM_Y(st.ball.pos.y) == aTeam) aGoals++; else bGoals++;
+			}
+		}
+	}
+
+	outBD = {
+		(float)(inAir / std::max(1L, samples)),
+		(float)(fieldY / std::max(1L, samples)),
+		(float)(boost / std::max(1L, samples))
+	};
+	// Trim/pad BD to the configured axis count.
+	outBD.resize(cfg.gridAxes.size(), 0.0f);
+	return (float)(aGoals - bGoals);
+}
+
+void LeagueArchive::TryInsert(Member&& m) {
+	if (m.fitness < cfg.competenceFloor) return;
+
+	m.cell = (int)CellIndex(m.bd);
+	auto it = cellToMember.find(m.cell);
+	if (it == cellToMember.end()) {
+		members.push_back(std::move(m));
+		cellToMember[members.back().cell] = (int)members.size() - 1;
+	} else if (m.fitness > members[it->second].fitness) {
+		members[it->second] = std::move(m); // within-cell replacement (style-preserving elitism)
+	}
+}
+
+int LeagueArchive::SampleOpponent() const {
+	if (members.empty()) return -1;
+	// PFSP: prefer members near the frontier (moderate fitness), softmax over -|fitness| / temp.
+	std::vector<double> logits(members.size());
+	double mx = -1e30;
+	for (size_t i = 0; i < members.size(); i++) {
+		logits[i] = -std::abs((double)members[i].fitness) / std::max(1e-3, (double)cfg.pfspTemp);
+		mx = std::max(mx, logits[i]);
+	}
+	double sum = 0; for (double& l : logits) { l = std::exp(l - mx); sum += l; }
+	double r = ((double)Math::RandInt(0, 100000) / 100000.0) * sum;
+	double acc = 0;
+	for (size_t i = 0; i < members.size(); i++) { acc += logits[i]; if (r <= acc) return (int)i; }
+	return (int)members.size() - 1;
+}
+
+void LeagueArchive::EvolveStep(Report& report) {
+	RG_NO_GRAD;
+
+	// Seed the archive from the main agent (a few mutated copies) when empty.
+	if (members.empty()) {
+		std::vector<torch::Tensor> mainW = SnapshotMain();
+		std::vector<float> bd;
+		float q = EvaluateMember(mainW, bd);
+		Member seed; seed.params = mainW; seed.bd = bd; seed.fitness = q;
+		TryInsert(std::move(seed));
+		return;
+	}
+
+	// Produce a batch of candidates via mutation + crossover on existing members.
+	int nCandidates = 4;
+	for (int c = 0; c < nCandidates; c++) {
+		int pa = SampleOpponent();
+		std::vector<torch::Tensor> childW;
+		if ((int)members.size() >= 2 && (Math::RandInt(0, 2) == 0)) {
+			int pb = SampleOpponent();
+			for (size_t k = 0; k < members[pa].params.size(); k++)
+				childW.push_back(League::CrossoverDARE(members[pa].params[k], members[pb].params[k], cfg.dareDropRate));
+		} else {
+			for (auto& t : members[pa].params)
+				childW.push_back(League::MutateGaussian(t, cfg.mutationSigma));
+		}
+
+		std::vector<float> bd;
+		float q = EvaluateMember(childW, bd);
+
+		Member m; m.params = childW; m.bd = bd; m.fitness = q; m.matches = 1;
+
+		// Exploiter audit: a strong member whose cell is already held by a *different* member is
+		// evidence the descriptor basis is missing an axis.
+		long cell = CellIndex(bd);
+		auto occ = cellToMember.find((int)cell);
+		if (q > 0 && occ != cellToMember.end())
+			exploiterUnmappedWins++;
+
+		TryInsert(std::move(m));
+	}
+
+	// Cull: cap total members, dropping the lowest-fitness non-cell-elite first.
+	while ((int)members.size() > cfg.maxMembers) {
+		int worst = -1; float wf = 1e30f;
+		for (int i = 0; i < (int)members.size(); i++)
+			if (members[i].fitness < wf) { wf = members[i].fitness; worst = i; }
+		if (worst < 0) break;
+		int lastCell = members[worst].cell;
+		members.erase(members.begin() + worst);
+		// Rebuild the cell map (indices shifted).
+		cellToMember.clear();
+		for (int i = 0; i < (int)members.size(); i++)
+			if (members[i].cell >= 0) {
+				auto it = cellToMember.find(members[i].cell);
+				if (it == cellToMember.end() || members[i].fitness > members[it->second].fitness)
+					cellToMember[members[i].cell] = i;
+			}
+		(void)lastCell;
+	}
+}
+
+void LeagueArchive::LogMetrics(Report& report) const {
+	long totalCells = 1;
+	for (size_t i = 0; i < cfg.gridAxes.size(); i++) totalCells *= cfg.binsPerAxis;
+	report["League/Cell Count"] = (float)cellToMember.size();
+	report["League/Member Count"] = (float)members.size();
+	report["League/Coverage"] = (float)cellToMember.size() / (float)std::max(1L, totalCells);
+	report["League/Exploiter Unmapped Wins"] = (float)exploiterUnmappedWins;
+
+	float worst = 1e30f;
+	for (auto& kv : cellToMember) worst = std::min(worst, members[kv.second].fitness);
+	if (!cellToMember.empty()) report["League/Worst Cell Fitness"] = worst;
+
+	// Mean pairwise behavioral distance (diversity health).
+	double dsum = 0; long dn = 0;
+	for (size_t i = 0; i < members.size(); i++)
+		for (size_t j = i + 1; j < members.size(); j++) {
+			double d = 0;
+			for (size_t a = 0; a < members[i].bd.size() && a < members[j].bd.size(); a++)
+				d += (members[i].bd[a] - members[j].bd[a]) * (members[i].bd[a] - members[j].bd[a]);
+			dsum += std::sqrt(d); dn++;
+		}
+	if (dn > 0) report["League/Pairwise Behavioral Distance"] = (float)(dsum / dn);
+}
+
+void LeagueArchive::OnIteration(Report& report, uint64_t totalIterations) {
+	if (!cfg.enabled) return;
+	if (cfg.evolveEveryIters > 0 && (totalIterations % cfg.evolveEveryIters) == 0)
+		EvolveStep(report);
+	LogMetrics(report);
+}
+
+void LeagueArchive::ToJSON(nlohmann::json& j) const {
+	nlohmann::json l;
+	l["member_count"] = members.size();
+	l["exploiter_unmapped_wins"] = exploiterUnmappedWins;
+	// Persist member metadata; weights are saved to the league dir keyed by index.
+	nlohmann::json arr = nlohmann::json::array();
+	for (size_t i = 0; i < members.size(); i++) {
+		nlohmann::json m;
+		m["bd"] = members[i].bd;
+		m["fitness"] = members[i].fitness;
+		m["cell"] = members[i].cell;
+		m["exploiter"] = members[i].exploiter;
+		arr.push_back(m);
+		if (!leagueDir.empty()) {
+			std::filesystem::create_directories(leagueDir / "members");
+			torch::save(members[i].params,
+				(leagueDir / "members" / (std::to_string(i) + ".pt")).string());
+		}
+	}
+	l["members"] = arr;
+	j["league"] = l;
+}
+
+void LeagueArchive::FromJSON(const nlohmann::json& j) {
+	if (!j.contains("league")) return;
+	auto& l = j["league"];
+	exploiterUnmappedWins = l.value("exploiter_unmapped_wins", 0L);
+	members.clear();
+	cellToMember.clear();
+	if (leagueDir.empty() || !l.contains("members")) return;
+	int nModels = 0; for (const char* n : SCRATCH_MODELS) if (scratch[n]) nModels++;
+	int i = 0;
+	for (auto& m : l["members"]) {
+		Member mem;
+		mem.bd = m.value("bd", std::vector<float>{});
+		mem.fitness = m.value("fitness", 0.0f);
+		mem.cell = m.value("cell", -1);
+		mem.exploiter = m.value("exploiter", false);
+		bool ok = true;
+		auto path = leagueDir / "members" / (std::to_string(i) + ".pt");
+		if (std::filesystem::exists(path))
+			torch::load(mem.params, path.string());
+		else
+			ok = false;
+		if (ok && (int)mem.params.size() == nModels) {
+			members.push_back(std::move(mem));
+			if (members.back().cell >= 0) cellToMember[members.back().cell] = (int)members.size() - 1;
+		}
+		i++;
+	}
+}

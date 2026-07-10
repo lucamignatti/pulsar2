@@ -251,6 +251,30 @@ int main(int argc, char* argv[]) {
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
 
+	// ---------------------------------------------------------------------------------------------
+	// Basin-Racing (PSD) + QD league. Both ADDITIVE and OFF by default: with these two flags false
+	// the trainer is byte-for-byte the proven 2.6 baseline. Enable to layer the outer loop on top.
+	//
+	// PSD alternates ordinary DESCEND (== the baseline above) with EGGROLL PROBE rounds: K antithetic
+	// low-rank perturbations of the policy each get a short factor-only finetune, are scored on
+	// held-out arenas, and the fitness-weighted sum of the ORIGINAL directions is folded into the
+	// base weights. warmupUntilPlateau keeps pure DESCEND until Rating/1v1 stalls, so the K-cost is
+	// only paid where PPO alone plateaus (resuming the live 2.6 checkpoint trips this immediately).
+	// Recommended first live run: enable PSD only; add the league once probe rounds look healthy.
+	cfg.psd.enabled = false;              // <- flip to true to turn on Basin-Racing
+	cfg.psd.warmupUntilPlateau = true;
+	cfg.psd.K = 16;
+	cfg.psd.rank = 4;
+	cfg.psd.sigma = 0.02f;
+	cfg.psd.GProbe = 50;
+	cfg.psd.GExploit = 2500;
+	cfg.psd.fitnessMode = 1;              // 1 = end-of-window slope (handoff §4.1 fix), 0 = level
+
+	cfg.league.enabled = false;           // <- flip to true to turn on the QD opponent league
+	cfg.league.gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
+	cfg.league.binsPerAxis = 4;
+	cfg.league.exploiterSlots = 2;
+
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
 

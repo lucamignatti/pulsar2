@@ -13,6 +13,8 @@
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
+#include <private/GigaLearnCPP/PSD/PSDController.h>
+#include <private/GigaLearnCPP/League/LeagueArchive.h>
 
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
@@ -149,6 +151,16 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		versionMgr = NULL;
 	}
 
+	// Basin-Racing (PSD) + QD league — additive, created only when enabled. Built BEFORE Load()
+	// so LoadStats can restore their persistent state from the checkpoint.
+	if (config.psd.enabled && !config.renderMode) {
+		psd = new PSDController(config.psd, device);
+		psd->Init(envSet, ppo, (int)envSet->arenas.size(), config.checkpointFolder);
+	}
+	if (config.league.enabled && !config.renderMode) {
+		league = new LeagueArchive(config.league, ppo, envSet, device, config.checkpointFolder);
+	}
+
 	if (!config.checkpointFolder.empty())
 		Load();
 
@@ -197,6 +209,11 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
+	if (psd)
+		psd->ToJSON(j);
+	if (league)
+		league->ToJSON(j);
+
 	std::string jStr = j.dump(4);
 	fOut << jStr;
 }
@@ -230,6 +247,11 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
+
+	if (psd)
+		psd->FromJSON(j);
+	if (league)
+		league->FromJSON(j);
 }
 
 // Different than RLGym-PPO to show that they are not compatible
@@ -2112,6 +2134,24 @@ void GGL::Learner::Start() {
 				if (versionMgr)
 					versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 
+				// QD league: evolve/evaluate members between iterations (additive, off by default).
+				if (league)
+					league->OnIteration(report, totalIterations);
+
+				// Basin-Racing (PSD): may run a full probe round in-line. If it does, the arenas
+				// were stepped out from under the in-flight trajectories, so clear them — the next
+				// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
+				if (psd) {
+					float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
+					bool probed = psd->OnDescendIteration(report, rating);
+					if (probed) {
+						// Clear the persistent per-player trajectories so post-probe collection
+						// starts fresh episodes (combinedTraj is rebuilt from these each iteration).
+						for (auto& traj : trajectories)
+							traj.Clear();
+					}
+				}
+
 				if (saveQueued) {
 					if (!config.checkpointFolder.empty())
 						Save();
@@ -2187,6 +2227,8 @@ void GGL::Learner::Start() {
 }
 
 GGL::Learner::~Learner() {
+	delete psd;
+	delete league;
 	delete ppo;
 	delete versionMgr;
 	delete metricSender;
