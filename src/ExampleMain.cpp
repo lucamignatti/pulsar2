@@ -245,8 +245,8 @@ int main(int argc, char* argv[]) {
 	// uncommitted addition). Flip it on later as its own experiment if desired.
 	cfg.skillTracker.enabled = true;
 
-	// Distinct wandb run name so this shows up as its own line, not resuming 9uz761ua.
-	cfg.metricsRunName = "2.6-reachgate-pbrs";
+	// Distinct wandb run name for the Basin-Racing run (its own line; won't resume 2.6).
+	cfg.metricsRunName = "3.0-psd";
 
 	cfg.sendMetrics = true; // Send metrics
 	cfg.renderMode = false; // Don't render
@@ -260,8 +260,12 @@ int main(int argc, char* argv[]) {
 	// held-out arenas, and the fitness-weighted sum of the ORIGINAL directions is folded into the
 	// base weights. warmupUntilPlateau keeps pure DESCEND until Rating/1v1 stalls, so the K-cost is
 	// only paid where PPO alone plateaus (resuming the live 2.6 checkpoint trips this immediately).
-	// Recommended first live run: enable PSD only; add the league once probe rounds look healthy.
-	cfg.psd.enabled = false;              // <- flip to true to turn on Basin-Racing
+	// FULL RUN: Basin-Racing + QD league both ON.
+	// warmupUntilPlateau keeps pure DESCEND (== the 2.6 baseline) until Rating/1v1 stalls, so the
+	// K-cost is only paid at a plateau: resuming a competent 2.6 checkpoint trips it quickly; a
+	// from-scratch start descends normally until its first plateau (~GExploit iters). K=16 -> 32
+	// antithetic probes; numGames 1024 splits cleanly (24 probe + 8 eval arenas per slot).
+	cfg.psd.enabled = true;
 	cfg.psd.warmupUntilPlateau = true;
 	cfg.psd.K = 16;
 	cfg.psd.rank = 4;
@@ -270,7 +274,7 @@ int main(int argc, char* argv[]) {
 	cfg.psd.GExploit = 2500;
 	cfg.psd.fitnessMode = 1;              // 1 = end-of-window slope (handoff §4.1 fix), 0 = level
 
-	cfg.league.enabled = false;           // <- flip to true to turn on the QD opponent league
+	cfg.league.enabled = true;
 	cfg.league.gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
 	cfg.league.binsPerAxis = 4;
 	cfg.league.exploiterSlots = 2;
