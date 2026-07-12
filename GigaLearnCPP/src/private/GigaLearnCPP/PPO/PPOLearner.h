@@ -59,6 +59,8 @@ namespace GGL {
 		// If models is null, this->models will be used
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
+		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
+		torch::Tensor InferGoalCritic(torch::Tensor obs);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		static torch::Tensor InferPolicyProbsFromModels(

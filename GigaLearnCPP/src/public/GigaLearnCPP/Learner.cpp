@@ -314,6 +314,64 @@ void GGL::Learner::Load() {
 	}
 }
 
+bool GGL::Learner::ReloadNewestCheckpointForRender(int64_t& loadedTimesteps) {
+	if (config.checkpointFolder.empty())
+		return false;
+
+	// Newest fully-numbered checkpoint dir. FindNumberedDirs already skips the sibling
+	// policy_versions / league / psd_rounds folders (their names aren't all-digits).
+	std::set<int64_t> saved = Utils::FindNumberedDirs(config.checkpointFolder);
+	if (saved.empty())
+		return false;
+	int64_t newest = *saved.rbegin();
+	if (newest <= loadedTimesteps)
+		return false; // nothing newer than what's already on screen
+
+	std::filesystem::path dir = config.checkpointFolder / std::to_string(newest);
+
+	// The trainer writes a checkpoint's files one-by-one (POLICY.lt, CRITIC.lt, ... + optims), not
+	// atomically, and it isn't built to drop a completion marker. So only swap once the directory
+	// has *settled* -- nothing in it written for a moment -- to avoid reading a half-written .lt.
+	constexpr double SETTLE_SECS = 2.0;
+	try {
+		if (!std::filesystem::exists(dir / "POLICY.lt"))
+			return false;
+		auto newestWrite = std::filesystem::file_time_type::min();
+		for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+			auto t = entry.last_write_time();
+			if (t > newestWrite)
+				newestWrite = t;
+		}
+		auto age = std::filesystem::file_time_type::clock::now() - newestWrite;
+		if (std::chrono::duration<double>(age).count() < SETTLE_SECS)
+			return false; // still being written; retry on the next poll
+	} catch (std::exception&) {
+		return false; // dir raced (checkpoint rotation / partial write); retry next poll
+	}
+
+	// A viewer only runs the policy forward (obs -> shared_head -> policy -> action), so reload just
+	// those two nets and skip the critic, reachability heads, and ALL optimizer state. That's
+	// strictly lighter than the startup LoadFrom() -- which matters when this runs live alongside a
+	// busy trainer -- so it can't regress the viewer's ability to coexist.
+	//
+	// Defense in depth: even settled, guard the load. Model::Load() throws (RG_ERR_CLOSE) on a
+	// truncated/corrupt file, and that throw would otherwise be caught by the Start() loop's handler
+	// and take the whole viewer down. Leave loadedTimesteps unchanged on failure so we re-attempt
+	// this same dir on the next poll.
+	try {
+		ModelSet policyModels = ppo->GetPolicyModels();
+		policyModels.Load(dir, /*allowNotExist=*/false, /*loadOptims=*/false);
+	} catch (std::exception& e) {
+		RG_LOG("[render] Checkpoint " << newest << " not ready, will retry: " << e.what());
+		return false;
+	}
+
+	loadedTimesteps = newest;
+	totalTimesteps = newest; // keep logging in sync with what's being shown
+	RG_LOG("[render] Now visualizing checkpoint " << newest);
+	return true;
+}
+
 void GGL::Learner::StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread) {
 	quitPressed = false;
 
@@ -523,6 +581,15 @@ void GGL::Learner::Start() {
 	if (render)
 		RG_LOG("\t(Render mode enabled)");
 
+	// Render-mode live reload: follow the newest checkpoint a separate training process writes, so
+	// the viewer tracks the model as it learns. Starts at the checkpoint loaded in the constructor
+	// (0 if none); the timer throttles how often we poll the checkpoint folder.
+	int64_t renderLoadedTS = (int64_t)totalTimesteps;
+	Timer renderReloadTimer = {};
+	if (render && config.renderReloadSecs > 0)
+		RG_LOG("\t(Live reload: polling " << config.checkpointFolder << " every "
+			<< config.renderReloadSecs << "s for newer checkpoints)");
+
 	try {
 		std::atomic<bool> saveQueued = false;
 		std::thread keyPressThread;
@@ -534,6 +601,10 @@ void GGL::Learner::Start() {
 
 		struct Trajectory {
 			FList states, nextStates, rewards, logProbs;
+			// Goal-only reward channel for the secondary goal critic (only filled when
+			// config.ppo.goalCritic.enabled): +1 own team scored / -1 conceded / 0 otherwise,
+			// computed straight from game outcomes — independent of the reward stack.
+			FList goalRews;
 			std::vector<uint8_t> actionMasks;
 			std::vector<int8_t> terminals;
 			std::vector<int32_t> actions;
@@ -583,6 +654,7 @@ void GGL::Learner::Start() {
 				states.clear();
 				nextStates.clear();
 				rewards.clear();
+				goalRews.clear();
 				logProbs.clear();
 				actionMasks.clear();
 				terminals.clear();
@@ -614,6 +686,7 @@ void GGL::Learner::Start() {
 				states.reserve(rows * obsSize);
 				actionMasks.reserve(rows * numActions);
 				rewards.reserve(rows);
+				goalRews.reserve(rows);
 				logProbs.reserve(rows);
 				terminals.reserve(rows);
 				actions.reserve(rows);
@@ -652,6 +725,7 @@ void GGL::Learner::Start() {
 				states += other.states;
 				nextStates += other.nextStates;
 				rewards += other.rewards;
+				goalRews += other.goalRews;
 				logProbs += other.logProbs;
 				actionMasks += other.actionMasks;
 				terminals += other.terminals;
@@ -684,6 +758,8 @@ void GGL::Learner::Start() {
 			void AssertAligned() const {
 				size_t n = actions.size();
 				RG_ASSERT(rewards.size() == n && logProbs.size() == n && terminals.size() == n);
+				if (!goalRews.empty())
+					RG_ASSERT(goalRews.size() == n);
 				if (!touched.empty()) {
 					RG_ASSERT(touched.size() == n && oppTouched.size() == n && gatedPos.size() == n);
 					RG_ASSERT(carHerGoals.size() == n * 6 && ballHerGoals.size() == n * 6 && ballMoved.size() == n);
@@ -719,6 +795,7 @@ void GGL::Learner::Start() {
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
 		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
+		const bool goalCriticOn = config.ppo.goalCritic.enabled && !render;
 		if (practiceOn) {
 			propCfg.drillBank->Configure(
 				(int)envSet->arenas.size(), propCfg.practiceWindowSteps, propCfg.maxDrillBankSize,
@@ -963,8 +1040,12 @@ void GGL::Learner::Start() {
 
 			bool isFirstIteration = (totalTimesteps == 0);
 
-			// TODO: Old version switching messes up the gameplay potentially
-			GGL::PolicyVersion* oldVersion = NULL;
+			// This iteration's opponent for the non-self team: an old policy version, a PFSP-sampled
+			// league member, or (default) the current self. `oppModels` is the opponent's network
+			// (null = mirror self-play); the player masking, trajectory exclusion, and split inference
+			// below are shared by all three sources. The sources are mutually exclusive and the choice
+			// is made once per iteration.
+			ModelSet* oppModels = nullptr;
 			std::vector<bool> oldVersionPlayerMask;
 			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
 			torch::Tensor tNewPlayerIndices, tOldPlayerIndices;
@@ -972,43 +1053,43 @@ void GGL::Learner::Start() {
 			for (int i = 0; i < numPlayers; i++)
 				newPlayerIndices.push_back(i);
 
-			if (config.trainAgainstOldVersions) {
+			if (!render) {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				bool shouldTrainAgainstOld =
-					(RocketSim::Math::RandFloat() < config.trainAgainstOldChance)
-					&& !versionMgr->versions.empty()
-					&& !render;
-
-				if (shouldTrainAgainstOld) {
-					// Set up training against old versions
-
+				if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
+					&& RocketSim::Math::RandFloat() < config.trainAgainstOldChance) {
 					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-					oldVersion = &versionMgr->versions[oldVersionIdx];
-
-					Team oldVersionTeam = Team(RocketSim::Math::RandInt(0, 2)); 
-					
-					newPlayerIndices.clear();
-					oldVersionPlayerMask.resize(numPlayers);
-					int i = 0;
-					for (auto& state : envSet->state.gameStates) {
-						for (auto& player : state.players) {
-							if (player.team == oldVersionTeam) {
-								oldVersionPlayerMask[i] = true;
-								oldPlayerIndices.push_back(i);
-							} else {
-								oldVersionPlayerMask[i] = false;
-								newPlayerIndices.push_back(i);
-							}
-							i++;
-						}
-					}
-
-					tNewPlayerIndices = torch::tensor(newPlayerIndices);
-					tOldPlayerIndices = torch::tensor(oldPlayerIndices);
+					oppModels = &versionMgr->versions[oldVersionIdx].models;
+				} else if (league && RocketSim::Math::RandFloat() < config.league.descendOpponentFrac) {
+					// PFSP-sampled league member -> the exposure to non-self styles the league is for
+					// (returns null while the archive is still empty, falling back to self-play).
+					oppModels = league->LoadPFSPOpponentModels();
 				}
 			}
 
-			int numRealPlayers = oldVersion ? newPlayerIndices.size() : envSet->state.numPlayers;
+			if (oppModels) {
+				Team oppTeam = Team(RocketSim::Math::RandInt(0, 2));
+
+				newPlayerIndices.clear();
+				oldVersionPlayerMask.resize(numPlayers);
+				int i = 0;
+				for (auto& state : envSet->state.gameStates) {
+					for (auto& player : state.players) {
+						if (player.team == oppTeam) {
+							oldVersionPlayerMask[i] = true;
+							oldPlayerIndices.push_back(i);
+						} else {
+							oldVersionPlayerMask[i] = false;
+							newPlayerIndices.push_back(i);
+						}
+						i++;
+					}
+				}
+
+				tNewPlayerIndices = torch::tensor(newPlayerIndices);
+				tOldPlayerIndices = torch::tensor(oldPlayerIndices);
+			}
+
+			int numRealPlayers = oppModels ? newPlayerIndices.size() : envSet->state.numPlayers;
 
 			int stepsCollected = 0;
 			{ // Generate experience
@@ -1016,24 +1097,18 @@ void GGL::Learner::Start() {
 				combinedTraj.ClearKeepCapacity();
 				stepSnapshots.clear();
 
-				// Players handed to an old version stop being collected this iteration; their
-				// in-flight partial episodes would otherwise silently SPLICE with a later
-				// episode when they return (HER goals and gate windows would cross a hidden
-				// reset). Finalize them as truncations instead — the current obs is exactly
-				// the next-state the critic should bootstrap from.
-				if (oldVersion) {
-					for (int oldPlayerIdx : oldPlayerIndices) {
-						auto& traj = trajectories[oldPlayerIdx];
-						if (traj.Length() == 0)
-							continue;
-
-						traj.terminals.back() = RLGC::TerminalType::TRUNCATED;
-						traj.nextStates += envSet->state.obs.GetRow(oldPlayerIdx);
-						fnRelabelReachGoals(traj, oldPlayerIdx);
-						fnAppendProposerTargets(traj);
-						combinedTraj.Append(traj);
-						traj.Clear();
-					}
+				// Players handed to the opponent this iteration stop being collected; their in-flight
+				// partial episode must not silently SPLICE with a later episode when they return to
+				// collecting (HER goals and gate windows would cross a hidden reset). DISCARD the
+				// partial (Clear) rather than finalize-and-append it: appending up to half the players'
+				// in-flight episodes into this iteration's freshly-cleared buffer can exceed tsPerItr
+				// and starve fresh collection entirely — the loop condition is `Length() < tsPerItr`,
+				// so a pre-filled buffer collects ZERO steps (Collection SPS -> 0, no progress). The
+				// discarded tails are minor, slightly-off-policy truncated data PPO doesn't want; the
+				// collection loop still gathers a full tsPerItr of fresh on-policy experience.
+				if (oppModels) {
+					for (int oldPlayerIdx : oldPlayerIndices)
+						trajectories[oldPlayerIdx].Clear();
 				}
 
 				Timer collectionTimer = {};
@@ -1129,7 +1204,7 @@ void GGL::Learner::Start() {
 
 						Timer inferTimer = {};
 
-						if (oldVersion) {
+						if (oppModels) {
 							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
@@ -1139,7 +1214,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tOldActions;
 
 							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
-							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, &oldVersion->models);
+							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
@@ -1167,6 +1242,10 @@ void GGL::Learner::Start() {
 
 						if (render) {
 							renderSender->Send(envSet->state.gameStates[0]);
+							if (config.renderReloadSecs > 0 && renderReloadTimer.Elapsed() >= config.renderReloadSecs) {
+								renderReloadTimer.Reset();
+								ReloadNewestCheckpointForRender(renderLoadedTS);
+							}
 							continue;
 						}
 
@@ -1231,6 +1310,19 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
+
+							if (goalCriticOn) {
+								// Goal-only channel, straight from game outcomes (same convention as
+								// GoalReward: RS_TEAM_FROM_Y(ball.y) = the team whose net the ball is
+								// in = the CONCEDING team; the scorer is the other one).
+								auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
+								float gr = 0;
+								if (gs.goalScored) {
+									auto& player = gs.players[playerSlotIdx[newPlayerIdx]];
+									gr = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y)) ? 1.f : -1.f;
+								}
+								trajectories[newPlayerIdx].goalRews += gr;
+							}
 
 							if (reachOn) {
 								auto& traj = trajectories[newPlayerIdx];
@@ -1349,6 +1441,7 @@ void GGL::Learner::Start() {
 					report["Average Step Reward"] = tRewards.mean().item<float>();
 					report["Collected Timesteps"] = stepsCollected;
 					
+					Timer valPredTimer = {};
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
 
@@ -1379,6 +1472,25 @@ void GGL::Learner::Start() {
 						}
 					}
 
+					// Secondary goal-critic value predictions (same minibatching pattern).
+					torch::Tensor tGoalValPreds, tGoalTruncValPreds;
+					if (goalCriticOn) {
+						if (ppo->device.is_cpu()) {
+							tGoalValPreds = ppo->InferGoalCritic(tStates.to(ppo->device, true, true)).cpu();
+						} else {
+							tGoalValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
+							for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
+								int start = i;
+								int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
+								auto part = ppo->InferGoalCritic(tStates.slice(0, start, end).to(ppo->device, true, true)).cpu();
+								tGoalValPreds.slice(0, start, end).copy_(part, true);
+							}
+						}
+						if (tNextTruncStates.defined())
+							tGoalTruncValPreds = ppo->InferGoalCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+					}
+					report["Value Pred Time"] = valPredTimer.Elapsed();
+
 					// Only report when at least one NORMAL terminal occurred; an all-truncated
 					// iteration (every episode hit maxEpisodeLength / handoff) makes the fraction
 					// 0 and the reciprocal +inf, which poisons the logged series.
@@ -1394,8 +1506,17 @@ void GGL::Learner::Start() {
 					// different dtype, so its trunk isn't interchangeable with this FP32 one. Left
 					// undefined when there's no shared head (the rho reads then feed raw obs to phi,
 					// exactly as before) or when neither consumer is active.
+					// Gate-off cadence: when the gate is disabled the whole rho-read block below (3
+					// full-buffer model passes + CPU smoothing) feeds nothing but Reach/* dashboard
+					// panels, so refresh them every diagEveryIters instead of every iteration. When
+					// the gate is ON, rewards depend on the reads — run every iteration as before.
+					const bool reachReadsThisIter = reachOn && ppo->reach &&
+						(reachCfg.gateEnabled ||
+						 (totalIterations % (uint64_t)RS_MAX(1, reachCfg.diagEveryIters)) == 0);
+
+					Timer reachReadTimer = {};
 					torch::Tensor tTrunkFeatures;
-					if ((reachOn || proposerOn) && combinedTraj.Length() > 0) {
+					if ((reachReadsThisIter || proposerOn) && combinedTraj.Length() > 0) {
 						Model* trunkModel = ppo->models["shared_head"];
 						if (trunkModel) {
 							int64_t nRows = (int64_t)combinedTraj.Length();
@@ -1415,7 +1536,7 @@ void GGL::Learner::Start() {
 					// Reachability: rho reads -> level x delta gate multiplier + validity metrics.
 					// The gate scales REWARDS only (never advantages/values); with beta=0 or
 					// gateEnabled=false the rewards are untouched.
-					if (reachOn && combinedTraj.Length() > 0 && ppo->reach) {
+					if (reachReadsThisIter && combinedTraj.Length() > 0) {
 						int64_t n = (int64_t)combinedTraj.Length();
 
 						torch::Tensor tOppStates = torch::tensor(combinedTraj.oppStates).reshape({ -1, obsSize });
@@ -1610,6 +1731,8 @@ void GGL::Learner::Start() {
 							// The reward PPO actually optimizes (Average Step Reward is pre-gate)
 							report["Reach/Gated Avg Step Reward"] = tRewards.mean().item<float>();
 						}
+
+						report["Reach Read Time"] = reachReadTimer.Elapsed();
 					}
 
 					// Deliberate-practice proposer: advantage-weighted-hindsight goal proposal +
@@ -2042,6 +2165,55 @@ void GGL::Learner::Start() {
 					report["GAE/Avg Advantage"] = tAdvantages.abs().mean().item<float>();
 					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
 
+					// --- Secondary goal-only critic: its own GAE pass at the long-horizon gamma, then
+					//     std-matched advantage blend. The goal channel is ±1 at goal terminals and 0
+					//     elsewhere, so returnStd=0/clip=0 (no standardization — it's already bounded).
+					torch::Tensor tGoalTargetVals;
+					if (goalCriticOn) {
+						torch::Tensor tGoalRews = torch::tensor(combinedTraj.goalRews);
+						RG_ASSERT(tGoalRews.size(0) == (int64_t)combinedTraj.Length());
+
+						torch::Tensor tGoalAdvantages, tGoalReturns;
+						float goalClipPortion;
+						GAE::Compute(
+							tGoalRews, tTerminals, tGoalValPreds, tGoalTruncValPreds,
+							tGoalAdvantages, tGoalTargetVals, tGoalReturns, goalClipPortion,
+							config.ppo.goalCritic.gamma, config.ppo.gaeLambda, /*returnStd=*/0, /*clipRange=*/0
+						);
+
+						// VALIDATION METRICS (the panels that prove correctness):
+						// V_goal and A_goal must correlate POSITIVELY with realized outcomes over rows
+						// whose episode actually ended in a goal (sign of the goal-channel MC return).
+						// A channel or sign bug reads NEGATIVE here within minutes on a goal-dense run.
+						torch::Tensor outcomeMask = tGoalReturns.abs() > 1e-6f;
+						long nOutcome = outcomeMask.sum().item<long>();
+						report["GoalCritic/Outcome Rows Frac"] = (float)nOutcome / RS_MAX(1, (int)combinedTraj.Length());
+						if (nOutcome > 100) {
+							auto fnCorr = [&](const torch::Tensor& a, const torch::Tensor& b) {
+								auto ac = a - a.mean(), bc = b - b.mean();
+								return ((ac * bc).mean() /
+									(a.std(false) * b.std(false) + 1e-8f)).item<float>();
+							};
+							torch::Tensor outcome = tGoalReturns.sign().masked_select(outcomeMask);
+							report["GoalCritic/Value-Outcome Corr"] = fnCorr(tGoalValPreds.masked_select(outcomeMask), outcome);
+							report["GoalCritic/Adv-Outcome Corr"] = fnCorr(tGoalAdvantages.masked_select(outcomeMask), outcome);
+						}
+						report["GoalCritic/Mean Val"] = tGoalValPreds.mean().item<float>();
+						report["GoalCritic/Val Abs Mean"] = tGoalValPreds.abs().mean().item<float>();
+
+						// Std-matched blend: beta is the FRACTION of dense-advantage scale contributed.
+						// Centered so the blend shifts relative preferences, never the average gradient.
+						float advStd = tAdvantages.std().item<float>();
+						float goalAdvStd = tGoalAdvantages.std().item<float>();
+						if (config.ppo.goalCritic.beta > 0 && goalAdvStd > 1e-8f && advStd > 1e-8f) {
+							float betaEff = config.ppo.goalCritic.beta * advStd / goalAdvStd;
+							torch::Tensor injected = betaEff * (tGoalAdvantages - tGoalAdvantages.mean());
+							tAdvantages = tAdvantages + injected;
+							report["GoalCritic/Blend BetaEff"] = betaEff;
+							report["GoalCritic/Injected Abs Mean"] = injected.abs().mean().item<float>();
+						}
+					}
+
 					// Stage 2 (deliberate-practice shaping): added AFTER GAE has already derived
 					// tTargetVals from the UNshaped advantages (GAE.cpp: targetValues = valPreds +
 					// advantages) - so the critic's targets never see this term, only the policy's
@@ -2078,6 +2250,8 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (goalCriticOn)
+						experience.data.goalTargetValues = tGoalTargetVals;
 
 					if (reachOn) {
 						experience.data.carHerGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
@@ -2143,7 +2317,7 @@ void GGL::Learner::Start() {
 				// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
 				if (psd) {
 					float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
-					bool probed = psd->OnDescendIteration(report, rating);
+					bool probed = psd->OnDescendIteration(report, rating, totalIterations);
 					if (probed) {
 						// Clear the persistent per-player trajectories so post-probe collection
 						// starts fresh episodes (combinedTraj is rebuilt from these each iteration).
@@ -2200,6 +2374,15 @@ void GGL::Learner::Start() {
 						"Critic Update Magnitude",
 						"Shared Head Update Magnitude",
 						"",
+						"GoalCritic/Loss",
+						"GoalCritic/Value-Outcome Corr",
+						"GoalCritic/Adv-Outcome Corr",
+						"GoalCritic/Outcome Rows Frac",
+						"GoalCritic/Mean Val",
+						"GoalCritic/Val Abs Mean",
+						"GoalCritic/Blend BetaEff",
+						"GoalCritic/Injected Abs Mean",
+						"",
 						"Collection Steps/Second",
 						"Consumption Steps/Second",
 						"Overall Steps/Second",
@@ -2210,6 +2393,8 @@ void GGL::Learner::Start() {
 						"-Prep Time",
 						"-Record Time",
 						"Consumption Time",
+						"-Value Pred Time",
+						"-Reach Read Time",
 						"-GAE Time",
 						"-PPO Learn Time"
 						"",

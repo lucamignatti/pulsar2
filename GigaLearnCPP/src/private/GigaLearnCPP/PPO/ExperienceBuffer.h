@@ -8,7 +8,10 @@ namespace GGL {
 		// begin()/end() below — new fields must go between `states` and `advantages`
 		// (`advantages` must stay last), and undefined means "feature disabled".
 		torch::Tensor
-			states, actions, logProbs, targetValues, actionMasks,
+			states, actions, logProbs, targetValues,
+			// Secondary goal-only critic value targets (undefined unless goalCritic.enabled)
+			goalTargetValues,
+			actionMasks,
 			// Reachability aux-training data (undefined when reachability is disabled)
 			carHerGoals, ballHerGoals, ballMovedMask,
 			// Car-state HER goals for the car proposer's psi head (undefined unless carEnabled)

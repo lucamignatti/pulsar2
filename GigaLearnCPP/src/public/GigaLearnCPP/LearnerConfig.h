@@ -22,7 +22,12 @@ namespace GGL {
 		// If renderMode, this is the scaling of time for the game
 		// 1.0 = Run the game at real time
 		// 2.0 = Run the game twice as fast as real time
-		float renderTimeScale = 1.0f; 
+		float renderTimeScale = 1.0f;
+
+		// If renderMode, poll checkpointFolder every this-many seconds and hot-swap in the newest
+		// checkpoint a separate training process has written, so the visualization tracks the model
+		// as it learns. Set <= 0 to pin to whatever checkpoint was loaded at startup.
+		float renderReloadSecs = 5.0f;
 
 		PPOLearnerConfig ppo = {};
 

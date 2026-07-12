@@ -31,6 +31,13 @@ namespace GGL {
 		bool havePhaseStartRating = false;
 		int descendItersThisPhase = 0;
 
+		// --- plasticity-intervention state (checkpointed) ---
+		float effRankMax = 0;           // running peak of the policy-head effective rank
+		int roundsSinceDistill = 0;     // probe rounds since the last distill reset
+		bool trunkFrozen = false;       // whether the shared trunk is currently frozen
+		float lastRating = NAN;         // latest Rating/1v1 seen (for competence conditioning)
+		uint64_t curTotalIters = 0;     // latest training-iteration count (gates intervention warmup)
+
 		// --- context (set by the Learner, not owned) ---
 		RLGC::EnvSet* envSet = nullptr;
 		PPOLearner* ppo = nullptr;
@@ -44,7 +51,7 @@ namespace GGL {
 		// Called at the END of every DESCEND iteration. `rating` is the latest Rating/1v1
 		// (pass NaN if the skill tracker hasn't produced one this iteration). Returns true if a
 		// probe round was run this call (so the Learner can finalise/clear its trajectories).
-		bool OnDescendIteration(Report& report, float rating);
+		bool OnDescendIteration(Report& report, float rating, uint64_t totalIterations);
 
 		// Serialise / restore the persistent state.
 		void ToJSON(nlohmann::json& j) const;
@@ -61,8 +68,36 @@ namespace GGL {
 			int rpp = 0;                           // rows per slot in the probe block
 		};
 
-		// The full probe round: partition arenas, perturb, finetune factors, score, ES-fold.
+		// The full probe round. Dispatches on cfg.pureES.
 		void RunProbeRound(Report& report);
+		// Pure-ES probe (default): large population, no finetune, level fitness over a long window,
+		// validation-gated fold. This is the EGGROLL-faithful path (arXiv 2511.16652 §6.1).
+		void RunProbeRoundPureES(Report& report);
+		// Legacy Baldwinian probe: small population, per-slot factor finetune, slope fitness. Kept for
+		// the phase-2 "few probes, long finetune" racing experiment; off unless cfg.pureES=false.
+		void RunProbeRoundBaldwinian(Report& report);
+
+		// Mean per-player per-step reward of the UNPERTURBED base policy over a held-out window
+		// (base-vs-base mirror). The tighten-rule baseline for the pure-ES round.
+		float MeasureAggregateReturn(int windowSteps);
+
+		// Pure-ES asymmetric eval step: seat 0 of each eval arena is driven by that arena's slot policy,
+		// the opponent seat(s) by the current base policy, so each slot plays a real match against the
+		// current self. seat0Idx (len S*perSlotEval, slot-major) lists the seat-0 player rows.
+		std::vector<int> StepActionsAsymmetric(PolicySlots& ps, const std::vector<int>& seat0Idx);
+
+		// Head-to-head: play the freshly folded policy (seat 0) vs the pre-fold policy `oldPolicy`
+		// (seat 1) across the whole pool; return the mean (seat0 - seat1) reward differential. The
+		// validation A/B for option D — dominated by the zero-sum competitive terms, so it tests "did
+		// the fold actually beat the policy it replaces", not who farmed more proximity.
+		float MeasureHeadToHead(Model* oldPolicy, int windowSteps);
+
+		// Log the plasticity signals and apply the enabled interventions to the just-folded weights.
+		void RunInterventions(Report& report);
+
+		// Deepest reset: reinit the policy sub-net and behavior-distill the current policy into it over
+		// the frozen trunk, then clear the policy optimizer moments. Called only when gated.
+		void DistillReset(Report& report);
 
 		// Build the full per-player action vector for the current env step: base policy for every
 		// player, then overwrite the [probe|eval] blocks with slot-routed actions. Records probe

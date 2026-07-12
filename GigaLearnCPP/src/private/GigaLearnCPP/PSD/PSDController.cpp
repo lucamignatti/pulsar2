@@ -27,6 +27,9 @@ void PSDController::ToJSON(nlohmann::json& j) const {
 	p["rating_at_phase_start"] = ratingAtPhaseStart;
 	p["have_phase_start_rating"] = havePhaseStartRating;
 	p["descend_iters_this_phase"] = descendItersThisPhase;
+	p["eff_rank_max"] = effRankMax;
+	p["rounds_since_distill"] = roundsSinceDistill;
+	p["trunk_frozen"] = trunkFrozen;
 	j["psd"] = p;
 }
 
@@ -39,6 +42,9 @@ void PSDController::FromJSON(const nlohmann::json& j) {
 	ratingAtPhaseStart = p.value("rating_at_phase_start", 0.0f);
 	havePhaseStartRating = p.value("have_phase_start_rating", false);
 	descendItersThisPhase = p.value("descend_iters_this_phase", 0);
+	effRankMax = p.value("eff_rank_max", 0.0f);
+	roundsSinceDistill = p.value("rounds_since_distill", 0);
+	trunkFrozen = p.value("trunk_frozen", false);
 }
 
 // Centered-rank transform (Salimans et al. 2017): rank ascending, map to [-0.5, 0.5].
@@ -53,13 +59,17 @@ static std::vector<float> CenteredRank(const std::vector<float>& f) {
 	return w;
 }
 
-bool PSDController::OnDescendIteration(Report& report, float rating) {
+bool PSDController::OnDescendIteration(Report& report, float rating, uint64_t totalIterations) {
 	if (!cfg.enabled) return false;
 
+	curTotalIters = totalIterations;
 	descendItersThisPhase++;
-	if (!std::isnan(rating) && !havePhaseStartRating) {
-		ratingAtPhaseStart = rating;
-		havePhaseStartRating = true;
+	if (!std::isnan(rating)) {
+		lastRating = rating; // latest competence signal, read by the interventions at the probe round
+		if (!havePhaseStartRating) {
+			ratingAtPhaseStart = rating;
+			havePhaseStartRating = true;
+		}
 	}
 
 	report["PSD/Round"] = (float)round;
@@ -248,6 +258,271 @@ float PSDController::FactorUpdate(PolicySlots& ps, torch::optim::Optimizer& opt,
 }
 
 void PSDController::RunProbeRound(Report& report) {
+	if (cfg.pureES)
+		RunProbeRoundPureES(report);
+	else
+		RunProbeRoundBaldwinian(report);
+}
+
+// Mean per-player per-step reward of the unperturbed base policy over a held-out window. Used both
+// as the validation A/B signal (option D) and as the tighten-rule baseline in the pure-ES round.
+float PSDController::MeasureAggregateReturn(int windowSteps) {
+	double total = 0; long count = 0;
+	int W = std::max(1, windowSteps);
+	for (int step = 0; step < W; step++) {
+		envSet->Reset(); // resets only arenas that actually terminated -> continuous episodes
+		Tensor obsAll = torch::from_blob(envSet->state.obs.data.data(),
+			{ (int64_t)envSet->state.obs.size[0], (int64_t)envSet->state.obs.size[1] }, torch::kFloat32).clone();
+		Tensor maskAll = torch::from_blob(envSet->state.actionMasks.data.data(),
+			{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] }, torch::kUInt8).clone();
+		std::vector<int> actions;
+		{
+			RG_NO_GRAD;
+			Tensor a;
+			ppo->InferActions(obsAll.to(ppo->device, true), maskAll.to(ppo->device, true), &a, nullptr);
+			actions = TENSOR_TO_VEC<int>(a.to(torch::kCPU).to(torch::kInt));
+		}
+		envSet->StepFirstHalf(true);
+		envSet->Sync();
+		envSet->StepSecondHalf(actions, false);
+		for (int i = 0; i < envSet->state.numPlayers; i++) { total += envSet->state.rewards[i]; count++; }
+	}
+	return count ? (float)(total / count) : 0.0f;
+}
+
+// Pure-ES asymmetric eval step: seat 0 of each eval arena runs that arena's slot policy, the opponent
+// seat(s) run the current base policy, so each slot plays a real match against the current self. The
+// zero-sum reward terms (which the old mirror eval cancelled to zero) now dominate fitness.
+std::vector<int> PSDController::StepActionsAsymmetric(PolicySlots& ps, const std::vector<int>& seat0Idx) {
+	Tensor obsAll = torch::from_blob(envSet->state.obs.data.data(),
+		{ (int64_t)envSet->state.obs.size[0], (int64_t)envSet->state.obs.size[1] }, torch::kFloat32).clone();
+	Tensor maskAll = torch::from_blob(envSet->state.actionMasks.data.data(),
+		{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] }, torch::kUInt8).clone();
+
+	// Base actions for EVERY player (covers the opponent seats + any non-eval arenas).
+	std::vector<int> actions;
+	{
+		RG_NO_GRAD;
+		Tensor a;
+		ppo->InferActions(obsAll.to(ppo->device, true), maskAll.to(ppo->device, true), &a, nullptr);
+		actions = TENSOR_TO_VEC<int>(a.to(torch::kCPU).to(torch::kInt));
+	}
+
+	// Route the seat-0 rows through the slots (gathered slot-major -> rowsPerSlot = perSlotEval).
+	std::vector<int64_t> idx64(seat0Idx.begin(), seat0Idx.end());
+	std::vector<int> seat0Acts;
+	{
+		RG_NO_GRAD;
+		Tensor idxDev = torch::from_blob(idx64.data(), { (int64_t)idx64.size() }, torch::kLong).to(ppo->device);
+		Tensor obsSeat0 = obsAll.to(ppo->device, true).index_select(0, idxDev);
+		Tensor maskSeat0 = maskAll.to(ppo->device, torch::kBool, true, true).index_select(0, idxDev);
+		Tensor trunk = ppo->models["shared_head"]
+			? ppo->models["shared_head"]->Forward(obsSeat0, false)
+			: obsSeat0;
+		Tensor logits = ps.Forward(trunk);
+		constexpr float DISABLED = -1e10f;
+		Tensor probs = torch::softmax(logits + DISABLED * maskSeat0.logical_not(), -1).clamp(1e-11f, 1);
+		seat0Acts = TENSOR_TO_VEC<int>(torch::multinomial(probs, 1, true).flatten().to(torch::kCPU).to(torch::kInt));
+	}
+	for (size_t k = 0; k < seat0Idx.size(); k++)
+		actions[seat0Idx[k]] = seat0Acts[k];
+	return actions;
+}
+
+// Play the freshly folded policy (seat 0) vs the pre-fold `oldPolicy` (seat 1) across the whole pool
+// and return the mean (seat0 - seat1) per-step reward differential. Both share the current (unfolded)
+// trunk; only the policy heads differ. Dominated by the zero-sum competitive terms (goals ±150,
+// ball-to-goal ±75) since the per-player farmable terms are tiny by weight -> a genuine win/edge test.
+float PSDController::MeasureHeadToHead(Model* oldPolicy, int windowSteps) {
+	std::vector<int64_t> s0, s1;
+	s0.reserve(numArenas); s1.reserve(numArenas);
+	for (int a = 0; a < numArenas; a++) {
+		int p0 = envSet->state.arenaPlayerStartIdx[a];
+		s0.push_back(p0);      // seat 0 = new (folded) policy
+		s1.push_back(p0 + 1);  // seat 1 = old policy (1v1 opponent)
+	}
+	Tensor s0Dev = torch::from_blob(s0.data(), { (int64_t)s0.size() }, torch::kLong).to(ppo->device);
+	Tensor s1Dev = torch::from_blob(s1.data(), { (int64_t)s1.size() }, torch::kLong).to(ppo->device);
+
+	auto fnSeatActions = [&](const Tensor& obsDev, const Tensor& maskBoolDev, const Tensor& idxDev, Model* head) {
+		RG_NO_GRAD;
+		Tensor obsS = obsDev.index_select(0, idxDev);
+		Tensor maskS = maskBoolDev.index_select(0, idxDev);
+		Tensor trunk = ppo->models["shared_head"] ? ppo->models["shared_head"]->Forward(obsS, false) : obsS;
+		Tensor logits = head->Forward(trunk, false);
+		constexpr float DISABLED = -1e10f;
+		Tensor probs = torch::softmax(logits + DISABLED * maskS.logical_not(), -1).clamp(1e-11f, 1);
+		return TENSOR_TO_VEC<int>(torch::multinomial(probs, 1, true).flatten().to(torch::kCPU).to(torch::kInt));
+	};
+
+	double sum0 = 0, sum1 = 0; long n = 0;
+	int W = std::max(1, windowSteps);
+	for (int step = 0; step < W; step++) {
+		envSet->Reset();
+		Tensor obsDev = torch::from_blob(envSet->state.obs.data.data(),
+			{ (int64_t)envSet->state.obs.size[0], (int64_t)envSet->state.obs.size[1] }, torch::kFloat32).clone().to(ppo->device, true);
+		Tensor maskBoolDev = torch::from_blob(envSet->state.actionMasks.data.data(),
+			{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] }, torch::kUInt8).clone().to(ppo->device, torch::kBool, true, true);
+		std::vector<int> actions;
+		{
+			RG_NO_GRAD;
+			Tensor a;
+			ppo->InferActions(obsDev, maskBoolDev, &a, nullptr);
+			actions = TENSOR_TO_VEC<int>(a.to(torch::kCPU).to(torch::kInt));
+		}
+		std::vector<int> a0 = fnSeatActions(obsDev, maskBoolDev, s0Dev, ppo->models["policy"]);
+		std::vector<int> a1 = fnSeatActions(obsDev, maskBoolDev, s1Dev, oldPolicy);
+		for (int a = 0; a < numArenas; a++) { actions[(size_t)s0[a]] = a0[a]; actions[(size_t)s1[a]] = a1[a]; }
+		envSet->StepFirstHalf(true);
+		envSet->Sync();
+		envSet->StepSecondHalf(actions, false);
+		for (int a = 0; a < numArenas; a++) { sum0 += envSet->state.rewards[s0[a]]; sum1 += envSet->state.rewards[s1[a]]; n++; }
+	}
+	return n ? (float)((sum0 - sum1) / n) : 0.0f;
+}
+
+// Pure-ES probe (EGGROLL-faithful; arXiv 2511.16652 §6.1: large populations are what make ES work).
+// No Baldwinian finetune: every arena is an eval arena and each of the S slots is scored on LEVEL
+// fitness (mean held-out episodic return) over a long window, so the whole round budget buys
+// population size N and fitness SNR instead of per-slot gradient steps. The fold is validation-gated.
+void PSDController::RunProbeRoundPureES(Report& report) {
+	RG_LOG("PSD: launching pure-ES probe round " << round << " (sigma=" << sigma << ", K=" << cfg.K << ")");
+	Timer roundTimer = {};
+
+	int S = cfg.antithetic ? 2 * cfg.K : cfg.K;
+	if (S > numArenas)
+		RG_LOG("PSD: WARNING pure-ES wants S=" << S << " slots but only " << numArenas
+			<< " arenas; slots will share arenas and fitness precision drops.");
+
+	int perSlotEval = std::max(1, numArenas / S);
+	int evalArenaStart = 0;
+	RG_LOG("PSD:   pure-ES slots=" << S << " arenas/slot=" << perSlotEval
+		<< " evalWindow=" << cfg.evalWindowSteps << " (asymmetric: slot vs current base)");
+
+	// Seat-0 player of every eval arena, slot-major (rowsPerSlot = perSlotEval). Each slot drives seat 0
+	// against the current base policy in seat 1, so the zero-sum competitive terms — which the old mirror
+	// eval cancelled to zero — now dominate fitness. Fixed across the window.
+	std::vector<int> seat0Idx;
+	seat0Idx.reserve((size_t)S * perSlotEval);
+	for (int s = 0; s < S; s++)
+		for (int j = 0; j < perSlotEval; j++)
+			seat0Idx.push_back(envSet->state.arenaPlayerStartIdx[evalArenaStart + s * perSlotEval + j]);
+
+	// Build the perturbation set for this round.
+	uint64_t roundSeed = PSD::NoiseKey(rngCounter, round, 0, 0);
+	PSD::PolicySlots ps(ppo->models["policy"], S, cfg.rank, sigma, ppo->device);
+	ps.InitFromNoise(roundSeed, cfg.antithetic);
+
+	// Tighten-rule baseline: base-vs-base mirror return (symmetric, so seat-0 mean == all-player mean),
+	// on the same scale as each slot's seat-0 fitness -> "hurt" = slot scores below the unperturbed self.
+	float baseReturn = MeasureAggregateReturn(cfg.valWindowSteps);
+
+	// --- Score every slot on LEVEL fitness (seat-0 competitive return vs the base opponent) over the
+	//     eval window. Split even/odd steps for a direct split-half reliability estimate. ---
+	int W = std::max(2, cfg.evalWindowSteps);
+	std::vector<double> accEven(S, 0.0), accOdd(S, 0.0);
+	for (int step = 0; step < W; step++) {
+		envSet->Reset(); // resets only arenas that actually terminated -> continuous episodes
+		std::vector<int> actions = StepActionsAsymmetric(ps, seat0Idx);
+		envSet->StepFirstHalf(true);
+		envSet->Sync();
+		envSet->StepSecondHalf(actions, false);
+		std::vector<double>& acc = (step & 1) ? accOdd : accEven;
+		for (int s = 0; s < S; s++)
+			for (int j = 0; j < perSlotEval; j++)
+				acc[s] += envSet->state.rewards[seat0Idx[(size_t)s * perSlotEval + j]];
+	}
+	int evenSteps = (W + 1) / 2, oddSteps = W / 2;
+	std::vector<float> fitness(S), fitEven(S), fitOdd(S);
+	for (int s = 0; s < S; s++) {
+		fitEven[s] = (float)(accEven[s] / std::max(1, perSlotEval * evenSteps));
+		fitOdd[s] = (float)(accOdd[s] / std::max(1, perSlotEval * oddSteps));
+		fitness[s] = (float)((accEven[s] + accOdd[s]) / std::max(1, perSlotEval * W));
+	}
+
+	// Split-half reliability: Spearman between the even- and odd-step rankings.
+	std::vector<float> ra = CenteredRank(fitEven), rb = CenteredRank(fitOdd);
+	double rnum = 0, rda = 0, rdb = 0;
+	for (int s = 0; s < S; s++) { rnum += ra[s] * rb[s]; rda += ra[s] * ra[s]; rdb += rb[s] * rb[s]; }
+	float reliability = (rda > 0 && rdb > 0) ? (float)(rnum / std::sqrt(rda * rdb)) : 0;
+
+	// --- metrics ---
+	float fmin = *std::min_element(fitness.begin(), fitness.end());
+	float fmax = *std::max_element(fitness.begin(), fitness.end());
+	float fmean = std::accumulate(fitness.begin(), fitness.end(), 0.0f) / S;
+	float fstd = 0; for (float v : fitness) fstd += (v - fmean) * (v - fmean); fstd = std::sqrt(fstd / S);
+	std::vector<float> sortedF = fitness; std::sort(sortedF.begin(), sortedF.end());
+	float fmed = sortedF[S / 2];
+	int hurt = 0; for (float v : fitness) if (v < baseReturn) hurt++;
+	float fracHurt = (float)hurt / S;
+
+	report["PSD/Probe Fitness Mean"] = fmean;
+	report["PSD/Probe Fitness Std"] = fstd;
+	report["PSD/Probe Fitness Max"] = fmax;
+	report["PSD/Probe Fitness Min"] = fmin;
+	report["PSD/Top Minus Median Fitness"] = fmax - fmed;
+	report["PSD/Fitness Reliability"] = reliability;
+	report["PSD/Base Return"] = baseReturn;
+	report["PSD/Frac Probes Hurt"] = fracHurt;
+	report["PSD/Population S"] = (float)S;
+	report["PSD/Round Time"] = roundTimer.Elapsed();
+
+	// --- sigma adaptation (handoff §4.2: the central knob). Rules that measure what they claim:
+	//   WIDEN   when the ranking is noise (split-half reliability low) -> perturbations too small.
+	//   TIGHTEN when most slots (both antithetic twins) fall below the base return -> too big. ---
+	if (cfg.adaptSigma) {
+		if (fracHurt > 0.75f)        sigma *= 0.85f;
+		else if (reliability < 0.2f) sigma *= 1.15f;
+		sigma = std::clamp(sigma, cfg.sigmaMin, cfg.sigmaMax);
+	}
+
+	// --- Validation-gated ES fold (option D). Snapshot the policy, fold the fitness-weighted ORIGINAL
+	//     directions into the base weights, then A/B the base policy's held-out return; revert if the
+	//     fold regressed return by more than valMargin, so a noise-fold never lands unchecked. ---
+	std::vector<float> weights = CenteredRank(fitness);
+
+	// --- Head-to-head validation-gated ES fold (option D, competitive form). Clone the pre-fold policy,
+	//     fold the fitness-weighted ORIGINAL directions into the base weights, then play NEW (seat 0) vs
+	//     OLD (seat 1) across the whole pool. Keep the fold only if the new policy is at least as strong
+	//     as the one it replaces; else revert. Zero-sum terms make this a true win/edge test, not a
+	//     farmable-return A/B. `oldPolicy` doubles as the opponent and the revert source. ---
+	Model* oldPolicy = cfg.valGateEnabled ? ppo->models["policy"]->MakeClone() : nullptr;
+	float stepNorm = ps.FoldESUpdate(roundSeed, cfg.antithetic, weights, cfg.alpha);
+	ppo->models["policy"]->_seqHalfOutdated = true;
+
+	bool reverted = false;
+	if (cfg.valGateEnabled) {
+		float h2h = MeasureHeadToHead(oldPolicy, cfg.valWindowSteps); // (new seat0) - (old seat1) reward
+		report["PSD/Val H2H Diff"] = h2h;
+		if (h2h < -cfg.valMargin) {
+			RG_NO_GRAD;
+			auto live = ppo->models["policy"]->parameters();
+			auto old = oldPolicy->parameters();
+			for (size_t i = 0; i < live.size(); i++)
+				live[i].copy_(old[i]);
+			ppo->models["policy"]->_seqHalfOutdated = true;
+			reverted = true;
+			stepNorm = 0;
+		}
+		delete oldPolicy->optim;
+		delete oldPolicy;
+	}
+	report["PSD/Fold Reverted"] = reverted ? 1.0f : 0.0f;
+	report["PSD/ES Step Norm"] = stepNorm;
+
+	// Plasticity signals + interventions (log, then act on the — possibly reverted — base weights).
+	RunInterventions(report);
+
+	if (cfg.dumpRounds)
+		PersistRound(fitness, weights, stepNorm);
+
+	round++;
+	rngCounter++;
+	RG_LOG("PSD: round done. reliability=" << reliability << " fracHurt=" << fracHurt
+		<< " stepNorm=" << stepNorm << (reverted ? " [REVERTED]" : "") << " -> sigma=" << sigma);
+}
+
+void PSDController::RunProbeRoundBaldwinian(Report& report) {
 	RG_LOG("PSD: launching probe round " << round << " (sigma=" << sigma << ", K=" << cfg.K << ")");
 	Timer roundTimer = {};
 
@@ -381,17 +656,63 @@ void PSDController::RunProbeRound(Report& report) {
 	report["PSD/Round Time"] = roundTimer.Elapsed();
 
 	// --- sigma adaptation (handoff §4.2: the central knob) ---
-	if (cfg.adaptSigma) {
-		float spread = (fmax - fmed) / (std::abs(fmed) + 1e-6f);
-		int hurt = 0; for (float v : fitness) if (v < fmed) hurt++;
-		float fracHurt = (float)hurt / S;
-		if (spread < 0.05f) sigma *= 1.15f;          // probes cluster at current perf -> widen
-		else if (fracHurt > 0.75f) sigma *= 0.85f;   // most perturbations hurt -> tighten
+	// The original rules were inert by construction: "spread" was normalized by |fmed| (~1e-4 under
+	// slope fitness, so the widen test could never trip) and "hurt" counted probes below the MEDIAN
+	// (~50% by definition, never > 75%). Replaced with rules that measure what they claim:
+	//   WIDEN   when the probe ranking is NOISE — split-half reliability: recompute per-slot fitness
+	//           from only the even- vs only the odd-indexed eval steps of the scoring window and
+	//           Spearman-correlate the two rankings. Same underlying trend, independent noise, so a
+	//           low correlation means perturbations are too small to create real differences.
+	//   TIGHTEN when most probes actively degrade during their finetune (slope fitness < 0):
+	//           perturbations are big enough to knock probes off the policy's basin.
+	if (cfg.adaptSigma && T >= 6) {
+		int w0 = T / 2;
+		// Per-slot fitness recomputed from one parity of the scoring window's eval steps.
+		auto fnFitnessOverParity = [&](int parity) {
+			std::vector<float> out(S, 0.0f);
+			std::vector<int> ts;
+			for (int t = w0; t < T; t++)
+				if ((t & 1) == parity) ts.push_back(t);
+			if (ts.size() < 2) return out;
+			if (cfg.fitnessMode == 0) {
+				for (int s = 0; s < S; s++) {
+					float ym = 0; for (int t : ts) ym += evalTraj[t][s];
+					out[s] = ym / ts.size();
+				}
+			} else {
+				float xm = 0; for (int t : ts) xm += t; xm /= ts.size();
+				float xv = 0; for (int t : ts) xv += (t - xm) * (t - xm);
+				for (int s = 0; s < S; s++) {
+					float ym = 0; for (int t : ts) ym += evalTraj[t][s]; ym /= ts.size();
+					float cov = 0; for (int t : ts) cov += (t - xm) * (evalTraj[t][s] - ym);
+					out[s] = (xv > 1e-9f) ? cov / xv : 0;
+				}
+			}
+			return out;
+		};
+		std::vector<float> ra = CenteredRank(fnFitnessOverParity(0)), rb = CenteredRank(fnFitnessOverParity(1));
+		double num = 0, da = 0, db = 0;
+		for (int s = 0; s < S; s++) { num += ra[s] * rb[s]; da += ra[s] * ra[s]; db += rb[s] * rb[s]; }
+		float reliability = (da > 0 && db > 0) ? (float)(num / std::sqrt(da * db)) : 0;
+		report["PSD/Fitness Reliability"] = reliability;
+
+		// Only meaningful under slope fitness (level of a shaped return has no natural zero).
+		float fracHurt = 0;
+		if (cfg.fitnessMode == 1) {
+			int hurt = 0; for (float v : fitness) if (v < 0) hurt++;
+			fracHurt = (float)hurt / S;
+			report["PSD/Frac Probes Hurt"] = fracHurt;
+		}
+
+		if (cfg.fitnessMode == 1 && fracHurt > 0.75f)
+			sigma *= 0.85f;                      // probes knocked off the basin -> tighten
+		else if (reliability < 0.2f)
+			sigma *= 1.15f;                      // ranking indistinguishable from noise -> widen
 		sigma = std::clamp(sigma, cfg.sigmaMin, cfg.sigmaMax);
 	}
 
-	// Plasticity canaries (read alongside the rating trend — collapse alone never means "freeze").
-	PSD::LogPlasticity(ppo->models, report);
+	// Plasticity signals + interventions (log, then act on the just-folded weights).
+	RunInterventions(report);
 
 	if (cfg.dumpRounds)
 		PersistRound(fitness, weights, stepNorm);
@@ -399,6 +720,164 @@ void PSDController::RunProbeRound(Report& report) {
 	round++;
 	rngCounter++;
 	RG_LOG("PSD: round done. fitness mean=" << fmean << " std=" << fstd << " stepNorm=" << stepNorm << " -> sigma=" << sigma);
+}
+
+// Log the two plasticity signals, then apply whichever interventions are enabled to the freshly
+// folded weights. Under healthy training every branch is a no-op; each fires only on real degradation
+// (or, for the critic reset, on its cadence). NOTE: no function-level no_grad here — DistillReset
+// needs autograd for the student; the pure-weight helpers each guard themselves.
+void PSDController::RunInterventions(Report& report) {
+	Model* pol = ppo->models["policy"];
+	if (!pol) return;
+	Model* critic = ppo->models["critic"];
+	Model* trunk = ppo->models["shared_head"];
+
+	// --- signals (kept: this is the logging the canaries always did) ---
+	auto lins = PSD::LinearLayers(pol);
+	float effRank = lins.empty() ? 0.0f : PSD::EffectiveRank(lins.back()->weight);
+	float deadFrac = PSD::DeadUnitFraction(pol);
+	report["Plasticity/Policy Head EffRank"] = effRank;
+	report["Plasticity/Policy Dead Unit Frac"] = deadFrac;
+
+	// Warmup gate: on a FRESH run the effective rank starts at its lifetime peak and falls during
+	// benign early specialization; the collapse-triggered interventions would read that drop as
+	// pathology and fire distill/perturb spuriously. During warmup we LOG the signals and keep the
+	// rolling peak up to date, but take NO action, so interventions later arm against an established
+	// baseline. (0 warmup = act immediately, correct when resuming a mature checkpoint.)
+	bool warming = curTotalIters < (uint64_t)cfg.interventionWarmupIters;
+	report["Plasticity/Intervention Warmup"] = warming ? 1.0f : 0.0f;
+	if (warming) {
+		if (effRank > effRankMax) effRankMax = effRank;
+		report["Plasticity/EffRank RollingMax"] = effRankMax;
+		return;
+	}
+
+	bool policyChanged = false;
+
+	// --- (1) ReDo: recycle dead units in the last hidden layer ---
+	if (cfg.redoEnabled)
+		policyChanged |= PSD::RecycleDeadUnits(pol, cfg.redoDeadThresh, cfg.redoDeadFracTrigger, report);
+
+	// --- (2) EffRank collapse response: shrink-and-perturb the head (also maintains effRankMax) ---
+	if (cfg.effRankResponseEnabled)
+		policyChanged |= PSD::EffRankResponse(pol, effRank, effRankMax,
+			cfg.effRankCollapseFrac, cfg.effRankShrink, cfg.effRankPerturbSigma, report);
+	else if (effRank > effRankMax)
+		effRankMax = effRank; // keep tracking the peak even when the response is off
+
+	// --- (3) Critic partial reset toward init (periodic; critic tolerates it) ---
+	if (critic && cfg.criticResetPeriod > 0 && round > 0 && (round % cfg.criticResetPeriod) == 0) {
+		if (PSD::PartialResetCritic(critic, cfg.criticPartialResetFrac, report))
+			critic->_seqHalfOutdated = true;
+	}
+
+	// --- (4) Distill reset (deepest): gated on cadence AND a real head-rank collapse ---
+	roundsSinceDistill++;
+	float effRatio = (effRankMax > 1e-6f) ? (effRank / effRankMax) : 1.0f;
+	report["Plasticity/Rounds Since Distill"] = (float)roundsSinceDistill;
+	if (cfg.distillPeriod > 0 && roundsSinceDistill >= cfg.distillPeriod && effRatio < cfg.distillTrigger) {
+		DistillReset(report);
+		roundsSinceDistill = 0;
+		policyChanged = true;
+	}
+
+	// --- (5) Competence-conditioned freeze of the shared trunk ---
+	if (cfg.freezeEnabled && trunk && !std::isnan(lastRating)) {
+		bool wantFrozen = lastRating >= cfg.freezeRatingThresh;
+		// Apply idempotently: a resumed checkpoint restores trunkFrozen but reloads params with
+		// requires_grad=true, so re-asserting the flag every round self-heals that mismatch.
+		for (auto& p : trunk->parameters())
+			p.set_requires_grad(!wantFrozen);
+		if (wantFrozen != trunkFrozen) {
+			trunkFrozen = wantFrozen;
+			RG_LOG("PSD: trunk " << (trunkFrozen ? "FROZEN" : "unfrozen") << " (Rating/1v1=" << lastRating << ")");
+		}
+	}
+	if (cfg.freezeEnabled)
+		report["Plasticity/Trunk Frozen"] = trunkFrozen ? 1.0f : 0.0f;
+
+	if (policyChanged)
+		pol->_seqHalfOutdated = true; // half-precision inference cache must rebuild from new weights
+}
+
+// Deepest plasticity reset: reinit the policy sub-net and behavior-distill the CURRENT policy into it
+// over the frozen trunk, so plasticity is restored while behavior is preserved. Only the policy is
+// reset (the trunk and critic are untouched); the policy optimizer moments are cleared afterward.
+void PSDController::DistillReset(Report& report) {
+	RG_LOG("PSD: distill reset (policy plasticity reset) at round " << round);
+	Model* pol = ppo->models["policy"];
+	Model* trunk = ppo->models["shared_head"];
+
+	// 1) Gather an observation batch by rolling the base policy forward a few resets (decorrelated).
+	std::vector<Tensor> obsChunks, maskChunks;
+	int gathered = 0;
+	while (gathered < cfg.distillBatch && (int)obsChunks.size() < 64) {
+		envSet->Reset();
+		auto& st = envSet->state;
+		Tensor obs = torch::from_blob(st.obs.data.data(),
+			{ (int64_t)st.obs.size[0], (int64_t)st.obs.size[1] }, torch::kFloat32).clone();
+		Tensor mask = torch::from_blob(st.actionMasks.data.data(),
+			{ (int64_t)st.actionMasks.size[0], (int64_t)st.actionMasks.size[1] }, torch::kUInt8).clone();
+		obsChunks.push_back(obs);
+		maskChunks.push_back(mask);
+		gathered += (int)obs.size(0);
+
+		std::vector<int> actions;
+		{
+			RG_NO_GRAD;
+			Tensor od = obs.to(ppo->device, true), md = mask.to(ppo->device, true), a;
+			ppo->InferActions(od, md, &a, nullptr);
+			actions = TENSOR_TO_VEC<int>(a.to(torch::kCPU).to(torch::kInt));
+		}
+		envSet->StepFirstHalf(true);
+		envSet->Sync();
+		envSet->StepSecondHalf(actions, false);
+	}
+	Tensor obsAll = torch::cat(obsChunks, 0).to(ppo->device);
+	Tensor maskAll = torch::cat(maskChunks, 0).to(ppo->device);
+
+	// 2) Teacher probabilities from the current policy (snapshot before reinit).
+	Tensor teacherProbs, trunkOut;
+	{
+		RG_NO_GRAD;
+		teacherProbs = PPOLearner::InferPolicyProbsFromModels(ppo->models, obsAll, maskAll, 1.0f, false).detach();
+		trunkOut = trunk ? trunk->Forward(obsAll, false).detach() : obsAll;
+	}
+	Tensor maskNot = maskAll.to(torch::kBool).logical_not();
+	constexpr float DISABLED = -1e10f;
+
+	// 3) Fresh student policy; distill teacher -> student over the (frozen) trunk features.
+	Model* student = pol->MakeEmptyClone();
+	torch::optim::Adam sopt(student->parameters(), torch::optim::AdamOptions(cfg.distillLR));
+	float finalKL = 0;
+	for (int it = 0; it < cfg.distillIters; it++) {
+		Tensor logits = student->Forward(trunkOut, false);
+		Tensor logp = torch::log_softmax(logits + DISABLED * maskNot, -1);
+		Tensor loss = (teacherProbs * (torch::log(teacherProbs) - logp)).sum(-1).mean(); // KL(teacher||student)
+		sopt.zero_grad();
+		loss.backward();
+		sopt.step();
+		finalKL = loss.detach().cpu().item<float>();
+	}
+
+	// 4) Copy the distilled weights into the live policy in place (keeps tensor identity/optim keys).
+	{
+		RG_NO_GRAD;
+		auto to = pol->parameters();
+		auto from = student->parameters();
+		for (size_t i = 0; i < to.size(); i++)
+			to[i].copy_(from[i]);
+	}
+	// 5) Deepest reset: drop the policy optimizer moments so it restarts fresh on the new basin.
+	pol->optim->state().clear();
+	pol->_seqHalfOutdated = true;
+
+	delete student->optim;
+	delete student;
+
+	report["Plasticity/Distill Fired"] = 1.0f;
+	report["Plasticity/Distill Final KL"] = finalKL;
+	RG_LOG("PSD:   distill done, final KL=" << finalKL);
 }
 
 void PSDController::PersistRound(const std::vector<float>& fitness, const std::vector<float>& weights, float stepNorm) {

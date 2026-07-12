@@ -1,5 +1,7 @@
 #include <GigaLearnCPP/Learner.h>
 
+#include <cstdlib>
+
 #include <RLGymCPP/Rewards/CommonRewards.h>
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
@@ -9,11 +11,18 @@
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
+#include <RLGymCPP/StateSetters/AirDrillState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
 using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
+
+// Discount factor, shared by the learner's GAE and every PBRS reward (they MUST match or the
+// potential terms stop telescoping against GAE). tickSkip 4 => 30 actions/sec, so 0.9985 gives a
+// ~15s half-life (462 steps) — a deliberately long horizon so full scoring/defensive possessions
+// reach the value target. If you change tickSkip, re-derive this: half-life_s = ln2 / (-ln gamma) / (120/tickSkip).
+static constexpr float TRAIN_GAMMA = 0.9985f;
 
 // 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
 // (fast) codebase.
@@ -35,43 +44,72 @@ using namespace RLGC; // RLGymCPP
 // self-play LEAGUE (trainAgainstOldVersions) and halved tsPerItr to 100k. None of those were in
 // the proven-good era.
 
-// SURGICAL-7 reward stack (Nexto-ratio potentials + impulse-scaled touch height), verbatim from
-// cf993b7 - the reward that got the bot to ~1004 Elo before the proposer was bolted on. NOT
-// touched: the regression was the proposer, not the reward, so re-establishing this as a clean
-// baseline means changing it as little as possible. (ShotReward/SaveReward from 2.5 are a
-// separate, unproven experiment to layer on top AFTER this baseline re-validates, not part of it.)
-std::vector<WeightedReward> BuildRewards() {
+// FRONTIER-9 reward stack (workflow-designed: understand -> research -> 5 competing designs ->
+// adversarial red-team+math+integration verification -> synthesis). Replaces SURGICAL-7.
+//
+// Backbone kept BIT-IDENTICAL to the proven 1132-Elo lineage (B2G 75, TouchAccel 10, Demo 37.5,
+// Goal 150 = 272.5 of 299 incumbent weight): the regression lesson was "the proposer broke it, not
+// the reward", so this changes only the terms the measurements convicted (TouchHeight's avg-shape
+// gradient produced Aerial Touch Ratio 0.00125 after 17B+ steps; per-player proximity/boost were
+// the biggest PSD-fitness polluters).
+//
+// Whole-stack invariant: every component is exactly zero-sum or antisymmetric (nothing gated) ->
+// the stack sums to 0 across both players every step, so PSD probe fitness is a pure competitive
+// margin instead of being dominated by farmable per-player income. No PBRS is ever gated (breaks
+// telescoping). ShotReward is deliberately NOT used: GameEventTracker's shot detector attributes
+// the shooter as the team OPPOSITE the threatened net, so a solo player blasting the ball at their
+// OWN net (after any opponent touch) arms a phantom shot credited to the opponent - a red-teamed,
+// source-verified exploit (GameEventTracker.cpp). OpposedSaveReward below closes the matching
+// self-save farm with a last-touch guard instead.
+std::vector<WeightedReward> BuildRewards(float gamma) {
 	return {
-		// Player->ball proximity potential (Nexto liu_dist, dist_w=0.5 x15). Exact PBRS, so the
-		// chase annuity telescopes to ~0 per cycle; its 3D distance also pays climbing toward an
-		// overhead ball and refunds whiffs.
-		{ new BallProximityPotentialReward(), 7.5f },
-
+		// ---- Proven core: bit-identical economics to the 1132-Elo run -------------
 		// Ball->goal potential (Nexto state_quality). Antisymmetric between teams, so ALREADY
 		// zero-sum - no ZeroSum wrapper (that would silently 2x it). exp() concentrates credit at
-		// the goal mouth and refunds rolled-back balls in full.
-		{ new BallToGoalPotentialReward(), 75.f },
+		// the goal mouth and refunds rolled-back balls in full. gamma MUST equal the learner's
+		// gaeGamma (threaded from TRAIN_GAMMA) or the potential stops telescoping against GAE.
+		{ new BallToGoalPotentialReward(gamma), 75.f },
 
 		// Touch quality (Nexto touch_accel): pays only for adding ball speed, ~10 total 0->110kph,
-		// zero-sum so touches can't be co-farmed.
+		// zero-sum so touches can't be co-farmed. Produced the 1933uu/s goal speed.
 		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
 
-		// Touch HEIGHT (Nexto touch_height x15), impulse-scaled: carries pay ~0, a real strike
-		// pays full height credit, airborne strikes pay double - the aerial gradient.
-		// GATED: the reachability gate mutes the aerial-juggle self-rally in states that don't
-		// matter. Beta anneals from 0, 0.2 floor keeps cold aerial learning intact.
-		{ new ZeroSumReward(new TouchHeightReward(), 0), 15.f, true },
+		// Demo: unchanged pair swing (75 = goal/2). teamSpirit 0 (was 0.5, an algebraic no-op in
+		// 1v1 that misleadingly implied a halving living entirely in the weight).
+		{ new ZeroSumReward(new DemoReward(), 0), 37.5f },
 
-		// Boost pickup, halved (big pad from empty = 4 = 2.7% of a goal).
-		// GATED: don't pay for a boost-collection circuit in states where we can't win the ball
-		// or score - the residual farmable surface the gate exists for.
-		{ new PickupBoostReward(), 4.f, true },
+		// ---- Hygiene conversions (PSD fitness cleanup) ----------------------------
+		// Proximity race: ZeroSum of an exact PBRS is still exact PBRS (Psi = Phi_own - Phi_opp),
+		// so policy-invariance holds while the stack's biggest per-player PSD polluter becomes "be
+		// closer to the ball than the opponent". Weight halved (7.5 -> 4) since the ZS swing
+		// doubles. Never gate a potential.
+		{ new ZeroSumReward(new BallProximityPotentialReward(gamma), 0), 4.f },
 
-		// Demo halved so the zero-sum pair swing is 75 = goal/2. No bump term (Nexto had none).
-		{ new ZeroSumReward(new DemoReward(), 0.5f), 37.5f },
+		// Boost economy: demo-respawn guarded (mandatory under ZeroSum - without it the demoer is
+		// charged for the victim's respawn tank), raised 4 -> 6, UNGATED. Zero-sum replaces the
+		// gate as anti-farm: mutual pad cycling cancels, denial is a real 1v1 skill, and gating a
+		// ZS term breaks its symmetry (positive side muted, mirror charged in full).
+		{ new ZeroSumReward(new GuardedPickupBoostReward(), 0), 6.f },
 
-		// The objective. All dense income per scoring possession sums to ~35-40 (~25% of a goal),
-		// none of it collectible without moving the ball toward scoring.
+		// ---- The frontier terms ----------------------------------------------------
+		// Aerial STRIKE (replaces gated ZeroSum(TouchHeight) 15): AND of sustained flight and a
+		// genuinely-high ball, impulse-scaled, ~0.8s refire cooldown. Pays exactly 0 for everything
+		// the bot currently does (ground strikes, wall pins, 193uu hop-pokes). UNGATED: the gate
+		// structurally discounts never-achieved states and made the old ZS pair net-negative.
+		{ new ZeroSumReward(new AerialTouchReward(), 0), 25.f },
+
+		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
+		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
+		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
+		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), 0), 10.f },
+
+		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
+		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
+		// - phantom-farmable). UNGATED - the gate's attack-oriented level is lowest exactly in the
+		// own-half states where saves fire.
+		{ new ZeroSumReward(new OpposedSaveReward(), 0), 25.f },
+
+		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
 	};
 }
@@ -99,16 +137,19 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.stateSetter = new CombinedState({
 		// Ground touch bootstrap - the proven anti-freeze state
 		{ new BallNearCarState(600, 900), 0.35f },
-		// Aerial drill: ball hangs at 500-1500uu drifting down, BOTH cars on a 300-1200 ring
-		// with >=40 boost, facing it. Symmetric, so the race to the falling ball IS the zero-sum
-		// challenge.
-		{ new BallNearCarState(300, 1200, 500, 1500, 400, 40), 0.20f },
+		// Aerial drill, REVERSE CURRICULUM: car spawns ALREADY AIRBORNE and climbing at an overhead
+		// ball, boost-fed, so it only has to COMPLETE the touch. Replaces the old ground-ring drill
+		// (ball overhead but both cars grounded + ball descending), which let the bot wait for the
+		// ball to fall and hit it on the ground -> no aerial ever required (0.1% aerial touches after
+		// 17B steps). Now that AerialTouch/AirInterceptPotential pay for the airborne touch, this
+		// gives the exposure the reward alone can't buy.
+		{ new AirDrillState(), 0.20f },
 		{ new KickoffState(), 0.15f },
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to corners/goal lines)
 		{ new RandomState(true, true, false), 0.30f },
 	});
 	result.terminalConditions = terminalConditions;
-	result.rewards = BuildRewards();
+	result.rewards = BuildRewards(TRAIN_GAMMA);
 
 	result.arena = arena;
 
@@ -163,8 +204,20 @@ int main(int argc, char* argv[]) {
 	LearnerConfig cfg = {};
 
 	cfg.deviceType = LearnerDeviceType::GPU_CUDA;
+	// Override the device with GGL_DEVICE=cpu|cuda|auto. Handy for running a live viewer (GGL_RENDER=1)
+	// on CPU while the GPU is fully occupied by a training process — a single render arena is cheap.
+	if (const char* d = std::getenv("GGL_DEVICE")) {
+		std::string dev = d;
+		if (dev == "cpu" || dev == "CPU")        cfg.deviceType = LearnerDeviceType::CPU;
+		else if (dev == "auto" || dev == "AUTO") cfg.deviceType = LearnerDeviceType::AUTO;
+		else                                     cfg.deviceType = LearnerDeviceType::GPU_CUDA;
+	}
 
-	cfg.tickSkip = 8;
+	// tickSkip 4 (30 actions/sec vs the old 15): finer control for mechanics — the biggest ceiling
+	// lever for aerials/dribbles/speed-flips. Halves game-time throughput per policy-step, so it is
+	// paired with a fresh run (not a resume) and the longer-horizon gamma below (halving tickSkip
+	// halves game-time horizon at fixed gamma, so gamma is raised to keep it).
+	cfg.tickSkip = 4;
 	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
 
 	cfg.numGames = 1024;
@@ -185,11 +238,17 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.epochs = 2;
 	cfg.ppo.entropyScale = 0.035f;
 
-	// Reachability: aux InfoNCE heads on the shared trunk + reward GATE on the two farmable terms
-	// (TouchHeight, PickupBoost). This is the ONLY "smart" component - and with the proposer gone,
-	// the heads have exactly one consumer: the gate. This is the arm that was live in the good era.
+	// Reachability: aux InfoNCE heads on the shared trunk. gateEnabled = false under FRONTIER-9:
+	// every reward component is now zero-sum/antisymmetric and ungated by design (gating breaks ZS
+	// symmetry - positive side muted, mirror charged in full - and PBRS telescoping), so the gate
+	// would be a mathematical no-op anyway; this makes that explicit. Keep enabled=true: the heads
+	// still feed the InfoNCE trunk aux + Reach/* plasticity canaries.
 	cfg.ppo.reachability.enabled = true;
-	cfg.ppo.reachability.gateEnabled = true;
+	cfg.ppo.reachability.gateEnabled = false;
+	// With the gate off, the rho/gate reads (3 full-buffer model passes/iter, the biggest single
+	// consumption cost after PPO Learn) feed only the Reach/* panels — refresh those every 16
+	// iterations instead. The InfoNCE trunk aux (the part that helps learning) is unaffected.
+	cfg.ppo.reachability.diagEveryIters = 16;
 
 	// Explicitly OFF - the regression. ProposerConfig defaults enabled=true upstream, so this
 	// override is what actually keeps the proposer / drill bank / car-proposer / HRL machinery
@@ -200,14 +259,29 @@ int main(int argc, char* argv[]) {
 	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
 	cfg.ppo.rewardClipRange = 50;
 
-	cfg.ppo.gaeGamma = 0.99;
+	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~15s half-life at 30Hz; MUST match the PBRS reward gammas above
+
+	// Secondary goal-only critic: long-horizon credit on the one unfarmable signal. Independent net,
+	// raw obs in; advantages blended at beta = 25% of dense-advantage scale (std-matched, centered).
+	// VALIDATION: GoalCritic/Value-Outcome Corr and Adv-Outcome Corr must be POSITIVE once goals flow;
+	// negative = channel/sign bug -> set beta = 0 (critic still trains, no blend) and investigate.
+	cfg.ppo.goalCritic.enabled = true;
+	cfg.ppo.goalCritic.gamma = 0.9997f;   // ~77s half-life at 30Hz ("huge distance", per plan)
+	cfg.ppo.goalCritic.beta = 0.25f;
+	cfg.ppo.goalCritic.lr = 1.5e-4f;
+	cfg.ppo.goalCritic.model.layerSizes = { 512, 512, 512 };
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
 
-	cfg.ppo.sharedHead.layerSizes = { 256, 256 };
-	cfg.ppo.policy.layerSizes = { 256, 256, 256 };
-	cfg.ppo.critic.layerSizes = { 256, 256, 256 };
+	// 512-wide (was 256): ~4x params. The saturation probe read the 256 net at 49-74% spectral
+	// utilization (not saturated), but the head's effective rank was grinding down all run and this
+	// is a FRESH run where underused capacity is nearly free while missing capacity compounds over
+	// an unattended week. Inference is latency-bound on the 5080 at these sizes, so the SPS cost is
+	// modest (~10-25%), not proportional to the param increase.
+	cfg.ppo.sharedHead.layerSizes = { 512, 512 };
+	cfg.ppo.policy.layerSizes = { 512, 512, 512 };
+	cfg.ppo.critic.layerSizes = { 512, 512, 512 };
 	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.lr = 3e-4f;
@@ -230,6 +304,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.activationType = activation;
 	cfg.ppo.reachability.phi.activationType = activation;
 	cfg.ppo.reachability.psi.activationType = activation;
+	cfg.ppo.goalCritic.model.activationType = activation;
 
 	bool addLayerNorm = true;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
@@ -237,6 +312,7 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 	cfg.ppo.reachability.phi.addLayerNorm = addLayerNorm;
 	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
+	cfg.ppo.goalCritic.model.addLayerNorm = addLayerNorm;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions. This was ON in the good era. NOTE: this only EVALUATES against old
@@ -245,11 +321,24 @@ int main(int argc, char* argv[]) {
 	// uncommitted addition). Flip it on later as its own experiment if desired.
 	cfg.skillTracker.enabled = true;
 
-	// Distinct wandb run name for the Basin-Racing run (its own line; won't resume 2.6).
-	cfg.metricsRunName = "3.0-psd";
+	// FRESH RUN (3.1): tickSkip 4, 512-wide, gamma 0.9985, secondary goal critic. Its own checkpoint
+	// folder + wandb run name so it can NEVER accidentally resume the 26B-step tickSkip-8 lineage
+	// (whose checkpoints live in "checkpoints/" and are architecture-incompatible anyway).
+	cfg.checkpointFolder = "checkpoints_3.1";
+	cfg.metricsRunName = "3.1-ts4";
 
 	cfg.sendMetrics = true; // Send metrics
-	cfg.renderMode = false; // Don't render
+
+	// Render/visualization mode. Off by default (this binary trains). Set GGL_RENDER=1 to instead
+	// run a single-arena live viewer against an existing run: it loads the newest checkpoint in
+	// cfg.checkpointFolder and hot-swaps in newer ones as the trainer writes them, so you can watch
+	// the model improve in real time without disturbing the training process. GGL_RENDER_RELOAD_SECS
+	// overrides the poll interval (seconds; <= 0 pins to the checkpoint loaded at startup).
+	cfg.renderMode = false;
+	if (const char* r = std::getenv("GGL_RENDER"); r && r[0] && std::string(r) != "0")
+		cfg.renderMode = true;
+	if (const char* s = std::getenv("GGL_RENDER_RELOAD_SECS"))
+		cfg.renderReloadSecs = (float)std::atof(s);
 
 	// ---------------------------------------------------------------------------------------------
 	// Basin-Racing (PSD) + QD league. Both ADDITIVE and OFF by default: with these two flags false
@@ -267,17 +356,58 @@ int main(int argc, char* argv[]) {
 	// antithetic probes; numGames 1024 splits cleanly (24 probe + 8 eval arenas per slot).
 	cfg.psd.enabled = true;
 	cfg.psd.warmupUntilPlateau = true;
-	cfg.psd.K = 16;
+	// Pure-ES probe (EGGROLL-faithful; arXiv 2511.16652). The 32-slot Baldwinian probe measured
+	// fitness reliability ~0 for 20 rounds -> the ranking was noise, so folds were a random walk.
+	// The paper's own sweeps show ES needs LARGE populations; K=256 -> S=512 antithetic slots puts N
+	// inside their proven envelope. numGames 1024 -> ~2 eval arenas/slot; the round budget goes to a
+	// long level-fitness window instead of a per-slot finetune that couldn't discriminate anyway.
+	cfg.psd.pureES = true;
+	cfg.psd.K = 256;                      // S = 512 slots (was 16 -> S=32, 16x below the paper's floor)
 	cfg.psd.rank = 4;
-	cfg.psd.sigma = 0.02f;
-	cfg.psd.GProbe = 50;
+	cfg.psd.sigma = 0.02f;                // adaptive: widens on low reliability, tightens if most slots hurt
+	cfg.psd.evalWindowSteps = 200;        // level-fitness rollout length (the reallocated probe budget)
 	cfg.psd.GExploit = 2500;
-	cfg.psd.fitnessMode = 1;              // 1 = end-of-window slope (handoff §4.1 fix), 0 = level
+	// Validation-gated fold: A/B the base policy's held-out return before vs after each fold and revert
+	// if it regressed, so no noise-fold ever lands unchecked (aggregate-level Baldwinian validation).
+	cfg.psd.valGateEnabled = true;
+	cfg.psd.valWindowSteps = 20;
 
+	// Plasticity interventions — the canaries now ACT (handoff §3.6/§4.2), not just log. Every knob
+	// is gated to be a no-op under healthy training and fires only on real plasticity loss:
+	//   (1) ReDo recycles dead policy units when >=10% collapse.
+	//   (2) EffRank collapse response shrink-and-perturbs the head when its effective rank drops
+	//       below 70% of its running peak.
+	//   (3) Critic gets a gentle 10%-toward-init partial reset every 5 probe rounds (it loses value
+	//       plasticity first and tolerates resets).
+	//   (4) Distill reset (deepest) reinits + behavior-distills the policy, but only when the head
+	//       rank has collapsed below 60% of peak AND >=8 rounds since the last distill.
+	//   (5) Competence freeze is wired but dormant: set freezeRatingThresh to the Rating/1v1 at which
+	//       you want the trunk locked in (the default never fires).
+	cfg.psd.redoEnabled = true;
+	cfg.psd.effRankResponseEnabled = true;
+	cfg.psd.criticResetPeriod = 5;
+	cfg.psd.criticPartialResetFrac = 0.10f;
+	cfg.psd.distillPeriod = 8;
+	cfg.psd.distillTrigger = 0.6f;
+	cfg.psd.freezeEnabled = true;
+	// FRESH run: interventions LOG from step 0 but only ACT after 25k iterations, so the naturally
+	// steep early effective-rank drop of a cold net doesn't trip distill/perturb with nobody watching.
+	cfg.psd.interventionWarmupIters = 25000;
+	// cfg.psd.freezeRatingThresh = <Rating/1v1 to freeze the trunk at>;  // leave unset = never freeze
+
+	// QD league: a MAP-Elites archive of behaviorally-diverse opponents so the main doesn't converge
+	// to one playstyle and gets exposure to others. Now actually WIRED into training: descendOpponentFrac
+	// of iterations face a PFSP-sampled league member (was dead code before - the archive existed but
+	// never fed the training loop). Members are past selves (re-seeded each era) + their mutations;
+	// exploiterSlots members hill-climb to attack the current main's weaknesses. Fitness = member goals
+	// minus main goals over a match (the sign was inverted before, breeding the worst losers).
 	cfg.league.enabled = true;
 	cfg.league.gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
 	cfg.league.binsPerAxis = 4;
 	cfg.league.exploiterSlots = 2;
+	cfg.league.descendOpponentFrac = 0.25f; // 25% of training iterations face a league opponent
+	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often
+	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

@@ -57,6 +57,12 @@ namespace GGL {
 		void SaveStats(std::filesystem::path path);
 		void LoadStats(std::filesystem::path path);
 
+		// Render-mode live reload: if a numbered checkpoint newer than loadedTimesteps has appeared
+		// in config.checkpointFolder and looks fully written, hot-swap its policy weights in and
+		// update loadedTimesteps. Returns true on a successful swap. Guarded so a mid-write race
+		// against the (uncontrolled) training process can only cost a retry, never the process.
+		bool ReloadNewestCheckpointForRender(int64_t& loadedTimesteps);
+
 		RG_NO_COPY(Learner);
 
 		~Learner();

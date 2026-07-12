@@ -17,6 +17,18 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
+	// Secondary goal-only critic: a fully independent net (raw obs in, no shared trunk) so its
+	// gradients can't touch the proven policy/critic path. Lives in `models` so it checkpoints and
+	// steps with everything else; excluded from GetPolicyModels() like the main critic.
+	if (config.goalCritic.enabled) {
+		RG_ASSERT(config.goalCritic.model.IsValid());
+		RG_ASSERT(config.goalCritic.beta >= 0); // a negative blend would train AWAY from goals
+		ModelConfig gcConfig = config.goalCritic.model;
+		gcConfig.numInputs = obsSize;
+		gcConfig.numOutputs = 1;
+		models.Add(new Model("goal_critic", gcConfig, device));
+	}
+
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
@@ -143,6 +155,11 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
 }
 
+torch::Tensor GGL::PPOLearner::InferGoalCritic(torch::Tensor obs) {
+	// Independent net: raw obs in, NO shared trunk (by design — zero gradient interference)
+	return models["goal_critic"]->Forward(obs, config.useHalfPrecision).flatten();
+}
+
 torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
 	// Compute log probs and entropy
 	auto entropy = -(probs.log() * probs).sum(-1);
@@ -168,6 +185,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgPolicyLoss,
 		avgRelEntropyLoss,
 		avgCriticLoss,
+		avgGoalCriticLoss,
 		avgGuidingLoss,
 		avgRatio,
 		avgClip,
@@ -195,6 +213,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchObs = batch.states;
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
+			auto batchGoalTargetValues = batch.goalTargetValues; // undefined unless goalCritic.enabled
 			auto batchAdvantages = batch.advantages;
 
 			auto fnRunMinibatch = [&](int start, int stop) {
@@ -265,6 +284,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					vals = vals.view_as(targetValues);
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
 					avgCriticLoss += criticLoss.detach().cpu().item<float>();
+				}
+
+				// Secondary goal-only critic: plain value regression on its own channel. Fully
+				// independent net, so this gradient touches nothing else.
+				torch::Tensor goalCriticLoss;
+				if (batchGoalTargetValues.defined() && models["goal_critic"]) {
+					auto goalTargets = batchGoalTargetValues.slice(0, start, stop).to(device, true, true);
+					auto goalVals = InferGoalCritic(obs).view_as(goalTargets);
+					goalCriticLoss = mseLoss(goalVals, goalTargets) * batchSizeRatio;
+					avgGoalCriticLoss += goalCriticLoss.detach().cpu().item<float>();
 				}
 
 				// Reachability aux losses (InfoNCE on a subsample; gradient flows into the shared head)
@@ -353,6 +382,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					totalLoss = ppoLoss;
 				if (trainCritic)
 					totalLoss = totalLoss.defined() ? totalLoss + criticLoss : criticLoss;
+				if (goalCriticLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + goalCriticLoss : goalCriticLoss;
 				if (reachLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + reachLoss : reachLoss;
 
@@ -379,6 +410,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 			if (trainSharedHead)
 				nn::utils::clip_grad_norm_(models["shared_head"]->parameters(), 0.5f);
+
+			if (models["goal_critic"])
+				nn::utils::clip_grad_norm_(models["goal_critic"]->parameters(), 0.5f);
 
 			if (reach) {
 				nn::utils::clip_grad_norm_(reach->phi->parameters(), 0.5f);
@@ -423,6 +457,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Policy Loss"] = avgPolicyLoss.Get();
 		report["Policy Relative Entropy Loss"] = avgRelEntropyLoss.Get();
 		report["Critic Loss"] = avgCriticLoss.Get();
+		if (avgGoalCriticLoss.count > 0)
+			report["GoalCritic/Loss"] = avgGoalCriticLoss.Get();
 
 		if (config.useGuidingPolicy)
 			report["Guiding Loss"] = avgGuidingLoss.Get();
@@ -512,6 +548,9 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	if (models["shared_head"])
 		models["shared_head"]->SetOptimLR(RS_MIN(policyLR, criticLR));
 
+	if (models["goal_critic"])
+		models["goal_critic"]->SetOptimLR(config.goalCritic.lr);
+
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }
 
@@ -519,7 +558,7 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 	ModelSet result = {};
 	for (Model* model : models) {
 		std::string name = model->modelName;
-		if (name == "critic")
+		if (name == "critic" || name == "goal_critic")
 			continue;
 
 		// Reachability heads are training-time-only; old policy versions don't carry them

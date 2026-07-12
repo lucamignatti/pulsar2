@@ -9,6 +9,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 using namespace GGL;
 using namespace torch;
@@ -28,10 +29,13 @@ LeagueArchive::LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::Env
 		matchEnv->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
 	}
 
-	// Scratch models to load member weights into (clones of the main policy path).
+	// Two model sets: `scratch` for evaluation, `oppServe` for the training loop to borrow as its
+	// opponent (kept separate so serving an opponent during collection can't race an evolve eval).
 	for (const char* name : SCRATCH_MODELS)
-		if (ppo->models[name])
+		if (ppo->models[name]) {
 			scratch.Add(ppo->models[name]->MakeClone());
+			oppServe.Add(ppo->models[name]->MakeClone());
+		}
 
 	if (!checkpointFolder.empty())
 		leagueDir = checkpointFolder / "league";
@@ -40,6 +44,7 @@ LeagueArchive::LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::Env
 LeagueArchive::~LeagueArchive() {
 	delete matchEnv;
 	scratch.Free();
+	oppServe.Free();
 }
 
 std::vector<torch::Tensor> LeagueArchive::SnapshotMain() const {
@@ -126,7 +131,9 @@ float LeagueArchive::EvaluateMember(const std::vector<torch::Tensor>& memberPara
 				samples++;
 			}
 			if (st.goalScored) {
-				if (RS_TEAM_FROM_Y(st.ball.pos.y) == aTeam) aGoals++; else bGoals++;
+				// RS_TEAM_FROM_Y returns the team whose NET the ball is in = the team that got
+				// scored ON. The SCORER is the opposite team (matches GoalReward's convention).
+				if (RS_TEAM_FROM_Y(st.ball.pos.y) != aTeam) aGoals++; else bGoals++;
 			}
 		}
 	}
@@ -138,7 +145,17 @@ float LeagueArchive::EvaluateMember(const std::vector<torch::Tensor>& memberPara
 	};
 	// Trim/pad BD to the configured axis count.
 	outBD.resize(cfg.gridAxes.size(), 0.0f);
-	return (float)(aGoals - bGoals);
+	return (float)(aGoals - bGoals); // > 0 => member BEATS the current main
+}
+
+void LeagueArchive::RebuildCellMap() {
+	cellToMember.clear();
+	for (int i = 0; i < (int)members.size(); i++) {
+		if (members[i].exploiter || members[i].cell < 0) continue;
+		auto it = cellToMember.find(members[i].cell);
+		if (it == cellToMember.end() || members[i].fitness > members[it->second].fitness)
+			cellToMember[members[i].cell] = i;
+	}
 }
 
 void LeagueArchive::TryInsert(Member&& m) {
@@ -156,7 +173,7 @@ void LeagueArchive::TryInsert(Member&& m) {
 
 int LeagueArchive::SampleOpponent() const {
 	if (members.empty()) return -1;
-	// PFSP: prefer members near the frontier (moderate fitness), softmax over -|fitness| / temp.
+	// PFSP: prefer members near the frontier (even matches), softmax over -|fitness| / temp.
 	std::vector<double> logits(members.size());
 	double mx = -1e30;
 	for (size_t i = 0; i < members.size(); i++) {
@@ -170,24 +187,137 @@ int LeagueArchive::SampleOpponent() const {
 	return (int)members.size() - 1;
 }
 
+ModelSet* LeagueArchive::LoadPFSPOpponentModels() {
+	if (members.empty()) return nullptr;
+	int idx = SampleOpponent();
+	if (idx < 0) return nullptr;
+	LoadInto(oppServe, members[idx].params);
+	return &oppServe;
+}
+
+void LeagueArchive::ReseedFromMain() {
+	RG_NO_GRAD;
+	std::vector<torch::Tensor> mainW = SnapshotMain();
+	std::vector<float> bd;
+	float q = EvaluateMember(mainW, bd); // ~0 vs itself; drifts negative as the main improves
+	Member seed;
+	seed.params = mainW; seed.bd = bd; seed.fitness = q; seed.matches = 1;
+	seed.lineage = nextLineage++;
+	TryInsert(std::move(seed));
+}
+
+void LeagueArchive::EvolveExploiters() {
+	RG_NO_GRAD;
+	if (cfg.exploiterSlots <= 0 || members.empty()) return;
+
+	int have = 0;
+	for (auto& m : members) if (m.exploiter) have++;
+
+	// Fill empty exploiter slots by mutating the strongest current member.
+	while (have < cfg.exploiterSlots) {
+		int best = 0;
+		for (int i = 1; i < (int)members.size(); i++)
+			if (members[i].fitness > members[best].fitness) best = i;
+		std::vector<torch::Tensor> childW;
+		for (auto& t : members[best].params)
+			childW.push_back(League::MutateGaussian(t, cfg.mutationSigma));
+		std::vector<float> bd;
+		float q = EvaluateMember(childW, bd);
+		Member e; e.params = childW; e.bd = bd; e.fitness = q; e.matches = 1;
+		e.exploiter = true; e.cell = -1; e.lineage = members[best].lineage;
+		members.push_back(std::move(e));
+		have++;
+	}
+
+	// Hill-climb one exploiter this step: mutate it, keep the mutation only if it beats the main by
+	// more. Exploiters chase pure fitness-vs-current-main, so they keep pressure on your weaknesses.
+	std::vector<int> expIdx;
+	for (int i = 0; i < (int)members.size(); i++) if (members[i].exploiter) expIdx.push_back(i);
+	if (expIdx.empty()) return;
+	int pick = expIdx[Math::RandInt(0, (int)expIdx.size())];
+	std::vector<torch::Tensor> mutW;
+	for (auto& t : members[pick].params)
+		mutW.push_back(League::MutateGaussian(t, cfg.mutationSigma));
+	std::vector<float> bd;
+	float q = EvaluateMember(mutW, bd);
+	if (q > members[pick].fitness) {
+		members[pick].params = std::move(mutW);
+		members[pick].bd = bd;
+		members[pick].fitness = q;
+	}
+	members[pick].age = 0;
+}
+
+void LeagueArchive::RefreshStalest() {
+	RG_NO_GRAD;
+	// Round-robin re-evaluation of non-exploiter members: as the MAIN improves, an old member's
+	// fitness (and its style relative to the new main) drifts, so a stale archive lies. Re-scoring
+	// keeps PFSP honest and lets a member that has fallen below the floor get culled.
+	if (members.empty()) return;
+	int n = (int)members.size();
+	for (int tries = 0; tries < n; tries++) {
+		int i = refreshCursor % n;
+		refreshCursor = (refreshCursor + 1) % n;
+		if (members[i].exploiter) continue; // exploiters refresh themselves in EvolveExploiters
+		std::vector<float> bd;
+		float q = EvaluateMember(members[i].params, bd);
+		members[i].fitness = q;
+		members[i].bd = bd;
+		members[i].cell = (int)CellIndex(bd);
+		members[i].age = 0;
+		return;
+	}
+}
+
+void LeagueArchive::Cull() {
+	// Cap total members. Never drop an exploiter or a member that is the sole elite of its cell;
+	// among the rest, drop the lowest fitness first. Also drop anyone below the competence floor.
+	RebuildCellMap();
+	std::set<int> protectedIdx;
+	for (auto& kv : cellToMember) protectedIdx.insert(kv.second);
+
+	// Below-floor removal (stale refresh may have pushed a member under the floor).
+	for (int i = (int)members.size() - 1; i >= 0; i--)
+		if (!members[i].exploiter && !protectedIdx.count(i) && members[i].fitness < cfg.competenceFloor) {
+			members.erase(members.begin() + i);
+			protectedIdx.clear();
+			RebuildCellMap();
+			for (auto& kv : cellToMember) protectedIdx.insert(kv.second);
+		}
+
+	while ((int)members.size() > cfg.maxMembers) {
+		int worst = -1; float wf = 1e30f;
+		for (int i = 0; i < (int)members.size(); i++) {
+			if (members[i].exploiter || protectedIdx.count(i)) continue;
+			if (members[i].fitness < wf) { wf = members[i].fitness; worst = i; }
+		}
+		if (worst < 0) break; // everything left is protected
+		members.erase(members.begin() + worst);
+		protectedIdx.clear();
+		RebuildCellMap();
+		for (auto& kv : cellToMember) protectedIdx.insert(kv.second);
+	}
+	RebuildCellMap();
+}
+
 void LeagueArchive::EvolveStep(Report& report) {
 	RG_NO_GRAD;
 
-	// Seed the archive from the main agent (a few mutated copies) when empty.
+	// Seed the archive from the main agent when empty (founds lineage 0).
 	if (members.empty()) {
-		std::vector<torch::Tensor> mainW = SnapshotMain();
-		std::vector<float> bd;
-		float q = EvaluateMember(mainW, bd);
-		Member seed; seed.params = mainW; seed.bd = bd; seed.fitness = q;
-		TryInsert(std::move(seed));
+		ReseedFromMain();
 		return;
 	}
 
-	// Produce a batch of candidates via mutation + crossover on existing members.
+	// Age everyone one step (drives the staleness refresh).
+	for (auto& m : members) m.age++;
+
+	// Produce a batch of MAP-Elites candidates via mutation + crossover on existing members.
 	int nCandidates = 4;
 	for (int c = 0; c < nCandidates; c++) {
 		int pa = SampleOpponent();
 		std::vector<torch::Tensor> childW;
+		int childLineage = members[pa].lineage;
 		if ((int)members.size() >= 2 && (Math::RandInt(0, 2) == 0)) {
 			int pb = SampleOpponent();
 			for (size_t k = 0; k < members[pa].params.size(); k++)
@@ -200,10 +330,10 @@ void LeagueArchive::EvolveStep(Report& report) {
 		std::vector<float> bd;
 		float q = EvaluateMember(childW, bd);
 
-		Member m; m.params = childW; m.bd = bd; m.fitness = q; m.matches = 1;
+		Member m; m.params = childW; m.bd = bd; m.fitness = q; m.matches = 1; m.lineage = childLineage;
 
-		// Exploiter audit: a strong member whose cell is already held by a *different* member is
-		// evidence the descriptor basis is missing an axis.
+		// Exploiter audit: a strong member whose cell is already held is evidence the descriptor
+		// basis is missing an axis.
 		long cell = CellIndex(bd);
 		auto occ = cellToMember.find((int)cell);
 		if (q > 0 && occ != cellToMember.end())
@@ -212,24 +342,9 @@ void LeagueArchive::EvolveStep(Report& report) {
 		TryInsert(std::move(m));
 	}
 
-	// Cull: cap total members, dropping the lowest-fitness non-cell-elite first.
-	while ((int)members.size() > cfg.maxMembers) {
-		int worst = -1; float wf = 1e30f;
-		for (int i = 0; i < (int)members.size(); i++)
-			if (members[i].fitness < wf) { wf = members[i].fitness; worst = i; }
-		if (worst < 0) break;
-		int lastCell = members[worst].cell;
-		members.erase(members.begin() + worst);
-		// Rebuild the cell map (indices shifted).
-		cellToMember.clear();
-		for (int i = 0; i < (int)members.size(); i++)
-			if (members[i].cell >= 0) {
-				auto it = cellToMember.find(members[i].cell);
-				if (it == cellToMember.end() || members[i].fitness > members[it->second].fitness)
-					cellToMember[members[i].cell] = i;
-			}
-		(void)lastCell;
-	}
+	EvolveExploiters();
+	RefreshStalest();
+	Cull();
 }
 
 void LeagueArchive::LogMetrics(Report& report) const {
@@ -240,9 +355,24 @@ void LeagueArchive::LogMetrics(Report& report) const {
 	report["League/Coverage"] = (float)cellToMember.size() / (float)std::max(1L, totalCells);
 	report["League/Exploiter Unmapped Wins"] = (float)exploiterUnmappedWins;
 
-	float worst = 1e30f;
-	for (auto& kv : cellToMember) worst = std::min(worst, members[kv.second].fitness);
-	if (!cellToMember.empty()) report["League/Worst Cell Fitness"] = worst;
+	int exploiters = 0; std::set<int> lineages;
+	float bestExploiterFit = -1e30f, meanFit = 0;
+	for (auto& m : members) {
+		if (m.exploiter) { exploiters++; bestExploiterFit = std::max(bestExploiterFit, m.fitness); }
+		lineages.insert(m.lineage);
+		meanFit += m.fitness;
+	}
+	report["League/Exploiter Count"] = (float)exploiters;
+	report["League/Lineage Count"] = (float)lineages.size();
+	if (!members.empty()) report["League/Mean Fitness"] = meanFit / members.size();
+	if (exploiters > 0) report["League/Best Exploiter Fitness"] = bestExploiterFit;
+
+	float worst = 1e30f, best = -1e30f;
+	for (auto& kv : cellToMember) { worst = std::min(worst, members[kv.second].fitness); best = std::max(best, members[kv.second].fitness); }
+	if (!cellToMember.empty()) {
+		report["League/Worst Cell Fitness"] = worst;
+		report["League/Best Cell Fitness"] = best;
+	}
 
 	// Mean pairwise behavioral distance (diversity health).
 	double dsum = 0; long dn = 0;
@@ -258,6 +388,14 @@ void LeagueArchive::LogMetrics(Report& report) const {
 
 void LeagueArchive::OnIteration(Report& report, uint64_t totalIterations) {
 	if (!cfg.enabled) return;
+
+	// Found a new lineage from the current main on the re-seed cadence (a fresh "era").
+	if (cfg.reseedEveryIters > 0 && totalIterations > 0 && (totalIterations % cfg.reseedEveryIters) == 0
+		&& !members.empty()) {
+		ReseedFromMain();
+		Cull();
+	}
+
 	if (cfg.evolveEveryIters > 0 && (totalIterations % cfg.evolveEveryIters) == 0)
 		EvolveStep(report);
 	LogMetrics(report);
@@ -267,6 +405,7 @@ void LeagueArchive::ToJSON(nlohmann::json& j) const {
 	nlohmann::json l;
 	l["member_count"] = members.size();
 	l["exploiter_unmapped_wins"] = exploiterUnmappedWins;
+	l["next_lineage"] = nextLineage;
 	// Persist member metadata; weights are saved to the league dir keyed by index.
 	nlohmann::json arr = nlohmann::json::array();
 	for (size_t i = 0; i < members.size(); i++) {
@@ -275,6 +414,7 @@ void LeagueArchive::ToJSON(nlohmann::json& j) const {
 		m["fitness"] = members[i].fitness;
 		m["cell"] = members[i].cell;
 		m["exploiter"] = members[i].exploiter;
+		m["lineage"] = members[i].lineage;
 		arr.push_back(m);
 		if (!leagueDir.empty()) {
 			std::filesystem::create_directories(leagueDir / "members");
@@ -290,6 +430,7 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 	if (!j.contains("league")) return;
 	auto& l = j["league"];
 	exploiterUnmappedWins = l.value("exploiter_unmapped_wins", 0L);
+	nextLineage = l.value("next_lineage", 0);
 	members.clear();
 	cellToMember.clear();
 	if (leagueDir.empty() || !l.contains("members")) return;
@@ -301,6 +442,7 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 		mem.fitness = m.value("fitness", 0.0f);
 		mem.cell = m.value("cell", -1);
 		mem.exploiter = m.value("exploiter", false);
+		mem.lineage = m.value("lineage", 0);
 		bool ok = true;
 		auto path = leagueDir / "members" / (std::to_string(i) + ".pt");
 		if (std::filesystem::exists(path))
@@ -309,8 +451,8 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 			ok = false;
 		if (ok && (int)mem.params.size() == nModels) {
 			members.push_back(std::move(mem));
-			if (members.back().cell >= 0) cellToMember[members.back().cell] = (int)members.size() - 1;
 		}
 		i++;
 	}
+	RebuildCellMap();
 }

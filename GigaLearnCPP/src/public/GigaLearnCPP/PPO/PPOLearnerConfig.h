@@ -20,6 +20,11 @@ namespace GGL {
 		bool enabled = false;     // Train the heads (aux loss) + compute gate diagnostics
 		bool gateEnabled = false; // Actually scale the gated rewards (requires enabled)
 
+		// When the gate is OFF, the rho/gate read block (3 full-buffer model passes + CPU smoothing)
+		// feeds nothing but the Reach/* diagnostic panels — so only run it every Nth iteration.
+		// Ignored (every iteration) when gateEnabled=true, since rewards then depend on it.
+		int diagEveryIters = 1;
+
 		// Model
 		int representationSize = 128;
 		float tau = 0.02f;          // Contrastive temperature; Score = cosine(phi, psi) / tau
@@ -170,6 +175,27 @@ namespace GGL {
 		}
 	};
 
+	// Secondary GOAL-ONLY critic (multi-horizon value decomposition). The dense shaped reward needs a
+	// moderate gamma or target variance swamps the critic; the true objective (goal/concede, the one
+	// unfarmable signal) carries meaning at much longer horizons. This trains a SECOND critic on a
+	// goal-only reward channel (+1 team scored / -1 conceded, computed straight from game outcomes —
+	// independent of the reward stack) at its own, much higher gamma, and blends its advantages into
+	// the policy gradient: A = A_dense + betaEff * A_goal, betaEff std-matched so beta is the FRACTION
+	// of dense-advantage scale contributed (a bounded influence by construction).
+	// Episodes terminate on goals, so V_goal is inherently bounded in [-1,1]: it converges toward
+	// P(score) - P(concede) with mild time preference — no standardization or clipping needed.
+	// The net is fully independent (raw obs in, own trunk): zero gradient interference with the
+	// proven policy/critic/shared-head path. Validation: watch GoalCritic/Value-Outcome Corr — the
+	// critic's prediction must correlate POSITIVELY with realized episode outcomes; a channel or
+	// sign bug reads negative there within minutes on a goal-dense checkpoint.
+	struct GoalCriticConfig {
+		bool enabled = false;
+		float gamma = 0.9997f;      // ~77s half-life at 30Hz (tickSkip 4) — the "huge distance" horizon
+		float beta = 0.25f;         // blended advantage fraction (std-matched); 0 = train critic, no blend
+		float lr = 1.5e-4f;
+		PartialModelConfig model;   // independent net, raw obs -> 1; set layerSizes in your main
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
 
@@ -223,6 +249,7 @@ namespace GGL {
 
 		ReachabilityConfig reachability;
 		ProposerConfig proposer;
+		GoalCriticConfig goalCritic;
 
 		PPOLearnerConfig() {
 			policy = {};

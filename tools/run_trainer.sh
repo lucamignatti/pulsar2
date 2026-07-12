@@ -59,6 +59,17 @@ export PYTORCH_CUDA_ALLOC_CONF
 : "${CUBLAS_WORKSPACE_CONFIG:=:4096:8}"
 export CUBLAS_WORKSPACE_CONFIG
 
+# GPU SVD (the plasticity effective-rank metric) lazily dlopens the system libcusolver, which
+# resolves cublasGetEmulationSpecialValuesSupport@libcublas.so.13. libtorch bundles an OLDER
+# libcublas with the same SONAME (libcublas.so.13) but without that symbol, so the loader binds
+# cusolver against the bundled cublas and the first probe-round SVD aborts the process. Force the
+# newer SYSTEM cuBLAS/cuBLASLt (same major version, an ABI-superset) to load first so the symbol
+# resolves. Reversible, keeps everything on CUDA, and respects an LD_PRELOAD you set yourself.
+_CUDA_LIB="${CUDA_LIB_DIR:-/usr/local/cuda/targets/x86_64-linux/lib}"
+if [ -e "$_CUDA_LIB/libcublas.so.13" ] && [ -e "$_CUDA_LIB/libcublasLt.so.13" ]; then
+	export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$_CUDA_LIB/libcublas.so.13:$_CUDA_LIB/libcublasLt.so.13"
+fi
+
 usage() {
 	sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
 }
