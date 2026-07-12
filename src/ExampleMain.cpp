@@ -222,6 +222,13 @@ int main(int argc, char* argv[]) {
 
 	cfg.numGames = 1024;
 
+	// Pipelined collection: collect iteration N+1 (worker, frozen policy snapshot) while N
+	// processes+learns. Collection and consumption are near-equal (~0.6s each at ts8) and fully
+	// sequential without this — the single biggest throughput lever, ~1.5-2x.
+	// KILL SWITCH if anything looks off (ratio/KL spikes, entropy crash, Elo bleed):
+	// set false, rebuild, restart — the flag-off path is the exact pre-pipeline sequential code.
+	cfg.pipelinedCollection = true;
+
 	// Leave this empty to use a random seed each run
 	cfg.randomSeed = 123;
 

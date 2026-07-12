@@ -1035,11 +1035,51 @@ void GGL::Learner::Start() {
 			}
 		};
 
-		while (true) {
-			Report report = {};
 
-			bool isFirstIteration = (totalTimesteps == 0);
-
+		// ================= Pipelined collection (config.pipelinedCollection) =================
+		// Overlaps NEXT-iteration experience collection with THIS iteration's processing + Learn().
+		// Collapse-safety design (this exact failure mode has killed runs before):
+		//   * The worker NEVER infers from live training weights — it uses `collectSnapshot`, a frozen
+		//     copy synced at the barrier, so a forward can never see half-updated (torn) parameters.
+		//   * logProbs are recorded from the SAME snapshot that sampled the actions, so PPO's ratio
+		//     pi_new/pi_behavior is exact; the one-update policy lag is standard async-PPO staleness
+		//     that the clip objective is built to absorb.
+		//   * Everything that steps the training EnvSet (PSD probes), submits to the global thread
+		//     pool (league/skill-eval match envs), or evaluates live weights (league, version manager)
+		//     runs in the BARRIER ZONE between join and kick — never concurrent with the worker.
+		// REVERT: set config.pipelinedCollection = false — the flag-off path is the exact sequential
+		// order and call pattern (inline collect, live models, original tail call sites).
+		const bool pipelineOn = config.pipelinedCollection && !render && !practiceOn && !proposerOn;
+		ModelSet collectSnapshot;
+		if (pipelineOn)
+			for (const char* nm : { "shared_head", "policy" })
+				if (ppo->models[nm])
+					collectSnapshot.Add(ppo->models[nm]->MakeClone());
+		ModelSet* const collectModelsPtr = pipelineOn ? &collectSnapshot : NULL;
+		auto fnSyncSnapshot = [&]() {
+			RG_NO_GRAD;
+			for (const char* nm : { "shared_head", "policy" }) {
+				Model* dst = collectSnapshot[nm];
+				if (!dst)
+					continue;
+				auto to = dst->parameters();
+				auto from = ppo->models[nm]->parameters();
+				for (size_t i = 0; i < to.size(); i++)
+					to[i].copy_(from[i], true);
+				dst->_seqHalfOutdated = true;
+			}
+		};
+		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
+		Report collectReport;         // worker-owned between barriers; merged into the iteration report
+		int collectSteps = 0;
+		float collectWallTime = 0;
+		uint64_t prevVersionTimesteps = totalTimesteps;
+		std::thread collectThread;
+		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
+		// Defined OUTSIDE the iteration loop on purpose: it must not capture any loop-local (the
+		// compiler enforces this — loop locals aren't in scope here), because in pipelined mode it
+		// executes concurrently with the NEXT iteration's locals.
+		auto fnCollectIteration = [&]() {
 			// This iteration's opponent for the non-self team: an old policy version, a PFSP-sampled
 			// league member, or (default) the current self. `oppModels` is the opponent's network
 			// (null = mirror self-play); the player masking, trajectory exclusion, and split inference
@@ -1091,10 +1131,10 @@ void GGL::Learner::Start() {
 
 			int numRealPlayers = oppModels ? newPlayerIndices.size() : envSet->state.numPlayers;
 
-			int stepsCollected = 0;
-			{ // Generate experience
+			collectSteps = 0;
+			// -- Generate experience (scope brace removed: body now lives in the collect fn) --
 
-				combinedTraj.ClearKeepCapacity();
+				combinedTrajNext.ClearKeepCapacity();
 				stepSnapshots.clear();
 
 				// Players handed to the opponent this iteration stop being collected; their in-flight
@@ -1120,7 +1160,19 @@ void GGL::Learner::Start() {
 					float prepTime = 0;
 					float recordTime = 0;
 
-					for (int step = 0; combinedTraj.Length() < config.ppo.tsPerItr || render; step++, stepsCollected += numRealPlayers) {
+					// Obs-normalization stats, fetched/clamped ONCE per collect call (hoisted out of the
+					// step loop): the running stat moves negligibly within a single iteration.
+					std::vector<double> obsNormMean, obsNormStd;
+					if (!render && obsStat) {
+						obsNormMean = obsStat->GetMean();
+						obsNormStd = obsStat->GetSTD();
+						for (double& f : obsNormMean)
+							f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
+						for (double& f : obsNormStd)
+							f = RS_MAX(f, config.minObsSTD);
+					}
+
+					for (int step = 0; combinedTrajNext.Length() < config.ppo.tsPerItr || render; step++, collectSteps += numRealPlayers) {
 						Timer stepTimer = {};
 						// Drop any practice window whose arena is about to reset for a reason
 						// OTHER than the drill itself (terminals still hold the PREVIOUS step's
@@ -1148,16 +1200,13 @@ void GGL::Learner::Start() {
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
 							}
 
-							std::vector<double> mean = obsStat->GetMean();
-							std::vector<double> std = obsStat->GetSTD();
-							for (double& f : mean)
-								f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
-							for (double& f : std)
-								f = RS_MAX(f, config.minObsSTD);
+							// mean/std hoisted: refreshed once per iteration below (obsNormMean/Std) — the
+							// running stat drifts negligibly within one iteration and per-step GetMean/GetSTD
+							// re-fetch + clamp was pure overhead
 							for (int i = 0; i < envSet->state.numPlayers; i++) {
 								for (int j = 0; j < obsSize; j++) {
 									float& obsVal = envSet->state.obs.At(i, j);
-									obsVal = (obsVal - mean[j]) / std[j];
+									obsVal = (obsVal - obsNormMean[j]) / obsNormStd[j];
 								}
 							}
 						}
@@ -1213,7 +1262,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr);
 							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
@@ -1222,7 +1271,7 @@ void GGL::Learner::Start() {
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs);
+							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr);
 							tActions = tActions.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
@@ -1238,7 +1287,7 @@ void GGL::Learner::Start() {
 						envStepTime += stepTimer.Elapsed();
 
 						if (stepCallback)
-							stepCallback(this, envSet->state.gameStates, report);
+							stepCallback(this, envSet->state.gameStates, collectReport);
 
 						if (render) {
 							renderSender->Send(envSet->state.gameStates[0]);
@@ -1264,7 +1313,7 @@ void GGL::Learner::Start() {
 							}
 
 							for (auto& pair : avgRewards)
-								report.AddAvg("Rewards/" + pair.first, pair.second.Get());
+								collectReport.AddAvg("Rewards/" + pair.first, pair.second.Get());
 						}
 
 						Timer recordTimer = {};
@@ -1366,7 +1415,7 @@ void GGL::Learner::Start() {
 
 						// Parallel per-player: decide the terminal type, record it, store the
 						// truncation next-state. Finalization stays serial below — the HER relabel
-						// draws from the shared RNG and combinedTraj is shared.
+						// draws from the shared RNG and combinedTrajNext is shared.
 						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 							int newPlayerIdx = newPlayerIndices[k];
 							int8_t terminalType = curTerminals[newPlayerIdx];
@@ -1388,7 +1437,7 @@ void GGL::Learner::Start() {
 						});
 
 						// Serial finalize, in the original player order (deterministic episode
-						// order in combinedTraj, same as the old fully-serial loop)
+						// order in combinedTrajNext, same as the old fully-serial loop)
 						for (int newPlayerIdx : newPlayerIndices) {
 							if (!finalTerminals[newPlayerIdx])
 								continue;
@@ -1396,19 +1445,69 @@ void GGL::Learner::Start() {
 							auto& traj = trajectories[newPlayerIdx];
 							fnRelabelReachGoals(traj, newPlayerIdx);
 							fnAppendProposerTargets(traj);
-							combinedTraj.Append(traj);
+							combinedTrajNext.Append(traj);
 							traj.Clear();
 						}
 
 						recordTime += recordTimer.Elapsed();
 					}
 
-					report["Inference Time"] = inferTime;
-					report["Env Step Time"] = envStepTime;
-					report["Prep Time"] = prepTime;
-					report["Record Time"] = recordTime;
+					collectReport["Inference Time"] = inferTime;
+					collectReport["Env Step Time"] = envStepTime;
+					collectReport["Prep Time"] = prepTime;
+					collectReport["Record Time"] = recordTime;
 				}
-				float collectionTime = collectionTimer.Elapsed();
+				collectWallTime = collectionTimer.Elapsed();
+				collectReport["Collection Time"] = collectWallTime;
+		};
+
+		while (true) {
+			Report report = {};
+
+			bool isFirstIteration = (totalTimesteps == 0);
+
+			// ================= Collection (pipelined orchestration) =================
+			// Sequential mode: collect runs inline right here (worker thread never started).
+			// Pipelined mode: the worker collected THIS iteration's data during the previous
+			// iteration's processing+Learn; join it, swap buffers, run the barrier-zone work, then
+			// kick the worker for the NEXT iteration with a freshly-frozen policy snapshot.
+			Timer iterTimer = {};
+			if (collectThread.joinable())
+				collectThread.join();
+			else
+				fnCollectIteration(); // first iteration, or sequential mode
+			int stepsCollected = collectSteps;
+			std::swap(combinedTraj, combinedTrajNext);
+			collectReport.Finish();
+			for (auto& kv : collectReport.data)
+				report.data[kv.first] = kv.second;
+			collectReport.Clear();
+			float collectionTime = collectWallTime;
+
+			// ---- BARRIER ZONE (worker idle): shared-resource consumers. In sequential mode these
+			// stay at their original tail call sites; exactly one site is active per mode. Running
+			// them here (top of iteration N) is the same program point as the tail of iteration N-1.
+			if (pipelineOn) {
+				if (versionMgr)
+					versionMgr->OnIteration(ppo, report, totalTimesteps, prevVersionTimesteps);
+				prevVersionTimesteps = totalTimesteps;
+				if (league)
+					league->OnIteration(report, totalIterations);
+				if (psd) {
+					float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
+					bool probed = psd->OnDescendIteration(report, rating, totalIterations);
+					if (probed) {
+						// Probe rounds stepped the arenas out from under the in-flight episodes
+						for (auto& traj : trajectories)
+							traj.Clear();
+					}
+				}
+				// Freeze the current policy for the worker, then collect the next iteration
+				// concurrently with this iteration's processing + Learn.
+				fnSyncSnapshot();
+				collectThread = std::thread([&]() { fnCollectIteration(); });
+			}
+
 
 				Timer consumptionTimer = {};
 
@@ -2297,7 +2396,10 @@ void GGL::Learner::Start() {
 				report["Consumption Time"] = consumptionTime;
 				report["Collection Steps/Second"] = stepsCollected / collectionTime;
 				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
-				report["Overall Steps/Second"] = stepsCollected / (collectionTime + consumptionTime);
+				// Pipelined: collection overlaps consumption, so summing the two double-counts —
+				// the iteration wall clock is the honest denominator.
+				report["Overall Steps/Second"] = stepsCollected /
+					(pipelineOn ? RS_MAX(1e-6f, iterTimer.Elapsed()) : (collectionTime + consumptionTime));
 
 				uint64_t prevTimesteps = totalTimesteps;
 				totalTimesteps += stepsCollected;
@@ -2305,28 +2407,37 @@ void GGL::Learner::Start() {
 				totalIterations++;
 				report["Total Iterations"] = totalIterations;
 
-				if (versionMgr)
-					versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
+				// In pipelined mode these three run in the BARRIER ZONE at the top of the next
+				// iteration (same program point: tail of N == top of N+1), where the collection
+				// worker is guaranteed idle — they step EnvSets on the shared thread pool and/or
+				// evaluate live model weights, so they must never overlap a collecting worker.
+				if (!pipelineOn) {
+					if (versionMgr)
+						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 
-				// QD league: evolve/evaluate members between iterations (additive, off by default).
-				if (league)
-					league->OnIteration(report, totalIterations);
+					// QD league: evolve/evaluate members between iterations (additive, off by default).
+					if (league)
+						league->OnIteration(report, totalIterations);
 
-				// Basin-Racing (PSD): may run a full probe round in-line. If it does, the arenas
-				// were stepped out from under the in-flight trajectories, so clear them — the next
-				// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
-				if (psd) {
-					float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
-					bool probed = psd->OnDescendIteration(report, rating, totalIterations);
-					if (probed) {
-						// Clear the persistent per-player trajectories so post-probe collection
-						// starts fresh episodes (combinedTraj is rebuilt from these each iteration).
-						for (auto& traj : trajectories)
-							traj.Clear();
+					// Basin-Racing (PSD): may run a full probe round in-line. If it does, the arenas
+					// were stepped out from under the in-flight trajectories, so clear them — the next
+					// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
+					if (psd) {
+						float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
+						bool probed = psd->OnDescendIteration(report, rating, totalIterations);
+						if (probed) {
+							// Clear the persistent per-player trajectories so post-probe collection
+							// starts fresh episodes (combinedTraj is rebuilt from these each iteration).
+							for (auto& traj : trajectories)
+								traj.Clear();
+						}
 					}
 				}
 
 				if (saveQueued) {
+					// Never exit with a collection worker in flight
+					if (collectThread.joinable())
+						collectThread.join();
 					if (!config.checkpointFolder.empty())
 						Save();
 					exit(0);
@@ -2403,7 +2514,6 @@ void GGL::Learner::Start() {
 						"Total Iterations"
 					}
 				);
-			}
 		}
 		
 	} catch (std::exception& e) {

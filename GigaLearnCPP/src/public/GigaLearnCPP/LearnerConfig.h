@@ -49,6 +49,14 @@ namespace GGL {
 		// tensor-core path. Set false for strict-fp32 reproducibility.
 		bool allowTF32 = true;
 
+		// Overlap NEXT-iteration experience collection (worker thread, frozen policy snapshot) with
+		// THIS iteration's processing + PPO learn. The worker never touches live training weights and
+		// its logProbs come from the same snapshot that sampled the actions, so PPO's importance
+		// ratio stays exact; the one-update policy lag is standard async-PPO staleness the clip
+		// objective absorbs. REVERT to exact sequential behavior by setting this false.
+		// Auto-disabled in render mode and with the proposer/practice machinery (unaudited overlap).
+		bool pipelinedCollection = false;
+
 		// Standardize the obs values (doesn't seem to help much from my testing)
 		bool standardizeObs = false;
 		float minObsSTD = 1 / 10.f;
