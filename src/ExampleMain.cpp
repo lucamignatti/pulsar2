@@ -236,7 +236,11 @@ int main(int argc, char* argv[]) {
 	int tsPerItr = 200'000;
 	cfg.ppo.tsPerItr = tsPerItr;
 	cfg.ppo.batchSize = tsPerItr;
-	cfg.ppo.miniBatchSize = 200'000; // Lower this if too much VRAM is being allocated
+	// 100k (was 200k): at 512-wide the learn pass holds autograd for policy+critic+goal-critic
+	// simultaneously — 200k rows peaked ~12.7GB of saved activations and OOM'd the 16GB card at the
+	// goal critic's forward. Halving the minibatch halves that peak; the minibatch loop accumulates
+	// gradients so the update is mathematically identical, just two passes instead of one.
+	cfg.ppo.miniBatchSize = 100'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
