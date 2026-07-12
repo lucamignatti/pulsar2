@@ -1074,7 +1074,12 @@ void GGL::Learner::Start() {
 		int collectSteps = 0;
 		float collectWallTime = 0;
 		uint64_t prevVersionTimesteps = totalTimesteps;
-		std::thread collectThread;
+		// jthread, NOT thread: if anything throws in the main loop while the worker is collecting,
+		// unwinding to the catch below destroys this object — a joinable std::thread would call
+		// std::terminate there, aborting BEFORE the real error is ever printed (found the hard way:
+		// the abort masked the underlying exception entirely). jthread joins on destruction instead,
+		// so the worker drains and the actual exception reaches RG_ERR_CLOSE.
+		std::jthread collectThread;
 		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
 		// Defined OUTSIDE the iteration loop on purpose: it must not capture any loop-local (the
 		// compiler enforces this — loop locals aren't in scope here), because in pipelined mode it
@@ -1505,7 +1510,7 @@ void GGL::Learner::Start() {
 				// Freeze the current policy for the worker, then collect the next iteration
 				// concurrently with this iteration's processing + Learn.
 				fnSyncSnapshot();
-				collectThread = std::thread([&]() { fnCollectIteration(); });
+				collectThread = std::jthread([&]() { fnCollectIteration(); });
 			}
 
 
