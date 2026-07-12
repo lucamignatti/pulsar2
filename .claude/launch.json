@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pulsar-dashboard",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["tools/remote/dashboard.py"],
+      "port": 8500
+    }
+  ]
+}

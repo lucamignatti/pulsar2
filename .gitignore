@@ -59,3 +59,9 @@ libtorch
 
 /checkpoints
 /wandb
+
+# remote tooling
+tools/viz/.venv/
+run_logs/
+analysis/
+build-viz/

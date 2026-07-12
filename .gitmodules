@@ -4,3 +4,7 @@
 [submodule "RLBotCPP"]
 	path = RLBotCPP
 	url = https://github.com/kipje13/RLBotCPP
+[submodule "tools/viz/RocketSimVisWeb"]
+	path = tools/viz/RocketSimVisWeb
+	url = https://github.com/lucamignatti/RocketSimVisWeb.git
+	branch = pulsar-patches

@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# trainerctl — one CLI for local + remote management of the GigaLearn trainer.
+#
+#   trainerctl status                # trainer / viz / git / gpu / disk overview
+#   trainerctl start|stop|restart    # trainer lifecycle (wraps run_trainer.sh)
+#   trainerctl follow                # tail the live trainer log
+#   trainerctl logs [N]              # last N lines of the latest log (default 200)
+#   trainerctl update [--no-restart] # git fetch + ff-only pull + rebuild + restart
+#   trainerctl build                 # rebuild build/ (and build-viz/ if present)
+#   trainerctl checkpoints [N]       # newest N checkpoints (default 5)
+#   trainerctl gpu                   # nvidia-smi snapshot
+#   trainerctl viz start|stop|status # RocketSimVisWeb + GGL_RENDER viewer stack
+#   trainerctl set-pin               # set the dashboard action PIN
+#   trainerctl doctor                # sanity-check the remote-management stack
+#
+# Designed to be driven over SSH (tailscale ssh) and shelled out to by
+# tools/remote/dashboard.py, so both paths execute identical logic.
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_DIR="${TRAINERCTL_BUILD_DIR:-$REPO_ROOT/build}"
+VIZ_BUILD_DIR="${TRAINERCTL_VIZ_BUILD_DIR:-$REPO_ROOT/build-viz}"
+CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_3.1}"
+RUN_TRAINER="$SCRIPT_DIR/run_trainer.sh"
+LOG_DIR="${RUN_TRAINER_LOG_DIR:-$REPO_ROOT/run_logs}"
+CONF_DIR="$HOME/.config/pulsar-remote"
+VIZ_DIR="$REPO_ROOT/tools/viz/RocketSimVisWeb"
+VIZ_PY="$REPO_ROOT/tools/viz/.venv/bin/python"
+
+VIZ_WEB_UNIT="pulsar-viz-web.service"
+VIZ_RENDER_UNIT="pulsar-viz-render.service"
+
+# Half the cores for builds so a concurrent training run keeps its CPU workers fed.
+BUILD_JOBS="${TRAINERCTL_BUILD_JOBS:-$(( $(nproc) / 2 > 2 ? $(nproc) / 2 : 2 ))}"
+
+die() { echo "trainerctl: $*" >&2; exit 1; }
+note() { echo "[trainerctl] $*"; }
+
+unit_active() { systemctl --user is-active --quiet "$1" 2>/dev/null; }
+
+trainer_running() {
+    local unit
+    unit="$(cat "$LOG_DIR/trainer.unit" 2>/dev/null || true)"
+    if [ -n "$unit" ] && unit_active "$unit"; then return 0; fi
+    local pid
+    pid="$(cat "$LOG_DIR/trainer.pid" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_status() {
+    echo "=== trainer ==="
+    (cd "$BUILD_DIR" && "$RUN_TRAINER" --status) || true
+    echo
+    echo "=== viz ==="
+    for u in "$VIZ_WEB_UNIT" "$VIZ_RENDER_UNIT"; do
+        if unit_active "$u"; then echo "running: $u"; else echo "stopped: $u"; fi
+    done
+    echo
+    echo "=== git ==="
+    git -C "$REPO_ROOT" log -1 --format='%h %s (%cr)' 2>/dev/null || true
+    git -C "$REPO_ROOT" status --short --branch | head -5
+    echo
+    echo "=== newest checkpoint ==="
+    newest_checkpoint || echo "none in $CKPT_DIR"
+    echo
+    echo "=== gpu ==="
+    cmd_gpu || true
+    echo
+    echo "=== disk ==="
+    df -h "$REPO_ROOT" | tail -1
+}
+
+newest_checkpoint() {
+    local newest
+    newest="$(ls -1 "$CKPT_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+    [ -n "$newest" ] || return 1
+    local ts
+    ts="$(stat -c '%y' "$CKPT_DIR/$newest" 2>/dev/null | cut -d. -f1)"
+    echo "$newest steps  ($ts)  in $CKPT_DIR"
+}
+
+cmd_checkpoints() {
+    local n="${1:-5}"
+    ls -1 "$CKPT_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -"$n" | while read -r c; do
+        printf '%s  %s\n' "$c" "$(stat -c '%y' "$CKPT_DIR/$c" | cut -d. -f1)"
+    done
+}
+
+cmd_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 || { echo "nvidia-smi not found"; return 1; }
+    nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+        --format=csv,noheader
+}
+
+cmd_build() {
+    note "building $BUILD_DIR (-j$BUILD_JOBS)"
+    cmake --build "$BUILD_DIR" -j"$BUILD_JOBS" || return 1
+    if [ -d "$VIZ_BUILD_DIR/CMakeFiles" ]; then
+        note "building $VIZ_BUILD_DIR (-j$BUILD_JOBS)"
+        cmake --build "$VIZ_BUILD_DIR" -j"$BUILD_JOBS" || return 1
+    fi
+    note "build OK"
+}
+
+cmd_update() {
+    local restart=1
+    [ "${1:-}" = "--no-restart" ] && restart=0
+
+    cd "$REPO_ROOT" || die "cannot cd to $REPO_ROOT"
+
+    # Refuse to pull over local edits; untracked files are fine.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        die "working tree has local modifications; resolve over SSH before updating"
+    fi
+
+    local branch
+    branch="$(git rev-parse --abbrev-ref HEAD)" || die "cannot determine branch"
+    note "fetching origin ($branch)"
+    git fetch origin --prune || die "git fetch failed"
+
+    if ! git rev-parse --verify -q "origin/$branch" >/dev/null; then
+        die "no origin/$branch — push the branch first"
+    fi
+
+    local behind
+    behind="$(git rev-list --count "HEAD..origin/$branch")"
+    if [ "$behind" -eq 0 ]; then
+        note "already up to date with origin/$branch"
+        return 0
+    fi
+
+    note "$behind new commit(s); fast-forwarding"
+    git merge --ff-only "origin/$branch" || die "not fast-forward-able; resolve over SSH"
+    git log --oneline "HEAD@{1}..HEAD" | sed 's/^/  /'
+
+    local was_running=0
+    trainer_running && was_running=1
+
+    # Build BEFORE touching the running trainer: a broken build must never
+    # leave the run stopped.
+    cmd_build || die "build FAILED — trainer left untouched (still on old binary)"
+
+    if [ "$was_running" -eq 1 ] && [ "$restart" -eq 1 ]; then
+        note "restarting trainer onto new binary"
+        cmd_restart
+    elif [ "$was_running" -eq 1 ]; then
+        note "trainer still running on OLD binary (--no-restart); restart when ready"
+    else
+        note "trainer not running; start it with: trainerctl start"
+    fi
+
+    # A running viz viewer also holds the old binary.
+    if unit_active "$VIZ_RENDER_UNIT"; then
+        note "restarting viz render onto new binary"
+        systemctl --user try-restart "$VIZ_RENDER_UNIT" 2>/dev/null || true
+    fi
+}
+
+cmd_start()   { (cd "$BUILD_DIR" && "$RUN_TRAINER" --detach); }
+cmd_stop()    { (cd "$BUILD_DIR" && "$RUN_TRAINER" --stop); }
+cmd_follow()  { (cd "$BUILD_DIR" && exec "$RUN_TRAINER" --follow); }
+
+cmd_restart() {
+    if trainer_running; then
+        cmd_stop || die "stop failed"
+        # run_trainer --stop waits up to 10s itself; give the process tree a moment more.
+        for _ in 1 2 3 4 5; do
+            trainer_running || break
+            sleep 1
+        done
+        trainer_running && die "trainer did not stop; not starting a second instance"
+    fi
+    cmd_start
+}
+
+cmd_logs() {
+    local n="${1:-200}"
+    local log
+    log="$(readlink -f "$LOG_DIR/latest.log" 2>/dev/null || true)"
+    [ -n "$log" ] && [ -f "$log" ] || die "no log at $LOG_DIR/latest.log"
+    tail -n "$n" "$log"
+}
+
+# Persistent user units: enabled units restart on crash and come back after a
+# reboot (linger), so the viz survives an unattended desktop crash. Regenerated
+# on every `viz start` so path changes are picked up.
+viz_install_units() {
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/$VIZ_WEB_UNIT" <<EOF
+[Unit]
+Description=Pulsar visualizer web server (RocketSimVisWeb)
+After=network.target
+
+[Service]
+ExecStart=$VIZ_PY $VIZ_DIR/server.py
+WorkingDirectory=$VIZ_DIR
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target
+EOF
+    cat > "$unit_dir/$VIZ_RENDER_UNIT" <<EOF
+[Unit]
+Description=Pulsar checkpoint viewer (GGL_RENDER=1, CPU)
+After=network.target
+
+[Service]
+ExecStart=$VIZ_BUILD_DIR/GigaLearnBot
+WorkingDirectory=$VIZ_BUILD_DIR
+Environment=GGL_RENDER=1
+Environment=GGL_DEVICE=cpu
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+}
+
+viz_start_web() {
+    [ -x "$VIZ_PY" ] || die "viz venv missing; run: python3 -m venv tools/viz/.venv && tools/viz/.venv/bin/pip install websockets"
+    systemctl --user enable --now --quiet "$VIZ_WEB_UNIT" || die "failed to start $VIZ_WEB_UNIT"
+    note "started $VIZ_WEB_UNIT (http 9275, ws 9274, udp-in 9273; localhost only)"
+}
+
+viz_start_render() {
+    [ -x "$VIZ_BUILD_DIR/GigaLearnBot" ] || die "no viewer binary at $VIZ_BUILD_DIR/GigaLearnBot"
+    # The viewer reads the TRAINING run's checkpoints; keep the symlink current.
+    ln -sfn "$BUILD_DIR/$(basename "$CKPT_DIR")" "$VIZ_BUILD_DIR/$(basename "$CKPT_DIR")"
+    # CPU device: the viewer must never compete with training for VRAM.
+    systemctl --user enable --now --quiet "$VIZ_RENDER_UNIT" || die "failed to start $VIZ_RENDER_UNIT"
+    note "started $VIZ_RENDER_UNIT (GGL_RENDER=1, GGL_DEVICE=cpu, hot-reloads newest checkpoint)"
+}
+
+cmd_viz() {
+    case "${1:-status}" in
+        start)
+            viz_install_units
+            viz_start_web
+            viz_start_render
+            note "enabled at boot: viz now auto-recovers from crashes and reboots (until 'viz stop')"
+            note "local view:  http://localhost:9275/visualizer/visualizer.html"
+            note "remote view: https://<this-machine>.<tailnet>.ts.net:8443/visualizer/visualizer.html"
+            ;;
+        stop)
+            for u in "$VIZ_RENDER_UNIT" "$VIZ_WEB_UNIT"; do
+                # disable too, so a stopped viz stays stopped across reboots
+                systemctl --user disable --now --quiet "$u" 2>/dev/null && note "stopped+disabled $u" \
+                    || note "$u not running"
+            done
+            ;;
+        status)
+            for u in "$VIZ_WEB_UNIT" "$VIZ_RENDER_UNIT"; do
+                if unit_active "$u"; then echo "running: $u"; else echo "stopped: $u"; fi
+            done
+            ;;
+        *) die "usage: trainerctl viz start|stop|status" ;;
+    esac
+}
+
+cmd_set_pin() {
+    mkdir -p "$CONF_DIR"
+    local pin pin2
+    read -r -s -p "New dashboard PIN (6+ chars): " pin; echo
+    read -r -s -p "Repeat: " pin2; echo
+    [ "$pin" = "$pin2" ] || die "PINs do not match"
+    [ "${#pin}" -ge 6 ] || die "PIN must be at least 6 characters"
+    PIN="$pin" python3 - "$CONF_DIR/pin.json" <<'EOF'
+import hashlib, json, os, secrets, sys
+pin = os.environ["PIN"].encode()
+salt = secrets.token_hex(16)
+h = hashlib.pbkdf2_hmac("sha256", pin, salt.encode(), 600_000).hex()
+path = sys.argv[1]
+with open(path, "w") as f:
+    json.dump({"salt": salt, "hash": h, "iterations": 600_000}, f)
+os.chmod(path, 0o600)
+print(f"PIN hash written to {path}")
+EOF
+}
+
+cmd_doctor() {
+    local ok=0 warn=0
+    check() { # check <name> <cmd...>
+        local name="$1"; shift
+        if "$@" >/dev/null 2>&1; then echo "  OK    $name"; ok=$((ok+1));
+        else echo "  WARN  $name"; warn=$((warn+1)); fi
+    }
+    echo "remote-management stack:"
+    check "tailscale installed"            command -v tailscale
+    check "tailscale up"                   tailscale status
+    check "dashboard unit active"          systemctl --user is-active --quiet pulsar-dashboard.service
+    check "dashboard answering"            curl -sf --max-time 3 http://127.0.0.1:8500/api/status
+    check "PIN configured"                 test -s "$CONF_DIR/pin.json"
+    check "linger enabled (survive logout)" sh -c "loginctl show-user $USER 2>/dev/null | grep -q Linger=yes"
+    check "trainer binary present"         test -x "$BUILD_DIR/GigaLearnBot"
+    check "viz viewer binary present"      test -x "$VIZ_BUILD_DIR/GigaLearnBot"
+    check "viz venv present"               test -x "$VIZ_PY"
+    check "git remote reachable"           git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD
+    echo "$ok ok, $warn warnings"
+    if command -v tailscale >/dev/null 2>&1; then
+        echo
+        echo "tailscale serve config:"
+        tailscale serve status 2>/dev/null || echo "  (none)"
+    fi
+    [ "$warn" -eq 0 ]
+}
+
+case "${1:-help}" in
+    status)       cmd_status ;;
+    start)        cmd_start ;;
+    stop)         cmd_stop ;;
+    restart)      cmd_restart ;;
+    follow)       cmd_follow ;;
+    logs)         cmd_logs "${2:-200}" ;;
+    update)       cmd_update "${2:-}" ;;
+    build)        cmd_build ;;
+    checkpoints)  cmd_checkpoints "${2:-5}" ;;
+    gpu)          cmd_gpu ;;
+    viz)          shift; cmd_viz "${1:-status}" ;;
+    set-pin)      cmd_set_pin ;;
+    doctor)       cmd_doctor ;;
+    help|--help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command: $1 (try: trainerctl help)" ;;
+esac
