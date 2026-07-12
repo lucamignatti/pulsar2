@@ -93,6 +93,7 @@
   <button data-action="viz_start">Viz on</button>
   <button data-action="viz_stop">Viz off</button>
   <button data-action="dashboard_restart">↻ Dashboard</button>
+  <a id="vizlink" href="#" target="_blank"><button type="button" class="primary">👁 Visualizer ↗</button></a>
 </div>
 
 <div class="card" id="jobcard">
@@ -170,11 +171,11 @@ async function refresh() {
     const vizUrl = location.protocol === "https:"
       ? `https://${location.hostname}:8443/visualizer/visualizer.html`
       : "http://localhost:9275/visualizer/visualizer.html";
-    $("viz-state").innerHTML = viz
-      ? `<span class="dot on"></span><a href="${vizUrl}" target="_blank">watch ↗</a>`
-      : (s.viz.web || s.viz.render
-         ? '<span class="dot off"></span>partial'
-         : '<span class="dot off"></span>off');
+    const vizLabel = viz ? "on" : (s.viz.web || s.viz.render ? "partial" : "off");
+    $("viz-state").innerHTML =
+      `<span class="dot ${viz ? "on" : "off"}"></span>` +
+      `<a href="${vizUrl}" target="_blank">open ↗</a> <span class="muted">(${vizLabel})</span>`;
+    $("vizlink").href = vizUrl;
     $("updated").textContent = "updated " + s.time
       + (s.locked_out_secs ? ` — PIN LOCKED ${s.locked_out_secs}s` : "");
   } catch (e) {
