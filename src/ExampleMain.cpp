@@ -414,7 +414,13 @@ int main(int argc, char* argv[]) {
 	// minus main goals over a match (the sign was inverted before, breeding the worst losers).
 	cfg.league.enabled = true;
 	cfg.league.gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
-	cfg.league.binsPerAxis = 4;
+	// 6 bins/axis + QUANTILE-ADAPTIVE edges (default-on in LeagueConfig). The uniform-[0,1] 4-bin
+	// grid was measured nearly dead at 919M steps: the whole population lived in in_air [0.51,0.92],
+	// field_y [0.37,0.62], boost [0.016,0.060] -> only 3 of 64 cells occupied, boost axis never left
+	// bin 0, and 58 exploiter-unmapped wins said the grid couldn't name the styles that matter.
+	// Quantile edges (rolling window of observed BDs, refreshed each reseed era) put every bin where
+	// the population actually lives and track it as the bot improves all week.
+	cfg.league.binsPerAxis = 6;
 	cfg.league.exploiterSlots = 2;
 	cfg.league.descendOpponentFrac = 0.25f; // 25% of training iterations face a league opponent
 	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often

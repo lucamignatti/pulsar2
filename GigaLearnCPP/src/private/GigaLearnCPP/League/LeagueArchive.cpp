@@ -69,11 +69,70 @@ void LeagueArchive::LoadInto(ModelSet& set, const std::vector<torch::Tensor>& pa
 
 long LeagueArchive::CellIndex(const std::vector<float>& bd) const {
 	long idx = 0;
-	for (float v : bd) {
-		int b = std::clamp((int)(v * cfg.binsPerAxis), 0, cfg.binsPerAxis - 1);
+	for (size_t a = 0; a < bd.size(); a++) {
+		int b;
+		if (a < binEdges.size() && !binEdges[a].empty()) {
+			// Quantile bins: bin = number of edges <= v. Edges are ascending (possibly tied when an
+			// axis has near-zero variance; ties just merge those bins, which is honest).
+			b = (int)(std::upper_bound(binEdges[a].begin(), binEdges[a].end(), bd[a]) - binEdges[a].begin());
+		} else {
+			// Uniform [0,1] fallback (quantileBins off, or edges not bootstrapped yet).
+			b = std::clamp((int)(bd[a] * cfg.binsPerAxis), 0, cfg.binsPerAxis - 1);
+		}
 		idx = idx * cfg.binsPerAxis + b;
 	}
 	return idx;
+}
+
+void LeagueArchive::RecordBDSample(const std::vector<float>& bd) {
+	if ((int)bdSamples.size() < cfg.quantileSampleCap) {
+		bdSamples.push_back(bd);
+	} else {
+		bdSamples[bdSampleCursor] = bd;
+		bdSampleCursor = (bdSampleCursor + 1) % cfg.quantileSampleCap;
+	}
+}
+
+void LeagueArchive::RefreshBinEdges() {
+	int axes = (int)cfg.gridAxes.size();
+	if ((int)bdSamples.size() < cfg.quantileMinSamples) return;
+	binEdges.assign(axes, {});
+	for (int a = 0; a < axes; a++) {
+		std::vector<float> v;
+		v.reserve(bdSamples.size());
+		for (auto& s : bdSamples)
+			if (a < (int)s.size()) v.push_back(s[a]);
+		if (v.empty()) continue;
+		std::sort(v.begin(), v.end());
+		for (int k = 1; k < cfg.binsPerAxis; k++) {
+			size_t i = std::min((size_t)((double)k / cfg.binsPerAxis * v.size()), v.size() - 1);
+			binEdges[a].push_back(v[i]);
+		}
+	}
+	// The coordinate system moved: re-tokenize every member under the new edges, then restore the
+	// one-elite-per-cell invariant.
+	for (auto& m : members)
+		if (!m.exploiter) m.cell = (int)CellIndex(m.bd);
+	DedupCells();
+}
+
+void LeagueArchive::DedupCells() {
+	// One elite per cell. RefreshStalest and bin-edge refreshes reassign EXISTING members' cells,
+	// which (unlike TryInsert) can stack several members in one cell; drop the weaker duplicates.
+	std::map<long, int> best;
+	for (int i = 0; i < (int)members.size(); i++) {
+		if (members[i].exploiter || members[i].cell < 0) continue;
+		auto it = best.find(members[i].cell);
+		if (it == best.end() || members[i].fitness > members[it->second].fitness)
+			best[members[i].cell] = i;
+	}
+	std::vector<Member> kept;
+	kept.reserve(members.size());
+	for (int i = 0; i < (int)members.size(); i++)
+		if (members[i].exploiter || members[i].cell < 0 || best[members[i].cell] == i)
+			kept.push_back(std::move(members[i]));
+	members = std::move(kept);
+	RebuildCellMap();
 }
 
 float LeagueArchive::EvaluateMember(const std::vector<torch::Tensor>& memberParams, std::vector<float>& outBD) {
@@ -145,6 +204,8 @@ float LeagueArchive::EvaluateMember(const std::vector<torch::Tensor>& memberPara
 	};
 	// Trim/pad BD to the configured axis count.
 	outBD.resize(cfg.gridAxes.size(), 0.0f);
+	if (cfg.quantileBins)
+		RecordBDSample(outBD); // every eval feeds the quantile-edge window
 	return (float)(aGoals - bGoals); // > 0 => member BEATS the current main
 }
 
@@ -272,6 +333,7 @@ void LeagueArchive::RefreshStalest() {
 void LeagueArchive::Cull() {
 	// Cap total members. Never drop an exploiter or a member that is the sole elite of its cell;
 	// among the rest, drop the lowest fitness first. Also drop anyone below the competence floor.
+	DedupCells(); // RefreshStalest may have drifted a member into an occupied cell
 	RebuildCellMap();
 	std::set<int> protectedIdx;
 	for (auto& kv : cellToMember) protectedIdx.insert(kv.second);
@@ -354,6 +416,12 @@ void LeagueArchive::LogMetrics(Report& report) const {
 	report["League/Member Count"] = (float)members.size();
 	report["League/Coverage"] = (float)cellToMember.size() / (float)std::max(1L, totalCells);
 	report["League/Exploiter Unmapped Wins"] = (float)exploiterUnmappedWins;
+	report["League/BD Samples"] = (float)bdSamples.size();
+	report["League/Quantile Bins Live"] = binEdges.empty() ? 0.0f : 1.0f;
+	// Per-axis span of the live quantile edges (how tightly the grid has zoomed onto the population).
+	for (size_t a = 0; a < binEdges.size() && a < cfg.gridAxes.size(); a++)
+		if (!binEdges[a].empty())
+			report["League/Edge Span " + cfg.gridAxes[a]] = binEdges[a].back() - binEdges[a].front();
 
 	int exploiters = 0; std::set<int> lineages;
 	float bestExploiterFit = -1e30f, meanFit = 0;
@@ -389,6 +457,17 @@ void LeagueArchive::LogMetrics(Report& report) const {
 void LeagueArchive::OnIteration(Report& report, uint64_t totalIterations) {
 	if (!cfg.enabled) return;
 
+	// Quantile-edge maintenance: bootstrap the edges as soon as enough BD samples exist (until then
+	// binning is uniform), then refresh on the reseed cadence so the grid tracks the population as
+	// the main improves. Runs BEFORE the reseed so a new seed is tokenized under fresh edges.
+	if (cfg.quantileBins) {
+		bool bootstrap = binEdges.empty() && (int)bdSamples.size() >= cfg.quantileMinSamples;
+		bool periodic = cfg.reseedEveryIters > 0 && totalIterations > 0
+			&& (totalIterations % cfg.reseedEveryIters) == 0 && !bdSamples.empty();
+		if (bootstrap || periodic)
+			RefreshBinEdges();
+	}
+
 	// Found a new lineage from the current main on the re-seed cadence (a fresh "era").
 	if (cfg.reseedEveryIters > 0 && totalIterations > 0 && (totalIterations % cfg.reseedEveryIters) == 0
 		&& !members.empty()) {
@@ -406,6 +485,9 @@ void LeagueArchive::ToJSON(nlohmann::json& j) const {
 	l["member_count"] = members.size();
 	l["exploiter_unmapped_wins"] = exploiterUnmappedWins;
 	l["next_lineage"] = nextLineage;
+	l["bin_edges"] = binEdges;
+	l["bd_samples"] = bdSamples;
+	l["bd_sample_cursor"] = bdSampleCursor;
 	// Persist member metadata; weights are saved to the league dir keyed by index.
 	nlohmann::json arr = nlohmann::json::array();
 	for (size_t i = 0; i < members.size(); i++) {
@@ -431,6 +513,13 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 	auto& l = j["league"];
 	exploiterUnmappedWins = l.value("exploiter_unmapped_wins", 0L);
 	nextLineage = l.value("next_lineage", 0);
+	binEdges = l.value("bin_edges", std::vector<std::vector<float>>{});
+	bdSamples = l.value("bd_samples", std::vector<std::vector<float>>{});
+	bdSampleCursor = l.value("bd_sample_cursor", 0);
+	if (bdSampleCursor < 0 || bdSampleCursor >= std::max(1, cfg.quantileSampleCap))
+		bdSampleCursor = 0; // cap may have changed between runs
+	if ((int)bdSamples.size() > cfg.quantileSampleCap)
+		bdSamples.resize(cfg.quantileSampleCap);
 	members.clear();
 	cellToMember.clear();
 	if (leagueDir.empty() || !l.contains("members")) return;
@@ -454,5 +543,10 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 		}
 		i++;
 	}
-	RebuildCellMap();
+	// Re-tokenize from the stored RAW BDs rather than trusting stored cells: the binning scheme
+	// (binsPerAxis / quantile edges) may have changed since this archive was saved. Old checkpoints
+	// without edges stay uniform-binned until the bootstrap refresh fires.
+	for (auto& mem : members)
+		if (!mem.exploiter) mem.cell = (int)CellIndex(mem.bd);
+	DedupCells();
 }

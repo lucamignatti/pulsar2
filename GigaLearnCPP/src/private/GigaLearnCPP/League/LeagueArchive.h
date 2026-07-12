@@ -45,6 +45,13 @@ namespace GGL {
 		int nextLineage = 0;                   // monotonic era counter for re-seeds
 		int refreshCursor = 0;                 // round-robin over members for staleness refresh
 
+		// Quantile-adaptive binning state (cfg.quantileBins): a rolling window of every BD ever
+		// measured, and the per-axis ascending bin edges derived from its quantiles. binEdges empty
+		// (or flag off) = the original uniform [0,1] binning.
+		std::vector<std::vector<float>> bdSamples;
+		int bdSampleCursor = 0;
+		std::vector<std::vector<float>> binEdges;
+
 		LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::EnvSet* trainEnv,
 			torch::Device device, std::filesystem::path checkpointFolder);
 		~LeagueArchive();
@@ -83,6 +90,9 @@ namespace GGL {
 		void TryInsert(Member&& m);            // MAP-Elites cell insert (one elite per cell)
 		void RebuildCellMap();                 // recompute cellToMember from members
 		void Cull();                           // cap member count, preserving cell elites + exploiters
+		void RecordBDSample(const std::vector<float>& bd); // rolling window for quantile edges
+		void RefreshBinEdges();                // recompute quantile edges + re-tokenize all members
+		void DedupCells();                     // enforce one elite per cell (drops weaker duplicates)
 		void LogMetrics(Report& report) const;
 	};
 }

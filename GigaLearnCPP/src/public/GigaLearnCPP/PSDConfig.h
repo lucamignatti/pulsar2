@@ -129,7 +129,20 @@ namespace GGL {
 		// Behavior-descriptor axes (progressive). Each name maps to a per-rollout stat the match
 		// engine already computes; the grid is binsPerAxis^|axes|.
 		std::vector<std::string> gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
-		int binsPerAxis = 4;
+		int binsPerAxis = 6;
+
+		// Quantile-adaptive binning (cheap CVT-MAP-Elites). Uniform bins over the theoretical [0,1]
+		// axis ranges are nearly all unreachable: the measured 3.1 population lived in
+		// in_air [0.51,0.92], field_y [0.37,0.62], boost [0.016,0.060] — the boost axis never left
+		// bin 0 and only 3 of 64 cells were occupied. With quantileBins, bin edges are the running
+		// quantiles of the last quantileSampleCap observed BDs (every EvaluateMember contributes), so
+		// resolution concentrates where the population actually lives and tracks it as the main
+		// improves. Edges refresh on the reseed cadence (plus one bootstrap refresh once
+		// quantileMinSamples BDs exist); each refresh re-tokenizes all members and enforces
+		// one-elite-per-cell. false = the original fixed uniform [0,1] binning.
+		bool quantileBins = true;
+		int quantileSampleCap = 512;   // rolling BD sample window (~one reseed era of evals)
+		int quantileMinSamples = 32;   // below this, fall back to uniform binning
 
 		// Admission floor on fitness = (member goals - main goals) over an eval. NEGATIVE on purpose:
 		// a good sparring partner is allowed to lose by a bit (style diversity matters more than the
