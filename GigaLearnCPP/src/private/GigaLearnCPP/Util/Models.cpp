@@ -25,7 +25,10 @@ GGL::Model::Model(
 	if (config.addOutputLayer) {
 		seq->push_back(torch::nn::Linear(lastSize, config.numOutputs));
 	} else {
-		config.numOutputs = config.layerSizes.back();
+		// Write the MEMBER, not the shadowing parameter: the member was already copied in the
+		// init list, so assigning `config.numOutputs` here was silently discarded and every
+		// no-output-layer model reported numOutputs = 0 to readers of model->config.
+		this->config.numOutputs = (int)config.layerSizes.back();
 	}
 
 	register_module("seq", seq);
