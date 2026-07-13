@@ -43,6 +43,15 @@ namespace GGL {
 		// touch-prediction agreement (persisted in the checkpoint stats)
 		float reachAccEMA = 0, reachAgreeEMA = 0;
 
+		// Last Rating/1v1 seen from the skill tracker (drives the best-checkpoint archive)
+		// and the archive's rate limiter
+		float lastEvalRating = NAN;
+		uint64_t lastBestArchiveTs = 0;
+
+		// Kickoff-touch probe on a throwaway arena; used by Load() to reject checkpoints
+		// that load structurally but are behaviorally destroyed (see LearnerConfig)
+		bool BootSanityProbe();
+
 		// Steered-practice collection state (config.steering); the direction tensor lives in the
 		// PPOLearner (this header stays torch-free) and is derived LIVE from each iteration's
 		// buffer inside Start() (see fnSteerUpdate there). These are fixed at startup:

@@ -355,6 +355,14 @@ int main(int argc, char* argv[]) {
 	cfg.checkpointFolder = "checkpoints_3.1";
 	cfg.metricsRunName = "3.1-ts4";
 
+	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
+	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
+	// it. 25M = a save every ~2.5 min, window ~20 min, and far less IO. Worst-case crash
+	// loss rises from ~6s to ~2.5min of training - the wrapper restart costs more anyway.
+	cfg.tsPerSave = 25'000'000;
+	// Golden archive + boot sanity probe use LearnerConfig defaults (keep 3 best-rated
+	// checkpoints outside rotation; probe loaded checkpoints rated >= 400).
+
 	cfg.sendMetrics = true; // Send metrics
 
 	// Render/visualization mode. Off by default (this binary trains). Set GGL_RENDER=1 to instead

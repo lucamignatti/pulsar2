@@ -132,6 +132,27 @@ namespace GGL {
 
 		int64_t randomSeed = -1; // Set to -1 to use the current time
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable
+
+		// Checkpoint robustness (2026-07-13 GPU-lockup incident: the card corrupted
+		// device-to-host reads for ~a minute before the driver killed it, poisoning the
+		// ENTIRE rotation window - including one checkpoint with finite weights and a
+		// behaviorally destroyed policy that structural checks cannot catch).
+		// Golden archive: keep the top-N rated checkpoints permanently, outside rotation
+		// (dir names "best_r<rating>_<ts>" are non-numeric, so FindNumberedDirs ignores
+		// them). Bounds any future loss to "since the last new best". Rate-limited by
+		// bestArchiveMinTsSpacing + a small rating margin so a steady climb doesn't copy
+		// a checkpoint every save.
+		int bestCheckpointsToKeep = 3;
+		float bestArchiveRatingMargin = 5.0f;
+		int64_t bestArchiveMinTsSpacing = 25'000'000;
+		// Boot sanity probe: after loading a checkpoint that CLAIMS competence (rating >=
+		// bootSanityMinRating), run a few kickoff episodes on a throwaway arena and require
+		// ball touches. A policy that can't touch kickoff balls is treated as corrupt and
+		// the loader falls back (healthy bots touch ~100% within ~4s; the incident's
+		// scrambled checkpoint managed 1/10). The rating floor keeps young/fresh runs
+		// (which legitimately can't kick off yet) exempt.
+		bool bootSanityCheckEnabled = true;
+		float bootSanityMinRating = 400.0f;
 		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto will use your CUDA GPU if available
 
 		// Allow TF32 tensor-core matmuls on CUDA (Ampere+/Blackwell). libtorch defaults cuBLAS

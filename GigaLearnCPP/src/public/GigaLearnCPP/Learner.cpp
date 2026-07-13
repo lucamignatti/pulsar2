@@ -262,6 +262,75 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 // Different than RLGym-PPO to show that they are not compatible
 constexpr const char* STATS_FILE_NAME = "RUNNING_STATS.json";
 
+bool GGL::Learner::BootSanityProbe() {
+	RG_NO_GRAD;
+
+	// Throwaway single arena driven manually (the main EnvSet is reserved for training).
+	// 3 kickoff episodes x 8s; a healthy policy touches the ball nearly every episode
+	// (median ~3.4s across every checkpoint ever tested); the 2026-07-13 scrambled
+	// checkpoint managed 1/10. Pass = touches in >= 2 of 3 episodes.
+	EnvCreateResult res = envCreateFn(0);
+	Arena* arena = res.arena;
+
+	int touchedEpisodes = 0;
+	int stepsPerEp = (int)(8 * 120 / RS_MAX(1, config.tickSkip));
+	int numPlayers = (int)arena->_cars.size();
+
+	for (int ep = 0; ep < 3; ep++) {
+		arena->ResetToRandomKickoff(ep);
+		GameState gs = GameState(arena);
+		res.obsBuilder->Reset(gs);
+		auto actions = std::vector<Action>(numPlayers);
+
+		for (int step = 0; step < stepsPerEp; step++) {
+			FList obsAll;
+			std::vector<uint8_t> masksAll;
+			int obsSizeLocal = 0;
+			for (int i = 0; i < numPlayers; i++) {
+				FList obs = res.obsBuilder->BuildObs(gs.players[i], gs);
+				obsSizeLocal = (int)obs.size();
+				obsAll += obs;
+				auto mask = res.actionParser->GetActionMask(gs.players[i], gs);
+				masksAll.insert(masksAll.end(), mask.begin(), mask.end());
+			}
+			torch::Tensor tObs = torch::tensor(obsAll).reshape({ numPlayers, obsSizeLocal }).to(ppo->device);
+			torch::Tensor tMasks = torch::tensor(masksAll).reshape({ numPlayers, -1 }).to(ppo->device);
+			torch::Tensor tActs;
+			ppo->InferActions(tObs, tMasks, &tActs, NULL); // no steer mask: raw policy
+			auto acts = TENSOR_TO_VEC<int>(tActs.cpu());
+
+			auto carItr = arena->_cars.begin();
+			for (int i = 0; i < numPlayers; i++, carItr++) {
+				actions[i] = res.actionParser->ParseAction(acts[i], gs.players[i], gs);
+				(*carItr)->controls = (CarControls)actions[i];
+			}
+			arena->Step(config.tickSkip);
+			gs.UpdateFromArena(arena, actions, NULL);
+
+			bool touched = false;
+			for (auto& player : gs.players)
+				touched |= player.ballTouchedStep;
+			if (touched) {
+				touchedEpisodes++;
+				break;
+			}
+		}
+	}
+
+	// Best-effort cleanup of the throwaway env pieces
+	delete res.obsBuilder;
+	delete res.actionParser;
+	delete res.stateSetter;
+	for (auto* c : res.terminalConditions)
+		delete c;
+	for (auto& wr : res.rewards)
+		delete wr.reward;
+	delete arena;
+
+	RG_LOG(" > Boot sanity probe: kickoff touches in " << touchedEpisodes << "/3 episodes");
+	return touchedEpisodes >= 2;
+}
+
 
 void GGL::Learner::Save() {
 	if (config.checkpointFolder.empty())
@@ -282,6 +351,41 @@ void GGL::Learner::Save() {
 	ppo->SaveTo(saveFolder);
 	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
 	std::filesystem::rename(saveFolder, finalFolder);
+
+	// Golden archive: keep the top-N rated checkpoints permanently (see LearnerConfig).
+	// Rate-limited (spacing + rating margin) so a steady climb doesn't copy every save.
+	if (config.bestCheckpointsToKeep > 0 && !std::isnan(lastEvalRating)
+		&& totalTimesteps - lastBestArchiveTs >= (uint64_t)config.bestArchiveMinTsSpacing) {
+		try {
+			std::vector<std::pair<float, std::filesystem::path>> bests;
+			for (auto& e : std::filesystem::directory_iterator(config.checkpointFolder)) {
+				std::string name = e.path().filename().string();
+				if (name.rfind("best_r", 0) == 0) {
+					size_t us = name.find('_', 6);
+					bests.push_back({ std::stof(name.substr(6, us - 6)), e.path() });
+				}
+			}
+			std::sort(bests.begin(), bests.end());
+			bool qualifies = (int)bests.size() < config.bestCheckpointsToKeep
+				|| lastEvalRating > bests.front().first + config.bestArchiveRatingMargin;
+			if (qualifies) {
+				std::string bestName = "best_r" + std::to_string((int)lastEvalRating)
+					+ "_" + std::to_string(totalTimesteps);
+				std::filesystem::copy(finalFolder, config.checkpointFolder / bestName,
+					std::filesystem::copy_options::recursive);
+				bests.push_back({ lastEvalRating, config.checkpointFolder / bestName });
+				std::sort(bests.begin(), bests.end());
+				while ((int)bests.size() > config.bestCheckpointsToKeep) {
+					std::filesystem::remove_all(bests.front().second);
+					bests.erase(bests.begin());
+				}
+				lastBestArchiveTs = totalTimesteps;
+				RG_LOG(" > Archived best-rated checkpoint (" << (int)lastEvalRating << ")");
+			}
+		} catch (std::exception& e) {
+			RG_LOG("WARNING: best-checkpoint archive maintenance failed: " << e.what());
+		}
+	}
 
 	// Remove old checkpoints
 	if (config.checkpointsToKeep != -1) {
@@ -321,13 +425,34 @@ void GGL::Learner::Load() {
 	// is safe: LoadStats parses before assigning, and LoadFrom re-loads every model.
 	std::set<int64_t> allSavedTimesteps = Utils::FindNumberedDirs(config.checkpointFolder);
 
+	// One attempt: stats + models + (for checkpoints that claim competence) a behavioral
+	// probe - a scrambled-but-loadable checkpoint (finite weights, destroyed policy;
+	// 2026-07-13 GPU-lockup incident) throws here so the fallback can skip past it.
+	auto fnTryLoad = [&](const std::filesystem::path& loadFolder) {
+		LoadStats(loadFolder / STATS_FILE_NAME);
+		ppo->LoadFrom(loadFolder);
+
+		if (config.bootSanityCheckEnabled) {
+			float claimedRating = 0;
+			try {
+				std::ifstream fIn(loadFolder / STATS_FILE_NAME);
+				auto j = nlohmann::json::parse(fIn);
+				if (j.contains("skill_ratings") && j["skill_ratings"].contains("1v1"))
+					claimedRating = j["skill_ratings"]["1v1"].get<float>();
+			} catch (...) {}
+			if (claimedRating >= config.bootSanityMinRating && !BootSanityProbe())
+				throw std::runtime_error("boot sanity probe failed: a policy rated "
+					+ std::to_string((int)claimedRating) + " cannot touch kickoff balls - "
+					"weights are likely scrambled (GPU-fault-era save)");
+		}
+	};
+
 	bool loaded = false;
 	for (auto itr = allSavedTimesteps.rbegin(); itr != allSavedTimesteps.rend(); itr++) {
 		std::filesystem::path loadFolder = config.checkpointFolder / std::to_string(*itr);
 		RG_LOG(" > Loading checkpoint " << loadFolder << "...");
 		try {
-			LoadStats(loadFolder / STATS_FILE_NAME);
-			ppo->LoadFrom(loadFolder);
+			fnTryLoad(loadFolder);
 			loaded = true;
 			RG_LOG(" > Done.");
 			break;
@@ -339,6 +464,29 @@ void GGL::Learner::Load() {
 				config.checkpointFolder / ("corrupt_" + std::to_string(*itr)), ec);
 			if (ec)
 				RG_LOG(" > (quarantine rename failed: " << ec.message() << " - skipping in place)");
+		}
+	}
+
+	// Last resort: the golden best-rated archive (full checkpoints, highest rating first).
+	// Loaded IN PLACE (not renamed) - archive entries are precious even if one is bad.
+	if (!loaded) {
+		std::vector<std::pair<float, std::filesystem::path>> bests;
+		for (auto& e : std::filesystem::directory_iterator(config.checkpointFolder)) {
+			std::string name = e.path().filename().string();
+			if (name.rfind("best_r", 0) == 0)
+				bests.push_back({ std::stof(name.substr(6, name.find('_', 6) - 6)), e.path() });
+		}
+		std::sort(bests.rbegin(), bests.rend());
+		for (auto& [rating, path] : bests) {
+			RG_LOG(" > FALLING BACK TO BEST-RATED ARCHIVE: " << path << "...");
+			try {
+				fnTryLoad(path);
+				loaded = true;
+				RG_LOG(" > Done (resumed from golden archive, rating " << (int)rating << ").");
+				break;
+			} catch (std::exception& e) {
+				RG_LOG(" > archive entry failed too (" << e.what() << "), trying next");
+			}
 		}
 	}
 
@@ -1896,6 +2044,8 @@ void GGL::Learner::Start() {
 				if (versionMgr)
 					versionMgr->OnIteration(ppo, report, totalTimesteps, prevVersionTimesteps);
 				prevVersionTimesteps = totalTimesteps;
+				if (report.Has("Rating/1v1"))
+					lastEvalRating = (float)report["Rating/1v1"]; // feeds the best-checkpoint archive
 				fnRatingGuard(report); // may latch steering off; applied by fnApplySteering below
 				if (league)
 					league->OnIteration(report, totalIterations);
@@ -2849,6 +2999,8 @@ void GGL::Learner::Start() {
 				if (!pipelineOn) {
 					if (versionMgr)
 						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
+					if (report.Has("Rating/1v1"))
+						lastEvalRating = (float)report["Rating/1v1"]; // feeds the best-checkpoint archive
 					fnRatingGuard(report); // may latch steering off before the next apply
 
 					// QD league: evolve/evaluate members between iterations (additive, off by default).
