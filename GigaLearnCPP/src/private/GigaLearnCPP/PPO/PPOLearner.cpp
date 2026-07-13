@@ -4,6 +4,7 @@
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
+#include <RLGymCPP/CommonValues.h>
 
 using namespace torch;
 
@@ -104,7 +105,8 @@ void GGL::PPOLearner::MakeModels(
 torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
-	float temperature, bool halfPrec) {
+	float temperature, bool halfPrec,
+	torch::Tensor steerDelta) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -114,6 +116,14 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	if (models["shared_head"])
 		obs = models["shared_head"]->Forward(obs, halfPrec);
 
+	// Steered-practice collection: shift the trunk output along the commitment direction for
+	// the masked rows. Model::Forward returns kFloat even on the halfPrec path, so this add is
+	// always fp32. Post-trunk only - steering raw obs would be meaningless.
+	if (steerDelta.defined()) {
+		RG_ASSERT(models["shared_head"]); // the direction lives in trunk-output space
+		obs = obs + steerDelta.to(obs.device());
+	}
+
 	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
 
 	auto result = torch::softmax(logits + ACTION_DISABLED_LOGIT * actionMasks.logical_not(), -1);
@@ -122,11 +132,12 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 
 void GGL::PPOLearner::InferActionsFromModels(
 	ModelSet& models,
-	torch::Tensor obs, torch::Tensor actionMasks, 
+	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
-	torch::Tensor* outActions, torch::Tensor* outLogProbs) {
+	torch::Tensor* outActions, torch::Tensor* outLogProbs,
+	torch::Tensor steerDelta) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec);
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -143,8 +154,88 @@ void GGL::PPOLearner::InferActionsFromModels(
 	}
 }
 
-void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
-	InferActionsFromModels(models ? *models : this->models, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs);
+void GGL::PPOLearner::SetSteering(torch::Tensor vecCpu, float sigma, float alpha) {
+	RG_ASSERT(vecCpu.dim() == 1);
+	Model* sharedHead = models["shared_head"];
+	RG_ASSERT(sharedHead); // the commitment direction lives in trunk-output space
+	// Belt and braces vs Model::config quirks: the trunk's output width is its last hidden
+	// layer when it has no output layer (the normal case)
+	int64_t trunkOut = sharedHead->config.addOutputLayer
+		? (int64_t)sharedHead->config.numOutputs
+		: (int64_t)sharedHead->config.layerSizes.back();
+	if (vecCpu.size(0) != trunkOut)
+		RG_ERR_CLOSE("SetSteering: vector dim " << vecCpu.size(0)
+			<< " != trunk output size " << trunkOut
+			<< " (direction derived against a different architecture?)");
+	// Store unit-norm on the inference device; the delta is alpha * sigma * v per steered row
+	steerVec = (vecCpu / vecCpu.norm().clamp_min(1e-8f)).to(device).to(torch::kFloat32);
+	steerSigma = sigma;
+	steerAlpha = alpha;
+}
+
+void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask) {
+	ModelSet& m = models ? *models : this->models;
+
+	torch::Tensor steerDelta = {};
+	if (steerRowMask.defined() && steerVec.defined() && steerAlpha != 0) {
+		auto maskF = steerRowMask.to(device).to(torch::kFloat32); // [n]
+
+		// Rho-band gate: among the arena-eligible rows, keep only those whose scoring-
+		// reachability sits in the batch's middle band - hard-but-plausible plays toward
+		// the net, by the bot's own estimate. Uses phi/psiBall from the SAME ModelSet as
+		// the policy when present (the pipelined snapshot carries them), so the worker
+		// never reads weights that Learn is concurrently updating.
+		Model* phi = m["reach_phi"] ? m["reach_phi"] : (reach ? reach->phi : NULL);
+		Model* psiB;
+		if (steerRhoContact)
+			psiB = m["reach_psi_car"] ? m["reach_psi_car"] : (reach ? reach->psiCar : NULL);
+		else
+			psiB = m["reach_psi_ball"] ? m["reach_psi_ball"] : (reach ? reach->psiBall : NULL);
+		if (steerRhoGate && phi && psiB && m["shared_head"]) {
+			RG_NO_GRAD;
+			auto idx = maskF.nonzero().flatten();
+			if (idx.numel() >= 16) {
+				auto obsSel = obs.index_select(0, idx);
+				auto maskSel = actionMasks.index_select(0, idx).to(torch::kFloat32).clamp_min(1e-9f);
+				torch::Tensor trunk = m["shared_head"]->Forward(obsSel, false);
+
+				// K uniform valid actions per row (capability read, not policy read)
+				auto acts = torch::multinomial(maskSel, steerRhoK, true);           // [s,K]
+				auto trunkRep = trunk.repeat_interleave(steerRhoK, 0);              // [s*K,trunk]
+				auto oneHot = torch::one_hot(acts.flatten(), maskSel.size(1)).to(torch::kFloat32);
+				auto fnL2 = [](torch::Tensor t) { return t / t.norm(2, -1, true).clamp_min(1e-6f); };
+				auto sa = fnL2(phi->Forward(torch::cat({ trunkRep, oneHot }, -1), false)); // [s*K,repr]
+
+				const auto& rc = config.reachability;
+				// Contact goal (car head): all-zeros car-local ball = "I am touching it".
+				// Scoring goal (ball head): canonical ball entering the net at speed.
+				torch::Tensor goal = steerRhoContact
+					? torch::zeros({ 1, 6 }).to(device)
+					: torch::tensor({
+						0.f,
+						RLGC::CommonValues::BACK_WALL_Y / rc.posScaleY,
+						(RLGC::CommonValues::GOAL_HEIGHT * 0.5f) / rc.posScaleZ,
+						0.f,
+						rc.scoringGoalSpeed / rc.velScale,
+						0.f }).to(device).view({ 1, 6 });
+				auto g = fnL2(psiB->Forward(goal, false));                          // [1,repr]
+
+				auto rho = sa.matmul(g.squeeze(0)).view({ idx.numel(), steerRhoK })
+					.mean(-1) / rc.tau;                                             // [s]
+				auto lo = rho.quantile(steerRhoLo);
+				auto hi = rho.quantile(steerRhoHi);
+				auto inBand = ((rho >= lo) & (rho <= hi)).to(torch::kFloat32);      // [s]
+
+				auto gated = torch::zeros_like(maskF);
+				gated.index_copy_(0, idx, inBand);
+				maskF = gated;
+				lastRhoGateFrac = inBand.mean().item<float>();
+			}
+		}
+
+		steerDelta = maskF.unsqueeze(-1) * (steerAlpha * steerSigma) * steerVec.unsqueeze(0); // [n,trunkOut]
+	}
+	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
 }
 
 torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
@@ -214,6 +305,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchActionMasks = batch.actionMasks;
 			auto batchTargetValues = batch.targetValues;
 			auto batchGoalTargetValues = batch.goalTargetValues; // undefined unless goalCritic.enabled
+			auto batchPracticeMask = batch.practiceMask; // undefined unless steering enabled
 			auto batchAdvantages = batch.advantages;
 
 			auto fnRunMinibatch = [&](int start, int stop) {
@@ -276,11 +368,33 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 				}
 
+				// Steered-practice rows: the MAIN critic MUST train on them. Excluding them
+				// (the first version of this code) left V(s) pricing frontier states at full
+				// match value while practice episodes end true-terminal with only the small
+				// attempt pay - GAE then charged ~ -V(s_end) as a phantom penalty smeared over
+				// every (short) practice episode, and the policy rapidly unlearned ball
+				// engagement (live Elo freefall, 2026-07-12). With practice rows included, V
+				// learns the honest practice/match mixture for aliased states; the residual
+				// mixture bias on match values is the far smaller error (escalation path if it
+				// ever matters: a dedicated practice-value head).
+				// The GOAL critic stays excluded: its +/-1 channel is structurally absent in
+				// resolution-terminated episodes, so those rows would only teach it "0 here".
+				torch::Tensor keepRow = {};
+				if (batchPracticeMask.defined())
+					keepRow = 1.0f - batchPracticeMask.slice(0, start, stop).to(device, true, true);
+
+				auto fnMaskedMSE = [&](torch::Tensor pred, torch::Tensor target) {
+					if (!keepRow.defined())
+						return mseLoss(pred, target);
+					auto keep = keepRow.view_as(target);
+					return ((pred - target).square() * keep).sum() / keep.sum().clamp_min(1);
+				};
+
 				torch::Tensor criticLoss;
 				if (trainCritic) {
 					auto vals = InferCritic(obs);
 
-					// Compute value loss
+					// Compute value loss (ALL rows - see comment above)
 					vals = vals.view_as(targetValues);
 					criticLoss = mseLoss(vals, targetValues) * batchSizeRatio;
 					avgCriticLoss += criticLoss.detach().cpu().item<float>();
@@ -292,7 +406,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (batchGoalTargetValues.defined() && models["goal_critic"]) {
 					auto goalTargets = batchGoalTargetValues.slice(0, start, stop).to(device, true, true);
 					auto goalVals = InferGoalCritic(obs).view_as(goalTargets);
-					goalCriticLoss = mseLoss(goalVals, goalTargets) * batchSizeRatio;
+					goalCriticLoss = fnMaskedMSE(goalVals, goalTargets) * batchSizeRatio;
 					avgGoalCriticLoss += goalCriticLoss.detach().cpu().item<float>();
 				}
 

@@ -43,6 +43,15 @@ namespace GGL {
 		// touch-prediction agreement (persisted in the checkpoint stats)
 		float reachAccEMA = 0, reachAgreeEMA = 0;
 
+		// Steered-practice collection state (config.steering); the direction tensor lives in the
+		// PPOLearner (this header stays torch-free) and is derived LIVE from each iteration's
+		// buffer inside Start() (see fnSteerUpdate there). These are fixed at startup:
+		// [0, numSteeredArenas) steered practice | [numSteeredArenas, numPracticeArenas)
+		// unsteered control practice | rest match.
+		bool steerLoaded = false;
+		int numPracticeArenas = 0;
+		int numSteeredArenas = 0;
+
 		StepCallbackFn stepCallback = NULL;
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);

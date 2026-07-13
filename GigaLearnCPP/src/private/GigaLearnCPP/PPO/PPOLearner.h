@@ -56,24 +56,47 @@ namespace GGL {
 			ModelSet& outModels
 		);
 		
-		// If models is null, this->models will be used
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
+		// Steered-practice collection (LearnerConfig::steering): unit commitment direction on
+		// this->device + its projection std + strength. Applied ONLY where InferActions gets a
+		// row mask - the learn pass, value preds, and old-version inference never pass one.
+		torch::Tensor steerVec;
+		float steerSigma = 0, steerAlpha = 0;
+		void SetSteering(torch::Tensor vecCpu, float sigma, float alpha);
+
+		// Rho-band gate on the steering delta (LearnerConfig::CollectSteeringConfig): steer a
+		// row only when its scoring-reachability sits in the middle band of the current
+		// batch's rho distribution. Set by the Learner at startup; reads phi/psi from the
+		// SAME ModelSet as the policy (the pipelined worker's snapshot includes them, so no
+		// concurrent read of live weights).
+		bool steerRhoGate = false;
+		bool steerRhoContact = true; // gate on the car head's contact reachability (races)
+		float steerRhoLo = 0.2f, steerRhoHi = 0.8f;
+		int steerRhoK = 8;
+		float lastRhoGateFrac = 0; // metric: fraction of eligible rows steered last call
+
+		// If models is null, this->models will be used. steerRowMask (optional, [n] bool, any
+		// device): rows to steer with steerAlpha*steerSigma*steerVec added to the trunk output.
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {});
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
+		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
+		// before the policy head. Requires a shared head. Collection-only - see SetSteering.
 		static torch::Tensor InferPolicyProbsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
-			bool halfPrec
+			bool halfPrec,
+			torch::Tensor steerDelta = {}
 		);
 		static void InferActionsFromModels(
-			ModelSet& models, 
-			torch::Tensor obs, torch::Tensor actionMasks, 
+			ModelSet& models,
+			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
-			torch::Tensor* outActions, torch::Tensor* outLogProbs
+			torch::Tensor* outActions, torch::Tensor* outLogProbs,
+			torch::Tensor steerDelta = {}
 		);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);

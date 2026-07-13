@@ -6,6 +6,7 @@
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
 #include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
+#include <RLGymCPP/TerminalConditions/AttemptResolutionCondition.h>
 #include <RLGymCPP/ObsBuilders/DefaultObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
@@ -114,12 +115,23 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 	};
 }
 
+// Steered-practice arena split (set in main() from cfg.steering before the Learner is built;
+// the Learner applies the SAME first-N rule for row tagging + collection steering, so these
+// two sites agree by construction). 0 = feature off = every arena is a normal match arena.
+static int g_NumPracticeArenas = 0;
+
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
 	std::vector<TerminalCondition*> terminalConditions = {
 		new NoTouchCondition(10),
 		new GoalScoreCondition()
 	};
+
+	// Practice arenas (steered-practice collection): episodes additionally end - as a TRUE
+	// terminal, no value bootstrap - the moment an airborne-ball attempt resolves, so a whiff's
+	// counterattack never enters the return. Match arenas keep full consequences.
+	if (index < g_NumPracticeArenas)
+		terminalConditions.push_back(new AttemptResolutionCondition());
 
 	// Make the arena
 	int playersPerTeam = 1;
@@ -240,7 +252,12 @@ int main(int argc, char* argv[]) {
 	// simultaneously — 200k rows peaked ~12.7GB of saved activations and OOM'd the 16GB card at the
 	// goal critic's forward. Halving the minibatch halves that peak; the minibatch loop accumulates
 	// gradients so the update is mathematically identical, just two passes instead of one.
-	cfg.ppo.miniBatchSize = 100'000;
+	// 50k (2026-07-12, late): OOM'd again mid-run with ~6GB of the card held by DESKTOP GRAPHICS
+	// (viz viewer + browser) - the trainer's burst headroom was ~700MB. 50k halves the learn peak
+	// again (same accumulated math, 4 passes). Side effect kept in mind: the reachability InfoNCE
+	// subsample (512/minibatch) now runs 4x per epoch instead of 2x - mildly more aux training,
+	// same as the accepted 200k->100k change. Revert to 100k if the graphics pressure goes away.
+	cfg.ppo.miniBatchSize = 50'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
@@ -422,9 +439,65 @@ int main(int argc, char* argv[]) {
 	// the population actually lives and track it as the bot improves all week.
 	cfg.league.binsPerAxis = 6;
 	cfg.league.exploiterSlots = 2;
-	cfg.league.descendOpponentFrac = 0.25f; // 25% of training iterations face a league opponent
+	// 0.25 -> 0.35 (2026-07-12): the steered style measurably beats its recent self (42-24)
+	// but loses to ARCHIVED styles (12-19 vs the 4.16B era) - nontransitive exploitability.
+	// PFSP already prefers members that beat the main, so more league iterations = targeted
+	// training against exactly the styles currently winning. Revert to 0.25 if Elo variance
+	// rises without the deficit closing.
+	cfg.league.descendOpponentFrac = 0.35f;
 	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often
 	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
+
+	// ---------------------------------------------------------------------------------------------
+	// Steered-practice collection ("optimism surgery"), ENABLED - takes effect when the trainer is
+	// restarted on this binary, resuming the 3.1 lineage from its latest checkpoint (checkpoints
+	// are fully compatible: no new networks, no external files).
+	// The commitment direction is derived LIVE each iteration from the collected buffer itself
+	// (ball-landing sims + went/declined trunk contrast, match-arena rows only, EMA-smoothed), and
+	// a slice of practice arenas runs unsteered as controls so a causal auto-gate can drop alpha
+	// to 0 the moment steering stops out-engaging the controls. No sidecar, nothing to babysit.
+	// Protocol, measured effects, and REVERT path (flag off + resume the branch-point backup in
+	// build/checkpoints_3.1_branch_backup/): analysis/probes/STEERED_PRACTICE.md.
+	//   Watch: Steer/* panels (Engagement Steered vs Control, Gate Active, Dir Drift, Pairs);
+	//   Player/Aerial Touch Ratio + contest metrics (must rise within ~a day or the mechanism
+	//   isn't engaging); GAE ratio/KL (same off-policyness class as pipelinedCollection);
+	//   Rating/1v1 slope vs the pre-switch trend as the revert trigger.
+	// STAGE-1 steered collection ("optimism surgery", terminationless), ENABLED.
+	// History: the first deployment (resolution-terminated practice episodes) tanked Elo twice
+	// - both failures from the TERMINATION half (phantom -V(s_end) penalty; shared critic
+	// cannot price aliased truncations). Stage 1 keeps episodes 100% NORMAL: the whiff tax
+	// stays, reality filters the attempts, and the only change is WHERE experience comes from.
+	//   - ~15% of arenas collect with the live-derived commitment direction (+1 sigma) added
+	//     to the policy head's trunk input, RHO-BAND GATED: only in states the ball head rates
+	//     as hard-but-plausible for scoring (per-batch quantile band). A few more arenas are
+	//     unsteered controls for the causal engagement gate.
+	//   - Guards, all automatic: engagement gate (steered must out-engage controls), rating
+	//     drawdown guard (Rating/1v1 falling >25 below its slow EMA LATCHES steering off for
+	//     the process), ratio/KL logs, branch backup + quarantine ritual.
+	//   - Watch: Steer/* panels (Alpha, Engagement Steered/Control/Match, Gate Delta EMA,
+	//     RhoGate In-Band Frac, Rating Guard Tripped), aerial/contest metrics, Rating slope.
+	// Post-mortems + stage-2 escalation path: analysis/probes/STEERED_PRACTICE.md.
+	// STAGE-1 v2 (2026-07-12, after ~200M treated steps of v1): v1's guidance metric ("landing
+	// attendance") aged out - pool-Elo drifted down while the style beat its predecessor 42-24
+	// and lost to older selves 12-19. v2 re-aims the SAME machinery at a possession-outcome
+	// definition: the direction contrasts "went and WON the race to the ball" vs "declined and
+	// nobody got it" (first-touch events within the landing window), and the gate measures
+	// possession-win rate steered-vs-control. Unfakeable by empty flight; doesn't age with
+	// style. League old-style exposure raised below to patch the measured exploitability.
+	cfg.steering.enabled = true;
+	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
+	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
+	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
+	// punished failures are discarded. That one-way ratchet is how overcommit-then-concede
+	// compounded into an Elo bleed despite real head-to-head gains. A smaller push keeps the
+	// induced ratios mostly inside the clip window so both outcome signs teach.
+	cfg.steering.alpha = 0.5f;
+	cfg.steering.practiceArenaFrac = 0.18f;      // ~184 arenas: ~156 steered + ~27 control
+	cfg.steering.resolutionTermination = false;  // STAGE 1: normal episodes, no exceptions
+	// AttemptResolutionCondition is a STAGE-2 semantic; only attach it when termination is on
+	// (and only ever together with a dedicated practice-value baseline - see post-mortems).
+	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
+		g_NumPracticeArenas = (int)(cfg.numGames * cfg.steering.practiceArenaFrac);
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

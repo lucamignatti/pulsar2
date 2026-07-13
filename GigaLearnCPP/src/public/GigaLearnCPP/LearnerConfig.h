@@ -11,6 +11,96 @@ namespace GGL {
 		GPU_CUDA
 	};
 
+	// Steered-practice collection ("optimism surgery"). During COLLECTION ONLY, current-policy
+	// rows belonging to the steered practice arenas get alpha*sigma*v added to the shared-trunk
+	// output feeding the POLICY head, where v is a behavior-derived "commitment" direction.
+	// Never steered: the learn pass, GAE value preds, skill-tracker evals, old-version
+	// opponents. Stored logProbs come from the steered distribution, so PPO's clipped
+	// importance ratio absorbs the bounded behavior/target divergence - the same mechanism
+	// that absorbs pipelinedCollection's one-iteration lag.
+	//
+	// The direction is derived LIVE, every iteration, from the just-collected buffer (no
+	// external file, no sidecar): airborne-ball readings from MATCH arenas are labeled by
+	// ball-only landing sims + within-episode lookahead (went to the landing / declined it),
+	// matched on (distance, flight time), and the went-declined difference of trunk means is
+	// EMA-folded into the active vector. Derivation uses match rows only so the steered data
+	// never feeds its own direction (no self-reinforcing loop). Directions go stale FAST as
+	// the trunk trains (measured: a vector that gained +7pp engagement was 75M steps later
+	// losing 11pp) - which is exactly why this is live instead of a file.
+	//
+	// Causal auto-gate: a slice of practice arenas runs UNSTEERED as controls (same
+	// resolution-termination), and the steered-vs-control landing-engagement delta is EMA'd;
+	// if steering stops helping, alpha drops to 0 automatically (derivation continues, and
+	// steering re-engages when the delta recovers). This replaces any offline validation.
+	//
+	// Arena layout: [0, numSteered) steered practice | [numSteered, numPractice) control
+	// practice | rest match. Pair ALL practice arenas (steered + control) with
+	// AttemptResolutionCondition (ExampleMain wiring): practice episodes end at attempt
+	// resolution with a NORMAL terminal (true terminal, NO value bootstrap - bootstrapping
+	// V(s_end) would re-inject the counterattack tax through the critic).
+	//
+	// CRITIC SEMANTICS (learned the hard way): the MAIN critic trains on practice rows too.
+	// Excluding them leaves V(s) at full match value while practice returns are truncated, so
+	// GAE charges ~ -V(s_end) as a phantom penalty across every practice episode and the
+	// policy unlearns ball engagement (live Elo freefall on first deployment, 2026-07-12).
+	// Including them makes V the honest practice/match mixture for aliased states - a much
+	// smaller, split bias. Practice rows stay excluded from the GOAL critic (its channel is
+	// structurally absent in truncated episodes) and from the goal-advantage blend.
+	struct CollectSteeringConfig {
+		bool enabled = false;
+		float alpha = 1.0f;             // strength, in units of sigma (trunk projection std, live-estimated)
+		float practiceArenaFrac = 0.2f; // fraction of arenas that are practice (steered + control)
+		float controlFracOfPractice = 0.15f; // fraction of practice arenas kept unsteered as gate controls
+
+		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
+		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no
+		// goal-critic masking, no blend guard; the whiff tax stays and reality does the
+		// filtering. Only flip to true (stage 2) together with a dedicated practice-value
+		// baseline; the shared critic provably cannot price mid-play truncations.
+		bool resolutionTermination = false;
+
+		// Rho-band gate: steer a row only when the ball head rates its state's scoring-
+		// reachability inside the middle band of the current inference batch's rho
+		// distribution (per-batch quantiles - self-calibrating, no absolute thresholds;
+		// offline calibration put the intermediate band at ~40-60% actual conversion).
+		// Points the optimism at hard-but-plausible plays toward the net.
+		bool rhoGateEnabled = true;
+		float rhoGateLo = 0.2f, rhoGateHi = 0.8f;
+		int rhoGateActionSamples = 8;   // K uniform valid actions per row for the rho read
+		// Gate by CONTACT reachability (car head, "can I reach the ball" - races) instead of
+		// scoring reachability (ball head, "can the ball reach the net" - shots). Added after
+		// the v2 possession gate kept reading scoring-gated steering as race-LOSING: we told
+		// it to commit where the shot was uncertain, then graded it on winning the ball.
+		bool rhoGateOnContact = true;
+
+		// Rating drawdown guard: if Rating/1v1 falls more than ratingDrawdownTrip below its
+		// slow EMA, steering LATCHES OFF for the rest of the process (loud log; derivation
+		// and metrics continue). The one signal that catches update-damage (behavioral gates
+		// cannot), made an actuator. Latched = no auto-re-enable; a human decides.
+		// Calibration note (learned live): Rating/1v1 wiggles +-30..50 in normal training, so
+		// the trip must sit outside that band. The collapse signature this guards against was
+		// -130 in ~10 minutes; 75 catches that within a few evals and never fires on noise.
+		bool ratingGuardEnabled = true;
+		float ratingDrawdownTrip = 75.0f;
+		float ratingEmaDecay = 0.995f;  // slow EMA (~140 rating-bearing iters half-life)
+
+		// Live derivation
+		float emaDecay = 0.9f;          // per-iteration EMA on the direction and sigma
+		int maxReadingsPerIter = 4000;  // airborne readings labeled per iteration (landing sims are ~free)
+		int minPairsPerUpdate = 100;    // skip the EMA update when matched pairs are scarcer than this
+
+		// Causal auto-gate (units: absolute engagement fraction, e.g. 0.01 = 1pp).
+		// Purpose in stage 1: detect a SIGN-INVERTED direction (steering actively suppressing
+		// engagement), NOT "not helping yet" - per-iteration delta se is ~1pp at these arena
+		// counts, so a 0.0 threshold trips on noise within minutes (observed live). While
+		// tripped, alpha=0 makes steered==control, the delta EMA decays toward 0 and crosses
+		// gateReenableAbove -> steering resumes -> re-trips only if genuinely harmful: the
+		// thresholds below produce a natural duty-cycled probe with no extra machinery.
+		int gateWarmupIters = 150;        // iterations with data before the gate may act
+		float gateDisableBelow = -0.03f;  // ~3 sigma of the delta EMA: real inversion only
+		float gateReenableAbove = -0.01f; // decay path back to probing
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
 	struct LearnerConfig {
 		int numGames = 300;
@@ -87,6 +177,9 @@ namespace GGL {
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
 		SkillTrackerConfig skillTracker = {};
+
+		// Steered-practice collection; additive and default-OFF (see struct comment above)
+		CollectSteeringConfig steering = {};
 
 		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
 		// unchanged unless psd.enabled / league.enabled are set.
