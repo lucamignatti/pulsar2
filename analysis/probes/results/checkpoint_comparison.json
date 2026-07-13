@@ -1,0 +1,49 @@
+{
+  "baseline": "4876131328",
+  "treated": "stage1_now",
+  "mirror_baseline": {
+    "engagement": 0.3664323374340949,
+    "attendance_of_free": 0.34394904458598724,
+    "contested_frac": 0.03427065026362039,
+    "n_feasible_readings": 1138,
+    "aerial_touch_ratio": 0.0,
+    "touch_ratio": 0.0027833333333333334,
+    "in_air_ratio": 0.38243333333333335,
+    "goals_per_episode": 0.2653061224489796,
+    "kickoff_first_touch_s": 3.6333333333333333,
+    "n_kickoffs_touched": 9
+  },
+  "mirror_treated": {
+    "engagement": 0.20691949434464404,
+    "attendance_of_free": 0.20691949434464404,
+    "contested_frac": 0.0,
+    "n_feasible_readings": 1503,
+    "aerial_touch_ratio": 0.0,
+    "touch_ratio": 0.0027,
+    "in_air_ratio": 0.4292,
+    "goals_per_episode": 0.2727272727272727,
+    "kickoff_first_touch_s": 3.0833333333333335,
+    "n_kickoffs_touched": 12
+  },
+  "cross_goals": {
+    "baseline": 24,
+    "treated": 42
+  },
+  "cross_episodes": 82,
+  "cross_baseline": {
+    "engagement": 0.40522679352466584,
+    "contested_frac": 0.012387387387387387,
+    "n_feasible_readings": 480.5,
+    "aerial_touch_ratio": 0.0,
+    "touch_ratio": 0.00245,
+    "in_air_ratio": 0.4366
+  },
+  "cross_treated": {
+    "engagement": 0.336583339138396,
+    "contested_frac": 0.014066496163682864,
+    "n_feasible_readings": 452.5,
+    "aerial_touch_ratio": 0.0,
+    "touch_ratio": 0.0031000000000000003,
+    "in_air_ratio": 0.433975
+  }
+}

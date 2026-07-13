@@ -63,7 +63,9 @@ libtorch
 # remote tooling
 tools/viz/.venv/
 run_logs/
-analysis/
+# scratch analyses stay untracked, but the probe suite ships (data/ excluded below)
+analysis/*
+!analysis/probes/
 build-viz/
 
 # local build trees and run artifacts

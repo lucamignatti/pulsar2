@@ -1,0 +1,130 @@
+{
+  "n_frames": 24694,
+  "checkpoint": 1461076992,
+  "bounce_frac": 0.17680408196322994,
+  "sources": {
+    "raw_obs": {
+      "r2": {
+        "x_land": 0.916770260757683,
+        "y_land": 0.93778552354121,
+        "t_land": 0.6186109870653744
+      },
+      "landing_err_uu_median": 555.3387689819604,
+      "landing_err_uu_mean": 773.613064217755,
+      "t_err_s_median": 0.2535662467324329,
+      "landing_err_uu_median_bounce": 1257.0272667462423,
+      "landing_err_uu_median_direct": 499.0359118585433
+    },
+    "trunk_h1": {
+      "r2": {
+        "x_land": 0.9213841178425521,
+        "y_land": 0.9556282563620286,
+        "t_land": 0.6633009035076725
+      },
+      "landing_err_uu_median": 618.3664903285041,
+      "landing_err_uu_mean": 756.8260815088947,
+      "t_err_s_median": 0.22013436168852962,
+      "landing_err_uu_median_bounce": 1007.0303937882343,
+      "landing_err_uu_median_direct": 563.601042882988
+    },
+    "trunk_h2": {
+      "r2": {
+        "x_land": 0.9035392214657689,
+        "y_land": 0.9338287185062285,
+        "t_land": 0.6979796122528077
+      },
+      "landing_err_uu_median": 810.2489692106556,
+      "landing_err_uu_mean": 923.0345947803778,
+      "t_err_s_median": 0.22424879027119682,
+      "landing_err_uu_median_bounce": 1162.7273405125825,
+      "landing_err_uu_median_direct": 753.0364773640254
+    },
+    "reach_phi": {
+      "r2": {
+        "x_land": 0.908217672664835,
+        "y_land": 0.9304850685527492,
+        "t_land": 0.6631608654175571
+      },
+      "landing_err_uu_median": 771.9273850484931,
+      "landing_err_uu_mean": 903.9129445328664,
+      "t_err_s_median": 0.2551175072684856,
+      "landing_err_uu_median_bounce": 1090.7823264757644,
+      "landing_err_uu_median_direct": 714.3156830580492
+    }
+  },
+  "controls": {
+    "ballistic_closed_form": {
+      "r2": {
+        "x_land": 0.6989786067805639,
+        "y_land": 0.8466526056370732,
+        "t_land": 0.5036530740157257
+      },
+      "landing_err_uu_median": 34.88143647920072,
+      "landing_err_uu_mean": 590.3535447504348,
+      "t_err_s_median": 0.021746311622812597,
+      "landing_err_uu_median_bounce": 1924.5192287223651,
+      "landing_err_uu_median_direct": 23.66001741040536
+    },
+    "shuffled_raw_obs": {
+      "r2": {
+        "x_land": -8.372096512188065e-05,
+        "y_land": -0.0002945399565223994,
+        "t_land": -0.0006453004385595928
+      },
+      "landing_err_uu_median": 3874.728546120821,
+      "landing_err_uu_mean": 3762.5600863161817,
+      "t_err_s_median": 0.6028750711164552
+    },
+    "shuffled_trunk_h1": {
+      "r2": {
+        "x_land": -0.0011243078482239266,
+        "y_land": -0.0010530241004951257,
+        "t_land": -0.0008020648638482619
+      },
+      "landing_err_uu_median": 3875.876667106487,
+      "landing_err_uu_mean": 3763.689568211824,
+      "t_err_s_median": 0.6014224251795026
+    },
+    "shuffled_trunk_h2": {
+      "r2": {
+        "x_land": -0.0014458676476423182,
+        "y_land": -0.0007977148082907171,
+        "t_land": -0.0008488896715683758
+      },
+      "landing_err_uu_median": 3873.1486257619754,
+      "landing_err_uu_mean": 3763.73997909378,
+      "t_err_s_median": 0.6020760929126829
+    },
+    "shuffled_reach_phi": {
+      "r2": {
+        "x_land": -0.0006038718077601146,
+        "y_land": -0.0006113803336011969,
+        "t_land": -0.00036620758529615216
+      },
+      "landing_err_uu_median": 3875.5996728184637,
+      "landing_err_uu_mean": 3763.3745269183796,
+      "t_err_s_median": 0.6013269297139652
+    },
+    "mlp_raw_obs": {
+      "r2": {
+        "x_land": 0.8781254012497998,
+        "y_land": 0.9047293394130503,
+        "t_land": 0.64904757294559
+      },
+      "landing_err_uu_median": 881.7436387627222,
+      "landing_err_uu_mean": 1047.8156140469791,
+      "t_err_s_median": 0.23561151517546164,
+      "landing_err_uu_median_bounce": 1187.3018365079074,
+      "landing_err_uu_median_direct": 825.7879256117174
+    },
+    "passthrough_ball_z_raw_obs": {
+      "r2": 0.9999999999995254
+    },
+    "passthrough_ball_z_trunk_h1": {
+      "r2": 0.9751649587655551
+    },
+    "passthrough_ball_z_trunk_h2": {
+      "r2": 0.9241605566136819
+    }
+  }
+}
