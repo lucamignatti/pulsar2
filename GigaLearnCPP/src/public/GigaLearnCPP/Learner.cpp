@@ -4,6 +4,7 @@
 #include <GigaLearnCPP/PPO/ExperienceBuffer.h>
 
 #include <torch/cuda.h>
+#include <torch/mps.h>
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
 
@@ -77,10 +78,53 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 				"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
 			)
 		device = at::Device(at::kCUDA);
+	} else if (
+		config.deviceType == LearnerDeviceType::GPU_MPS ||
+		(config.deviceType == LearnerDeviceType::AUTO && torch::mps::is_available())
+		) {
+		RG_LOG("\tUsing MPS (Apple Metal) device...");
+
+		bool deviceTestFailed = false;
+		try {
+			torch::Tensor t = torch::tensor(0);
+			t = t.to(at::Device(at::kMPS));
+			t = t.cpu();
+		} catch (...) {
+			deviceTestFailed = true;
+		}
+
+		if (!torch::mps::is_available() || deviceTestFailed)
+			RG_ERR_CLOSE(
+				"Learner::Learner(): Can't use MPS because " <<
+				(torch::mps::is_available() ? "libtorch cannot access the Metal device" : "MPS is not available to libtorch") << ".\n" <<
+				"MPS needs an Apple-silicon Mac and a libtorch built with Metal support."
+			)
+		device = at::Device(at::kMPS);
+
+		// The halfPrec inference path clones weights to BF16 on-device (Models.cpp);
+		// probe it here so an unsupported macOS/libtorch combo degrades loudly to fp32
+		// at boot instead of throwing mid-collection
+		if (config.ppo.useHalfPrecision) {
+			try {
+				auto t = torch::ones({ 4, 4 },
+					torch::TensorOptions().device(device).dtype(torch::kBFloat16));
+				(void)t.matmul(t).to(torch::kFloat).cpu();
+			} catch (std::exception& e) {
+				RG_LOG("\tWARNING: BF16 matmul unsupported on this MPS device (" << e.what()
+					<< ") - disabling useHalfPrecision (fp32 inference)");
+				config.ppo.useHalfPrecision = false;
+			}
+		}
 	} else {
 		RG_LOG("\tUsing CPU device...");
 		device = at::Device(at::kCPU);
 	}
+
+	// The ctor body mutates its `config` PARAMETER (tsPerSave/randomSeed fix-ups above, the
+	// MPS halfPrec fallback) but the member was copy-initialized before the body ran - sync
+	// it here or Start()/Save() read the un-fixed values (e.g. tsPerSave=0 saving every
+	// iteration; the same shadowing family as the Model ctor bug fixed in 155c2da).
+	this->config = config;
 
 	// Apply the TF32 matmul policy on CUDA (inert elsewhere) — without this the dense MLPs
 	// run strict fp32 and never touch the Ampere+/Blackwell tensor-core path
@@ -88,11 +132,13 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		at::globalContext().setAllowTF32CuBLAS(config.allowTF32);
 		at::globalContext().setAllowTF32CuDNN(config.allowTF32);
 		RG_LOG("\tTF32 matmuls (CUDA tensor cores): " << (config.allowTF32 ? "enabled" : "disabled"));
+	}
 
-		// On the GPU path the heavy math runs on-device; libtorch's default intra-op pool
-		// (one thread per core) otherwise oversubscribes the machine against RLGymCPP's own
-		// collection thread pool for the many small CPU-side tensor ops (index_select, blob
-		// conversions, .cpu() copies) in the consumption phase. Cap it low.
+	if (!device.is_cpu()) {
+		// On the GPU paths (CUDA/MPS) the heavy math runs on-device; libtorch's default
+		// intra-op pool (one thread per core) otherwise oversubscribes the machine against
+		// RLGymCPP's own collection thread pool for the many small CPU-side tensor ops
+		// (index_select, blob conversions, .cpu() copies) in the consumption phase. Cap it low.
 		at::set_num_threads(2);
 	}
 

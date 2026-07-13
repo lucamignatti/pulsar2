@@ -3,6 +3,20 @@
 #include <GigaLearnCPP/Util/Models.h>
 #include <GigaLearnCPP/PPO/PPOLearner.h>
 
+#include <torch/cuda.h>
+#include <torch/mps.h>
+
+// useGPU means "best available GPU": CUDA, else MPS (Apple Metal), else CPU
+static at::Device BestInferDevice(bool useGPU) {
+	if (useGPU) {
+		if (torch::cuda::is_available())
+			return at::Device(at::kCUDA);
+		if (torch::mps::is_available())
+			return at::Device(at::kMPS);
+	}
+	return at::Device(at::kCPU);
+}
+
 GGL::InferUnit::InferUnit(
 	RLGC::ObsBuilder* obsBuilder, int obsSize, RLGC::ActionParser* actionParser,
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, 
@@ -15,7 +29,7 @@ GGL::InferUnit::InferUnit(
 		PPOLearner::MakeModels(
 			false, obsSize, actionParser->GetActionAmount(),
 			sharedHeadConfig, policyConfig, {},
-			useGPU ? torch::kCUDA : torch::kCPU,
+			BestInferDevice(useGPU),
 			*this->models
 		);
 	} catch (std::exception& e) {
@@ -59,7 +73,7 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 	try {
 		RG_NO_GRAD;
 
-		auto device = useGPU ? torch::kCUDA : torch::kCPU;
+		auto device = BestInferDevice(useGPU);
 
 		auto tObs = torch::tensor(allObs).reshape({(int64_t)players.size(), obsSize});
 		auto tActionMasks = torch::tensor(allActionMasks).reshape({(int64_t)players.size(), this->actionParser->GetActionAmount()});

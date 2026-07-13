@@ -215,13 +215,22 @@ int main(int argc, char* argv[]) {
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
 
+	// Per-platform default, deliberately NOT AUTO: the training box must fail LOUDLY if CUDA
+	// goes missing (AUTO would silently fall back to CPU at ~1/100 speed on a driver hiccup),
+	// and the Mac checkout (render/analysis/smoke) should use the Apple GPU without env vars.
+#ifdef __APPLE__
+	cfg.deviceType = LearnerDeviceType::GPU_MPS;
+#else
 	cfg.deviceType = LearnerDeviceType::GPU_CUDA;
-	// Override the device with GGL_DEVICE=cpu|cuda|auto. Handy for running a live viewer (GGL_RENDER=1)
-	// on CPU while the GPU is fully occupied by a training process — a single render arena is cheap.
+#endif
+	// Override the device with GGL_DEVICE=cpu|cuda|mps|auto. Handy for running a live viewer
+	// (GGL_RENDER=1) on CPU while the GPU is fully occupied by a training process — a single
+	// render arena is cheap.
 	if (const char* d = std::getenv("GGL_DEVICE")) {
 		std::string dev = d;
 		if (dev == "cpu" || dev == "CPU")        cfg.deviceType = LearnerDeviceType::CPU;
 		else if (dev == "auto" || dev == "AUTO") cfg.deviceType = LearnerDeviceType::AUTO;
+		else if (dev == "mps" || dev == "MPS")   cfg.deviceType = LearnerDeviceType::GPU_MPS;
 		else                                     cfg.deviceType = LearnerDeviceType::GPU_CUDA;
 	}
 

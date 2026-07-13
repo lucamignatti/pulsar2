@@ -6,9 +6,10 @@
 
 namespace GGL {
 	enum class LearnerDeviceType {
-		AUTO,
+		AUTO, // CUDA if available, else MPS (Apple Metal), else CPU
 		CPU,
-		GPU_CUDA
+		GPU_CUDA,
+		GPU_MPS
 	};
 
 	// Steered-practice collection ("optimism surgery"). During COLLECTION ONLY, current-policy
