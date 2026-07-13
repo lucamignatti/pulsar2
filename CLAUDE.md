@@ -68,9 +68,12 @@ Key operational facts:
   aux nets (+their optims) from the newest healthy full backup, current
   `RUNNING_STATS.json`; omit `POLICY_OPTIM`/`SHARED_HEAD_OPTIM` (they reset
   gracefully); quarantine every checkpoint/version from the damaged lineage
-  first so the loader can't prefer them. Planned proper fix: a boot-time
-  behavioral sanity eval that treats a catastrophically-losing checkpoint as
-  corrupt and falls back automatically.
+  first so the loader can't prefer them. CLOSED (same day): the boot sanity
+  probe now does this automatically (3 kickoff episodes on a throwaway arena,
+  >= 2 must have touches, only for checkpoints claiming rating >= 400), a
+  golden archive keeps the top-3 rated checkpoints outside rotation as the
+  loader's last resort ("best_r<rating>_<ts>"), and tsPerSave was raised to 25M
+  so the rotation window spans ~20 minutes instead of ~50 seconds.
 - **Checkpoints rotate** (`checkpointsToKeep=8`, ~1M steps apart at full speed —
   a ~10-minute window). Always copy a checkpoint dir out before reading it, and
   retry on next-newest if files vanish mid-copy.
