@@ -84,7 +84,11 @@ void GGL::PolicyVersionManager::SaveVersions() {
 	for (auto& version : versions) {
 		if (allSavedTimesteps.contains(version.timesteps))
 			continue;
-		auto versionSaveFolder = saveFolder / std::to_string(version.timesteps);
+		// Atomic like Learner::Save: write to .tmp, rename into place, so a crash
+		// mid-save can never leave a truncated version dir for LoadVersions to abort on
+		auto versionFinalFolder = saveFolder / std::to_string(version.timesteps);
+		auto versionSaveFolder = saveFolder / (std::to_string(version.timesteps) + ".tmp");
+		std::filesystem::remove_all(versionSaveFolder);
 		std::filesystem::create_directories(versionSaveFolder);
 
 		version.models.Save(versionSaveFolder, false);
@@ -100,6 +104,9 @@ void GGL::PolicyVersionManager::SaveVersions() {
 			std::string jStr = j.dump(4);
 			fOut << jStr;
 		}
+
+		std::filesystem::remove_all(versionFinalFolder);
+		std::filesystem::rename(versionSaveFolder, versionFinalFolder);
 	}
 }
 
@@ -117,24 +124,45 @@ void GGL::PolicyVersionManager::LoadVersions(ModelSet modelsTemplate, uint64_t c
 
 	for (int64_t savedTimesteps : allSavedTimesteps) {
 
-		if (savedTimesteps > curTimesteps) {
-			RG_ERR_CLOSE(
-				"Tried to load saved policy version that is newer than our current model (" << savedTimesteps << " > " << curTimesteps << ")!\n" <<
-				"If you deleted some checkpoints, make sure to delete that far back in the saved policy versions as well");
-		}
 		auto path = saveFolder / std::to_string(savedTimesteps);
-		PolicyVersion& version = AddVersion(modelsTemplate, savedTimesteps);
-		version.models.Load(path, false, false);
 
-		{ // Load JSON
-			// TODO: Repetitive
-			auto jsonPath = path / "STATS.json";
-			std::ifstream fIn(jsonPath);
-			RG_ASSERT(fIn.good());
+		// A version NEWER than the current model happens legitimately now: the checkpoint
+		// loader falls back across corrupt checkpoints (2026-07-13), which moves time
+		// backwards. Aborting here would strand an unattended run - quarantine instead.
+		if (savedTimesteps > curTimesteps) {
+			RG_LOG(" > Version " << savedTimesteps << " is newer than the loaded checkpoint ("
+				<< curTimesteps << ") - quarantining (checkpoint fallback moved time backwards)");
+			std::error_code ec;
+			std::filesystem::rename(path, saveFolder / ("stale_" + std::to_string(savedTimesteps)), ec);
+			continue;
+		}
 
-			json j = json::parse(fIn);
-			if (j.contains("skill_ratings"))
-				version.ratings.ReadFromJSON(j["skill_ratings"]);
+		// Corrupt/truncated version dirs (pre-atomic-save crashes) must not abort the boot
+		try {
+			PolicyVersion& version = AddVersion(modelsTemplate, savedTimesteps);
+			try {
+				version.models.Load(path, false, false);
+
+				{ // Load JSON
+					// TODO: Repetitive
+					auto jsonPath = path / "STATS.json";
+					std::ifstream fIn(jsonPath);
+					RG_ASSERT(fIn.good());
+
+					json j = json::parse(fIn);
+					if (j.contains("skill_ratings"))
+						version.ratings.ReadFromJSON(j["skill_ratings"]);
+				}
+			} catch (...) {
+				version.models.Free();
+				versions.pop_back();
+				throw;
+			}
+		} catch (std::exception& e) {
+			RG_LOG(" > CORRUPT/UNREADABLE version " << path << " (" << e.what()
+				<< ") - quarantining and continuing");
+			std::error_code ec;
+			std::filesystem::rename(path, saveFolder / ("corrupt_" + std::to_string(savedTimesteps)), ec);
 		}
 	}
 

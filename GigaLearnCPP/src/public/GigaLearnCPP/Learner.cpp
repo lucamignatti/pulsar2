@@ -267,12 +267,21 @@ void GGL::Learner::Save() {
 	if (config.checkpointFolder.empty())
 		RG_ERR_CLOSE("Learner::Save(): Cannot save because config.checkpointSaveFolder is not set");
 
-	std::filesystem::path saveFolder = config.checkpointFolder / std::to_string(totalTimesteps);
+	// ATOMIC save (2026-07-13): a CUDA-watchdog crash mid-save left a truncated
+	// checkpoint (0-byte RUNNING_STATS.json); the loader aborted on it every restart and
+	// the wrapper crash-looped into giving up overnight. Write into "<ts>.tmp" (ignored
+	// by FindNumberedDirs - not all-digits) and rename into place at the end: a crash
+	// mid-save now leaves no numbered dir at all, and rename() is atomic on POSIX.
+	std::filesystem::path finalFolder = config.checkpointFolder / std::to_string(totalTimesteps);
+	std::filesystem::path saveFolder = config.checkpointFolder / (std::to_string(totalTimesteps) + ".tmp");
+	std::filesystem::remove_all(saveFolder); // stale tmp from a prior mid-save crash
 	std::filesystem::create_directories(saveFolder);
 
-	RG_LOG("Saving to folder " << saveFolder << "...");
+	RG_LOG("Saving to folder " << finalFolder << "...");
 	SaveStats(saveFolder / STATS_FILE_NAME);
 	ppo->SaveTo(saveFolder);
+	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
+	std::filesystem::rename(saveFolder, finalFolder);
 
 	// Remove old checkpoints
 	if (config.checkpointsToKeep != -1) {
@@ -304,20 +313,37 @@ void GGL::Learner::Load() {
 
 	RG_LOG("Loading most recent checkpoint in " << config.checkpointFolder << "...");
 
-	int64_t highest = -1;
+	// Fallback across corrupt checkpoints (2026-07-13): a crash that interrupts a save
+	// (pre-atomic-rename era, disk-full, etc.) must not strand an unattended run - abort
+	// here meant the wrapper crash-looped on the same poisoned dir until it gave up.
+	// Try newest -> oldest; a candidate that throws is renamed to "corrupt_<ts>" (ignored
+	// by FindNumberedDirs) so future boots and the rotation never see it again. Retrying
+	// is safe: LoadStats parses before assigning, and LoadFrom re-loads every model.
 	std::set<int64_t> allSavedTimesteps = Utils::FindNumberedDirs(config.checkpointFolder);
-	for (int64_t timesteps : allSavedTimesteps)
-		highest = RS_MAX(timesteps, highest);
 
-	if (highest != -1) {
-		std::filesystem::path loadFolder = config.checkpointFolder / std::to_string(highest);
+	bool loaded = false;
+	for (auto itr = allSavedTimesteps.rbegin(); itr != allSavedTimesteps.rend(); itr++) {
+		std::filesystem::path loadFolder = config.checkpointFolder / std::to_string(*itr);
 		RG_LOG(" > Loading checkpoint " << loadFolder << "...");
-		LoadStats(loadFolder / STATS_FILE_NAME);
-		ppo->LoadFrom(loadFolder);
-		RG_LOG(" > Done.");
-	} else {
-		RG_LOG(" > No checkpoints found, starting new model.")
+		try {
+			LoadStats(loadFolder / STATS_FILE_NAME);
+			ppo->LoadFrom(loadFolder);
+			loaded = true;
+			RG_LOG(" > Done.");
+			break;
+		} catch (std::exception& e) {
+			RG_LOG(" > CORRUPT/UNREADABLE checkpoint " << loadFolder << " (" << e.what()
+				<< ") - quarantining and falling back to the previous one");
+			std::error_code ec;
+			std::filesystem::rename(loadFolder,
+				config.checkpointFolder / ("corrupt_" + std::to_string(*itr)), ec);
+			if (ec)
+				RG_LOG(" > (quarantine rename failed: " << ec.message() << " - skipping in place)");
+		}
 	}
+
+	if (!loaded)
+		RG_LOG(" > No (loadable) checkpoints found, starting new model.")
 }
 
 bool GGL::Learner::ReloadNewestCheckpointForRender(int64_t& loadedTimesteps) {

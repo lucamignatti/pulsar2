@@ -46,6 +46,7 @@ CMD=("./GigaLearnBot")
 RESTART_DELAY_SECS="${RESTART_DELAY_SECS:-5}"
 FAST_CRASH_SECS="${FAST_CRASH_SECS:-120}"
 MAX_FAST_CRASHES="${MAX_FAST_CRASHES:-5}"
+CRASH_LOOP_BACKOFF_SECS="${CRASH_LOOP_BACKOFF_SECS:-900}"
 
 # --- GPU runtime defaults (NVIDIA CUDA) -------------------------------------
 # Set before the process starts so they're honored before the CUDA context /
@@ -406,8 +407,18 @@ while true; do
 	if [ "$runtime" -lt "$FAST_CRASH_SECS" ]; then
 		fast_crashes=$((fast_crashes + 1))
 		if [ "$fast_crashes" -ge "$MAX_FAST_CRASHES" ]; then
-			log "$fast_crashes consecutive crashes within ${FAST_CRASH_SECS}s each, giving up"
-			exit "$code"
+			# Never strand an unattended run (2026-07-13: a corrupt checkpoint crash-looped
+			# this counter and "giving up" left the trainer down all night). Back off long
+			# instead: transient causes (driver hiccups, freed disk, self-healing loader
+			# quarantining a bad checkpoint) resolve, and a genuinely stuck loop costs a
+			# few seconds of CPU per backoff rather than the whole run.
+			log "$fast_crashes consecutive crashes within ${FAST_CRASH_SECS}s each - backing off ${CRASH_LOOP_BACKOFF_SECS}s, then retrying (will never give up)"
+			sleep "$CRASH_LOOP_BACKOFF_SECS" || exit 130
+			if [ "$interrupted" -eq 1 ]; then
+				log "stopped by user during crash-loop backoff, not restarting"
+				exit 130
+			fi
+			fast_crashes=0
 		fi
 	else
 		fast_crashes=0
