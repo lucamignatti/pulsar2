@@ -401,12 +401,22 @@ int main(int argc, char* argv[]) {
 	cfg.psd.K = 256;                      // S = 512 slots (was 16 -> S=32, 16x below the paper's floor)
 	cfg.psd.rank = 4;
 	cfg.psd.sigma = 0.02f;                // adaptive: widens on low reliability, tightens if most slots hurt
-	cfg.psd.evalWindowSteps = 200;        // level-fitness rollout length (the reallocated probe budget)
+	// 200 -> 2400 (2026-07-13): fold direction-SNR scales with sqrt(total eval steps), and at
+	// 200 steps/slot the slot ranking's measured reliability sat at 0.13-0.65 (mostly ~0.55 -
+	// half the fold was noise) while norm-15..20 folds landed anyway; a bracketed fold at
+	// reliability 0.57 measurably degraded behavior (engagement -7.6pp, ~3 sigma). 12x the
+	// eval window costs ~30-60s of wall per round (slots parallelize across all arenas) and
+	// should lift reliability toward 0.8+. PRE-REGISTERED VERDICT: if reliability still reads
+	// ~0.5 after 2-3 rounds at this budget, the noise is structural (non-stationary base /
+	// antithetic pairing under drift) and PSD gets disabled per the measurement doctrine.
+	cfg.psd.evalWindowSteps = 2400;
 	cfg.psd.GExploit = 2500;
 	// Validation-gated fold: A/B the base policy's held-out return before vs after each fold and revert
 	// if it regressed, so no noise-fold ever lands unchecked (aggregate-level Baldwinian validation).
 	cfg.psd.valGateEnabled = true;
-	cfg.psd.valWindowSteps = 20;
+	// 20 -> 200: the fold-approval A/B gets the same medicine - a 20-step window green-lit a
+	// fold with fracHurt 0.58 and another at ranking reliability 0.13.
+	cfg.psd.valWindowSteps = 200;
 
 	// Plasticity interventions — the canaries now ACT (handoff §3.6/§4.2), not just log. Every knob
 	// is gated to be a no-op under healthy training and fires only on real plasticity loss:
