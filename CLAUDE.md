@@ -40,9 +40,19 @@ Key operational facts:
   inode); the new binary takes effect at the next restart — including the
   wrapper's automatic crash-restart, which is how staged fixes self-deploy.
 - The wrapper (`tools/run_trainer.sh`, transient systemd --user service)
-  restarts on crashes but NOT on clean exits or `--stop`. Logs:
-  `run_logs/train-<ts>.log` (`latest.log` symlink; this box's Rust-coreutils
-  `tail -f` freezes on symlinks — `readlink -f` first).
+  restarts on crashes but NOT on clean exits or `--stop`; on a fast crash-loop
+  it backs off `CRASH_LOOP_BACKOFF_SECS` (900) and retries forever — it NEVER
+  gives up (a corrupt-checkpoint loop once stranded an unattended run for
+  hours). Logs: `run_logs/train-<ts>.log` (`latest.log` symlink; this box's
+  Rust-coreutils `tail -f` freezes on symlinks — `readlink -f` first).
+- **Checkpoint saves are atomic** (written to `<ts>.tmp`, renamed into place)
+  and the loader **falls back newest→oldest across corrupt checkpoints**,
+  renaming them `corrupt_<ts>`; the version manager quarantines corrupt/stale
+  version dirs the same way. A crash can therefore cost at most one save
+  interval, never the run. Root-cause note: CUDA launch-timeout crashes
+  (display-attached GPU watchdog) and OOMs under desktop-graphics memory
+  pressure are environmental and expected occasionally — the system is designed
+  to make them cheap, not impossible.
 - **Checkpoints rotate** (`checkpointsToKeep=8`, ~1M steps apart at full speed —
   a ~10-minute window). Always copy a checkpoint dir out before reading it, and
   retry on next-newest if files vanish mid-copy.
