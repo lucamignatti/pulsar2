@@ -390,7 +390,16 @@ int main(int argc, char* argv[]) {
 	// K-cost is only paid at a plateau: resuming a competent 2.6 checkpoint trips it quickly; a
 	// from-scratch start descends normally until its first plateau (~GExploit iters). K=16 -> 32
 	// antithetic probes; numGames 1024 splits cleanly (24 probe + 8 eval arenas per slot).
-	cfg.psd.enabled = true;
+	// DISABLED 2026-07-13 by pre-registered measurement (see the evalWindowSteps note below
+	// for the full trial design): with 12x eval data per slot, the ES slot-ranking
+	// reliability read 0.20 and 0.23 across two probe rounds - the fitness signal is
+	// structurally unresolvable (episode-level variance in zero-sum 1v1 swamps
+	// perturbation-scale effects at any affordable budget), so every fold is a noise kick.
+	// A live-bracketed fold (reliability 0.57, norm 17.3) measurably degraded behavior
+	// (engagement -7.6pp ~3sigma). Disabling also disarms the plasticity interventions,
+	// which were past their 25k-iteration warmup. The theory of ES stands; its
+	// precondition - a cheap reliable fitness - does not exist in this domain.
+	cfg.psd.enabled = false;
 	cfg.psd.warmupUntilPlateau = true;
 	// Pure-ES probe (EGGROLL-faithful; arXiv 2511.16652). The 32-slot Baldwinian probe measured
 	// fitness reliability ~0 for 20 rounds -> the ranking was noise, so folds were a random walk.
