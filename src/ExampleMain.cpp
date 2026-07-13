@@ -9,6 +9,7 @@
 #include <RLGymCPP/TerminalConditions/AttemptResolutionCondition.h>
 #include <RLGymCPP/ObsBuilders/DefaultObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
+#include <RLGymCPP/ObsBuilders/AdvancedObsPadded.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
@@ -24,6 +25,33 @@ using namespace RLGC; // RLGymCPP
 // ~15s half-life (462 steps) — a deliberately long horizon so full scoring/defensive possessions
 // reach the value target. If you change tickSkip, re-derive this: half-life_s = ln2 / (-ln gamma) / (120/tickSkip).
 static constexpr float TRAIN_GAMMA = 0.9985f;
+
+// ---- 4.0: one net for 1v1/2v2/3v3 (team-play program) ------------------------------------
+// The 4.0 lineage trains a SINGLE policy across team sizes via a padded obs
+// (AdvancedObsPadded: fixed width at MAX_PLAYERS_PER_TEAM, zero-padded slots + presence
+// flags, slots shuffled per build so every slot's weights train even while the mix is
+// mostly 1v1). PHASE A (this config): every arena is 1v1 — the proven bootstrap; June's
+// multi-mode-from-scratch runs diluted touch data 4x and froze, pure-1v1 phase-1 fixed it.
+// PHASE B (once 1v1 performs decently): raise FRAC_2V2/FRAC_3V3 — a config-only change,
+// checkpoint-compatible because the obs width never changes.
+static constexpr int MAX_PLAYERS_PER_TEAM = 3;
+
+// Fraction of arenas running each team mode, applied by arena index with the team arenas
+// at the END of the index range (deterministic across restarts). Keeping them at the end
+// means: (a) the steering practice arenas (the FIRST practiceArenaFrac of indices) stay
+// 1v1, and (b) the skill tracker / league eval EnvSets — which clone this create-func
+// with small numArenas, so only low indices — stay 1v1, keeping Rating/1v1 continuous
+// across the phase switch (it is also the guard key: the Learner tracks arena 0's mode).
+// PHASE B suggestion: 0.20/0.15 to start, keep FRAC_2V2 + FRAC_3V3 + practiceArenaFrac
+// well under 1 so a healthy 1v1 match population remains for steering derivation.
+static constexpr float FRAC_2V2 = 0.0f;
+static constexpr float FRAC_3V3 = 0.0f;
+
+// Team spirit for the zero-sum reward terms: own*(1-ts) + teamMean*ts - oppTeamMean.
+// 0 in 1v1 (where it is an algebraic no-op). PHASE B: ramp toward ~0.3-0.5 so teammates
+// stop fighting over the ball — but change it as its OWN experiment, not bundled with
+// the mode-mix flip (one lever at a time).
+static constexpr float TEAM_SPIRIT = 0.0f;
 
 // 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
 // (fast) codebase.
@@ -73,42 +101,42 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 
 		// Touch quality (Nexto touch_accel): pays only for adding ball speed, ~10 total 0->110kph,
 		// zero-sum so touches can't be co-farmed. Produced the 1933uu/s goal speed.
-		{ new ZeroSumReward(new TouchAccelReward(), 0), 10.f },
+		{ new ZeroSumReward(new TouchAccelReward(), TEAM_SPIRIT), 10.f },
 
-		// Demo: unchanged pair swing (75 = goal/2). teamSpirit 0 (was 0.5, an algebraic no-op in
-		// 1v1 that misleadingly implied a halving living entirely in the weight).
-		{ new ZeroSumReward(new DemoReward(), 0), 37.5f },
+		// Demo: unchanged pair swing (75 = goal/2). TEAM_SPIRIT is 0 in PHASE A (was 0.5 once,
+		// an algebraic no-op in 1v1 that misleadingly implied a halving living in the weight).
+		{ new ZeroSumReward(new DemoReward(), TEAM_SPIRIT), 37.5f },
 
 		// ---- Hygiene conversions (PSD fitness cleanup) ----------------------------
 		// Proximity race: ZeroSum of an exact PBRS is still exact PBRS (Psi = Phi_own - Phi_opp),
 		// so policy-invariance holds while the stack's biggest per-player PSD polluter becomes "be
 		// closer to the ball than the opponent". Weight halved (7.5 -> 4) since the ZS swing
 		// doubles. Never gate a potential.
-		{ new ZeroSumReward(new BallProximityPotentialReward(gamma), 0), 4.f },
+		{ new ZeroSumReward(new BallProximityPotentialReward(gamma), TEAM_SPIRIT), 4.f },
 
 		// Boost economy: demo-respawn guarded (mandatory under ZeroSum - without it the demoer is
 		// charged for the victim's respawn tank), raised 4 -> 6, UNGATED. Zero-sum replaces the
 		// gate as anti-farm: mutual pad cycling cancels, denial is a real 1v1 skill, and gating a
 		// ZS term breaks its symmetry (positive side muted, mirror charged in full).
-		{ new ZeroSumReward(new GuardedPickupBoostReward(), 0), 6.f },
+		{ new ZeroSumReward(new GuardedPickupBoostReward(), TEAM_SPIRIT), 6.f },
 
 		// ---- The frontier terms ----------------------------------------------------
 		// Aerial STRIKE (replaces gated ZeroSum(TouchHeight) 15): AND of sustained flight and a
 		// genuinely-high ball, impulse-scaled, ~0.8s refire cooldown. Pays exactly 0 for everything
 		// the bot currently does (ground strikes, wall pins, 193uu hop-pokes). UNGATED: the gate
 		// structurally discounts never-achieved states and made the old ZS pair net-negative.
-		{ new ZeroSumReward(new AerialTouchReward(), 0), 25.f },
+		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 25.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
 		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
-		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), 0), 10.f },
+		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 10.f },
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
 		// - phantom-farmable). UNGATED - the gate's attack-oriented level is lowest exactly in the
 		// own-half states where saves fire.
-		{ new ZeroSumReward(new OpposedSaveReward(), 0), 25.f },
+		{ new ZeroSumReward(new OpposedSaveReward(), TEAM_SPIRIT), 25.f },
 
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
@@ -119,6 +147,12 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 // the Learner applies the SAME first-N rule for row tagging + collection steering, so these
 // two sites agree by construction). 0 = feature off = every arena is a normal match arena.
 static int g_NumPracticeArenas = 0;
+
+// Team-mode arena split (set in main() from cfg.numGames and the FRAC_2V2/FRAC_3V3 constants).
+// Team arenas occupy the END of the index range — see the FRAC_2V2 comment for why.
+static int g_NumGames = 0;
+static int g_NumArenas2v2 = 0;
+static int g_NumArenas3v3 = 0;
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
@@ -133,8 +167,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 	if (index < g_NumPracticeArenas)
 		terminalConditions.push_back(new AttemptResolutionCondition());
 
-	// Make the arena
+	// Make the arena. PHASE A: every arena is 1v1. PHASE B raises FRAC_2V2/FRAC_3V3, putting
+	// team modes on the trailing indices — the padded obs keeps the net identical either way,
+	// so the phase switch is checkpoint-compatible.
 	int playersPerTeam = 1;
+	if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3)
+		playersPerTeam = 3;
+	else if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3 - g_NumArenas2v2)
+		playersPerTeam = 2;
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -143,7 +183,11 @@ EnvCreateResult EnvCreateFunc(int index) {
 
 	EnvCreateResult result = {};
 	result.actionParser = new DefaultAction();
-	result.obsBuilder = new AdvancedObs();
+	// Padded team obs (4.0): fixed 230-dim for any team size up to 3v3 (51 header + 6x29
+	// player slots + 5 presence flags). Ball@0 and self@51 offsets match AdvancedObs exactly,
+	// which the steering landing sims and analysis tooling rely on. NOT weight-compatible
+	// with the 3.1 lineage's 109-dim AdvancedObs checkpoints - 4.0 is a fresh run.
+	result.obsBuilder = new AdvancedObsPadded(MAX_PLAYERS_PER_TEAM);
 	// The proven cf993b7 reset mix - effective near-ball share 0.55 (0.35 ground + 0.20 aerial
 	// drill), no drill-replay slice (that came with the drill bank in the regression).
 	result.stateSetter = new CombinedState({
@@ -358,11 +402,14 @@ int main(int argc, char* argv[]) {
 	// uncommitted addition). Flip it on later as its own experiment if desired.
 	cfg.skillTracker.enabled = true;
 
-	// FRESH RUN (3.1): tickSkip 4, 512-wide, gamma 0.9985, secondary goal critic. Its own checkpoint
-	// folder + wandb run name so it can NEVER accidentally resume the 26B-step tickSkip-8 lineage
-	// (whose checkpoints live in "checkpoints/" and are architecture-incompatible anyway).
-	cfg.checkpointFolder = "checkpoints_3.1";
-	cfg.metricsRunName = "3.1-ts4";
+	// FRESH RUN (4.0): the team-play lineage - padded 230-dim obs (AdvancedObsPadded(3)),
+	// PHASE A all-1v1 curriculum, otherwise the proven 3.1 config (tickSkip 4, 512-wide,
+	// gamma 0.9985, secondary goal critic). Its own checkpoint folder + wandb run name so it
+	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
+	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
+	// rather than merely loud).
+	cfg.checkpointFolder = "checkpoints_4.0";
+	cfg.metricsRunName = "4.0-team";
 
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
 	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
@@ -485,9 +532,8 @@ int main(int argc, char* argv[]) {
 	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
 
 	// ---------------------------------------------------------------------------------------------
-	// Steered-practice collection ("optimism surgery"), ENABLED - takes effect when the trainer is
-	// restarted on this binary, resuming the 3.1 lineage from its latest checkpoint (checkpoints
-	// are fully compatible: no new networks, no external files).
+	// Steered-practice collection ("optimism surgery"), ENABLED - carried over from the 3.1
+	// lineage, where v2 (possession-outcome derivation + rho-band gate) ran with healthy guards.
 	// The commitment direction is derived LIVE each iteration from the collected buffer itself
 	// (ball-landing sims + went/declined trunk contrast, match-arena rows only, EMA-smoothed), and
 	// a slice of practice arenas runs unsteered as controls so a causal auto-gate can drop alpha
@@ -535,6 +581,12 @@ int main(int argc, char* argv[]) {
 	// (and only ever together with a dedicated practice-value baseline - see post-mortems).
 	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
 		g_NumPracticeArenas = (int)(cfg.numGames * cfg.steering.practiceArenaFrac);
+
+	// Team-mode arena split (PHASE A: both fractions 0 -> all arenas 1v1). Must be set before
+	// the Learner is built - EnvCreateFunc reads these.
+	g_NumGames = cfg.numGames;
+	g_NumArenas2v2 = (int)(cfg.numGames * FRAC_2V2);
+	g_NumArenas3v3 = (int)(cfg.numGames * FRAC_3V3);
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

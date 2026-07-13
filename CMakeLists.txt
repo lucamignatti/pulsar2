@@ -34,3 +34,10 @@ target_link_libraries(GigaLearnBot GigaLearnCPP)
 # Include RLBot
 add_subdirectory(RLBotCPP)
 target_link_libraries(GigaLearnBot RLBotCPP)
+
+# Offline unit tests (GigaLearnTests). OFF by default so the training box's
+# `cmake --build build` stays byte-identical; enable with -DGGL_BUILD_TESTS=ON.
+option(GGL_BUILD_TESTS "Build the GigaLearnTests unit test binary" OFF)
+if (GGL_BUILD_TESTS)
+	add_subdirectory(tests)
+endif()

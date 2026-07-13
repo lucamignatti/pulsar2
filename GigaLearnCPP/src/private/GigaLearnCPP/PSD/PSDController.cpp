@@ -339,17 +339,21 @@ std::vector<int> PSDController::StepActionsAsymmetric(PolicySlots& ps, const std
 	return actions;
 }
 
-// Play the freshly folded policy (seat 0) vs the pre-fold `oldPolicy` (seat 1) across the whole pool
-// and return the mean (seat0 - seat1) per-step reward differential. Both share the current (unfolded)
-// trunk; only the policy heads differ. Dominated by the zero-sum competitive terms (goals ±150,
-// ball-to-goal ±75) since the per-player farmable terms are tiny by weight -> a genuine win/edge test.
+// Play the freshly folded policy (one full team) vs the pre-fold `oldPolicy` (the other team)
+// across the whole pool and return the mean per-player (new-team - old-team) per-step reward
+// differential. Both share the current (unfolded) trunk; only the policy heads differ. Dominated
+// by the zero-sum competitive terms (goals ±150, ball-to-goal ±75) since the per-player farmable
+// terms are tiny by weight -> a genuine win/edge test. Team membership is read from the live game
+// states, so this is valid at any team size (2v2/3v3), not just 1v1.
 float PSDController::MeasureHeadToHead(Model* oldPolicy, int windowSteps) {
 	std::vector<int64_t> s0, s1;
 	s0.reserve(numArenas); s1.reserve(numArenas);
 	for (int a = 0; a < numArenas; a++) {
 		int p0 = envSet->state.arenaPlayerStartIdx[a];
-		s0.push_back(p0);      // seat 0 = new (folded) policy
-		s1.push_back(p0 + 1);  // seat 1 = old policy (1v1 opponent)
+		auto& players = envSet->state.gameStates[a].players;
+		Team newTeam = players[0].team; // new (folded) policy drives this whole team
+		for (int i = 0; i < (int)players.size(); i++)
+			((players[i].team == newTeam) ? s0 : s1).push_back(p0 + i);
 	}
 	Tensor s0Dev = torch::from_blob(s0.data(), { (int64_t)s0.size() }, torch::kLong).to(ppo->device);
 	Tensor s1Dev = torch::from_blob(s1.data(), { (int64_t)s1.size() }, torch::kLong).to(ppo->device);
@@ -365,7 +369,7 @@ float PSDController::MeasureHeadToHead(Model* oldPolicy, int windowSteps) {
 		return TENSOR_TO_VEC<int>(torch::multinomial(probs, 1, true).flatten().to(torch::kCPU).to(torch::kInt));
 	};
 
-	double sum0 = 0, sum1 = 0; long n = 0;
+	double sum0 = 0, sum1 = 0; long n0 = 0, n1 = 0;
 	int W = std::max(1, windowSteps);
 	for (int step = 0; step < W; step++) {
 		envSet->Reset();
@@ -382,13 +386,16 @@ float PSDController::MeasureHeadToHead(Model* oldPolicy, int windowSteps) {
 		}
 		std::vector<int> a0 = fnSeatActions(obsDev, maskBoolDev, s0Dev, ppo->models["policy"]);
 		std::vector<int> a1 = fnSeatActions(obsDev, maskBoolDev, s1Dev, oldPolicy);
-		for (int a = 0; a < numArenas; a++) { actions[(size_t)s0[a]] = a0[a]; actions[(size_t)s1[a]] = a1[a]; }
+		for (size_t k = 0; k < s0.size(); k++) actions[(size_t)s0[k]] = a0[k];
+		for (size_t k = 0; k < s1.size(); k++) actions[(size_t)s1[k]] = a1[k];
 		envSet->StepFirstHalf(true);
 		envSet->Sync();
 		envSet->StepSecondHalf(actions, false);
-		for (int a = 0; a < numArenas; a++) { sum0 += envSet->state.rewards[s0[a]]; sum1 += envSet->state.rewards[s1[a]]; n++; }
+		for (int64_t idx : s0) { sum0 += envSet->state.rewards[idx]; n0++; }
+		for (int64_t idx : s1) { sum1 += envSet->state.rewards[idx]; n1++; }
 	}
-	return n ? (float)((sum0 - sum1) / n) : 0.0f;
+	// Per-player means so unequal team sizes can't bias the differential
+	return (n0 && n1) ? (float)(sum0 / n0 - sum1 / n1) : 0.0f;
 }
 
 // Pure-ES probe (EGGROLL-faithful; arXiv 2511.16652 §6.1: large populations are what make ES work).
@@ -802,7 +809,7 @@ void PSDController::RunInterventions(Report& report) {
 			p.set_requires_grad(!wantFrozen);
 		if (wantFrozen != trunkFrozen) {
 			trunkFrozen = wantFrozen;
-			RG_LOG("PSD: trunk " << (trunkFrozen ? "FROZEN" : "unfrozen") << " (Rating/1v1=" << lastRating << ")");
+			RG_LOG("PSD: trunk " << (trunkFrozen ? "FROZEN" : "unfrozen") << " (rating=" << lastRating << ")");
 		}
 	}
 	if (cfg.freezeEnabled)

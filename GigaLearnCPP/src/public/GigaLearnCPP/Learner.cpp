@@ -1073,6 +1073,14 @@ void GGL::Learner::Start() {
 		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
 		const bool goalCriticOn = config.ppo.goalCritic.enabled && !render;
 
+		// The report key the skill tracker writes for the TRAINING arenas' team size
+		// ("Rating/1v1", "Rating/2v2", ...). Every in-loop rating consumer (steering rating
+		// guard, golden-archive feed, PSD plateau/freeze feed) tracks this key, so the guards
+		// keep working when the fleet moves to 2v2/3v3 instead of silently going dark on a
+		// stale "Rating/1v1" literal. With a mixed-mode fleet, arena 0's mode is the one
+		// tracked - keep the primary mode at index 0.
+		const std::string ratingKey = "Rating/" + SkillRating::GetModeName(envSet->state.gameStates[0]);
+
 		// Steered-practice collection (LearnerConfig::steering): the first numSteeredArenas
 		// arenas collect with the live-derived commitment direction added to the policy head's
 		// trunk input; the next few practice arenas stay unsteered as gate controls. All
@@ -1654,14 +1662,14 @@ void GGL::Learner::Start() {
 		};
 
 		// Rating drawdown guard: called wherever the skill tracker may have just written
-		// Rating/1v1 into the report. A drop of more than ratingDrawdownTrip below the slow
-		// EMA latches steering OFF for the rest of the process - no auto-re-enable, a human
-		// decides (both live collapses tonight were visible on this signal within minutes
-		// while every behavioral gate stayed green).
+		// the training mode's rating into the report. A drop of more than ratingDrawdownTrip
+		// below the slow EMA latches steering OFF for the rest of the process - no
+		// auto-re-enable, a human decides (both live collapses tonight were visible on this
+		// signal within minutes while every behavioral gate stayed green).
 		auto fnRatingGuard = [&](Report& report) {
-			if (!steerOn || !config.steering.ratingGuardEnabled || !report.Has("Rating/1v1"))
+			if (!steerOn || !config.steering.ratingGuardEnabled || !report.Has(ratingKey))
 				return;
-			float rating = (float)report["Rating/1v1"];
+			float rating = (float)report[ratingKey];
 			if (std::isnan(steerRatingEMA)) {
 				steerRatingEMA = rating;
 				return;
@@ -1669,7 +1677,7 @@ void GGL::Learner::Start() {
 			if (!steerRatingTripped && rating < steerRatingEMA - config.steering.ratingDrawdownTrip) {
 				steerRatingTripped = true;
 				steerPendingApply = true; // push alpha=0 at the next barrier
-				RG_LOG("STEERING RATING GUARD TRIPPED: Rating/1v1 " << rating
+				RG_LOG("STEERING RATING GUARD TRIPPED: " << ratingKey << " " << rating
 					<< " vs EMA " << steerRatingEMA << " (drawdown > "
 					<< config.steering.ratingDrawdownTrip << ") - steering latched OFF");
 			}
@@ -2141,13 +2149,13 @@ void GGL::Learner::Start() {
 				if (versionMgr)
 					versionMgr->OnIteration(ppo, report, totalTimesteps, prevVersionTimesteps);
 				prevVersionTimesteps = totalTimesteps;
-				if (report.Has("Rating/1v1"))
-					lastEvalRating = (float)report["Rating/1v1"]; // feeds the best-checkpoint archive
+				if (report.Has(ratingKey))
+					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
 				fnRatingGuard(report); // may latch steering off; applied by fnApplySteering below
 				if (league)
 					league->OnIteration(report, totalIterations);
 				if (psd) {
-					float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
+					float rating = report.Has(ratingKey) ? (float)report[ratingKey] : NAN;
 					bool probed = psd->OnDescendIteration(report, rating, totalIterations);
 					if (probed) {
 						// Probe rounds stepped the arenas out from under the in-flight episodes
@@ -3096,8 +3104,8 @@ void GGL::Learner::Start() {
 				if (!pipelineOn) {
 					if (versionMgr)
 						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
-					if (report.Has("Rating/1v1"))
-						lastEvalRating = (float)report["Rating/1v1"]; // feeds the best-checkpoint archive
+					if (report.Has(ratingKey))
+						lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
 					fnRatingGuard(report); // may latch steering off before the next apply
 
 					// QD league: evolve/evaluate members between iterations (additive, off by default).
@@ -3108,7 +3116,7 @@ void GGL::Learner::Start() {
 					// were stepped out from under the in-flight trajectories, so clear them — the next
 					// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
 					if (psd) {
-						float rating = report.Has("Rating/1v1") ? (float)report["Rating/1v1"] : NAN;
+						float rating = report.Has(ratingKey) ? (float)report[ratingKey] : NAN;
 						bool probed = psd->OnDescendIteration(report, rating, totalIterations);
 						if (probed) {
 							// Clear the persistent per-player trajectories so post-probe collection
