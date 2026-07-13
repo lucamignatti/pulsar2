@@ -62,18 +62,24 @@ Key operational facts:
   No structural check can catch these. Detection: the in-run rating guard trips
   (it did), and offline a 2-minute kickoff test
   (`analysis/probes` — healthy ≈ 10/10 touches, median ~3.4s) is definitive.
-  Recovery recipe (used successfully): find the newest HEALTHY
-  `policy_versions/<ts>` by kickoff-testing backwards; assemble a hybrid
-  checkpoint dir = healthy `POLICY.lt`+`SHARED_HEAD.lt` from the version,
-  aux nets (+their optims) from the newest healthy full backup, current
-  `RUNNING_STATS.json`; omit `POLICY_OPTIM`/`SHARED_HEAD_OPTIM` (they reset
-  gracefully); quarantine every checkpoint/version from the damaged lineage
-  first so the loader can't prefer them. CLOSED (same day): the boot sanity
-  probe now does this automatically (3 kickoff episodes on a throwaway arena,
-  >= 2 must have touches, only for checkpoints claiming rating >= 400), a
-  golden archive keeps the top-3 rated checkpoints outside rotation as the
-  loader's last resort ("best_r<rating>_<ts>"), and tsPerSave was raised to 25M
-  so the rotation window spans ~20 minutes instead of ~50 seconds.
+  Automatic defenses (same day): the boot sanity probe (3 kickoff episodes on a
+  throwaway arena, >= 2 must have touches, only for checkpoints claiming rating
+  >= 400), a golden archive keeping the top-3 rated checkpoints outside rotation
+  as the loader's last resort ("best_r<rating>_<ts>"), and tsPerSave raised to
+  25M so the rotation window spans ~20 minutes instead of ~50 seconds.
+- **RECOVERY DOCTRINE (user-set, binding): NO recovery machinery.** If a
+  checkpoint is corrupt/damaged, restore a KNOWN-GOOD FULL checkpoint (golden
+  archive or `checkpoints_3.1_branch_backup/`), however old; if none exists,
+  start a fresh run. NEVER hand-assemble hybrid checkpoints (healthy policy +
+  borrowed critic/optims): it was tried once and 550M steps of training against
+  the mismatched value baseline made the policy WORSE than its restore point
+  (measured 16-31 head-to-head) while every guard stayed green. Partial
+  restores create subtle damage that no warmup machinery should exist to
+  compensate for. Full checkpoint or fresh start, nothing in between.
+  Before any restore: quarantine (never delete) the entire damaged lineage —
+  numbered checkpoints, best_r* entries, and policy versions descended from it —
+  so the loader cannot prefer them; versions newer than the restored timestep
+  auto-quarantine at boot.
 - **Checkpoints rotate** (`checkpointsToKeep=8`, ~1M steps apart at full speed —
   a ~10-minute window). Always copy a checkpoint dir out before reading it, and
   retry on next-newest if files vanish mid-copy.
