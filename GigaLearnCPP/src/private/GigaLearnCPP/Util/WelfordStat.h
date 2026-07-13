@@ -112,8 +112,9 @@ namespace GGL {
 		}
 
 		void ReadFromJSON(const nlohmann::json& json) {
-			runningMeans = Utils::MakeVecFromJSON<double>(json["mean"]);
-			runningVariances = Utils::MakeVecFromJSON<double>(json["var"]);
+			// Keys must match ToJSON above ("means"/"vars") or the round-trip throws on resume
+			runningMeans = Utils::MakeVecFromJSON<double>(json["means"]);
+			runningVariances = Utils::MakeVecFromJSON<double>(json["vars"]);
 			count = json["count"];
 		}
 	};

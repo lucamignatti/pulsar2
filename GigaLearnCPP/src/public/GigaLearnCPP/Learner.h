@@ -61,6 +61,12 @@ namespace GGL {
 		int numPracticeArenas = 0;
 		int numSteeredArenas = 0;
 
+		// Rating drawdown guard state (persisted in the checkpoint stats): the latch is the
+		// ONLY guard that can see update-damage, and the ops wrapper auto-restarts on crashes -
+		// process-local latch state would silently re-arm steering on a damaged policy
+		float steerRatingEMA = NAN;
+		bool steerRatingTripped = false;
+
 		StepCallbackFn stepCallback = NULL;
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);

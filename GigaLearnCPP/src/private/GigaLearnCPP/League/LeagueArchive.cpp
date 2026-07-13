@@ -500,8 +500,16 @@ void LeagueArchive::ToJSON(nlohmann::json& j) const {
 		arr.push_back(m);
 		if (!leagueDir.empty()) {
 			std::filesystem::create_directories(leagueDir / "members");
-			torch::save(members[i].params,
-				(leagueDir / "members" / (std::to_string(i) + ".pt")).string());
+			// tmp + rename: this dir is SHARED by every checkpoint (and the golden archive's
+			// stats reference it too) - a crash mid-write would otherwise leave a truncated
+			// .pt that makes every checkpoint's FromJSON throw at boot
+			auto finalPath = leagueDir / "members" / (std::to_string(i) + ".pt");
+			auto tmpPath = leagueDir / "members" / (std::to_string(i) + ".pt.tmp");
+			torch::save(members[i].params, tmpPath.string());
+			std::error_code ec;
+			std::filesystem::rename(tmpPath, finalPath, ec);
+			if (ec)
+				RG_LOG("LeagueArchive: failed to finalize member " << i << " save: " << ec.message());
 		}
 	}
 	l["members"] = arr;
@@ -534,9 +542,19 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 		mem.lineage = m.value("lineage", 0);
 		bool ok = true;
 		auto path = leagueDir / "members" / (std::to_string(i) + ".pt");
-		if (std::filesystem::exists(path))
-			torch::load(mem.params, path.string());
-		else
+		if (std::filesystem::exists(path)) {
+			try {
+				torch::load(mem.params, path.string());
+			} catch (std::exception& e) {
+				// Drop just this member: throwing here would make the checkpoint loader
+				// quarantine the (healthy) checkpoint dir - and since the member files are
+				// shared across all checkpoints, it would then destroy the ENTIRE rotation
+				// and fall through the golden archive for one bad league file
+				RG_LOG("LeagueArchive: dropping member " << i << " (unreadable weights: "
+					<< e.what() << ")");
+				ok = false;
+			}
+		} else
 			ok = false;
 		if (ok && (int)mem.params.size() == nModels) {
 			members.push_back(std::move(mem));

@@ -123,11 +123,26 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		}
 
 		if (config.standardizeObs) {
+			// Only the main collection loop standardizes obs. Every other inference surface
+			// (steering derivation's obs decoding, PSD/league/skill-tracker eval rollouts,
+			// and Save() racing the worker's stat updates under pipelining) reads RAW obs
+			// and would silently measure garbage - fail loudly instead of training on it.
+			if (config.steering.enabled || config.psd.enabled || config.league.enabled
+				|| config.skillTracker.enabled || config.pipelinedCollection)
+				RG_ERR_CLOSE("Learner::Learner(): standardizeObs is only supported by the plain "
+					"sequential PPO path - steering/PSD/league/skillTracker/pipelinedCollection "
+					"all feed raw obs to the models and would break silently");
 			this->obsStat = new BatchedWelfordStat(obsSize);
 		} else {
 			this->obsStat = NULL;
 		}
 	}
+
+	// Deterministic sampling records no logprobs: training would read empty logprob rows
+	// (garbage IS ratios / OOB) long before PPO's own learn-time check could throw
+	if (config.ppo.deterministic && !config.renderMode)
+		RG_ERR_CLOSE("Learner::Learner(): config.ppo.deterministic is for render/eval only, "
+			"it cannot collect trainable experience");
 
 	try {
 		RG_LOG("\tMaking PPO learner...");
@@ -211,6 +226,12 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	j["reach_acc_ema"] = reachAccEMA;
 	j["reach_agree_ema"] = reachAgreeEMA;
 
+	// Steering rating-guard state: the latch must survive the wrapper's automatic
+	// crash-restarts (NaN EMA is skipped - JSON has no NaN and it just means "unseeded")
+	if (!std::isnan(steerRatingEMA))
+		j["steer_rating_ema"] = steerRatingEMA;
+	j["steer_rating_tripped"] = steerRatingTripped;
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -249,6 +270,16 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		reachAccEMA = RS_MAX(0.f, (float)j["reach_acc_ema"]);
 	if (j.contains("reach_agree_ema"))
 		reachAgreeEMA = RS_MAX(0.f, (float)j["reach_agree_ema"]);
+
+	if (j.contains("steer_rating_ema"))
+		steerRatingEMA = (float)j["steer_rating_ema"];
+	if (j.contains("steer_rating_tripped")) {
+		steerRatingTripped = (bool)j["steer_rating_tripped"];
+		if (steerRatingTripped)
+			RG_LOG("NOTE: steering rating guard was TRIPPED in this checkpoint - steering stays "
+				"latched OFF (a human decides; clear steer_rating_tripped in the checkpoint's "
+				"running-stats JSON or restore an untripped checkpoint to re-enable)");
+	}
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
@@ -469,12 +500,20 @@ void GGL::Learner::Load() {
 
 	// Last resort: the golden best-rated archive (full checkpoints, highest rating first).
 	// Loaded IN PLACE (not renamed) - archive entries are precious even if one is bad.
-	if (!loaded) {
+	// exists() guard: on a fresh run the folder may not exist yet and directory_iterator
+	// would throw out of the constructor; a malformed best_r* name must skip, not abort -
+	// this is exactly the unattended-recovery path.
+	if (!loaded && std::filesystem::exists(config.checkpointFolder)) {
 		std::vector<std::pair<float, std::filesystem::path>> bests;
 		for (auto& e : std::filesystem::directory_iterator(config.checkpointFolder)) {
 			std::string name = e.path().filename().string();
-			if (name.rfind("best_r", 0) == 0)
-				bests.push_back({ std::stof(name.substr(6, name.find('_', 6) - 6)), e.path() });
+			if (name.rfind("best_r", 0) == 0) {
+				try {
+					bests.push_back({ std::stof(name.substr(6, name.find('_', 6) - 6)), e.path() });
+				} catch (...) {
+					RG_LOG(" > (ignoring unparseable archive dir name: " << name << ")");
+				}
+			}
 		}
 		std::sort(bests.rbegin(), bests.rend());
 		for (auto& [rating, path] : bests) {
@@ -1024,9 +1063,9 @@ void GGL::Learner::Start() {
 		int steerGateIters = 0;           // iterations that contributed gate data
 		bool steerGateActive = true;      // alpha drops to 0 when the causal gate trips
 		bool steerPendingApply = false;
-		// Rating drawdown guard: the one signal that catches update-damage. LATCHES.
-		float steerRatingEMA = NAN;
-		bool steerRatingTripped = false;
+		// Rating drawdown guard state (steerRatingEMA / steerRatingTripped) lives on the
+		// Learner and is persisted in the checkpoint stats - a crash-restart must not
+		// silently un-latch steering (the wrapper restarts automatically and unattended)
 		// Car-free arenas for ball-landing sims, one per ad-hoc sim thread (lazy, reused).
 		// Deliberately NOT on the shared thread pool: in pipelined mode learn-prep overlaps the
 		// collect worker, which owns the pool.
@@ -1081,7 +1120,10 @@ void GGL::Learner::Start() {
 		// combinedTraj each iteration (step always restarts at 0) - the learn-prep Phi-drop pass
 		// looks these up via each row's srcStep/srcPlayer provenance before they're dropped.
 		std::unordered_map<int64_t, RLGC::ArenaSnapshot> stepSnapshots;
-		if (reachOn || steerOn) {
+		// goalCriticOn: the goal-channel recorder below indexes these maps too - without it,
+		// a goal-critic-only config would read arena 0 / slot 0 for every player and train
+		// the goal critic on garbage credit
+		if (reachOn || steerOn || goalCriticOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
 				auto& players = envSet->state.gameStates[arenaIdx].players;
@@ -1735,7 +1777,7 @@ void GGL::Learner::Start() {
 
 						if (!render && obsStat) {
 							// TODO: This samples from old versions too
-							int numSamples = RS_MAX(envSet->state.numPlayers, config.maxObsSamples);
+							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 							for (int i = 0; i < numSamples; i++) {
 								int idx = Math::RandInt(0, envSet->state.numPlayers);
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
@@ -1982,6 +2024,15 @@ void GGL::Learner::Start() {
 							if (terminalType == RLGC::TerminalType::TRUNCATED) {
 								// Truncation requires an additional next state for the critic
 								traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
+								if (!render && obsStat) {
+									// This row is post-step, captured BEFORE the next loop-top
+									// standardization pass - normalize it here or the critic
+									// (trained on standardized obs) bootstraps from a raw row
+									size_t rowStart = traj.nextStates.size() - obsSize;
+									for (int j = 0; j < obsSize; j++)
+										traj.nextStates[rowStart + j] =
+											(traj.nextStates[rowStart + j] - (float)obsNormMean[j]) / (float)obsNormStd[j];
+								}
 							}
 
 							finalTerminals[newPlayerIdx] = terminalType;
@@ -2842,7 +2893,7 @@ void GGL::Learner::Start() {
 						// whose episode actually ended in a goal (sign of the goal-channel MC return).
 						// A channel or sign bug reads NEGATIVE here within minutes on a goal-dense run.
 						torch::Tensor outcomeMask = tGoalReturns.abs() > 1e-6f;
-						long nOutcome = outcomeMask.sum().item<long>();
+						int64_t nOutcome = outcomeMask.sum().item<int64_t>();
 						report["GoalCritic/Outcome Rows Frac"] = (float)nOutcome / RS_MAX(1, (int)combinedTraj.Length());
 						if (nOutcome > 100) {
 							auto fnCorr = [&](const torch::Tensor& a, const torch::Tensor& b) {
@@ -3101,7 +3152,7 @@ void GGL::Learner::Start() {
 						"-Value Pred Time",
 						"-Reach Read Time",
 						"-GAE Time",
-						"-PPO Learn Time"
+						"-PPO Learn Time",
 						"",
 						"Collected Timesteps",
 						"Total Timesteps",

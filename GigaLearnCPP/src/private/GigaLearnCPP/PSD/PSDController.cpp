@@ -79,11 +79,21 @@ bool PSDController::OnDescendIteration(Report& report, float rating, uint64_t to
 	// Decide whether to launch a probe round.
 	bool budgetReached = descendItersThisPhase >= cfg.GExploit;
 	bool plateaued = true;
-	if (cfg.warmupUntilPlateau && havePhaseStartRating && !std::isnan(rating)) {
-		float gain = rating - ratingAtPhaseStart;
-		report["PSD/Phase Elo Gain"] = gain;
-		// Plateau only judged once we've spent the exploit budget; before that, keep descending.
-		plateaued = gain < cfg.plateauEloGain;
+	if (cfg.warmupUntilPlateau) {
+		// Judge on lastRating (the most recent sample), not this iteration's `rating`:
+		// rating lands only every skill-eval interval, so requiring a sample to coincide
+		// with the budget-hit iteration made the gate FAIL OPEN - probe rounds fired
+		// ungated on nearly every budget hit, regardless of whether Rating had stalled.
+		if (havePhaseStartRating && !std::isnan(lastRating)) {
+			float gain = lastRating - ratingAtPhaseStart;
+			report["PSD/Phase Elo Gain"] = gain;
+			// Plateau only judged once we've spent the exploit budget; before that, keep descending.
+			plateaued = gain < cfg.plateauEloGain;
+		} else {
+			// No competence signal this phase (e.g. skill tracker off or no eval yet):
+			// fail SAFE - keep descending rather than probe with an unjudgeable plateau.
+			plateaued = false;
+		}
 	}
 
 	if (!budgetReached) return false;
@@ -391,8 +401,10 @@ void PSDController::RunProbeRoundPureES(Report& report) {
 
 	int S = cfg.antithetic ? 2 * cfg.K : cfg.K;
 	if (S > numArenas)
-		RG_LOG("PSD: WARNING pure-ES wants S=" << S << " slots but only " << numArenas
-			<< " arenas; slots will share arenas and fitness precision drops.");
+		RG_ERR_CLOSE("PSD: pure-ES needs S=" << S << " slots <= numArenas=" << numArenas
+			<< " - each slot drives seat 0 of its own eval arenas (the seat-0 index walk"
+			" below would read past arenaPlayerStartIdx, silently corrupting fitness)."
+			" Reduce psd.K or raise numGames.");
 
 	int perSlotEval = std::max(1, numArenas / S);
 	int evalArenaStart = 0;

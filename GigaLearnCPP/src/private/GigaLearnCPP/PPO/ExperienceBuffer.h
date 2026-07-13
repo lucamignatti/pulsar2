@@ -16,9 +16,11 @@ namespace GGL {
 			carHerGoals, ballHerGoals, ballMovedMask,
 			// Car-state HER goals for the car proposer's psi head (undefined unless carEnabled)
 			carStateHerGoals,
-			// Steered-practice rows, float 0/1 (undefined unless steering enabled): still train
-			// the policy, but are excluded from critic/goal-critic regression (their episodes
-			// end true-terminal at attempt resolution - the returns would alias match returns)
+			// Steered-practice rows, float 0/1 (undefined unless steering enabled). The MAIN
+			// critic deliberately trains on these rows too (excluding them caused the phantom
+			// -V(s_end) Elo freefall, 2026-07-12 - see the comment in PPOLearner::Learn);
+			// only the GOAL critic excludes them, and only under stage-2 resolution
+			// termination (their goal channel is structurally absent there)
 			practiceMask,
 			advantages;
 

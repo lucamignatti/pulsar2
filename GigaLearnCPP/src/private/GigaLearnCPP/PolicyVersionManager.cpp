@@ -82,8 +82,24 @@ void GGL::PolicyVersionManager::SaveVersions() {
 	}
 
 	for (auto& version : versions) {
-		if (allSavedTimesteps.contains(version.timesteps))
+		if (allSavedTimesteps.contains(version.timesteps)) {
+			// Models are immutable but the version's Elo evolves with every skill eval:
+			// re-persist STATS.json (tmp + rename) or every restart snaps the opponent
+			// pool back to creation-time ratings, stepping Rating/1v1 - which feeds the
+			// steering latch, the PSD plateau gate, and the golden archive.
+			auto dir = saveFolder / std::to_string(version.timesteps);
+			auto jsonTmp = dir / "STATS.json.tmp";
+			std::ofstream fOut(jsonTmp);
+			if (fOut.good()) {
+				json j = {};
+				j["skill_ratings"] = version.ratings.ToJSON();
+				fOut << j.dump(4);
+				fOut.close();
+				std::error_code ec;
+				std::filesystem::rename(jsonTmp, dir / "STATS.json", ec);
+			}
 			continue;
+		}
 		// Atomic like Learner::Save: write to .tmp, rename into place, so a crash
 		// mid-save can never leave a truncated version dir for LoadVersions to abort on
 		auto versionFinalFolder = saveFolder / std::to_string(version.timesteps);

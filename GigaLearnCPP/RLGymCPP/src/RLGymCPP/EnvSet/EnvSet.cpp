@@ -48,45 +48,56 @@ RLGC::EnvSet::EnvSet(const EnvSetConfig& config) : config(config) {
 	RG_ASSERT(config.tickSkip > 0);
 	RG_ASSERT(config.actionDelay >= 0 && config.actionDelay <= config.tickSkip);
 
-	std::mutex appendMutex = {};
+	// Pre-sized + indexed writes: every arena MUST land at position == its creation index.
+	// The event callbacks below capture arenaIdx at creation and dereference
+	// state.gameStates[arenaIdx], which the step loops index by POSITION in `arenas`;
+	// index-dependent EnvCreateFns (e.g. "first N arenas are practice") rely on it too.
+	// (These used to be push_back'd under a mutex, so position was completion order of the
+	// parallel jobs — every bump/demo/shot/goal/save event was silently routed to whatever
+	// arena happened to land at the creator's index.) Distinct slots per job: no mutex.
+	arenas.resize(config.numArenas);
+	eventCallbackInfos.resize(config.numArenas);
+	eventTrackers.resize(config.numArenas);
+	userInfos.resize(config.numArenas);
+	rewards.resize(config.numArenas);
+	terminalConditions.resize(config.numArenas);
+	obsBuilders.resize(config.numArenas);
+	actionParsers.resize(config.numArenas);
+	stateSetters.resize(config.numArenas);
+
 	auto fnCreateArenas = [&](int idx) {
 		auto createResult = config.envCreateFn(idx);
 		auto arena = createResult.arena;
 
-		appendMutex.lock();
-		{
-			arenas.push_back(arena);
+		arenas[idx] = arena;
 
-			auto userInfo = new CallbackUserInfo();
-			userInfo->arena = arena;
-			userInfo->arenaIdx = idx;
-			userInfo->envSet = this;
-			eventCallbackInfos.push_back(userInfo);
-			arena->SetCarBumpCallback(_BumpCallback, userInfo);
+		auto userInfo = new CallbackUserInfo();
+		userInfo->arena = arena;
+		userInfo->arenaIdx = idx;
+		userInfo->envSet = this;
+		eventCallbackInfos[idx] = userInfo;
+		arena->SetCarBumpCallback(_BumpCallback, userInfo);
 
-			if (arena->gameMode != GameMode::HEATSEEKER) {
-				GameEventTracker* tracker = new GameEventTracker({});
-				eventTrackers.push_back(tracker);
+		if (arena->gameMode != GameMode::HEATSEEKER) {
+			GameEventTracker* tracker = new GameEventTracker({});
+			eventTrackers[idx] = tracker;
 
-				tracker->SetShotCallback(_ShotEventCallback, userInfo);
-				tracker->SetGoalCallback(_GoalEventCallback, userInfo);
-				tracker->SetSaveCallback(_SaveEventCallback, userInfo);
-			} else {
-				// eventCallbackInfos already got this arena's userInfo above (one per arena);
-				// heatseeker just has no GameEventTracker. Pushing again here would desync the
-				// vector from arenas/eventTrackers.
-				eventTrackers.push_back(NULL);
-			}
-
-			userInfos.push_back(createResult.userInfo);
-
-			rewards.push_back(createResult.rewards);
-			terminalConditions.push_back(createResult.terminalConditions);
-			obsBuilders.push_back(createResult.obsBuilder);
-			actionParsers.push_back(createResult.actionParser);
-			stateSetters.push_back(createResult.stateSetter);
+			tracker->SetShotCallback(_ShotEventCallback, userInfo);
+			tracker->SetGoalCallback(_GoalEventCallback, userInfo);
+			tracker->SetSaveCallback(_SaveEventCallback, userInfo);
+		} else {
+			// Heatseeker has no GameEventTracker; the slot stays NULL so the vector
+			// keeps its 1:1 alignment with arenas/eventCallbackInfos.
+			eventTrackers[idx] = NULL;
 		}
-		appendMutex.unlock();
+
+		userInfos[idx] = createResult.userInfo;
+
+		rewards[idx] = createResult.rewards;
+		terminalConditions[idx] = createResult.terminalConditions;
+		obsBuilders[idx] = createResult.obsBuilder;
+		actionParsers[idx] = createResult.actionParser;
+		stateSetters[idx] = createResult.stateSetter;
 	};
 	g_ThreadPool.StartBatchedJobs(fnCreateArenas, config.numArenas, false);
 
@@ -281,10 +292,17 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 
 void RLGC::EnvSet::ResetArena(int index) {
 	stateSetters[index]->ResetArena(arenas[index]);
-	GameState newState = GameState(arenas[index]);
-	state.gameStates[index] = newState;
 
-	newState.userInfo = userInfos[index];
+	// The dead episode's final controls would otherwise keep driving the first
+	// actionDelay ticks of the new one (StepFirstHalf steps before new actions are
+	// set), while the reset obs advertises prevAction = 0 — including a phantom
+	// jump/flip consumed at spawn whenever the old episode died holding jump.
+	for (Car* car : arenas[index]->_cars)
+		car->controls = {};
+
+	GameState newState = GameState(arenas[index]);
+	newState.userInfo = userInfos[index]; // must be set before the copy below or the live state loses it
+	state.gameStates[index] = newState;
 
 	// Update event tracker
 	if (eventTrackers[index])

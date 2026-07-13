@@ -230,6 +230,11 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 				gated.index_copy_(0, idx, inBand);
 				maskF = gated;
 				lastRhoGateFrac = inBand.mean().item<float>();
+			} else {
+				// Too few eligible rows to estimate the band quantiles: fail CLOSED
+				// (steer nothing) — the gate's contract is "steer ONLY in-band rows"
+				maskF = torch::zeros_like(maskF);
+				lastRhoGateFrac = 0;
 			}
 		}
 
@@ -259,7 +264,9 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 		// Account for action masking in entropy
 		// We will effectively narrow the entropy to the scope of the valid actions
 		// This way states with more masked actions don't just have inherently lower entropy
-		entropy /= actionMasks.to(torch::kFloat32).sum(-1).log();
+		// clamp_min(2): a single-valid-action row would divide by log(1) = 0 (its true
+		// entropy is ~0 anyway, so log(2) keeps it finite without changing the semantics)
+		entropy /= actionMasks.to(torch::kFloat32).sum(-1).clamp_min(2).log();
 	} else {
 		entropy /= logf(actionMasks.size(-1));
 	}
@@ -308,9 +315,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto batchPracticeMask = batch.practiceMask; // undefined unless steering enabled
 			auto batchAdvantages = batch.advantages;
 
-			auto fnRunMinibatch = [&](int start, int stop) {
+			// May exceed config.batchSize: with overbatching (default on) the final batch
+			// of each epoch is extended with the whole-episode collection overshoot. The
+			// minibatch loop below must cover ALL of it, and batchSizeRatio must divide by
+			// the ACTUAL size so the accumulated gradient is the exact mean over the
+			// (possibly larger) batch — otherwise the overshoot rows are silently dropped.
+			const int64_t curBatchSize = batch.states.size(0);
 
-				float batchSizeRatio = (stop - start) / (float)config.batchSize;
+			auto fnRunMinibatch = [&](int64_t start, int64_t stop) {
+
+				float batchSizeRatio = (stop - start) / (float)curBatchSize;
 
 				// Send everything to the device and enforce correct shapes
 				auto acts = batchActs.slice(0, start, stop).to(device, true, true);
@@ -363,7 +377,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
 						avgGuidingLoss.Add(guidingLoss.detach().cpu().item<float>());
-						guidingLoss = guidingLoss * config.guidingStrength;
+						// batchSizeRatio keeps gradient accumulation identical to a full-batch
+						// pass; without it the accumulated guiding gradient scales with the
+						// minibatch count (effective strength would depend on miniBatchSize)
+						guidingLoss = guidingLoss * config.guidingStrength * batchSizeRatio;
 						ppoLoss = ppoLoss + guidingLoss;
 					}
 				}
@@ -508,11 +525,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			
 			if (device.is_cpu()) {
 				// Just run one minibatch
-				fnRunMinibatch(0, config.batchSize);
+				fnRunMinibatch(0, curBatchSize);
 			} else {
-				for (int mbs = 0; mbs < config.batchSize; mbs += config.miniBatchSize) {
-					int start = mbs;
-					int stop = start + config.miniBatchSize;
+				for (int64_t mbs = 0; mbs < curBatchSize; mbs += config.miniBatchSize) {
+					int64_t start = mbs;
+					int64_t stop = RS_MIN(start + config.miniBatchSize, curBatchSize);
 					fnRunMinibatch(start, stop);
 				}
 			}

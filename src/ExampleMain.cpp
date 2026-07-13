@@ -499,8 +499,9 @@ int main(int argc, char* argv[]) {
 	//     as hard-but-plausible for scoring (per-batch quantile band). A few more arenas are
 	//     unsteered controls for the causal engagement gate.
 	//   - Guards, all automatic: engagement gate (steered must out-engage controls), rating
-	//     drawdown guard (Rating/1v1 falling >25 below its slow EMA LATCHES steering off for
-	//     the process), ratio/KL logs, branch backup + quarantine ritual.
+	//     drawdown guard (Rating/1v1 falling >75 below its slow EMA LATCHES steering off -
+	//     the LearnerConfig default; 75 sits outside the +-30-50 noise band), ratio/KL logs,
+	//     branch backup + quarantine ritual.
 	//   - Watch: Steer/* panels (Alpha, Engagement Steered/Control/Match, Gate Delta EMA,
 	//     RhoGate In-Band Frac, Rating Guard Tripped), aerial/contest metrics, Rating slope.
 	// Post-mortems + stage-2 escalation path: analysis/probes/STEERED_PRACTICE.md.

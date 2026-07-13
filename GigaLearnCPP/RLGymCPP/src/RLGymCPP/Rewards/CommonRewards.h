@@ -299,7 +299,7 @@ namespace RLGC {
 		constexpr static float BALL_FULL_Z = 1450;           // full height credit at/above
 		constexpr static float MAX_CREDIT_AIR_TIME = 1.75f;  // seconds of flight for full air credit
 		constexpr static float FULL_CREDIT_DELTA_V = 500;    // uu/s of ball delta-v for full credit
-		constexpr static int REFIRE_COOLDOWN_STEPS = 12;     // ~0.8s at tickSkip 8
+		constexpr static int REFIRE_COOLDOWN_STEPS = 24;     // ~0.8s at tickSkip 4 (30Hz steps); re-derive if tickSkip changes
 
 		std::vector<int> stepsSincePay; // per player.index; per-arena instance, so safe
 
