@@ -261,6 +261,20 @@ document.querySelector("details").addEventListener("toggle", loadAudit);
 document.querySelectorAll("button[data-action]").forEach(b =>
   b.onclick = () => act(b.dataset.action));
 
+// A hidden tab keeps its SSE streams open while the browser freezes the page,
+// so data piles up until the renderer dies (white tab). Pause streams while
+// hidden; resume whatever was streaming when the tab wakes.
+let resumeLog = false;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (logES) { resumeLog = true; $("logbtn").onclick(); }   // close stream
+    if (jobES) { jobES.close(); jobES = null; $("jobstate").textContent = "paused (tab hidden)"; }
+  } else {
+    refresh();
+    if (resumeLog) { resumeLog = false; $("logbtn").onclick(); } // reopen stream
+  }
+});
+
 refresh();
 setInterval(refresh, 15000);
 </script>

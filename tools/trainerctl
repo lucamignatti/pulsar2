@@ -195,7 +195,7 @@ Description=Pulsar visualizer web server (RocketSimVisWeb)
 After=network.target
 
 [Service]
-ExecStart=$VIZ_PY $VIZ_DIR/server.py
+ExecStart=$VIZ_PY -u $VIZ_DIR/server.py
 WorkingDirectory=$VIZ_DIR
 Restart=always
 RestartSec=3
