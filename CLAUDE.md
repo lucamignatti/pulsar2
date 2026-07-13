@@ -54,9 +54,10 @@ Key operational facts:
   pressure are environmental and expected occasionally — the system is designed
   to make them cheap, not impossible.
 - **KNOWN RESIDUAL GAP — corrupt-but-loadable checkpoints** (2026-07-13
-  incident): a GPU lockup (kernel `Xid 8`) degraded for ~an hour before
-  crashing; some checkpoints from that window were truncated (caught by the
-  fallback) but others **loaded fine with finite, sane-magnitude weights and a
+  incident): a GPU lockup (kernel `Xid 8`, "GPU is probably locked") corrupted
+  device-to-host reads during its ~50s onset (saves are ~6s apart at tsPerSave
+  1M); most checkpoints from that window were truncated (caught by the
+  fallback) but at least one **loaded fine with finite, sane-magnitude weights and a
   behaviorally destroyed policy** (1/10 kickoff touches, 89% aimless air time).
   No structural check can catch these. Detection: the in-run rating guard trips
   (it did), and offline a 2-minute kickoff test
