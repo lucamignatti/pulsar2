@@ -53,6 +53,23 @@ Key operational facts:
   (display-attached GPU watchdog) and OOMs under desktop-graphics memory
   pressure are environmental and expected occasionally — the system is designed
   to make them cheap, not impossible.
+- **KNOWN RESIDUAL GAP — corrupt-but-loadable checkpoints** (2026-07-13
+  incident): a GPU lockup (kernel `Xid 8`) degraded for ~an hour before
+  crashing; some checkpoints from that window were truncated (caught by the
+  fallback) but others **loaded fine with finite, sane-magnitude weights and a
+  behaviorally destroyed policy** (1/10 kickoff touches, 89% aimless air time).
+  No structural check can catch these. Detection: the in-run rating guard trips
+  (it did), and offline a 2-minute kickoff test
+  (`analysis/probes` — healthy ≈ 10/10 touches, median ~3.4s) is definitive.
+  Recovery recipe (used successfully): find the newest HEALTHY
+  `policy_versions/<ts>` by kickoff-testing backwards; assemble a hybrid
+  checkpoint dir = healthy `POLICY.lt`+`SHARED_HEAD.lt` from the version,
+  aux nets (+their optims) from the newest healthy full backup, current
+  `RUNNING_STATS.json`; omit `POLICY_OPTIM`/`SHARED_HEAD_OPTIM` (they reset
+  gracefully); quarantine every checkpoint/version from the damaged lineage
+  first so the loader can't prefer them. Planned proper fix: a boot-time
+  behavioral sanity eval that treats a catastrophically-losing checkpoint as
+  corrupt and falls back automatically.
 - **Checkpoints rotate** (`checkpointsToKeep=8`, ~1M steps apart at full speed —
   a ~10-minute window). Always copy a checkpoint dir out before reading it, and
   retry on next-newest if files vanish mid-copy.
