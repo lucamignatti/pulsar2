@@ -76,3 +76,4 @@ run_logs/
 # probe analysis: datasets and checkpoint caches are large and regenerable
 analysis/probes/data/
 __pycache__/
+analysis/probes/wandb/

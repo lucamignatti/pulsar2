@@ -11,16 +11,21 @@ at any moment - we pick the newest, COPY it out, and re-verify the copy is compl
 
 Architecture expected (from src/ExampleMain.cpp + PPOLearner.cpp, verified against
 tensor shapes at load time):
-  shared_head: obs(109) -> [Linear 512, LN, LeakyReLU] x2            (trunk)
+  shared_head: obs(OBS) -> [Linear 512, LN, LeakyReLU] x2            (trunk)
   policy:      512 -> [Linear 512, LN, LeakyReLU] x3 -> Linear 90    (DefaultAction table)
   critic:      512 -> [Linear 512, LN, LeakyReLU] x3 -> Linear 1
   reach_phi:   trunk(512)+onehot(90)=602 -> [Linear 256, LN, LeakyReLU] x2 -> Linear 128
   reach_psi_*: 6 -> [Linear 256, LN, LeakyReLU] x2 -> Linear 128
+OBS is lineage-dependent and AUTO-DETECTED from SHARED_HEAD's first Linear:
+  109 = 3.1 lineage (AdvancedObs, 1v1) | 230 = 4.0 lineage (AdvancedObsPadded(3),
+  51 header + 6x29 player slots + 5 presence flags - ball@0 / self@51 offsets are
+  IDENTICAL to AdvancedObs, so landing sims and spatial readers work unchanged).
 Obs are NOT normalized (LearnerConfig.standardizeObs defaults to false and
 ExampleMain never sets it), so raw AdvancedObs floats feed the trunk directly.
 """
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -28,22 +33,35 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[2]
-CHECKPOINT_ROOT = REPO / "build" / "checkpoints_3.1"
+# Root preference: $PULSAR_CKPT_ROOT > the 4.0 offline copy (scp'd from the training
+# box; already safe to read in place, but we still copy-first out of habit/uniformity)
+# > the 3.1 live folder (older setups).
+def _default_root() -> Path:
+    if env := os.environ.get("PULSAR_CKPT_ROOT"):
+        return Path(env)
+    for cand in ["checkpoints_4.0-copy", "checkpoints_4.0", "checkpoints_3.1"]:
+        if (REPO / "build" / cand).is_dir():
+            return REPO / "build" / cand
+    return REPO / "build" / "checkpoints_3.1"
+
+CHECKPOINT_ROOT = _default_root()
 
 MODEL_FILES = ["SHARED_HEAD", "POLICY", "CRITIC", "REACH_PHI", "REACH_PSI_BALL", "REACH_PSI_CAR"]
 
-EXPECTED_SHAPES = {
-    "SHARED_HEAD": [(512, 109), (512,), (512,), (512,), (512, 512), (512,), (512,), (512,)],
-    "POLICY": [(512, 512), (512,), (512,), (512,)] * 3 + [(90, 512), (90,)],
-    "CRITIC": [(512, 512), (512,), (512,), (512,)] * 3 + [(1, 512), (1,)],
-    "REACH_PHI": [(256, 602), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
-    "REACH_PSI_BALL": [(256, 6), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
-    "REACH_PSI_CAR": [(256, 6), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
-}
+def expected_shapes(obs_size: int) -> dict:
+    return {
+        "SHARED_HEAD": [(512, obs_size), (512,), (512,), (512,), (512, 512), (512,), (512,), (512,)],
+        "POLICY": [(512, 512), (512,), (512,), (512,)] * 3 + [(90, 512), (90,)],
+        "CRITIC": [(512, 512), (512,), (512,), (512,)] * 3 + [(1, 512), (1,)],
+        "REACH_PHI": [(256, 602), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
+        "REACH_PSI_BALL": [(256, 6), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
+        "REACH_PSI_CAR": [(256, 6), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
+    }
 
 
-def list_checkpoints(root: Path = CHECKPOINT_ROOT):
+def list_checkpoints(root: Path = None):
     """Numeric checkpoint dirs, newest (highest timestep) first."""
+    root = root or CHECKPOINT_ROOT
     dirs = [d for d in root.iterdir() if d.is_dir() and d.name.isdigit()]
     return sorted(dirs, key=lambda d: int(d.name), reverse=True)
 
@@ -109,14 +127,21 @@ def rebuild_sequential(jit_module) -> torch.nn.Sequential:
 
 def load_models(ckpt_dir: Path, names=None) -> dict[str, torch.nn.Sequential]:
     """names: subset of MODEL_FILES to load (policy_versions snapshots only carry
-    SHARED_HEAD + POLICY)."""
+    SHARED_HEAD + POLICY). The lineage's obs width is auto-detected from
+    SHARED_HEAD's first Linear (109 = 3.1 AdvancedObs, 230 = 4.0 AdvancedObsPadded)."""
+    names = list(names or MODEL_FILES)
+    # Detect obs width first so every shape check uses the right lineage
+    head = torch.jit.load(str(ckpt_dir / "SHARED_HEAD.lt"), map_location="cpu")
+    obs_size = dict(head.named_parameters())["0.weight"].shape[1]
+    shapes_for = expected_shapes(obs_size)
+
     models = {}
-    for name in (names or MODEL_FILES):
+    for name in names:
         jit_mod = torch.jit.load(str(ckpt_dir / f"{name}.lt"), map_location="cpu")
 
         shapes = [tuple(p.shape) for _, p in jit_mod.named_parameters()]
-        if shapes != EXPECTED_SHAPES[name]:
-            raise RuntimeError(f"{name}: shape mismatch\n got      {shapes}\n expected {EXPECTED_SHAPES[name]}")
+        if shapes != shapes_for[name]:
+            raise RuntimeError(f"{name}: shape mismatch\n got      {shapes}\n expected {shapes_for[name]}")
 
         # The archive stores no scripted forward and no module-type metadata (generic
         # mangled '__torch__.Module' children), so the rebuild is verified structurally:
@@ -150,6 +175,7 @@ class PulsarPolicy:
         self.policy = models["POLICY"]
         self.critic = models.get("CRITIC")
         self.phi = models.get("REACH_PHI")
+        self.obs_size = self.trunk[0].in_features  # 109 = 3.1, 230 = 4.0 padded
         # trunk = [Lin, LN, Act, Lin, LN, Act]; h1 taps after index 2
         self.trunk_block1 = self.trunk[:3]
         self.trunk_block2 = self.trunk[3:]
@@ -206,7 +232,7 @@ if __name__ == "__main__":
         print(f"  {name:16s} {arch:42s} {n_params:>10,} params")
 
     pol = PulsarPolicy(models)
-    obs = torch.randn(8, 109)
+    obs = torch.randn(8, pol.obs_size)
     h1, h2 = pol.trunk_forward(obs)
     mask = torch.ones(8, 90, dtype=torch.uint8)
     probs = pol.action_probs(h2, mask)

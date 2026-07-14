@@ -47,9 +47,12 @@ static constexpr int MAX_PLAYERS_PER_TEAM = 3;
 // plays 2v2/3v3 eval matches and wandb gains Rating/2v2 + Rating/3v3; its arena 0 is
 // always 1v1, keeping Rating/1v1 continuous across the phase switch (it is also the
 // guard key: the Learner tracks arena 0's mode). Keep the fractions + practiceArenaFrac
-// well under 1 so a healthy 1v1 match population remains for steering derivation (which
-// currently contrasts trunk rows from ALL match arenas — team rows included after the
-// flip; watch Steer/* if that mix degrades the direction).
+// well under 1 so a healthy 1v1 match population remains for steering derivation.
+// 2026-07-14: the derivation EXCLUDES team-arena rows (steerPractice group 3) - the
+// self-only possession labels scored a teammate's race win as "nobody got it", and the
+// polluted pool coincided with the gate duty-cycling around zero all PHASE B (wandb).
+// Team arenas get their own correctly-team-labeled Steer/PossWin TeamMatch panel
+// instead: measurement first, team-mode steering only as its own later experiment.
 static constexpr float PHASE_B_FRAC_2V2 = 0.20f;
 static constexpr float PHASE_B_FRAC_3V3 = 0.15f;
 

@@ -6,8 +6,11 @@ Replicates the trainer's env loop (EnvSet.cpp):
     set new controls, 1 more tick, then build obs (whose prevAction = the just-set action).
   - stochastic sampling with DefaultAction masking (InferActionsFromModels parity)
   - terminals: goal scored, 10s without any ball touch (NoTouchCondition(10)), 30s cap
-  - reset mix: 25% kickoff / 75% RandomState(randBallSpeed, randCarSpeed, carsOnGround=false)
-    (the training mix minus the drill/near-ball setters; RandomState gives airborne balls)
+  - reset mix: TRAINER PARITY (ExampleMain MakeEnv): 35% BallNearCarState(600,900) /
+    20% AirDrillState / 15% kickoff / 30% RandomState(randBall, randCar, air).
+    The earlier kickoff+random-only mix starved ball interactions ~10x vs the trainer
+    (touch ratio 0.001 vs 0.006 live), which left the v2 possession labeler with
+    almost no resolved races - the drill setters are where contests concentrate.
 
 Per player-frame we store: raw obs (109), trunk hidden 1 + 2 (512 each, f16), the
 reach_phi embedding of (trunk out, sampled action) (128, f16), the sampled action,
@@ -28,21 +31,131 @@ import numpy as np
 import torch
 
 import RocketSim as rs
-from advanced_obs import (ACTION_TABLE, OBS_SIZE, build_obs, build_pad_index_map,
-                          get_action_mask)
+from advanced_obs import (ACTION_TABLE, OBS_SIZE, OBS_SIZE_PADDED, build_obs,
+                          build_obs_padded, build_pad_index_map, get_action_mask)
 from load_checkpoint import load_latest
 
 SEED = 1234
 NUM_ARENAS = 16
+
+# Obs width of the checkpoint being analyzed: 109 (3.1 AdvancedObs) or 230
+# (4.0 AdvancedObsPadded). Set from PulsarPolicy.obs_size before building envs.
+_OBS_SIZE = OBS_SIZE
+
+
+def set_obs_size(n: int):
+    global _OBS_SIZE
+    assert n in (OBS_SIZE, OBS_SIZE_PADDED), n
+    _OBS_SIZE = n
+
+
+def cur_obs_size() -> int:
+    return _OBS_SIZE
 TARGET_FRAMES = int(os.environ.get("PROBE_FRAMES", 100_000))  # player-frames (2 per arena-step)
 
 TICK_SKIP = 4
 ACTION_DELAY = 3
 NO_TOUCH_TERMINAL_S = 10.0
 EPISODE_CAP_S = 30.0
-KICKOFF_PROB = 0.25
+# Trainer-parity reset mix (ExampleMain MakeEnv): cumulative weights over
+# (ball_near_car, air_drill, kickoff, random)
+RESET_MIX = [(0.35, "near"), (0.55, "air"), (0.70, "kickoff"), (1.01, "random")]
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+
+SIDE_WALL_X, BACK_WALL_Y = 4096.0, 5120.0
+BALL_RADIUS = 92.75
+
+
+def _face_ball_yaw_rotmat(car_pos, ball_pos):
+    to_ball = ball_pos - car_pos
+    yaw = float(np.arctan2(to_ball[1], to_ball[0]))
+    return rs.Angle(yaw, 0, 0).as_rot_mat()
+
+
+def set_ball_near_car_state(arena, rng, min_dist=600.0, max_dist=900.0):
+    """Port of the team-aware BallNearCarState's 1v1 path (both cars = contesters in
+    the ring, on-ground, at rest, facing the ball; the ground-touch bootstrap state)."""
+    arena.reset_kickoff(seed=int(rng.integers(0, 2**30)))
+
+    bs = rs.BallState()
+    ball = np.array([rng.uniform(-2800, 2800), rng.uniform(-3800, 3800), BALL_RADIUS])
+    bs.pos = rs.Vec(*ball)
+    arena.ball.set_state(bs)
+
+    clamp_x, clamp_y = SIDE_WALL_X - 300, BACK_WALL_Y - 300
+    placed = []
+    for car in arena.get_cars():
+        pos = None
+        for _ in range(16):
+            theta = rng.uniform(0, 2 * np.pi)
+            dist = rng.uniform(min_dist, max_dist)
+            cand = ball + np.array([np.cos(theta) * dist, np.sin(theta) * dist, 0.0])
+            cand[2] = 17.0
+            if abs(cand[0]) > clamp_x or abs(cand[1]) > clamp_y:
+                continue
+            if any(np.linalg.norm(cand - o) < 300 for o in placed):
+                continue
+            pos = cand
+            break
+        if pos is None:
+            pos = np.array([np.clip(ball[0] + min_dist, -clamp_x, clamp_x),
+                            np.clip(ball[1], -clamp_y, clamp_y), 17.0])
+        placed.append(pos)
+
+        cs = rs.CarState()
+        cs.pos = rs.Vec(*pos)
+        cs.rot_mat = _face_ball_yaw_rotmat(pos, ball)
+        cs.boost = rng.uniform(0, 100)
+        car.set_state(cs)
+
+
+def set_air_drill_state(arena, rng):
+    """Port of the team-aware AirDrillState's 1v1 path (both cars airborne, climbing
+    at an overhead ball, nose on it, boost-fed; the reverse-curriculum aerial state)."""
+    arena.reset_kickoff(seed=int(rng.integers(0, 2**30)))
+
+    bs = rs.BallState()
+    ball = np.array([rng.uniform(-2600, 2600), rng.uniform(-3400, 3400), rng.uniform(900, 1500)])
+    bs.pos = rs.Vec(*ball)
+    bs.vel = rs.Vec(rng.uniform(-200, 200), rng.uniform(-200, 200), rng.uniform(-100, 100))
+    arena.ball.set_state(bs)
+
+    clamp_x, clamp_y = SIDE_WALL_X - 300, BACK_WALL_Y - 300
+    placed = []
+    for car in arena.get_cars():
+        pos = None
+        for _ in range(16):
+            theta = rng.uniform(0, 2 * np.pi)
+            horiz = rng.uniform(350, 750)
+            cand = ball + np.array([np.cos(theta) * horiz, np.sin(theta) * horiz, 0.0])
+            cand[2] = max(250.0, ball[2] - rng.uniform(400, 900))
+            if abs(cand[0]) > clamp_x or abs(cand[1]) > clamp_y:
+                continue
+            if any(np.linalg.norm(cand - o) < 350 for o in placed):
+                continue
+            pos = cand
+            break
+        if pos is None:
+            pos = np.array([np.clip(ball[0] + 500, -clamp_x, clamp_x),
+                            np.clip(ball[1], -clamp_y, clamp_y), max(250.0, ball[2] - 600)])
+        placed.append(pos)
+
+        # RotMat::LookAt(toBall, world-up) parity
+        f = ball - pos
+        f = f / max(np.linalg.norm(f), 1e-9)
+        tr = np.cross([0.0, 0.0, 1.0], f)
+        u = np.cross(f, tr)
+        u = u / max(np.linalg.norm(u), 1e-9)
+        r = np.cross(u, f)
+        r = r / max(np.linalg.norm(r), 1e-9)
+
+        cs = rs.CarState()
+        cs.pos = rs.Vec(*pos)
+        cs.rot_mat = rs.RotMat(rs.Vec(*f), rs.Vec(*r), rs.Vec(*u))
+        cs.vel = rs.Vec(*(f * rng.uniform(700, 1400)))
+        cs.boost = rng.uniform(45, 100)
+        car.set_state(cs)
 
 
 def set_random_state(arena, rng):
@@ -109,8 +222,14 @@ class ArenaEnv:
         self.goal_scored = True
 
     def reset(self, episode_counter=[0]):
-        self.is_kickoff = self.rng.random() < KICKOFF_PROB
-        if self.is_kickoff:
+        u = self.rng.random()
+        kind = next(k for w, k in RESET_MIX if u < w)
+        self.is_kickoff = kind == "kickoff"
+        if kind == "near":
+            set_ball_near_car_state(self.arena, self.rng)
+        elif kind == "air":
+            set_air_drill_state(self.arena, self.rng)
+        elif kind == "kickoff":
             self.arena.reset_kickoff(seed=int(self.rng.integers(0, 2**30)))
         else:
             set_random_state(self.arena, self.rng)
@@ -139,10 +258,18 @@ class ArenaEnv:
         states = [car.get_state() for car in self.cars]
         active, cooldown = self.pad_states()
 
-        obs = np.stack([
-            build_obs(states[0], states[1], ball, self.prev_actions[0], active, cooldown, False),
-            build_obs(states[1], states[0], ball, self.prev_actions[1], active, cooldown, True),
-        ])
+        if _OBS_SIZE == OBS_SIZE_PADDED:  # 4.0 padded lineage: 1v1 = empty teammate slots
+            obs = np.stack([
+                build_obs_padded(states[0], [], [states[1]], ball, self.prev_actions[0],
+                                 active, cooldown, False, self.rng),
+                build_obs_padded(states[1], [], [states[0]], ball, self.prev_actions[1],
+                                 active, cooldown, True, self.rng),
+            ])
+        else:
+            obs = np.stack([
+                build_obs(states[0], states[1], ball, self.prev_actions[0], active, cooldown, False),
+                build_obs(states[1], states[0], ball, self.prev_actions[1], active, cooldown, True),
+            ])
         masks = np.stack([get_action_mask(states[0]), get_action_mask(states[1])])
 
         phys = np.concatenate([
@@ -186,13 +313,14 @@ def main():
 
     rs.init(str(Path(__file__).resolve().parents[2] / "build" / "collision_meshes"))
     policy, ckpt_dir = load_latest()
-    print(f"policy checkpoint: {ckpt_dir.name}")
+    set_obs_size(policy.obs_size)
+    print(f"policy checkpoint: {ckpt_dir.name} (obs {policy.obs_size})")
 
     envs = [ArenaEnv(i, np.random.default_rng(SEED + 1000 + i)) for i in range(NUM_ARENAS)]
 
     n = TARGET_FRAMES
     out = {
-        "obs": np.empty((n, OBS_SIZE), np.float32),
+        "obs": np.empty((n, cur_obs_size()), np.float32),
         "h1": np.empty((n, 512), np.float16),
         "h2": np.empty((n, 512), np.float16),
         "phi": np.empty((n, 128), np.float16),

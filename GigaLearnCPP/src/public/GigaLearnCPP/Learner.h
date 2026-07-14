@@ -72,6 +72,15 @@ namespace GGL {
 		float steerRatingEMA = NAN;
 		bool steerRatingTripped = false;
 
+		// Churn-telemetry archive of the live steering direction (STEERING_ROADMAP
+		// "continuous items"): the current EMA vector + sigma are snapshotted into every
+		// checkpoint's RUNNING_STATS ("steer_vec"/"steer_sigma", ~5KB of JSON) so offline
+		// analysis gets the staleness curve for free and deployment can steer at inference.
+		// Save-only, NEVER loaded: the direction re-derives within one iteration of any
+		// restart by design (a stale vector must not outlive its trunk).
+		std::vector<float> steerVecSave;
+		float steerSigmaSave = 0;
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 

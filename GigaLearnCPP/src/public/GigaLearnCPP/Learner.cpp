@@ -278,6 +278,12 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["steer_rating_ema"] = steerRatingEMA;
 	j["steer_rating_tripped"] = steerRatingTripped;
 
+	// Churn-telemetry vector archive (save-only; see Learner.h steerVecSave)
+	if (!steerVecSave.empty()) {
+		j["steer_vec"] = steerVecSave;
+		j["steer_sigma"] = steerSigmaSave;
+	}
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -884,6 +890,10 @@ void GGL::Learner::Start() {
 			FList achievedCarBall;              // Car-local normalized ball pos+vel, 6/row
 			FList achievedCarState;             // Canonical normalized CAR pos+vel, 6/row (car proposer)
 			std::vector<uint8_t> touched, oppTouched; // Per-step touch flags (gate validity metric)
+			// Own-TEAM touch (self OR teammate) - lets the steering labeler score team-arena
+			// (group 3) readings by TEAM possession outcome, where self-only `touched` would
+			// mislabel a teammate's race win as "nobody got it"
+			std::vector<uint8_t> teamTouched;
 			FList gatedPos;                     // Positive parts of the gated reward components
 			// Built at episode finalize by the HER relabel:
 			FList carHerGoals, ballHerGoals;
@@ -936,6 +946,7 @@ void GGL::Learner::Start() {
 				achievedCarState.clear();
 				touched.clear();
 				oppTouched.clear();
+				teamTouched.clear();
 				gatedPos.clear();
 				carHerGoals.clear();
 				ballHerGoals.clear();
@@ -967,6 +978,7 @@ void GGL::Learner::Start() {
 					oppActionMasks.reserve(rows * numActions);
 					touched.reserve(rows);
 					oppTouched.reserve(rows);
+					teamTouched.reserve(rows);
 					gatedPos.reserve(rows);
 					carHerGoals.reserve(rows * 6);
 					ballHerGoals.reserve(rows * 6);
@@ -1008,6 +1020,7 @@ void GGL::Learner::Start() {
 				oppActionMasks += other.oppActionMasks;
 				touched += other.touched;
 				oppTouched += other.oppTouched;
+				teamTouched += other.teamTouched;
 				gatedPos += other.gatedPos;
 				carHerGoals += other.carHerGoals;
 				ballHerGoals += other.ballHerGoals;
@@ -1036,6 +1049,7 @@ void GGL::Learner::Start() {
 					RG_ASSERT(goalRews.size() == n);
 				if (!touched.empty()) {
 					RG_ASSERT(touched.size() == n && oppTouched.size() == n && gatedPos.size() == n);
+					RG_ASSERT(teamTouched.size() == n);
 					RG_ASSERT(carHerGoals.size() == n * 6 && ballHerGoals.size() == n * 6 && ballMoved.size() == n);
 				}
 				if (!proposerCurBall.empty())
@@ -1462,7 +1476,8 @@ void GGL::Learner::Start() {
 			if (n == 0 || groups.size() != (size_t)n)
 				return;
 			// v2 possession labels need the reach buffers' touch flags
-			if (combinedTraj.touched.size() != (size_t)n || combinedTraj.oppTouched.size() != (size_t)n)
+			if (combinedTraj.touched.size() != (size_t)n || combinedTraj.oppTouched.size() != (size_t)n
+				|| combinedTraj.teamTouched.size() != (size_t)n)
 				return;
 
 			// Obs layout (AdvancedObs, 1v1), team-canonical frame - the field is symmetric under
@@ -1492,10 +1507,7 @@ void GGL::Learner::Start() {
 					if (!combinedTraj.terminals[r])
 						continue;
 					for (int64_t i = epStart; i <= r; i++)
-						// Group 3 (team-match rows, PHASE B) is excluded up front: their
-						// possession labels are blind to teammate touches (see the
-						// arenaSteerGroup comment), and feas/possWon below only size 3
-						if (groups[i] != 3 && fnObs(i, BALL_POS + 2) * POS_SCALE > ARM_Z)
+						if (fnObs(i, BALL_POS + 2) * POS_SCALE > ARM_Z)
 							cand.push_back({ i, r });
 					epStart = r + 1;
 				}
@@ -1560,7 +1572,7 @@ void GGL::Learner::Start() {
 			std::vector<Labeled> pool; // direction contrast: WON vs NONE. LOST (tried, got
 			                           // beaten) is excluded - punishing lost races would
 			                           // train the hesitation right back in.
-			int feas[3] = {}, possWon[3] = {};
+			int feas[4] = {}, possWon[4] = {};
 			const float raceMarginRows = 0.5f * stepsPerSec; // grace past touchdown for the race
 			for (auto& rd : readings) {
 				if (!rd.ok)
@@ -1575,10 +1587,15 @@ void GGL::Learner::Start() {
 					continue;
 				feas[rd.group]++;
 
+				// Group 3 (TEAM match rows): score the race by TEAM possession - a
+				// teammate's first touch is a WIN, not "nobody got it". Self-only labels
+				// would count good second-man play as declined; that pollution is why
+				// group 3 stays OUT of the direction pool below regardless.
+				const auto& wonFlags = (rd.group == 3) ? combinedTraj.teamTouched : combinedTraj.touched;
 				int outcome = 0; // 0 none, 1 won, 2 lost
 				int64_t scanEnd = RS_MIN(rd.epEnd, tdRow + (int64_t)raceMarginRows);
 				for (int64_t rr = rd.row + 1; rr <= scanEnd; rr++) {
-					if (combinedTraj.touched[rr]) { outcome = 1; break; }
+					if (wonFlags[rr]) { outcome = 1; break; }
 					if (combinedTraj.oppTouched[rr]) { outcome = 2; break; }
 				}
 
@@ -1588,8 +1605,8 @@ void GGL::Learner::Start() {
 					pool.push_back({ rd.row, outcome == 1, dNow, rd.land[2] });
 			}
 
-			const char* groupNames[3] = { "Match", "Steered", "Control" };
-			for (int g = 0; g < 3; g++)
+			const char* groupNames[4] = { "Match", "Steered", "Control", "TeamMatch" };
+			for (int g = 0; g < 4; g++)
 				if (feas[g] >= 50)
 					report[std::string("Steer/PossWin ") + groupNames[g]] = (float)possWon[g] / feas[g];
 
@@ -1725,6 +1742,12 @@ void GGL::Learner::Start() {
 			ppo->SetSteering(steerVecEMA, steerSigmaEMA, active ? config.steering.alpha : 0.f);
 			steerLoaded = true;
 			steerPendingApply = false;
+
+			// Snapshot for the checkpoint's churn-telemetry archive (Save() runs on this
+			// thread at the same safe point, so no synchronization is needed)
+			auto vec = steerVecEMA.contiguous();
+			steerVecSave.assign(vec.data_ptr<float>(), vec.data_ptr<float>() + vec.numel());
+			steerSigmaSave = steerSigmaEMA;
 		};
 
 		std::jthread collectThread;
@@ -2058,6 +2081,7 @@ void GGL::Learner::Start() {
 								auto& player = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[newPlayerIdx]];
 								traj.touched.push_back(player.ballTouchedStep);
 								traj.oppTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 1 : 0][arenaIdx]);
+								traj.teamTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 0 : 1][arenaIdx]);
 
 								// Deliberate-practice DRILL per-row tagging (Stage 3): only the
 								// PRACTICING team's rows get tagged - the opponent trains normally

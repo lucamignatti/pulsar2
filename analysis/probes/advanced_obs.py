@@ -202,6 +202,64 @@ def build_obs(car_state, opp_state, ball_state, prev_action: np.ndarray,
     return o
 
 
+# ---------------------------------------------------------------------------
+# AdvancedObsPadded (the 4.0 lineage): fixed 230-float obs for any team size up
+# to 3v3. Header + self block are byte-identical to AdvancedObs; then 2 teammate
+# slots + 3 opponent slots (29 floats each, all-zero when empty), then 5 presence
+# flags (1 = slot holds a real player). Real players are SHUFFLED across their
+# group's slots every build (AdvancedObsPadded.cpp parity) - pass an rng for
+# that; a fixed rng seed gives deterministic slot assignment.
+# ---------------------------------------------------------------------------
+MAX_PLAYERS_PER_TEAM = 3
+PLAYER_ELEMS = 29
+OBS_SIZE_PADDED = OBS_SIZE + PLAYER_ELEMS * (2 * MAX_PLAYERS_PER_TEAM - 2) \
+    + (2 * MAX_PLAYERS_PER_TEAM - 1)  # 109 + 29*4 + 5 = 230
+
+
+def build_obs_padded(car_state, teammate_states, opp_states, ball_state,
+                     prev_action: np.ndarray, pad_active: np.ndarray,
+                     pad_cooldown: np.ndarray, is_orange: bool,
+                     rng: np.random.Generator) -> np.ndarray:
+    """AdvancedObsPadded::BuildObs. teammate_states/opp_states: lists of CarState
+    (empty teammates in 1v1). Slot shuffling matches the C++ builder's behavior in
+    distribution (both draw uniform slot permutations)."""
+    inv = is_orange
+    ball = PhysSnap(ball_state, inv)
+
+    obs = []
+    obs += (ball.pos * POS_COEF).tolist()
+    obs += (ball.vel * VEL_COEF).tolist()
+    obs += (ball.ang_vel * ANG_VEL_COEF).tolist()
+    obs += prev_action.tolist()
+
+    active = pad_active[::-1] if inv else pad_active
+    cooldown = pad_cooldown[::-1] if inv else pad_cooldown
+    obs += np.where(active, 1.0, 1.0 / (1.0 + cooldown)).tolist()
+
+    obs += _player_obs(car_state, PhysSnap(car_state, inv), ball)
+
+    presence = []
+    for group, slot_count in ((teammate_states, MAX_PLAYERS_PER_TEAM - 1),
+                              (opp_states, MAX_PLAYERS_PER_TEAM)):
+        assert len(group) <= slot_count, f"{len(group)} players for {slot_count} slots"
+        slots = [None] * slot_count
+        order = rng.permutation(slot_count)
+        for i, st in enumerate(group):
+            slots[order[i]] = st
+        for st in slots:
+            if st is None:
+                obs += [0.0] * PLAYER_ELEMS
+                presence.append(0.0)
+            else:
+                obs += _player_obs(st, PhysSnap(st, inv), ball)
+                presence.append(1.0)
+    obs += presence
+
+    o = np.asarray(obs, dtype=np.float32)
+    assert o.shape == (OBS_SIZE_PADDED,), o.shape
+    return o
+
+
 if __name__ == "__main__":
     print(f"action table: {ACTION_TABLE.shape}, ground {GROUND_MASK.sum()}, air {AIR_MASK.sum()}, "
           f"jump {JUMP_MASK.sum()}, boost {BOOST_MASK.sum()}")
