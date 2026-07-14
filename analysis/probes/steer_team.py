@@ -350,9 +350,13 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
         # Per-row ACHIEVED-GOAL vectors in the reachability heads' exact normalization
         # (Learner.cpp fnAppendAchieved parity), derived from the canonical obs the
         # policy consumed: ball head = canonical ball pos/vel; car head = car-local
-        # ball pos/vel. These are the agent's own achieved-state trajectories.
+        # ball pos/vel; carstate = canonical CAR pos/vel (the proposer-era third
+        # stream - the candidate movement-frontier goal space). These are the agent's
+        # own achieved-state trajectories.
         rec["ach_ball"] = np.empty((n_rows, 6), np.float32)
         rec["ach_car"] = np.empty((n_rows, 6), np.float32)
+        rec["ach_carstate"] = np.empty((n_rows, 6), np.float32)
+        rec["action"] = np.empty(n_rows, np.int16)
     if want_states:
         rec["state_bank"] = np.empty((n_rows // npl + 1, 9 + npl * 17), np.float32)
     goals = 0
@@ -432,6 +436,12 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
                     # (+21..23, coef 1/2300) -> carLocalScale 2300
                     rec["ach_car"][row, 0:3] = o[51 + 18: 51 + 21] * 5000.0 / 2300.0
                     rec["ach_car"][row, 3:6] = o[51 + 21: 51 + 24]  # 2300/2300
+                    # self block canonical car pos (+0..2) and vel (+9..11)
+                    rec["ach_carstate"][row, 0] = o[51 + 0] * 5000.0 / 4096.0
+                    rec["ach_carstate"][row, 1] = o[51 + 1] * 5000.0 / 6000.0
+                    rec["ach_carstate"][row, 2] = o[51 + 2] * 5000.0 / 2044.0
+                    rec["ach_carstate"][row, 3:6] = o[51 + 9: 51 + 12] * 2300.0 / 6000.0
+                    rec["action"][row] = int(actions[npl * i + p])
                 row += 1
 
         for i, env in enumerate(envs):

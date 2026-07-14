@@ -998,8 +998,9 @@ void GGL::Learner::Start() {
 					proposerTargetBall.reserve(rows * 6);
 					proposerCarCur.reserve(rows * 6);
 					proposerCarTarget.reserve(rows * 6);
-					carStateHerGoals.reserve(rows * 6);
 				}
+				if (proposer || reach)
+					carStateHerGoals.reserve(rows * 6); // proposer-era buffer, also fed by the car-state reach head
 
 				if (practice) {
 					practiceMask.reserve(rows);
@@ -1092,6 +1093,9 @@ void GGL::Learner::Start() {
 		const auto& propCfg = config.ppo.proposer;
 		const bool proposerOn = propCfg.enabled && reachOn;
 		const bool proposerCarOn = proposerOn && propCfg.carEnabled;
+		// Car-state reachability head (META third goal space) - trains the proposer-era
+		// psiCarState machinery independent of the proposer
+		const bool reachCarStateOn = reachOn && config.ppo.reachability.carStateHead;
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
 		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
@@ -1390,7 +1394,7 @@ void GGL::Learner::Start() {
 
 			traj.ballHerGoals.resize((size_t)n * 6);
 			traj.carHerGoals.resize((size_t)n * 6);
-			if (proposerCarOn)
+			if (proposerCarOn || reachCarStateOn)
 				traj.carStateHerGoals.resize((size_t)n * 6);
 			for (int t = 0; t < n; t++) {
 				int ballOff = fnPickOffset(t, reachCfg.ballHerMinOffset, reachCfg.ballHerMaxOffset, ballBiasPow, ballGoalwardBias);
@@ -1402,10 +1406,12 @@ void GGL::Learner::Start() {
 					traj.carHerGoals[(size_t)t * 6 + d] = traj.achievedCarBall[(size_t)(t + carOff) * 6 + d];
 				}
 
-				// Car-STATE HER goal (for the car proposer's psi head): future canonical car state,
-				// broad window (~proposer horizon), no goalward bias - car states have no +y analog
-				if (proposerCarOn) {
-					int carStateOff = fnPickOffset(t, reachCfg.ballHerMinOffset, reachCfg.ballHerMaxOffset, ballBiasPow, 0);
+				// Car-STATE HER goal: future canonical car state, no goalward bias (car
+				// states have no +y analog). Window: the head's own calibration-chosen
+				// horizon (carStateHerMaxOffset; the proposer-era code used the ball
+				// window - the proposer is off, this head's semantics own the choice now).
+				if (proposerCarOn || reachCarStateOn) {
+					int carStateOff = fnPickOffset(t, reachCfg.carStateHerMinOffset, reachCfg.carStateHerMaxOffset, ballBiasPow, 0);
 					for (int d = 0; d < 6; d++)
 						traj.carStateHerGoals[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)(t + carStateOff) * 6 + d];
 				}
@@ -1483,10 +1489,13 @@ void GGL::Learner::Start() {
 		// The pipelined worker's frozen model set. With the steering rho-gate on, the reach
 		// heads are snapshotted too - the worker must never read weights Learn is updating.
 		std::vector<const char*> snapshotNames = { "shared_head", "policy" };
+		// (reach heads appended below when present; reach_psi_carstate joins them so the
+		// META gate can score against it from the pipelined snapshot)
 		if (steerOn && config.steering.rhoGateEnabled) {
 			snapshotNames.push_back("reach_phi");
 			snapshotNames.push_back("reach_psi_ball");
 			snapshotNames.push_back("reach_psi_car");
+			snapshotNames.push_back("reach_psi_carstate");
 		}
 		ModelSet collectSnapshot;
 		if (pipelineOn)
@@ -1901,10 +1910,13 @@ void GGL::Learner::Start() {
 			int64_t lastDwellIdx = -1;
 			int lastPairs = 0;
 		};
-		std::array<std::vector<MetaClusterState>, 2> metaSlots; // [0]=car head, [1]=ball head
-		std::array<std::array<float, 3>, 2> metaCalibEMA = {};  // median attain below/in/above
-		std::array<int, 2> metaCalibIters = {};
-		std::array<bool, 2> metaHeadValid = { false, false };   // monotone calibration gate
+		// Heads: [0]=car-local ball, [1]=canonical ball, [2]=canonical CAR state (the
+		// movement-capability space; entry-gated by its decisively-monotone offline
+		// calibration, actuation-gated live like every head)
+		std::array<std::vector<MetaClusterState>, 3> metaSlots;
+		std::array<std::array<float, 3>, 3> metaCalibEMA = {};  // median attain below/in/above
+		std::array<int, 3> metaCalibIters = {};
+		std::array<bool, 3> metaHeadValid = { false, false, false }; // monotone calibration gate
 		int metaActiveHead = -1, metaActiveCluster = -1;
 		int64_t metaDwellIdx = 0;
 		int metaDwellLeft = 0;
@@ -1952,6 +1964,7 @@ void GGL::Learner::Start() {
 			// consumed (fnAppendAchieved parity; obs coefs 1/5000 pos, 1/2300 vel)
 			const auto& rc = config.ppo.reachability;
 			auto fnAch = [&](int64_t r, int head, float* out) {
+				constexpr int SELF = 51;
 				if (head == 1) { // ball: canonical pos/vel -> reach scales
 					out[0] = fnObs(r, 0) * 5000.f / rc.posScaleX;
 					out[1] = fnObs(r, 1) * 5000.f / rc.posScaleY;
@@ -1959,14 +1972,20 @@ void GGL::Learner::Start() {
 					out[3] = fnObs(r, 3) * 2300.f / rc.velScale;
 					out[4] = fnObs(r, 4) * 2300.f / rc.velScale;
 					out[5] = fnObs(r, 5) * 2300.f / rc.velScale;
-				} else { // car: self-block local ball pos/vel -> carLocalScale
-					constexpr int SELF = 51;
+				} else if (head == 0) { // car: self-block local ball pos/vel -> carLocalScale
 					out[0] = fnObs(r, SELF + 18) * 5000.f / 2300.f;
 					out[1] = fnObs(r, SELF + 19) * 5000.f / 2300.f;
 					out[2] = fnObs(r, SELF + 20) * 5000.f / 2300.f;
 					out[3] = fnObs(r, SELF + 21);
 					out[4] = fnObs(r, SELF + 22);
 					out[5] = fnObs(r, SELF + 23);
+				} else { // carstate: self-block canonical CAR pos/vel -> reach scales
+					out[0] = fnObs(r, SELF + 0) * 5000.f / rc.posScaleX;
+					out[1] = fnObs(r, SELF + 1) * 5000.f / rc.posScaleY;
+					out[2] = fnObs(r, SELF + 2) * 5000.f / rc.posScaleZ;
+					out[3] = fnObs(r, SELF + 9) * 2300.f / rc.velScale;
+					out[4] = fnObs(r, SELF + 10) * 2300.f / rc.velScale;
+					out[5] = fnObs(r, SELF + 11) * 2300.f / rc.velScale;
 				}
 			};
 
@@ -1998,13 +2017,15 @@ void GGL::Learner::Start() {
 			};
 
 			// ---- per head: bank -> clusters -> mined pairs -> calibration/dirs/effect
-			for (int head = 0; head < 2; head++) {
-				const char* headName = head == 0 ? "car" : "ball";
-				Model* psi = ppo->models[head == 0 ? "reach_psi_car" : "reach_psi_ball"];
+			for (int head = 0; head < 3; head++) {
+				const char* headName = head == 0 ? "car" : (head == 1 ? "ball" : "carstate");
+				Model* psi = ppo->models[head == 0 ? "reach_psi_car"
+					: (head == 1 ? "reach_psi_ball" : "reach_psi_carstate")];
 				Model* phi = ppo->models["reach_phi"];
 				if (!psi || !phi)
 					continue;
-				int W = head == 0 ? rc.carHerMaxOffset : rc.ballHerMaxOffset;
+				int W = head == 0 ? rc.carHerMaxOffset
+					: (head == 1 ? rc.ballHerMaxOffset : rc.carStateHerMaxOffset);
 
 				// Bank: the agent's own achieved goals, from MATCH rows with a full window
 				std::vector<int64_t> bankRows;
@@ -2259,7 +2280,7 @@ void GGL::Learner::Start() {
 				bool explore = (metaDwellIdx % RS_MAX(1, (int64_t)cfgS.metaExploreEvery)) == 0;
 				int bestH = -1, bestC = -1;
 				float bestScore = -1e30f;
-				for (int h = 0; h < 2; h++) {
+				for (int h = 0; h < 3; h++) {
 					if (!metaHeadValid[h])
 						continue;
 					for (int c = 0; c < (int)metaSlots[h].size(); c++) {
@@ -2282,7 +2303,7 @@ void GGL::Learner::Start() {
 				if (bestH >= 0) {
 					if (bestH != metaActiveHead || bestC != metaActiveCluster)
 						RG_LOG("Meta steering: active cluster -> "
-							<< (bestH == 0 ? "car" : "ball") << "/" << bestC
+							<< (bestH == 0 ? "car" : (bestH == 1 ? "ball" : "carstate")) << "/" << bestC
 							<< (explore ? " (exploration dwell)" : ""));
 					metaActiveHead = bestH;
 					metaActiveCluster = bestC;
@@ -2369,7 +2390,7 @@ void GGL::Learner::Start() {
 			if (!any)
 				return;
 			ppo->SetSteering(vecs, sigmas, alphas);
-			ppo->SetSteerGoal(act.repGoal, metaActiveHead == 0);
+			ppo->SetSteerGoal(act.repGoal, metaActiveHead);
 			steerLoaded = true;
 			metaPendingApply = false;
 
@@ -3780,7 +3801,7 @@ void GGL::Learner::Start() {
 						experience.data.carHerGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
 						experience.data.ballHerGoals = torch::tensor(combinedTraj.ballHerGoals).reshape({ -1, 6 });
 						experience.data.ballMovedMask = torch::tensor(combinedTraj.ballMoved);
-						if (proposerCarOn && !combinedTraj.carStateHerGoals.empty())
+						if ((proposerCarOn || reachCarStateOn) && !combinedTraj.carStateHerGoals.empty())
 							experience.data.carStateHerGoals = torch::tensor(combinedTraj.carStateHerGoals).reshape({ -1, 6 });
 					}
 

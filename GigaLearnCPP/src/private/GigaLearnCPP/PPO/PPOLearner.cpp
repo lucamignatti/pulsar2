@@ -33,7 +33,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
-			/*makeCarStateHead=*/config.proposer.enabled && config.proposer.carEnabled);
+			/*makeCarStateHead=*/(config.proposer.enabled && config.proposer.carEnabled)
+				|| config.reachability.carStateHead);
 	}
 
 	if (config.proposer.enabled) {
@@ -211,14 +212,15 @@ void GGL::PPOLearner::SetSteering(const std::array<torch::Tensor, STEER_MODES>& 
 	}
 }
 
-void GGL::PPOLearner::SetSteerGoal(torch::Tensor goal6Cpu, bool carHead) {
+void GGL::PPOLearner::SetSteerGoal(torch::Tensor goal6Cpu, int head) {
 	if (!goal6Cpu.defined()) {
 		steerGoalOverride = torch::Tensor();
 		return;
 	}
 	RG_ASSERT(goal6Cpu.numel() == 6);
+	RG_ASSERT(head >= 0 && head <= 2);
 	steerGoalOverride = goal6Cpu.to(device).to(torch::kFloat32).view({ 1, 6 });
-	steerGoalOverrideCar = carHead;
+	steerGoalOverrideHead = head;
 }
 
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask, torch::Tensor steerRowModes, torch::Tensor styleVec, float styleCoef) {
@@ -262,12 +264,14 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 		Model* phi = m["reach_phi"] ? m["reach_phi"] : (reach ? reach->phi : NULL);
 		// META override (see SetSteerGoal) redirects the gate to the active emergent
 		// cluster's representative goal on its head; otherwise the fixed default.
-		bool useCarHead = steerGoalOverride.defined() ? steerGoalOverrideCar : steerRhoContact;
+		int headSel = steerGoalOverride.defined() ? steerGoalOverrideHead : (steerRhoContact ? 0 : 1);
 		Model* psiB;
-		if (useCarHead)
+		if (headSel == 0)
 			psiB = m["reach_psi_car"] ? m["reach_psi_car"] : (reach ? reach->psiCar : NULL);
-		else
+		else if (headSel == 1)
 			psiB = m["reach_psi_ball"] ? m["reach_psi_ball"] : (reach ? reach->psiBall : NULL);
+		else
+			psiB = m["reach_psi_carstate"] ? m["reach_psi_carstate"] : (reach ? reach->psiCarState : NULL);
 		if (steerRhoGate && phi && psiB && m["shared_head"]) {
 			RG_NO_GRAD;
 			auto idx = maskF.nonzero().flatten();

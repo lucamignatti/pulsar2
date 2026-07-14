@@ -46,6 +46,19 @@ namespace GGL {
 		int carHerMinOffset = 1;
 		int carHerMaxOffset = 20;
 		float carHerShortBiasPower = 2;
+		// Third goal-space head: canonical CAR pos+vel ("where can my car be, moving
+		// how") - the movement-capability frontier for the META steering system. The
+		// head + HER machinery predate this (car-proposer era); this flag trains it
+		// INDEPENDENT of the proposer. Offline (conservative frozen-phi test,
+		// analysis/probes/carstate_head_validate.py): its calibration curve is monotone
+		// with ~7x the ball head's margin at every candidate window - the sharpest
+		// frontier detector of the three heads. The window below was chosen BY
+		// calibration margin across {20,45,90}, not by hand. Actuation stays gated
+		// live (meta head-validity + per-cluster causal gates). Resume-safe: a missing
+		// reach_psi_carstate.lt initializes fresh (ModelSet::Load allowNotExist).
+		bool carStateHead = false;
+		int carStateHerMinOffset = 1;
+		int carStateHerMaxOffset = 45;
 		// The ball head only trains on episodes where the ball exceeded this speed;
 		// a dead never-touched episode would just reteach the stationary-ball manifold
 		float minBallMoveSpeed = 300;

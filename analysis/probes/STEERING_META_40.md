@@ -78,6 +78,33 @@ The incumbent derivation keeps running for its Steer/* panels either way.
 Panels: `Meta/Calib Valid car|ball`, `Meta/Active Head|Cluster|Pairs`,
 `Meta/Effect EMA`, `Meta/Attain Steered|Control`.
 
+## Extension: the car-state head (third goal space, same day)
+
+Canonical CAR pos+vel — movement/positioning capability, decoupled from the ball
+(the achieved stream + HER machinery predate this from the proposer era; only the
+psi head was untrained). Offline test (`carstate_head_validate.py`), deliberately
+conservative — psi trained against the FROZEN phi, which was never given gradients
+toward car-state information:
+
+- **Detector gate: PASS, decisively.** Calibration monotone at every candidate
+  window with margin ~0.65 — ~7x the ball head's. Window 45 chosen BY margin
+  across {20, 45, 90}, not by hand.
+- **Offline steerability: not demonstrated.** 0/3 sampled clusters show a clean
+  monotone attainment uplift (best: +0.058 @ α=0.5, non-monotone). Note the
+  structural pessimism: frozen phi (InfoNCE acc plateaued ~0.2 offline vs the
+  live heads' 0.67–0.83), fresh directions, single seeds.
+
+**Decision: shipped as a SENSE** (`reachability.carStateHead`, window 45): the
+head trains its InfoNCE aux live (phi co-trains toward car-state discrimination),
+initializes fresh on resume (`allowNotExist`), and enters the meta registry as
+head index 2 — where the head-validity gate and per-cluster effect gates hold it
+out of actuation until its LIVE calibration is monotone and clusters earn effect.
+In this architecture steering rights are never granted by offline fiat anyway;
+the offline detector pass is the entry criterion, and it passed. Watch:
+`Meta/Calib Valid carstate` (expect 0 for a while — a fresh head over a mostly
+ground-dwelling movement distribution needs training before its band means
+anything), then whether the scheduler ever dwells there. Revert = flag false.
+
 ## Honest limitations
 
 - Offline effect sizes are small at this checkpoint (the 1v1 positive side has

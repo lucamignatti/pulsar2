@@ -460,6 +460,16 @@ int main(int argc, char* argv[]) {
 	// still feed the InfoNCE trunk aux + Reach/* plasticity canaries.
 	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = false;
+	// Third goal-space head (2026-07-14): canonical CAR pos+vel - the movement-capability
+	// frontier for META steering. Offline (conservative frozen-phi test): calibration
+	// DECISIVELY monotone (~7x the ball head's margin; window 45 chosen by margin across
+	// {20,45,90}); per-cluster causal steerability NOT yet demonstrated offline (0/3
+	// clusters clean - but phi was frozen there and never trained to represent car-state
+	// goals; live it co-trains). It therefore ships as a SENSE: the meta head-validity +
+	// per-cluster effect gates hold it out of actuation until it earns it live. Resume:
+	// the head initializes fresh (allowNotExist) and starts training its InfoNCE aux.
+	// Revert = false. Record: analysis/probes/carstate_head_validate.py + results/.
+	cfg.ppo.reachability.carStateHead = true;
 	// With the gate off, the rho/gate reads (3 full-buffer model passes/iter, the biggest single
 	// consumption cost after PPO Learn) feed only the Reach/* panels — refresh those every 16
 	// iterations instead. The InfoNCE trunk aux (the part that helps learning) is unaffected.
