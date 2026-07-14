@@ -395,13 +395,19 @@ while true; do
 		exit 0
 	fi
 
-	sig=""
-	if [ "$code" -gt 128 ]; then
-		sig=" (SIG$(kill -l $((code - 128)) 2>/dev/null || echo "?"))"
-	fi
-	log "CRASH: exit $code$sig after ${runtime}s"
-	if [ "$code" -eq 139 ] && command -v coredumpctl >/dev/null 2>&1; then
-		log "backtrace: coredumpctl info ${CMD[0]##*/}"
+	if [ "$code" -eq 99 ]; then
+		# The trainer's programmatic restart request (Learner::RequestSaveAndExit, e.g. the
+		# team-curriculum phase flip): checkpoint already saved, relaunch is the intent.
+		log "planned restart (exit 99) after ${runtime}s"
+	else
+		sig=""
+		if [ "$code" -gt 128 ]; then
+			sig=" (SIG$(kill -l $((code - 128)) 2>/dev/null || echo "?"))"
+		fi
+		log "CRASH: exit $code$sig after ${runtime}s"
+		if [ "$code" -eq 139 ] && command -v coredumpctl >/dev/null 2>&1; then
+			log "backtrace: coredumpctl info ${CMD[0]##*/}"
+		fi
 	fi
 
 	if [ "$runtime" -lt "$FAST_CRASH_SECS" ]; then

@@ -11,6 +11,11 @@ namespace GGL {
 
 	typedef std::function<void(class Learner*, const std::vector<RLGC::GameState>& states, Report& report)> StepCallbackFn;
 
+	// Called once per training iteration at the tail of the loop, after the skill tracker /
+	// guards have written into the report (so Rating/* keys are visible when they refreshed
+	// this iteration). May call RequestSaveAndExit (e.g. curriculum phase triggers).
+	typedef std::function<void(class Learner*, Report& report)> IterationCallbackFn;
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
 	class RG_IMEXPORT Learner {
 	public:
@@ -68,6 +73,18 @@ namespace GGL {
 		bool steerRatingTripped = false;
 
 		StepCallbackFn stepCallback = NULL;
+		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
+
+		// Programmatic save-and-exit, honored at the same safe point as the Q key (worker
+		// joined, checkpoint saved first). A nonzero code makes tools/run_trainer.sh RESTART
+		// the trainer (its crash-restart path) - the self-deploy vehicle for boot-time config
+		// changes like a curriculum phase flip; 0 stops it like a clean quit.
+		std::atomic<bool> exitRequested = false;
+		std::atomic<int> requestedExitCode = 0;
+		void RequestSaveAndExit(int exitCode) {
+			requestedExitCode = exitCode;
+			exitRequested = true;
+		}
 
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);
 		void Start();

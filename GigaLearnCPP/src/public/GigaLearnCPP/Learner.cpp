@@ -3127,13 +3127,23 @@ void GGL::Learner::Start() {
 					}
 				}
 
-				if (saveQueued) {
+				// User per-iteration hook (curriculum triggers etc.): sees the finished
+				// iteration's report and may call RequestSaveAndExit, which the check just
+				// below honors this same iteration.
+				if (iterationCallback)
+					iterationCallback(this, report);
+
+				if (saveQueued || exitRequested) {
 					// Never exit with a collection worker in flight
 					if (collectThread.joinable())
 						collectThread.join();
 					if (!config.checkpointFolder.empty())
 						Save();
-					exit(0);
+					int exitCode = exitRequested ? requestedExitCode.load() : 0;
+					if (exitCode != 0)
+						RG_LOG("Learner: exiting with code " << exitCode
+							<< " (programmatic restart request - the ops wrapper relaunches onto the saved checkpoint)");
+					exit(exitCode);
 				}
 
 				if (!config.checkpointFolder.empty()) {

@@ -1,6 +1,8 @@
 #include <GigaLearnCPP/Learner.h>
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 #include <RLGymCPP/Rewards/CommonRewards.h>
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
@@ -36,16 +38,31 @@ static constexpr float TRAIN_GAMMA = 0.9985f;
 // checkpoint-compatible because the obs width never changes.
 static constexpr int MAX_PLAYERS_PER_TEAM = 3;
 
-// Fraction of arenas running each team mode, applied by arena index with the team arenas
-// at the END of the index range (deterministic across restarts). Keeping them at the end
-// means: (a) the steering practice arenas (the FIRST practiceArenaFrac of indices) stay
-// 1v1, and (b) the skill tracker / league eval EnvSets — which clone this create-func
-// with small numArenas, so only low indices — stay 1v1, keeping Rating/1v1 continuous
-// across the phase switch (it is also the guard key: the Learner tracks arena 0's mode).
-// PHASE B suggestion: 0.20/0.15 to start, keep FRAC_2V2 + FRAC_3V3 + practiceArenaFrac
-// well under 1 so a healthy 1v1 match population remains for steering derivation.
-static constexpr float FRAC_2V2 = 0.0f;
-static constexpr float FRAC_3V3 = 0.0f;
+// PHASE B arena fractions, applied by arena index with the team arenas at the END of the
+// index range (deterministic across restarts). Keeping them at the end means: (a) the
+// steering practice arenas (the FIRST practiceArenaFrac of indices) stay 1v1, and (b) the
+// skill tracker / league eval EnvSets — which clone this create-func with small numArenas,
+// so only low indices — stay 1v1, keeping Rating/1v1 continuous across the phase switch
+// (it is also the guard key: the Learner tracks arena 0's mode). Keep the fractions +
+// practiceArenaFrac well under 1 so a healthy 1v1 match population remains for steering
+// derivation (which currently contrasts trunk rows from ALL match arenas — team rows
+// included after the flip; watch Steer/* if that mix degrades the direction).
+static constexpr float PHASE_B_FRAC_2V2 = 0.20f;
+static constexpr float PHASE_B_FRAC_3V3 = 0.15f;
+
+// AUTOMATIC PHASE-B TRIGGER ("once 1v1 performs decently", made mechanical): when
+// Rating/1v1 posts PHASE_B_TRIGGER_STREAK consecutive skill-tracker evals at or above
+// PHASE_B_RATING_TRIGGER, the iteration callback below writes the PHASE_B_MARKER file
+// into the checkpoint folder, checkpoints, and exits with PHASE_B_RESTART_EXIT_CODE.
+// run_trainer.sh treats any nonzero exit as restart -> the relaunch finds the marker and
+// builds the PHASE B fleet, resuming the same checkpoint (obs width never changes).
+// 1200 sits ~1 noise-band below the measured 1v1 plateau (~1250-1300 on the 3.1 lineage);
+// the 3-eval streak filters single-eval noise (band is +-30-50). The marker is
+// lineage-scoped: wiping/branching checkpoints_4.0 resets the curriculum with it.
+static constexpr float PHASE_B_RATING_TRIGGER = 1200.0f;
+static constexpr int PHASE_B_TRIGGER_STREAK = 3;
+static constexpr int PHASE_B_RESTART_EXIT_CODE = 99; // nonzero and outside the wrapper's stop set {0,130,143}
+static constexpr const char* PHASE_B_MARKER = "PHASE_B_ENGAGED";
 
 // Team spirit for the zero-sum reward terms: own*(1-ts) + teamMean*ts - oppTeamMean.
 // 0 in 1v1 (where it is an algebraic no-op). PHASE B: ramp toward ~0.3-0.5 so teammates
@@ -148,11 +165,16 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 // two sites agree by construction). 0 = feature off = every arena is a normal match arena.
 static int g_NumPracticeArenas = 0;
 
-// Team-mode arena split (set in main() from cfg.numGames and the FRAC_2V2/FRAC_3V3 constants).
-// Team arenas occupy the END of the index range — see the FRAC_2V2 comment for why.
+// Team-mode arena split (set in main(): zero in PHASE A, the PHASE_B_FRAC_* fractions once
+// the phase marker exists). Team arenas occupy the END of the index range — see the
+// PHASE_B_FRAC_2V2 comment for why.
 static int g_NumGames = 0;
 static int g_NumArenas2v2 = 0;
 static int g_NumArenas3v3 = 0;
+
+// Phase-B trigger state (iteration callback below)
+static bool g_PhaseB = false;
+static int g_PhaseBStreak = 0;
 
 // Create the RLGymCPP environment for each of our games
 EnvCreateResult EnvCreateFunc(int index) {
@@ -582,14 +604,50 @@ int main(int argc, char* argv[]) {
 	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
 		g_NumPracticeArenas = (int)(cfg.numGames * cfg.steering.practiceArenaFrac);
 
-	// Team-mode arena split (PHASE A: both fractions 0 -> all arenas 1v1). Must be set before
-	// the Learner is built - EnvCreateFunc reads these.
+	// Team-mode arena split, decided by the lineage-scoped phase marker (see the
+	// PHASE_B_RATING_TRIGGER comment). Must be set before the Learner is built -
+	// EnvCreateFunc reads these.
+	g_PhaseB = std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
 	g_NumGames = cfg.numGames;
-	g_NumArenas2v2 = (int)(cfg.numGames * FRAC_2V2);
-	g_NumArenas3v3 = (int)(cfg.numGames * FRAC_3V3);
+	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
+	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
+	RG_LOG("Team curriculum: PHASE " << (g_PhaseB ? "B" : "A") << " - "
+		<< (cfg.numGames - g_NumArenas2v2 - g_NumArenas3v3) << " 1v1 / "
+		<< g_NumArenas2v2 << " 2v2 / " << g_NumArenas3v3 << " 3v3 arenas");
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
+
+	// The automatic PHASE A -> PHASE B flip. Runs at the tail of every iteration; ratings
+	// only appear in the report on iterations where the skill tracker actually evaluated,
+	// so the streak counts consecutive EVALS, not iterations. On trigger: marker -> save ->
+	// exit(99) -> wrapper relaunches this same binary, which now boots into PHASE B on the
+	// checkpoint just saved. Render mode never sets the callback (no ratings there anyway).
+	if (!cfg.renderMode) {
+		learner->iterationCallback = [](Learner* learner, Report& report) {
+			report["Curriculum/Team Phase"] = g_PhaseB ? 1.0f : 0.0f;
+			report["Curriculum/Phase B Streak"] = (float)g_PhaseBStreak;
+			if (g_PhaseB || !report.Has("Rating/1v1"))
+				return;
+			float rating = (float)report["Rating/1v1"];
+			g_PhaseBStreak = (rating >= PHASE_B_RATING_TRIGGER) ? g_PhaseBStreak + 1 : 0;
+			if (g_PhaseBStreak < PHASE_B_TRIGGER_STREAK)
+				return;
+
+			auto markerPath = learner->config.checkpointFolder / PHASE_B_MARKER;
+			std::filesystem::create_directories(learner->config.checkpointFolder);
+			std::ofstream(markerPath) << "engaged at ts " << learner->totalTimesteps
+				<< ", Rating/1v1 " << rating << "\n";
+			RG_LOG("=============================================================");
+			RG_LOG("TEAM CURRICULUM: PHASE B ENGAGED - Rating/1v1 held >= "
+				<< PHASE_B_RATING_TRIGGER << " for " << PHASE_B_TRIGGER_STREAK
+				<< " consecutive evals (now " << rating << ", ts " << learner->totalTimesteps << ")");
+			RG_LOG("Wrote " << markerPath << "; saving and exiting " << PHASE_B_RESTART_EXIT_CODE
+				<< " for the wrapper to relaunch into the 2v2/3v3 mix");
+			RG_LOG("=============================================================");
+			learner->RequestSaveAndExit(PHASE_B_RESTART_EXIT_CODE);
+		};
+	}
 
 	// Start learning!
 	learner->Start();
