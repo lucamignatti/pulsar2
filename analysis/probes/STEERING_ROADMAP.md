@@ -28,6 +28,18 @@
 > Phase 4 = the per-mode registry structure is its seed; scheduler/battery
 > beyond commitment deferred (needs more validated player-side contrasts).
 > Render-mode style knob deferred. GGL_SMOKE=1 sandbox smoke affordance added.
+>
+> STATUS 2026-07-14 (third program - record in STEERING_META_40.md): PHASE 4
+> SHIPPED, prior-free per hard requirement (no human priors; a hand-task
+> registry draft was discarded). Goals from the agent's own achieved bank;
+> frontier by its own self-model; emergent psi-space clusters (never named);
+> model-free continuous-attainment outcomes; head-validity self-check (ball
+> head passes calibration, car head self-disables for arbitrary goals);
+> per-cluster causal gates + dwell scheduler with exploration. Offline: one
+> emergent cluster shows monotone causal attainment uplift; heterogeneity
+> across clusters = the scheduling signal. cfg.steering.meta=false is the
+> pinned incumbent AND the pre-registered live baseline (Elo slope, matched
+> window). Commit 86fefb7.
 
 > Drafted 2026-07-13 from a design discussion while the trainer ran unattended.
 > Context at time of writing: stage-1 steered collection (terminationless, v2
