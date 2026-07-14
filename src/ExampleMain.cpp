@@ -68,10 +68,18 @@ static constexpr int PHASE_B_RESTART_EXIT_CODE = 99; // nonzero and outside the 
 static constexpr const char* PHASE_B_MARKER = "PHASE_B_ENGAGED";
 
 // Team spirit for the zero-sum reward terms: own*(1-ts) + teamMean*ts - oppTeamMean.
-// 0 in 1v1 (where it is an algebraic no-op). PHASE B: ramp toward ~0.3-0.5 so teammates
-// stop fighting over the ball — but change it as its OWN experiment, not bundled with
-// the mode-mix flip (one lever at a time).
-static constexpr float TEAM_SPIRIT = 0.0f;
+// An algebraic no-op in 1v1 (teamMean == own), so this only changes the 2v2/3v3 arenas.
+// 0.0 -> 0.3 (2026-07-14, PHASE B team-play fix, its own lever now that the mode-mix flip
+// has landed): at ts=0 teammates were pure competitors for every per-player term
+// (TouchAccel/Demo/Boost/AerialTouch/OpposedSave) — the only shared signal was GoalReward.
+// 0.3 is the low end of the Necto/Nexto-lineage range (0.3-0.6): teammates now bank 30%
+// of each other's touches/demos/saves, weak enough that personal credit still dominates
+// data efficiency early. Shipped together with the team-closest BallProximityPotential
+// (see BuildRewards below) — both are inert on 1v1 rows by construction.
+//   Watch: Rating/2v2 + Rating/3v3 slope vs the pre-change trend; teammate-proximity /
+//   double-commit behavior in the 2v2 viz. Revert = set back to 0.0 (resume-compatible,
+//   nothing checkpointed depends on it). Escalate toward 0.5 only as its own change.
+static constexpr float TEAM_SPIRIT = 0.3f;
 
 // 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
 // (fast) codebase.
@@ -132,6 +140,10 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// so policy-invariance holds while the stack's biggest per-player PSD polluter becomes "be
 		// closer to the ball than the opponent". Weight halved (7.5 -> 4) since the ZS swing
 		// doubles. Never gate a potential.
+		// TEAM-CLOSEST since 2026-07-14 (4.0 team play): Phi = the closest alive TEAM car's
+		// proximity, so in 2v2/3v3 the race is "our nearest man vs theirs" and the 2nd/3rd man
+		// earns nothing for crowding the ball — per-player proximity was the stack's biggest
+		// ball-chasing gradient. Identical in 1v1 (team of one), see BallProximityPotentialReward.
 		{ new ZeroSumReward(new BallProximityPotentialReward(gamma), TEAM_SPIRIT), 4.f },
 
 		// Boost economy: demo-respawn guarded (mandatory under ZeroSum - without it the demoer is

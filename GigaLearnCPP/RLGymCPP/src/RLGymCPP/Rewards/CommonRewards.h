@@ -86,23 +86,46 @@ namespace RLGC {
 	// cycles and whack-and-chase loops telescope to ~0 and episode truncation can't be
 	// harvested — unlike VelocityPlayerToBallReward, the Phi drop when the ball is knocked
 	// away is charged immediately. gamma must match the learner's gaeGamma.
+	//
+	// TEAM-CLOSEST (4.0 team play): Phi is the CLOSEST alive team car's proximity, not the
+	// player's own — "someone on our team is on the ball", the team analogue of the same
+	// race. With one car per team this is algebraically identical to the old per-player
+	// form (verified by test); in 2v2/3v3 it stops paying the 2nd/3rd man for crowding the
+	// ball (per-player proximity paid every teammate for converging on it — the single
+	// biggest ball-chasing gradient in the stack). Every teammate receives the same value,
+	// so under ZeroSumReward the result is exactly Psi = Phi_ownTeam - Phi_oppTeam at any
+	// teamSpirit. Still an exact potential (a function of state only): telescoping holds.
 	class BallProximityPotentialReward : public Reward {
 	public:
 		constexpr static float LIU_DIST_SCALE = 1410; // Nexto: max driving speed without boost
 		float gamma;
 		BallProximityPotentialReward(float gamma = 0.99f) : gamma(gamma) {}
 
+		// Closest ALIVE team car's proximity; 0 if the whole team is demoed (no car = no coverage)
+		static float TeamPhi(const GameState& state, Team team) {
+			float best = 0;
+			for (const Player& p : state.players)
+				if (p.team == team && !p.isDemoed)
+					best = RS_MAX(best, expf(-(state.ball.pos - p.pos).Length() / LIU_DIST_SCALE));
+			return best;
+		}
+
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
-			if (!state.prev || !player.prev)
+			if (!state.prev)
 				return 0; // First step of the episode: nothing to diff against
 
-			// A demo/respawn teleport is not the player's action; don't charge/pay the jump
-			if (player.isDemoed || player.prev->isDemoed)
-				return 0;
+			// A demo/respawn teleport is not anyone's action; skip the step whenever a team
+			// car's demo state flips (the team analogue of the old self-only guard — with one
+			// car per team the returned values are identical: transitions return 0 here, and
+			// steady-demoed steps diff an empty-team Phi of 0 against 0).
+			for (const Player& p : state.players) {
+				if (p.team != player.team)
+					continue;
+				if (!p.prev || p.isDemoed != p.prev->isDemoed)
+					return 0;
+			}
 
-			float cur = expf(-(state.ball.pos - player.pos).Length() / LIU_DIST_SCALE);
-			float prev = expf(-(state.prev->ball.pos - player.prev->pos).Length() / LIU_DIST_SCALE);
-			return gamma * cur - prev;
+			return gamma * TeamPhi(state, player.team) - TeamPhi(*state.prev, player.team);
 		}
 	};
 

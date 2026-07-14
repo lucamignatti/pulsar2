@@ -14,6 +14,14 @@ namespace RLGC {
 	// has to COMPLETE the touch (an achievable sub-skill). Reverse curriculum — start at the goal
 	// state and let PPO extend it backward into initiating the takeoff itself, now that the reward
 	// (AerialTouch / AirInterceptPotential) actually pays for the airborne touch.
+	//
+	// TEAM-AWARE (4.0 team play, 2026-07-14): with >1 car per team, exactly ONE random car per
+	// team is the CLIMBER (the airborne placement above — both teams' climbers contest the same
+	// ball, keeping the drill a symmetric 50/50 like it always was in 1v1); the remaining cars
+	// spawn GROUNDED goal-side of the ball's shadow at supportMinDist..supportMaxDist, facing
+	// the ball, at rest. The old behavior launched all 4-6 cars at one ball — a midair scrum
+	// teaching simultaneous full-team commitment. With one car per team the climber path is
+	// exactly the old placement, so 1v1 arenas are unaffected.
 	class AirDrillState : public StateSetter {
 	public:
 		float minBallZ, maxBallZ;   // overhead ball height
@@ -21,19 +29,22 @@ namespace RLGC {
 		float minHoriz, maxHoriz;   // horizontal offset of the car from under the ball
 		float minSpeed, maxSpeed;   // car climb speed toward the ball
 		float minBoost;
+		float supportMinDist, supportMaxDist; // Team play: grounded non-climber spawn ring (goal-side arc)
 
 		AirDrillState(
 			float minBallZ = 900, float maxBallZ = 1500,
 			float minDrop = 400, float maxDrop = 900,
 			float minHoriz = 350, float maxHoriz = 750,
 			float minSpeed = 700, float maxSpeed = 1400,
-			float minBoost = 45)
+			float minBoost = 45,
+			float supportMinDist = 1500, float supportMaxDist = 3000)
 			: minBallZ(minBallZ), maxBallZ(maxBallZ), minDrop(minDrop), maxDrop(maxDrop),
 			  minHoriz(minHoriz), maxHoriz(maxHoriz), minSpeed(minSpeed), maxSpeed(maxSpeed),
-			  minBoost(minBoost) {}
+			  minBoost(minBoost), supportMinDist(supportMinDist), supportMaxDist(supportMaxDist) {}
 
 		virtual void ResetArena(Arena* arena) {
 			using RocketSim::Math::RandFloat;
+			using RocketSim::Math::RandInt;
 
 			arena->ResetToRandomKickoff(); // reset boost pads etc.
 
@@ -49,12 +60,21 @@ namespace RLGC {
 			const float clampY = CommonValues::BACK_WALL_Y - WALL_MARGIN;
 
 			std::vector<Vec> placed = {};
-			for (Car* car : arena->_cars) {
+
+			auto fnOverlaps = [&](const Vec& carPos) {
+				for (Vec& o : placed)
+					if ((carPos - o).Length() < CAR_SEPARATION)
+						return true;
+				return false;
+			};
+
+			// The drill placement: airborne, below and horizontally offset from the ball, climbing at it
+			auto fnSetClimber = [&](Car* car) {
 				CarState cs = {};
 
-				// Place the car airborne, below and horizontally offset from the ball, in-bounds and
-				// clear of the other car. The vertical gap + horizontal offset keep the car->ball
-				// direction well off vertical, so LookAt below is never degenerate.
+				// Place the car airborne, in-bounds and clear of the other cars. The vertical
+				// gap + horizontal offset keep the car->ball direction well off vertical, so
+				// LookAt below is never degenerate.
 				Vec carPos = {};
 				bool ok = false;
 				for (int attempt = 0; attempt < 16 && !ok; attempt++) {
@@ -66,10 +86,7 @@ namespace RLGC {
 
 					if (fabsf(carPos.x) > clampX || fabsf(carPos.y) > clampY)
 						continue;
-					bool overlaps = false;
-					for (Vec& o : placed)
-						if ((carPos - o).Length() < CAR_SEPARATION) { overlaps = true; break; }
-					ok = !overlaps;
+					ok = !fnOverlaps(carPos);
 				}
 				if (!ok) {
 					carPos.x = RS_CLAMP(carPos.x, -clampX, clampX);
@@ -89,7 +106,65 @@ namespace RLGC {
 				cs.boost = RandFloat(minBoost, 100);
 
 				car->SetState(cs);
-			}
+			};
+
+			// Grounded support: goal-side of the ball's shadow, facing the ball, at rest —
+			// positioned to play the follow-up (clear, rebound, cover) rather than joining the aerial
+			auto fnSetSupport = [&](Car* car, Team team) {
+				Vec ownGoal = (team == Team::BLUE) ? CommonValues::BLUE_GOAL_BACK : CommonValues::ORANGE_GOAL_BACK;
+				Vec ballShadow = Vec(bs.pos.x, bs.pos.y, 0);
+				Vec toGoal = ownGoal - ballShadow;
+				float goalTheta = atan2f(toGoal.y, toGoal.x);
+
+				Vec carPos = {};
+				bool ok = false;
+				for (int attempt = 0; attempt < 16 && !ok; attempt++) {
+					float theta = goalTheta + RandFloat(-M_PI / 2, M_PI / 2);
+					float dist = RandFloat(supportMinDist, supportMaxDist);
+					carPos = ballShadow + Vec(cosf(theta) * dist, sinf(theta) * dist, 0);
+					carPos.z = 17;
+
+					if (fabsf(carPos.x) > clampX || fabsf(carPos.y) > clampY)
+						continue;
+					ok = !fnOverlaps(carPos);
+				}
+				if (!ok) {
+					carPos.x = RS_CLAMP(carPos.x, -clampX, clampX);
+					carPos.y = RS_CLAMP(carPos.y, -clampY, clampY);
+					carPos.z = 17;
+				}
+				placed.push_back(carPos);
+
+				CarState cs = {};
+				cs.pos = carPos;
+
+				Vec toBall = bs.pos - carPos;
+				float yaw = atan2f(toBall.y, toBall.x);
+				cs.rotMat = Angle(yaw, 0, 0).ToRotMat();
+
+				cs.boost = RandFloat(minBoost, 100);
+
+				car->SetState(cs);
+			};
+
+			// Pick one climber per team (the only car, in 1v1)
+			std::vector<Car*> teamCars[2];
+			for (Car* car : arena->_cars)
+				teamCars[(int)car->team].push_back(car);
+			int climberIdx[2] = {};
+			for (int t = 0; t < 2; t++)
+				if (teamCars[t].size() > 1)
+					climberIdx[t] = RandInt(0, (int)teamCars[t].size());
+
+			// Climbers first so the aerial contest is never crowded out by support placement
+			for (int t = 0; t < 2; t++)
+				if (!teamCars[t].empty())
+					fnSetClimber(teamCars[t][climberIdx[t]]);
+
+			for (int t = 0; t < 2; t++)
+				for (int i = 0; i < (int)teamCars[t].size(); i++)
+					if (i != climberIdx[t])
+						fnSetSupport(teamCars[t][i], (Team)t);
 		}
 	};
 }
