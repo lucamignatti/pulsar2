@@ -188,6 +188,11 @@ static int g_SkillArenas3v3 = 0;
 static bool g_PhaseB = false;
 static int g_PhaseBStreak = 0;
 
+// Render mode only (GGL_RENDER_TEAM_SIZE, set in main()): the viewer's single arena plays
+// this team size regardless of the curriculum split. 0 = not in render mode. The padded obs
+// makes any size checkpoint-compatible, so the viewer can watch 1v1/2v2/3v3 off the same run.
+static int g_RenderTeamSize = 0;
+
 // Shared env body for the training and skill-eval create-funcs: everything except the
 // team size and the practice-terminal decision is identical (and the skill tracker
 // overwrites eval rewards/state setters/terminal conditions anyway — for eval arenas only
@@ -246,6 +251,9 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 // trailing indices — the padded obs keeps the net identical either way, so the phase switch
 // is checkpoint-compatible.
 EnvCreateResult EnvCreateFunc(int index) {
+	// Render viewer: one arena, team size picked by GGL_RENDER_TEAM_SIZE (never a practice arena)
+	if (g_RenderTeamSize > 0)
+		return MakeEnv(g_RenderTeamSize, false);
 	int playersPerTeam = 1;
 	if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3)
 		playersPerTeam = 3;
@@ -487,6 +495,18 @@ int main(int argc, char* argv[]) {
 		cfg.renderMode = true;
 	if (const char* s = std::getenv("GGL_RENDER_RELOAD_SECS"))
 		cfg.renderReloadSecs = (float)std::atof(s);
+	// GGL_RENDER_TEAM_SIZE=1|2|3 picks the viewer arena's mode (default 1v1). Render mode only;
+	// the training fleet's split is owned by the phase curriculum, never by an env var.
+	if (cfg.renderMode) {
+		g_RenderTeamSize = 1;
+		if (const char* t = std::getenv("GGL_RENDER_TEAM_SIZE")) {
+			int n = std::atoi(t);
+			if (n < 1 || n > MAX_PLAYERS_PER_TEAM)
+				RG_ERR_CLOSE("GGL_RENDER_TEAM_SIZE must be 1.." << MAX_PLAYERS_PER_TEAM << ", got \"" << t << "\"");
+			g_RenderTeamSize = n;
+		}
+		RG_LOG("Render mode: " << g_RenderTeamSize << "v" << g_RenderTeamSize << " arena");
+	}
 
 	// ---------------------------------------------------------------------------------------------
 	// Basin-Racing (PSD) + QD league. Both ADDITIVE and OFF by default: with these two flags false

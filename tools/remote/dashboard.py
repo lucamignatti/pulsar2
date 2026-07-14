@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAINERCTL = REPO_ROOT / "tools" / "trainerctl"
 LOG_DIR = Path(os.environ.get("RUN_TRAINER_LOG_DIR", REPO_ROOT / "run_logs"))
 BUILD_DIR = Path(os.environ.get("TRAINERCTL_BUILD_DIR", REPO_ROOT / "build"))
-CKPT_DIR = Path(os.environ.get("TRAINERCTL_CKPT_DIR", BUILD_DIR / "checkpoints_3.1"))
+CKPT_DIR = Path(os.environ.get("TRAINERCTL_CKPT_DIR", BUILD_DIR / "checkpoints_4.0"))
 
 CONF_DIR = Path.home() / ".config" / "pulsar-remote"
 STATE_DIR = Path.home() / ".local" / "state" / "pulsar-remote"
@@ -58,6 +58,11 @@ ACTIONS = {
     "build":         ([str(TRAINERCTL), "build"], "Rebuild only"),
     "viz_start":     ([str(TRAINERCTL), "viz", "start"], "Start visualizer"),
     "viz_stop":      ([str(TRAINERCTL), "viz", "stop"], "Stop visualizer"),
+    # Mode switch for the single viewer arena (restarts the render unit in place —
+    # one viz at a time is guaranteed by the unit being a singleton)
+    "viz_mode_1v1":  ([str(TRAINERCTL), "viz", "mode", "1v1"], "Viz mode 1v1"),
+    "viz_mode_2v2":  ([str(TRAINERCTL), "viz", "mode", "2v2"], "Viz mode 2v2"),
+    "viz_mode_3v3":  ([str(TRAINERCTL), "viz", "mode", "3v3"], "Viz mode 3v3"),
     "check_updates": (["git", "-C", str(REPO_ROOT), "fetch", "origin", "--prune"],
                       "Fetch origin (no merge)"),
     "dashboard_restart": (["systemctl", "--user", "restart", "pulsar-dashboard.service"],
@@ -318,6 +323,12 @@ def viz_status():
                       ("render", "pulsar-viz-render.service")):
         rc, _ = systemctl_user("is-active", "--quiet", unit)
         st[key] = rc == 0
+    # Team size of the single viewer arena (trainerctl viz mode); default 1v1
+    try:
+        mode = (CONF_DIR / "viz_mode").read_text().strip()
+    except Exception:
+        mode = ""
+    st["mode"] = int(mode) if mode in ("1", "2", "3") else 1
     return st
 
 

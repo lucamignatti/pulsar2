@@ -47,6 +47,12 @@
            border-radius: 10px; display: none; max-width: 90vw; z-index: 10; }
   details { margin-top: 12px; }
   summary { color: var(--dim); cursor: pointer; font-size: 13px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
+         overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 4px 10px; font-size: 12px;
+                background: transparent; }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.active { background: #1f6feb33; color: var(--blue); }
 </style>
 </head>
 <body>
@@ -80,6 +86,13 @@
     <div class="kv"><span class="k">head</span><span class="v" id="git-head">–</span></div>
     <div class="kv"><span class="k">vs origin</span><span class="v" id="git-sync">–</span></div>
     <div class="kv"><span class="k">visualizer</span><span class="v" id="viz-state">–</span></div>
+    <div class="kv"><span class="k">viz mode</span><span class="v">
+      <span class="seg" id="viz-mode">
+        <button data-action="viz_mode_1v1" data-mode="1">1v1</button><button
+          data-action="viz_mode_2v2" data-mode="2">2v2</button><button
+          data-action="viz_mode_3v3" data-mode="3">3v3</button>
+      </span>
+    </span></div>
   </div>
 </div>
 
@@ -176,6 +189,8 @@ async function refresh() {
       `<span class="dot ${viz ? "on" : "off"}"></span>` +
       `<a href="${vizUrl}" target="_blank">open ↗</a> <span class="muted">(${vizLabel})</span>`;
     $("vizlink").href = vizUrl;
+    document.querySelectorAll("#viz-mode button").forEach(b =>
+      b.classList.toggle("active", Number(b.dataset.mode) === (s.viz.mode || 1)));
     $("updated").textContent = "updated " + s.time
       + (s.locked_out_secs ? ` — PIN LOCKED ${s.locked_out_secs}s` : "");
   } catch (e) {

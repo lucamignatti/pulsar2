@@ -10,6 +10,7 @@
 #   trainerctl checkpoints [N]       # newest N checkpoints (default 5)
 #   trainerctl gpu                   # nvidia-smi snapshot
 #   trainerctl viz start|stop|status # RocketSimVisWeb + GGL_RENDER viewer stack
+#   trainerctl viz mode [1v1|2v2|3v3] # switch the single viewer arena's team size
 #   trainerctl set-pin               # set the dashboard action PIN
 #   trainerctl doctor                # sanity-check the remote-management stack
 #
@@ -31,6 +32,13 @@ VIZ_PY="$REPO_ROOT/tools/viz/.venv/bin/python"
 
 VIZ_WEB_UNIT="pulsar-viz-web.service"
 VIZ_RENDER_UNIT="pulsar-viz-render.service"
+VIZ_MODE_FILE="$CONF_DIR/viz_mode"   # 1|2|3 = team size of the single viewer arena
+
+viz_mode() { # current team size, default 1
+    local m
+    m="$(cat "$VIZ_MODE_FILE" 2>/dev/null || true)"
+    case "$m" in 1|2|3) echo "$m" ;; *) echo 1 ;; esac
+}
 
 # Half the cores for builds so a concurrent training run keeps its CPU workers fed.
 BUILD_JOBS="${TRAINERCTL_BUILD_JOBS:-$(( $(nproc) / 2 > 2 ? $(nproc) / 2 : 2 ))}"
@@ -214,6 +222,7 @@ ExecStart=$VIZ_BUILD_DIR/GigaLearnBot
 WorkingDirectory=$VIZ_BUILD_DIR
 Environment=GGL_RENDER=1
 Environment=GGL_DEVICE=cpu
+Environment=GGL_RENDER_TEAM_SIZE=$(viz_mode)
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
@@ -260,8 +269,32 @@ cmd_viz() {
             for u in "$VIZ_WEB_UNIT" "$VIZ_RENDER_UNIT"; do
                 if unit_active "$u"; then echo "running: $u"; else echo "stopped: $u"; fi
             done
+            echo "mode: $(viz_mode)v$(viz_mode)"
             ;;
-        *) die "usage: trainerctl viz start|stop|status" ;;
+        mode)
+            # trainerctl viz mode [1v1|2v2|3v3]. One viewer, one mode: the mode is baked
+            # into the single render unit and switching restarts it in place, so two
+            # viewers can never run at once (systemd unit = singleton).
+            local want=""
+            case "${2:-}" in
+                "") echo "$(viz_mode)v$(viz_mode)"; return 0 ;;
+                1v1|1) want=1 ;;
+                2v2|2) want=2 ;;
+                3v3|3) want=3 ;;
+                *) die "usage: trainerctl viz mode [1v1|2v2|3v3]" ;;
+            esac
+            mkdir -p "$CONF_DIR"
+            echo "$want" > "$VIZ_MODE_FILE"
+            note "viz mode set to ${want}v${want}"
+            if unit_active "$VIZ_RENDER_UNIT"; then
+                viz_install_units   # regenerate with the new GGL_RENDER_TEAM_SIZE
+                systemctl --user restart "$VIZ_RENDER_UNIT" || die "failed to restart $VIZ_RENDER_UNIT"
+                note "restarted viewer as ${want}v${want}"
+            else
+                note "viewer not running; ${want}v${want} takes effect at next 'viz start'"
+            fi
+            ;;
+        *) die "usage: trainerctl viz start|stop|status|mode [1v1|2v2|3v3]" ;;
     esac
 }
 
@@ -323,9 +356,9 @@ case "${1:-help}" in
     build)        cmd_build ;;
     checkpoints)  cmd_checkpoints "${2:-5}" ;;
     gpu)          cmd_gpu ;;
-    viz)          shift; cmd_viz "${1:-status}" ;;
+    viz)          shift; cmd_viz "${1:-status}" "${2:-}" ;;
     set-pin)      cmd_set_pin ;;
     doctor)       cmd_doctor ;;
-    help|--help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+    help|--help|-h) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $1 (try: trainerctl help)" ;;
 esac
