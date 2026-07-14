@@ -211,6 +211,16 @@ void GGL::PPOLearner::SetSteering(const std::array<torch::Tensor, STEER_MODES>& 
 	}
 }
 
+void GGL::PPOLearner::SetSteerGoal(torch::Tensor goal6Cpu, bool carHead) {
+	if (!goal6Cpu.defined()) {
+		steerGoalOverride = torch::Tensor();
+		return;
+	}
+	RG_ASSERT(goal6Cpu.numel() == 6);
+	steerGoalOverride = goal6Cpu.to(device).to(torch::kFloat32).view({ 1, 6 });
+	steerGoalOverrideCar = carHead;
+}
+
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask, torch::Tensor steerRowModes, torch::Tensor styleVec, float styleCoef) {
 	ModelSet& m = models ? *models : this->models;
 
@@ -250,8 +260,11 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 		// when present (the pipelined snapshot carries them), so the worker never reads
 		// weights that Learn is concurrently updating.
 		Model* phi = m["reach_phi"] ? m["reach_phi"] : (reach ? reach->phi : NULL);
+		// META override (see SetSteerGoal) redirects the gate to the active emergent
+		// cluster's representative goal on its head; otherwise the fixed default.
+		bool useCarHead = steerGoalOverride.defined() ? steerGoalOverrideCar : steerRhoContact;
 		Model* psiB;
-		if (steerRhoContact)
+		if (useCarHead)
 			psiB = m["reach_psi_car"] ? m["reach_psi_car"] : (reach ? reach->psiCar : NULL);
 		else
 			psiB = m["reach_psi_ball"] ? m["reach_psi_ball"] : (reach ? reach->psiBall : NULL);
@@ -271,11 +284,16 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 				auto sa = fnL2(phi->Forward(torch::cat({ trunkRep, oneHot }, -1), false)); // [s*K,repr]
 
 				const auto& rc = config.reachability;
-				// Contact goal (car head): all-zeros car-local ball = "I am touching it".
-				// Scoring goal (ball head): canonical ball entering the net at speed.
-				torch::Tensor goal = steerRhoContact
-					? torch::zeros({ 1, 6 }).to(device)
-					: torch::tensor({
+				// META override goal, else the fixed defaults: contact (car head, zeros
+				// car-local ball = "I am touching it") or scoring (ball head, canonical
+				// ball entering the net at speed).
+				torch::Tensor goal;
+				if (steerGoalOverride.defined())
+					goal = steerGoalOverride;
+				else if (steerRhoContact)
+					goal = torch::zeros({ 1, 6 }).to(device);
+				else
+					goal = torch::tensor({
 						0.f,
 						RLGC::CommonValues::BACK_WALL_Y / rc.posScaleY,
 						(RLGC::CommonValues::GOAL_HEIGHT * 0.5f) / rc.posScaleZ,

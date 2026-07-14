@@ -730,6 +730,17 @@ int main(int argc, char* argv[]) {
 	// 74%/88%/92% of feasible balls for 1v1/2v2/3v3). Revert = false (team arenas revert
 	// to measurement-only panels).
 	cfg.steering.steerTeamModes = true;
+	// META frontier steering (2026-07-14, prior-free phase 4): goals from the agent's own
+	// achieved bank, frontier by its own self-model, emergent clusters in its own psi
+	// geometry, model-free attainment outcomes, per-cluster causal gates + a dwell
+	// scheduler. Offline: ball-head calibration monotone (car head self-disables for
+	// arbitrary goals), and at least one emergent cluster shows a monotone causal
+	// attainment uplift (deep-own-half high ball: -1.002 -> -0.901 across alpha 0..1)
+	// with clean canaries - plus cluster heterogeneity, the scheduler's raison d'etre.
+	// The incumbent commitment derivation keeps running for its panels; meta=false is
+	// the pinned fallback AND the pre-registered baseline: meta must beat it on Elo
+	// slope over a matched window or it reverts. Watch: Meta/* panels.
+	cfg.steering.meta = true;
 	// Phase 1 (steered league opponents): offline-validated style directions the opponent
 	// side occasionally plays (challenge/shadow + commitment styles from the Phase-0
 	// program; exploiter styles FAILED their offline bar and are absent until re-derived

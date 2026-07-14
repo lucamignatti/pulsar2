@@ -81,6 +81,36 @@ namespace GGL {
 		std::filesystem::path opponentStylesFile;
 		float opponentStyleChance = 0.25f;
 
+		// ===== META frontier steering (roadmap phase 4, prior-free) =====
+		// HARD REQUIREMENT: no human priors. Everything the meta system steers toward is
+		// agent-derived: goals sampled from the agent's OWN achieved-state bank (both
+		// self-model goal spaces); the frontier = (state, goal) pairs its OWN self-model
+		// rates coin-flip (rho band); structure = emergent k-means clusters in its OWN
+		// psi-embedding geometry (no cluster is ever named); outcome = CONTINUOUS
+		// ATTAINMENT (model-free: how close future achieved states got to the goal within
+		// the head's own HER horizon), compared only via within-population quantiles.
+		// A head drives steering ONLY while its own calibration curve is monotone
+		// (median attain below < in < above band) - the system disables its own
+		// unreliable senses (offline: the ball head passes, the car head fails for
+		// arbitrary goals and self-disables while keeping its contact-gate role).
+		// The scheduler dwells on the cluster with the best causal effect (normalized
+		// steered-vs-control attain shift), explores stale clusters periodically, and
+		// benches clusters whose effect goes negative (duty-cycle probing, same shape
+		// as the possession gate). Rating latch stays the global backstop.
+		// meta=false = the pinned incumbent (commitment steering) - the baseline the
+		// meta system must beat on Elo slope over a matched window (pre-registered).
+		bool meta = false;
+		int metaClusters = 6;            // emergent regions per head
+		int metaBankSize = 512;          // achieved-goal bank per head per iteration
+		int metaMaxRows = 4000;          // mined state rows per iteration
+		int metaGoalsPerRow = 3;         // sampled cross-episode goals per row
+		int metaDwellIters = 10;         // scheduler dwell per cluster
+		int metaExploreEvery = 4;        // every Nth dwell visits the stalest cluster
+		int metaWarmupIters = 150;       // effect-EMA iterations before benching may act
+		float metaEffectTrip = -0.3f;    // bench below this normalized effect EMA
+		float metaEffectReenable = -0.1f;// unbench above this (duty-cycle re-probe)
+		float metaCentroidEma = 0.7f;    // cluster-slot stability across iterations
+
 		// Frontier reset pool (roadmap phase 3): when set, the learner banks each
 		// iteration's feasible-but-declined MATCH readings (reconstructed from obs) into
 		// this pool, and the user's EnvCreateFunc wraps the PRACTICE arenas' setter in a

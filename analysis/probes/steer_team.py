@@ -324,7 +324,7 @@ class SteeredPolicyRho(PulsarPolicy):
 
 
 def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
-                 want_states=False):
+                 want_states=False, want_masks=False, want_goals=False):
     """policies: one policy for all rows, or (blue_policy, orange_policy) for
     cross-play. Records the interleaved per-player rows. want_states banks the FULL
     physical state per arena-step (ball 9 + per-car 17: pos vel angVel forward up
@@ -344,10 +344,20 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
     }
     if want_h2:
         rec["h2"] = np.empty((n_rows, 512), np.float16)
+    if want_masks:
+        rec["masks"] = np.empty((n_rows, 90), np.uint8)
+    if want_goals:
+        # Per-row ACHIEVED-GOAL vectors in the reachability heads' exact normalization
+        # (Learner.cpp fnAppendAchieved parity), derived from the canonical obs the
+        # policy consumed: ball head = canonical ball pos/vel; car head = car-local
+        # ball pos/vel. These are the agent's own achieved-state trajectories.
+        rec["ach_ball"] = np.empty((n_rows, 6), np.float32)
+        rec["ach_car"] = np.empty((n_rows, 6), np.float32)
     if want_states:
         rec["state_bank"] = np.empty((n_rows // npl + 1, 9 + npl * 17), np.float32)
     goals = 0
     goals_by_team = [0, 0]
+    ep_goal_team = {}  # episode id -> scoring team (0/1) for goal-ended episodes
     episodes_done = 0
     last_hit = [dict() for _ in envs]
     kick_first_touch = []
@@ -409,6 +419,19 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
                 rec["kickoff"][row] = is_kick
                 if want_h2:
                     rec["h2"][row] = h2[npl * i + p].numpy()
+                if want_masks:
+                    rec["masks"][row] = mask_b[npl * i + p].numpy()
+                if want_goals:
+                    o = obs_b[npl * i + p].numpy()
+                    # obs ball pos coef 1/5000, vel coef 1/2300 -> reach scales
+                    rec["ach_ball"][row, 0] = o[0] * 5000.0 / 4096.0
+                    rec["ach_ball"][row, 1] = o[1] * 5000.0 / 6000.0
+                    rec["ach_ball"][row, 2] = o[2] * 5000.0 / 2044.0
+                    rec["ach_ball"][row, 3:6] = o[3:6] * 2300.0 / 6000.0
+                    # self block local ball pos (+18..20, coef 1/5000) and vel
+                    # (+21..23, coef 1/2300) -> carLocalScale 2300
+                    rec["ach_car"][row, 0:3] = o[51 + 18: 51 + 21] * 5000.0 / 2300.0
+                    rec["ach_car"][row, 3:6] = o[51 + 21: 51 + 24]  # 2300/2300
                 row += 1
 
         for i, env in enumerate(envs):
@@ -416,6 +439,7 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
                 goals += int(env.goal_scored)
                 if env.goal_scored and env.goal_team is not None:
                     goals_by_team[env.goal_team] += 1
+                    ep_goal_team[env.episode_id] = env.goal_team
                 episodes_done += 1
                 env.reset()
                 if env.is_kickoff:
@@ -428,6 +452,7 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
         rec["state_bank"] = bank[: row // npl]
     rec["goals"] = goals
     rec["goals_by_team"] = goals_by_team
+    rec["ep_goal_team"] = ep_goal_team
     rec["episodes"] = max(episodes_done, 1)
     rec["kick_first_touch"] = kick_first_touch
     rec["ppt"] = ppt

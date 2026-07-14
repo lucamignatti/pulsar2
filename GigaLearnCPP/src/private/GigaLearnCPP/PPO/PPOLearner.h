@@ -82,6 +82,14 @@ namespace GGL {
 		int steerRhoK = 8;
 		float lastRhoGateFrac = 0; // metric: fraction of eligible rows steered last call
 
+		// META gate-goal override: when defined, the rho band scores reachability toward
+		// THIS goal (the active emergent cluster's representative, an achieved state from
+		// the agent's own bank) on the given head, replacing the fixed contact/scoring
+		// default. Set in the barrier zone only (the worker reads it unsynchronized).
+		torch::Tensor steerGoalOverride; // [6], goal-space normalized, on `device`
+		bool steerGoalOverrideCar = false;
+		void SetSteerGoal(torch::Tensor goal6Cpu, bool carHead); // undefined tensor = clear
+
 		// If models is null, this->models will be used. steerRowMask (optional, [n] bool, any
 		// device): rows eligible for steering; steerRowModes ([n] int64, REQUIRED when the
 		// mask is passed): each row's mode index (playersPerTeam-1) selecting the direction.
