@@ -24,6 +24,8 @@ GGL::PolicyVersionManager::PolicyVersionManager(
 	if (skill.config.enabled) {
 		RLGC::EnvSetConfig skillEnvSetConfig = envSetConfig;
 		skillEnvSetConfig.numArenas = skill.config.numArenas;
+		if (skill.config.envCreateFn)
+			skillEnvSetConfig.envCreateFn = skill.config.envCreateFn;
 		skill.envSet = new RLGC::EnvSet(skillEnvSetConfig);
 		for (int i = 0; i < skill.envSet->arenas.size(); i++) {
 			skill.envSet->rewards[i].clear();

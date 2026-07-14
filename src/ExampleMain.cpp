@@ -41,12 +41,15 @@ static constexpr int MAX_PLAYERS_PER_TEAM = 3;
 // PHASE B arena fractions, applied by arena index with the team arenas at the END of the
 // index range (deterministic across restarts). Keeping them at the end means: (a) the
 // steering practice arenas (the FIRST practiceArenaFrac of indices) stay 1v1, and (b) the
-// skill tracker / league eval EnvSets — which clone this create-func with small numArenas,
-// so only low indices — stay 1v1, keeping Rating/1v1 continuous across the phase switch
-// (it is also the guard key: the Learner tracks arena 0's mode). Keep the fractions +
-// practiceArenaFrac well under 1 so a healthy 1v1 match population remains for steering
-// derivation (which currently contrasts trunk rows from ALL match arenas — team rows
-// included after the flip; watch Steer/* if that mix degrades the direction).
+// league eval EnvSet — which clones this create-func with small numArenas, so only low
+// indices — stays 1v1. The skill tracker gets its OWN create-func (SkillEnvCreateFunc)
+// with the same trailing-team layout scaled to its small eval fleet, so PHASE B also
+// plays 2v2/3v3 eval matches and wandb gains Rating/2v2 + Rating/3v3; its arena 0 is
+// always 1v1, keeping Rating/1v1 continuous across the phase switch (it is also the
+// guard key: the Learner tracks arena 0's mode). Keep the fractions + practiceArenaFrac
+// well under 1 so a healthy 1v1 match population remains for steering derivation (which
+// currently contrasts trunk rows from ALL match arenas — team rows included after the
+// flip; watch Steer/* if that mix degrades the direction).
 static constexpr float PHASE_B_FRAC_2V2 = 0.20f;
 static constexpr float PHASE_B_FRAC_3V3 = 0.15f;
 
@@ -172,12 +175,24 @@ static int g_NumGames = 0;
 static int g_NumArenas2v2 = 0;
 static int g_NumArenas3v3 = 0;
 
+// Same trailing-team layout for the skill tracker's own small eval fleet (set in main()
+// alongside the split above; zero in PHASE A). Separate from the training split because the
+// eval EnvSet has its own numArenas — cloning the training create-func there would land every
+// eval arena on a low (= 1v1) index, which is exactly why Rating/2v2 / Rating/3v3 never
+// appeared in wandb after the flip.
+static int g_SkillNumArenas = 0;
+static int g_SkillArenas2v2 = 0;
+static int g_SkillArenas3v3 = 0;
+
 // Phase-B trigger state (iteration callback below)
 static bool g_PhaseB = false;
 static int g_PhaseBStreak = 0;
 
-// Create the RLGymCPP environment for each of our games
-EnvCreateResult EnvCreateFunc(int index) {
+// Shared env body for the training and skill-eval create-funcs: everything except the
+// team size and the practice-terminal decision is identical (and the skill tracker
+// overwrites eval rewards/state setters/terminal conditions anyway — for eval arenas only
+// the arena's team size, the obs builder and the action parser matter).
+static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	std::vector<TerminalCondition*> terminalConditions = {
 		new NoTouchCondition(10),
 		new GoalScoreCondition()
@@ -186,17 +201,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 	// Practice arenas (steered-practice collection): episodes additionally end - as a TRUE
 	// terminal, no value bootstrap - the moment an airborne-ball attempt resolves, so a whiff's
 	// counterattack never enters the return. Match arenas keep full consequences.
-	if (index < g_NumPracticeArenas)
+	if (practiceArena)
 		terminalConditions.push_back(new AttemptResolutionCondition());
 
-	// Make the arena. PHASE A: every arena is 1v1. PHASE B raises FRAC_2V2/FRAC_3V3, putting
-	// team modes on the trailing indices — the padded obs keeps the net identical either way,
-	// so the phase switch is checkpoint-compatible.
-	int playersPerTeam = 1;
-	if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3)
-		playersPerTeam = 3;
-	else if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3 - g_NumArenas2v2)
-		playersPerTeam = 2;
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -232,6 +239,33 @@ EnvCreateResult EnvCreateFunc(int index) {
 	result.arena = arena;
 
 	return result;
+}
+
+// Create the RLGymCPP environment for each of our games (the TRAINING fleet).
+// PHASE A: every arena is 1v1. PHASE B raises FRAC_2V2/FRAC_3V3, putting team modes on the
+// trailing indices — the padded obs keeps the net identical either way, so the phase switch
+// is checkpoint-compatible.
+EnvCreateResult EnvCreateFunc(int index) {
+	int playersPerTeam = 1;
+	if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3)
+		playersPerTeam = 3;
+	else if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3 - g_NumArenas2v2)
+		playersPerTeam = 2;
+	return MakeEnv(playersPerTeam, index < g_NumPracticeArenas);
+}
+
+// Create-func for the skill tracker's eval fleet: the same trailing-team layout, scaled to
+// the eval EnvSet's g_SkillNumArenas, so PHASE B evals also play 2v2/3v3 and per-mode Elo
+// (Rating/2v2, Rating/3v3) reaches wandb. Arena 0 is always 1v1 — it feeds the render
+// sender, and Rating/1v1 (the guard/trigger key) stays continuous across the flip. Never
+// a practice arena: eval matches must keep full consequences.
+EnvCreateResult SkillEnvCreateFunc(int index) {
+	int playersPerTeam = 1;
+	if (g_SkillNumArenas > 0 && index >= g_SkillNumArenas - g_SkillArenas3v3)
+		playersPerTeam = 3;
+	else if (g_SkillNumArenas > 0 && index >= g_SkillNumArenas - g_SkillArenas3v3 - g_SkillArenas2v2)
+		playersPerTeam = 2;
+	return MakeEnv(playersPerTeam, false);
 }
 
 void StepCallback(Learner* learner, const std::vector<GameState>& states, Report& report) {
@@ -614,6 +648,20 @@ int main(int argc, char* argv[]) {
 	RG_LOG("Team curriculum: PHASE " << (g_PhaseB ? "B" : "A") << " - "
 		<< (cfg.numGames - g_NumArenas2v2 - g_NumArenas3v3) << " 1v1 / "
 		<< g_NumArenas2v2 << " 2v2 / " << g_NumArenas3v3 << " 3v3 arenas");
+
+	// Skill tracker eval mix: same fractions over its own small fleet, team arenas trailing,
+	// at least one arena per team mode in PHASE B (16 arenas -> 11 1v1 / 3 2v2 / 2 3v3).
+	// This is what puts Rating/2v2 / Rating/3v3 on wandb once the phase flips; with few
+	// arenas per team mode those Elos move slower per eval than Rating/1v1 - expect them to
+	// take some evals to leave their initial value.
+	g_SkillNumArenas = cfg.skillTracker.numArenas;
+	g_SkillArenas2v2 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_2V2)) : 0;
+	g_SkillArenas3v3 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_3V3)) : 0;
+	cfg.skillTracker.envCreateFn = SkillEnvCreateFunc;
+	if (cfg.skillTracker.enabled)
+		RG_LOG("Skill tracker eval fleet: "
+			<< (g_SkillNumArenas - g_SkillArenas2v2 - g_SkillArenas3v3) << " 1v1 / "
+			<< g_SkillArenas2v2 << " 2v2 / " << g_SkillArenas3v3 << " 3v3 arenas");
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
