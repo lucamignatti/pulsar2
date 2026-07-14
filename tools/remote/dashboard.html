@@ -58,6 +58,12 @@
 <body>
 <h1>pulsar trainer <span class="host" id="host"></span></h1>
 
+<div class="card" id="verwarn" style="display:none; border-color:#6e5518; margin-bottom:10px">
+  <span class="warn">⚠ The dashboard service is running older code than this page
+  (updated files on disk, old process in memory). API buttons may fail until it reloads —
+  press <b>↻ Dashboard</b>, then reload this page.</span>
+</div>
+
 <div class="grid">
   <div class="card">
     <h2>Trainer</h2>
@@ -142,6 +148,9 @@
 <script>
 "use strict";
 let PIN = null;
+// Must match DASH_VERSION in dashboard.py (see the comment there): the page comes from
+// disk, the service from memory - after a git pull they can diverge until ↻ Dashboard.
+const EXPECT_DASH_VERSION = "2026-07-14.2";
 
 const $ = id => document.getElementById(id);
 function toast(msg, ms = 3500) {
@@ -162,6 +171,7 @@ function fmtSteps(n) {
 async function refresh() {
   try {
     const s = await (await fetch("/api/status")).json();
+    $("verwarn").style.display = s.dash_version === EXPECT_DASH_VERSION ? "none" : "block";
     $("host").textContent = "@ " + s.host;
     const tr = s.trainer;
     $("t-state").innerHTML = tr.running
@@ -242,8 +252,13 @@ async function loadGolden() {
   box.textContent = "loading…";
   let entries;
   try {
-    entries = (await (await fetch("/api/golden")).json()).entries;
-  } catch (e) { box.textContent = "fetch failed: " + e; return; }
+    const resp = await fetch("/api/golden");
+    const body = await resp.json();
+    if (!resp.ok || !Array.isArray(body.entries))
+      throw new Error((body.error || "HTTP " + resp.status) +
+        " — the dashboard service is likely running pre-update code; press ↻ Dashboard, then retry");
+    entries = body.entries;
+  } catch (e) { box.textContent = "golden list failed: " + (e.message || e); return; }
   if (!entries.length) { box.textContent = "(no golden checkpoints)"; return; }
   box.textContent = "";
   entries.forEach(e => {

@@ -45,6 +45,14 @@ LOCKOUT_FILE = STATE_DIR / "lockout.json"
 
 BIND = ("127.0.0.1", int(os.environ.get("DASHBOARD_PORT", "8500")))
 
+# Version handshake with dashboard.html. The HTML is read from DISK per request while
+# this process keeps whatever code it loaded at start - so after a git pull the page
+# can be newer than the service and API routes it expects may not exist (bit us live:
+# /api/golden 404'd from a stale service and the card hung). Bump BOTH this constant
+# and EXPECT_DASH_VERSION in dashboard.html whenever the API surface changes; the page
+# shows a "restart the dashboard" banner on mismatch.
+DASH_VERSION = "2026-07-14.2"
+
 MAX_PIN_FAILURES = 5
 LOCKOUT_WINDOW_SECS = 15 * 60
 
@@ -364,6 +372,7 @@ def full_status():
     cfg = load_config()
     return {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "dash_version": DASH_VERSION,
         "host": os.uname().nodename,
         "trainer": trainer_status(),
         "log": log_status(),
