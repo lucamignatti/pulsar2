@@ -332,9 +332,10 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (j.contains("steer_rating_tripped")) {
 		steerRatingTripped = (bool)j["steer_rating_tripped"];
 		if (steerRatingTripped)
-			RG_LOG("NOTE: steering rating guard was TRIPPED in this checkpoint - steering stays "
-				"latched OFF (a human decides; clear steer_rating_tripped in the checkpoint's "
-				"running-stats JSON or restore an untripped checkpoint to re-enable)");
+			RG_LOG("NOTE: steering rating guard was TRIPPED in this checkpoint - steering, "
+				"opponent styles and frontier drills stay latched OFF (a human decides; clear "
+				"steer_rating_tripped in the checkpoint's running-stats JSON or restore an "
+				"untripped checkpoint to re-enable)");
 	}
 
 	if (versionMgr)
@@ -1812,9 +1813,13 @@ void GGL::Learner::Start() {
 			// readings as canonical-frame reset entries reconstructed from obs-visible
 			// quantities. Layout support: AdvancedObsPadded(3) (230) and plain AdvancedObs
 			// 1v1 (109); anything else skips (loudly, once).
-			if (cfgS.frontierPool) {
+			if (cfgS.frontierPool)
+				cfgS.frontierPool->Advance(totalIterations); // staleness clock ALWAYS ticks
+			// Rating latch coverage: under the latch the Fill stops, so within maxAgeIters
+			// every pool goes stale and FrontierDrillState falls back to the normal reset
+			// mix on its own - "latched OFF" silences the whole intervention, not just alpha.
+			if (cfgS.frontierPool && !steerRatingTripped) {
 				auto& fpool = cfgS.frontierPool;
-				fpool->Advance(totalIterations);
 				const bool padded = obsSize == 230, plain = obsSize == 109;
 				static bool warnedLayout = false;
 				if (!padded && !plain) {
@@ -2358,7 +2363,8 @@ void GGL::Learner::Start() {
 				steerPendingApply = true; // push alpha=0 at the next barrier
 				RG_LOG("STEERING RATING GUARD TRIPPED: " << ratingKey << " " << rating
 					<< " vs EMA " << steerRatingEMA << " (drawdown > "
-					<< config.steering.ratingDrawdownTrip << ") - steering latched OFF");
+					<< config.steering.ratingDrawdownTrip << ") - steering, opponent styles "
+					"and frontier drills latched OFF");
 			}
 			steerRatingEMA = config.steering.ratingEmaDecay * steerRatingEMA
 				+ (1.f - config.steering.ratingEmaDecay) * rating;
@@ -2511,7 +2517,10 @@ void GGL::Learner::Start() {
 			float oppStyleCoef = 0;
 			if (oppModels) {
 				oppIters++;
-				if (!oppStyles.empty()
+				// steerRatingTripped: written only in the barrier zone (fnRatingGuard), read
+				// here on the collect thread - same discipline as ppo->steerVec. Latched OFF
+				// means the WHOLE steering intervention, styles included.
+				if (!oppStyles.empty() && !steerRatingTripped
 					&& RocketSim::Math::RandFloat() < config.steering.opponentStyleChance) {
 					auto& st = oppStyles[RocketSim::Math::RandInt(0, (int)oppStyles.size())];
 					oppStyleVec = st.vec;
