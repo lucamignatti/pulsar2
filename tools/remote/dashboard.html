@@ -109,6 +109,15 @@
   <a id="vizlink" href="#" target="_blank"><button type="button" class="primary">👁 Visualizer ↗</button></a>
 </div>
 
+<div class="card">
+  <div class="row">
+    <h2>Golden checkpoints</h2>
+    <span><button id="goldenbtn">↻ list</button></span>
+  </div>
+  <div id="goldenlist" class="muted">(press list — restore stops the trainer, quarantines
+    newer checkpoints, reinstates the golden as newest, and restarts)</div>
+</div>
+
 <div class="card" id="jobcard">
   <div class="row"><h2 id="jobtitle">Job</h2><span class="muted" id="jobstate"></span></div>
   <pre id="jobout"></pre>
@@ -198,7 +207,7 @@ async function refresh() {
   }
 }
 
-async function act(action) {
+async function act(action, extra) {
   if (["stop", "restart", "update", "dashboard_restart"].includes(action)
       && !confirm(action.replace("_", " ") + " — sure?")) return;
   if (!PIN) {
@@ -210,7 +219,7 @@ async function act(action) {
     resp = await fetch("/api/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, pin: PIN }),
+      body: JSON.stringify(Object.assign({ action, pin: PIN }, extra || {})),
     });
     body = await resp.json();
   } catch (e) { toast("request failed: " + e); return; }
@@ -221,6 +230,44 @@ async function act(action) {
   }
   followJob(body.job, action);
 }
+
+async function loadGolden() {
+  const box = $("goldenlist");
+  box.textContent = "loading…";
+  let entries;
+  try {
+    entries = (await (await fetch("/api/golden")).json()).entries;
+  } catch (e) { box.textContent = "fetch failed: " + e; return; }
+  if (!entries.length) { box.textContent = "(no golden checkpoints)"; return; }
+  box.textContent = "";
+  entries.forEach(e => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.margin = "6px 0";
+    const label = document.createElement("span");
+    label.style.fontFamily = "var(--mono)";
+    label.style.fontSize = "13px";
+    label.textContent = `rating ${e.rating}  ·  ${fmtSteps(e.timesteps)} steps  ·  ${e.date}`;
+    const btn = document.createElement("button");
+    btn.className = "danger";
+    btn.textContent = "Restore";
+    btn.onclick = () => {
+      if (!confirm(
+        `Restore ${e.name}?\n\n` +
+        `This will:\n` +
+        `  1. stop the trainer\n` +
+        `  2. QUARANTINE every rotation checkpoint newer than ${fmtSteps(e.timesteps)} steps (moved, never deleted)\n` +
+        `  3. reinstate this golden checkpoint as the newest\n` +
+        `  4. restart the trainer (policy versions newer than it auto-quarantine at boot)\n\n` +
+        `Training resumes from rating ~${e.rating}.`)) return;
+      act("restore_golden", { target: e.name });
+    };
+    row.appendChild(label);
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+$("goldenbtn").onclick = loadGolden;
 
 let jobES = null;
 function followJob(id, action) {

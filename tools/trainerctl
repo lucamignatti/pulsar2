@@ -8,6 +8,8 @@
 #   trainerctl update [--no-restart] # git fetch + ff-only pull + rebuild + restart
 #   trainerctl build                 # rebuild build/ (and build-viz/ if present)
 #   trainerctl checkpoints [N]       # newest N checkpoints (default 5)
+#   trainerctl golden                # list golden-archive checkpoints (best_r*)
+#   trainerctl restore-golden NAME   # restore a golden checkpoint (quarantines newer)
 #   trainerctl gpu                   # nvidia-smi snapshot
 #   trainerctl viz start|stop|status # RocketSimVisWeb + GGL_RENDER viewer stack
 #   trainerctl viz mode [1v1|2v2|3v3] # switch the single viewer arena's team size
@@ -100,6 +102,82 @@ cmd_gpu() {
     command -v nvidia-smi >/dev/null 2>&1 || { echo "nvidia-smi not found"; return 1; }
     nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
         --format=csv,noheader
+}
+
+# Golden archive = best_r<rating>_<ts> dirs INSIDE the checkpoint folder (kept by the
+# trainer itself: top-N rated full checkpoints, outside the numbered rotation).
+cmd_golden() {
+    local found=0
+    while read -r name; do
+        [ -n "$name" ] || continue
+        found=1
+        local rating="${name#best_r}"; rating="${rating%%_*}"
+        local ts="${name##*_}"
+        printf '%s  rating %s  %s steps  %s\n' "$name" "$rating" "$ts" \
+            "$(stat -c '%y' "$CKPT_DIR/$name" 2>/dev/null | cut -d. -f1)"
+    done < <(ls -1 "$CKPT_DIR" 2>/dev/null | grep -E '^best_r[0-9]+_[0-9]+$' | sort -t_ -k2 -rn)
+    [ "$found" -eq 1 ] || { echo "no golden checkpoints in $CKPT_DIR"; return 1; }
+}
+
+# Restore a golden checkpoint per the recovery doctrine: FULL checkpoint only, never
+# hand-assembled hybrids; QUARANTINE (never delete) everything newer so the loader
+# cannot prefer the damaged lineage. Policy versions newer than the restored timestep
+# quarantine themselves at the next boot (PolicyVersionManager renames them stale_*).
+cmd_restore_golden() {
+    local name="${1:-}"
+    case "$name" in
+        best_r*_*) ;;
+        *) die "usage: trainerctl restore-golden best_r<rating>_<ts>  (see: trainerctl golden)" ;;
+    esac
+    echo "$name" | grep -qE '^best_r[0-9]+_[0-9]+$' || die "malformed golden name: $name"
+    local src="$CKPT_DIR/$name"
+    [ -d "$src" ] || die "no golden checkpoint at $src"
+    local ts="${name##*_}"
+
+    local was_running=0
+    trainer_running && was_running=1
+    if [ "$was_running" -eq 1 ]; then
+        note "stopping trainer for restore"
+        cmd_stop || die "stop failed; aborting restore"
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            trainer_running || break
+            sleep 1
+        done
+        trainer_running && die "trainer did not stop; aborting restore (nothing was changed)"
+    fi
+
+    # Quarantine every numbered rotation checkpoint NEWER than the restore point.
+    local qdir="$BUILD_DIR/$(basename "$CKPT_DIR")_quarantine_$(date +%Y%m%d_%H%M%S)"
+    local moved=0
+    while read -r c; do
+        [ -n "$c" ] || continue
+        if [ "$c" -gt "$ts" ]; then
+            mkdir -p "$qdir" || die "cannot create quarantine dir $qdir"
+            mv "$CKPT_DIR/$c" "$qdir/" || die "failed to quarantine $c (restore incomplete - inspect $CKPT_DIR)"
+            note "quarantined $c -> $qdir/"
+            moved=$((moved+1))
+        fi
+    done < <(ls -1 "$CKPT_DIR" 2>/dev/null | grep -E '^[0-9]+$')
+    [ "$moved" -eq 0 ] && note "no rotation checkpoints newer than $ts (nothing to quarantine)"
+
+    # Reinstate the golden as the newest numbered rotation checkpoint. If the numbered
+    # dir still exists the golden is its byte-identical copy - leave it alone.
+    if [ -d "$CKPT_DIR/$ts" ]; then
+        note "rotation already holds $ts (the golden's source) - leaving it in place"
+    else
+        note "reinstating $name as rotation checkpoint $ts"
+        cp -a "$src" "$CKPT_DIR/$ts.tmp" || die "copy failed"
+        mv "$CKPT_DIR/$ts.tmp" "$CKPT_DIR/$ts" || die "rename failed"
+    fi
+
+    if [ "$was_running" -eq 1 ]; then
+        note "starting trainer on restored checkpoint $ts"
+        cmd_start || die "start failed - start manually with: trainerctl start"
+    else
+        note "trainer was not running; start it with: trainerctl start"
+    fi
+    local rating="${name#best_r}"; rating="${rating%%_*}"
+    note "restore complete: newest rotation checkpoint = $ts (rating $rating); quarantine = ${qdir}"
 }
 
 cmd_build() {
@@ -355,10 +433,12 @@ case "${1:-help}" in
     update)       cmd_update "${2:-}" ;;
     build)        cmd_build ;;
     checkpoints)  cmd_checkpoints "${2:-5}" ;;
+    golden)       cmd_golden ;;
+    restore-golden) cmd_restore_golden "${2:-}" ;;
     gpu)          cmd_gpu ;;
     viz)          shift; cmd_viz "${1:-status}" "${2:-}" ;;
     set-pin)      cmd_set_pin ;;
     doctor)       cmd_doctor ;;
-    help|--help|-h) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+    help|--help|-h) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $1 (try: trainerctl help)" ;;
 esac

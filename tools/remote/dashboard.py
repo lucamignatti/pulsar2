@@ -69,6 +69,31 @@ ACTIONS = {
                           "Restart this dashboard"),
 }
 
+# restore_golden is the one action with a parameter (which golden checkpoint). It keeps
+# the allowlist discipline anyway: the target must match this strict pattern AND name an
+# existing best_r* directory in CKPT_DIR - i.e. the argv argument is validated against an
+# enumerated set the trainer itself maintains, never free-form user input.
+GOLDEN_RE = re.compile(r"best_r\d+_\d+")
+
+
+def golden_entries():
+    entries = []
+    try:
+        for p in CKPT_DIR.iterdir():
+            if p.is_dir() and GOLDEN_RE.fullmatch(p.name):
+                rating, _, ts = p.name[len("best_r"):].partition("_")
+                entries.append({
+                    "name": p.name,
+                    "rating": int(rating),
+                    "timesteps": int(ts),
+                    "date": time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(p.stat().st_mtime)),
+                })
+    except Exception:
+        pass
+    entries.sort(key=lambda e: e["rating"], reverse=True)
+    return entries
+
 
 def load_config():
     try:
@@ -428,6 +453,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/checkpoints":
             rc, out = run([str(TRAINERCTL), "checkpoints", "15"], timeout=10)
             self.send_json({"ok": rc == 0, "lines": out.splitlines()})
+        elif path == "/api/golden":
+            self.send_json({"entries": golden_entries()})
         elif path == "/api/audit":
             lines = []
             try:
@@ -463,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "bad request"}, 400)
             return
         action = body.get("action", "")
-        if action not in ACTIONS:
+        if action not in ACTIONS and action != "restore_golden":
             audit(self, action or "?", False, "unknown action")
             self.send_json({"error": "unknown action"}, 400)
             return
@@ -472,13 +499,27 @@ class Handler(BaseHTTPRequestHandler):
             audit(self, action, False, msg)
             self.send_json({"error": msg}, 403)
             return
-        argv, _ = ACTIONS[action]
+        if action == "restore_golden":
+            # Parameterized action: the target must be an EXISTING golden dir whose
+            # name matches the strict pattern (see GOLDEN_RE comment). Re-enumerate at
+            # request time so the check races nothing.
+            target = str(body.get("target", ""))
+            if not GOLDEN_RE.fullmatch(target) \
+                    or target not in {e["name"] for e in golden_entries()}:
+                audit(self, action, False, f"invalid target {target!r}")
+                self.send_json({"error": "unknown golden checkpoint"}, 400)
+                return
+            argv = [str(TRAINERCTL), "restore-golden", target]
+            audit_detail = target
+        else:
+            argv, _ = ACTIONS[action]
+            audit_detail = ""
         job, msg = RUNNER.start(action, argv)
         if job is None:
             audit(self, action, False, msg)
             self.send_json({"error": msg}, 409)
             return
-        audit(self, action, True)
+        audit(self, action, True, audit_detail)
         self.send_json({"job": job.id})
 
     # -- streaming ----------------------------------------------------------
