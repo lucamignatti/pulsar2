@@ -10,6 +10,7 @@
 #   trainerctl checkpoints [N]       # newest N checkpoints (default 5)
 #   trainerctl golden                # list golden-archive checkpoints (best_r*)
 #   trainerctl restore-golden NAME   # restore a golden checkpoint (quarantines newer)
+#   trainerctl clear-latch           # un-trip the steering rating latch (stop+edit+start)
 #   trainerctl gpu                   # nvidia-smi snapshot
 #   trainerctl viz start|stop|status # RocketSimVisWeb + GGL_RENDER viewer stack
 #   trainerctl viz mode [1v1|2v2|3v3] # switch the single viewer arena's team size
@@ -178,6 +179,57 @@ cmd_restore_golden() {
     fi
     local rating="${name#best_r}"; rating="${rating%%_*}"
     note "restore complete: newest rotation checkpoint = $ts (rating $rating); quarantine = ${qdir}"
+}
+
+# Un-trip the steering rating latch. The latch (steer_rating_tripped) is persisted in
+# every checkpoint's RUNNING_STATS.json precisely so crash-restarts cannot silently
+# re-arm steering on a damaged policy - which means re-enabling is deliberately manual:
+# stop the trainer, clear the flag in the NEWEST checkpoint (the one the loader will
+# pick), start. The trainer logs the latch state at boot, so the trainer log is the
+# confirmation. EMA/peak guard state is left untouched (it is honest history; the
+# latch re-arms itself on the next genuine drawdown).
+cmd_clear_latch() {
+    local newest
+    newest="$(ls -1 "$CKPT_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+    [ -n "$newest" ] || die "no numbered checkpoints in $CKPT_DIR"
+    local stats="$CKPT_DIR/$newest/RUNNING_STATS.json"
+    [ -f "$stats" ] || die "no RUNNING_STATS.json in checkpoint $newest"
+
+    local was_running=0
+    trainer_running && was_running=1
+    if [ "$was_running" -eq 1 ]; then
+        note "stopping trainer to clear the latch"
+        cmd_stop || die "stop failed; latch unchanged"
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            trainer_running || break
+            sleep 1
+        done
+        trainer_running && die "trainer did not stop; latch unchanged"
+    fi
+
+    STATS_PATH="$stats" python3 - <<'EOF' || die "failed to edit $stats (latch unchanged)"
+import json, os
+path = os.environ["STATS_PATH"]
+with open(path) as f:
+    j = json.load(f)
+prev = j.get("steer_rating_tripped")
+if prev is not True:
+    print(f"[trainerctl] latch was not tripped in this checkpoint (steer_rating_tripped={prev!r}) - nothing to clear")
+else:
+    j["steer_rating_tripped"] = False
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(j, f, indent=4)
+    os.replace(tmp, path)
+    print(f"[trainerctl] steer_rating_tripped: True -> False in {path}")
+EOF
+
+    if [ "$was_running" -eq 1 ]; then
+        note "starting trainer (steering re-armed; watch Steer/Alpha + the rating guards)"
+        cmd_start || die "start failed - start manually with: trainerctl start"
+    else
+        note "trainer was not running; start it with: trainerctl start"
+    fi
 }
 
 cmd_build() {
@@ -435,10 +487,11 @@ case "${1:-help}" in
     checkpoints)  cmd_checkpoints "${2:-5}" ;;
     golden)       cmd_golden ;;
     restore-golden) cmd_restore_golden "${2:-}" ;;
+    clear-latch)  cmd_clear_latch ;;
     gpu)          cmd_gpu ;;
     viz)          shift; cmd_viz "${1:-status}" "${2:-}" ;;
     set-pin)      cmd_set_pin ;;
     doctor)       cmd_doctor ;;
-    help|--help|-h) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    help|--help|-h) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command: $1 (try: trainerctl help)" ;;
 esac

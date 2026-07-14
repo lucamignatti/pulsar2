@@ -63,6 +63,8 @@ ACTIONS = {
     "viz_mode_1v1":  ([str(TRAINERCTL), "viz", "mode", "1v1"], "Viz mode 1v1"),
     "viz_mode_2v2":  ([str(TRAINERCTL), "viz", "mode", "2v2"], "Viz mode 2v2"),
     "viz_mode_3v3":  ([str(TRAINERCTL), "viz", "mode", "3v3"], "Viz mode 3v3"),
+    "clear_latch":   ([str(TRAINERCTL), "clear-latch"],
+                      "Un-trip the steering rating latch (stop+edit+start)"),
     "check_updates": (["git", "-C", str(REPO_ROOT), "fetch", "origin", "--prune"],
                       "Fetch origin (no merge)"),
     "dashboard_restart": (["systemctl", "--user", "restart", "pulsar-dashboard.service"],

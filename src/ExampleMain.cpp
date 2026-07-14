@@ -765,7 +765,14 @@ int main(int argc, char* argv[]) {
 	// and vice versa). meta=false remains the pinned fallback AND the pre-registered
 	// baseline: meta must beat it on Elo slope over a matched window or it reverts.
 	// Watch: Meta/Owns Slot, Meta/* panels, Steer/Rating Peak.
-	cfg.steering.meta = true;
+	// RE-ENABLE SEQUENCE (2026-07-14, post-incident): steering returns in its PROVEN
+	// configuration first - pinned commitment, meta OFF. This is the exact config that
+	// drove 1380 -> 1462, it re-establishes value with clean attribution, and it IS the
+	// pre-registered baseline the meta system must beat. Flipping meta back on is the
+	// next one-lever experiment, judged on Elo slope vs this baseline with the peak
+	// latch armed. (The meta machinery, banks and panels are all still built and the
+	// probe/promote scheduler smoke-passed - this flag is the only thing holding it.)
+	cfg.steering.meta = false;
 	// Phase 1 (steered league opponents): offline-validated style directions the opponent
 	// side occasionally plays (challenge/shadow + commitment styles from the Phase-0
 	// program; exploiter styles FAILED their offline bar and are absent until re-derived

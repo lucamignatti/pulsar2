@@ -103,6 +103,7 @@
   <button data-action="check_updates">Check updates</button>
   <button data-action="update" class="primary">⬆ Update (pull+build+restart)</button>
   <button data-action="build">Build only</button>
+  <button data-action="clear_latch" class="danger">⚡ Clear steering latch</button>
   <button data-action="viz_start">Viz on</button>
   <button data-action="viz_stop">Viz off</button>
   <button data-action="dashboard_restart">↻ Dashboard</button>
@@ -208,6 +209,11 @@ async function refresh() {
 }
 
 async function act(action, extra) {
+  if (action === "clear_latch"
+      && !confirm("Clear the steering rating latch?\n\n" +
+        "This stops the trainer, sets steer_rating_tripped=false in the newest " +
+        "checkpoint, and restarts. Steering (plus opponent styles and frontier " +
+        "drills) re-enables and the rating guards re-arm.")) return;
   if (["stop", "restart", "update", "dashboard_restart"].includes(action)
       && !confirm(action.replace("_", " ") + " — sure?")) return;
   if (!PIN) {
