@@ -1109,6 +1109,33 @@ void GGL::Learner::Start() {
 			ppo->steerRhoK = RS_MAX(1, config.steering.rhoGateActionSamples);
 		}
 
+		// Steered-practice row group per arena: 0 match, 1 steered, 2 control, 3 TEAM match
+		// (>1 player per team - the PHASE B trailing arenas). Group 3 exists so the steering
+		// derivation can EXCLUDE team rows: the possession labels read only SELF touches vs
+		// OPPONENT-team touches, so in a team arena a teammate winning the race is mislabeled
+		// NONE ("nobody got it") and good second-man play would enter the direction contrast
+		// as "declined" - polluting the WON-vs-NONE contrast with exactly the behavior team
+		// play wants. Steered/control arenas are all 1v1 (leading indices, team arenas
+		// trailing - the ExampleMain layout contract, enforced loudly here), so a 1v1-only
+		// derivation stays exactly matched to the treatment population.
+		std::vector<uint8_t> arenaSteerGroup(envSet->arenas.size(), 0);
+		if (steerOn) {
+			for (int a = 0; a < (int)envSet->arenas.size(); a++) {
+				bool teamArena = envSet->arenas[a]->_cars.size() > 2;
+				if (a < numSteeredArenas)
+					arenaSteerGroup[a] = 1;
+				else if (a < numPracticeArenas)
+					arenaSteerGroup[a] = 2;
+				else if (teamArena)
+					arenaSteerGroup[a] = 3;
+				if (teamArena && a < numPracticeArenas)
+					RG_ERR_CLOSE("Steered/control practice arena " << a << " has "
+						<< envSet->arenas[a]->_cars.size() << " cars: the steering practice split "
+						"must stay on 1v1 arenas (keep practiceArenaFrac + team fractions from "
+						"overlapping - team arenas belong at the END of the index range)");
+			}
+		}
+
 		// Live steering state (derived in fnSteerUpdate during learn-prep, applied in the
 		// barrier zone where no collect worker is in flight). CPU tensors.
 		torch::Tensor steerVecEMA;
@@ -1465,7 +1492,10 @@ void GGL::Learner::Start() {
 					if (!combinedTraj.terminals[r])
 						continue;
 					for (int64_t i = epStart; i <= r; i++)
-						if (fnObs(i, BALL_POS + 2) * POS_SCALE > ARM_Z)
+						// Group 3 (team-match rows, PHASE B) is excluded up front: their
+						// possession labels are blind to teammate touches (see the
+						// arenaSteerGroup comment), and feas/possWon below only size 3
+						if (groups[i] != 3 && fnObs(i, BALL_POS + 2) * POS_SCALE > ARM_Z)
 							cand.push_back({ i, r });
 					epStart = r + 1;
 				}
@@ -1998,14 +2028,13 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
 
 							// Steered-practice row tag (0 = match, 1 = steered practice, 2 =
-							// control practice). Tagged by ARENA, not by whether a vector is
-							// active: the resolution-terminated returns are what poison the
-							// critic, steered or not; the 1-vs-2 split feeds the causal gate.
-							if (steerOn) {
-								int arena = playerArenaIdx[newPlayerIdx];
+							// control practice, 3 = TEAM match - excluded from derivation).
+							// Tagged by ARENA, not by whether a vector is active: the
+							// resolution-terminated returns are what poison the critic,
+							// steered or not; the 1-vs-2 split feeds the causal gate.
+							if (steerOn)
 								trajectories[newPlayerIdx].steerPractice.push_back(
-									arena < numSteeredArenas ? 1 : (arena < numPracticeArenas ? 2 : 0));
-							}
+									arenaSteerGroup[playerArenaIdx[newPlayerIdx]]);
 
 							if (goalCriticOn) {
 								// Goal-only channel, straight from game outcomes (same convention as
@@ -2971,9 +3000,13 @@ void GGL::Learner::Start() {
 							torch::Tensor injected = betaEff * (tGoalAdvantages - tGoalAdvantages.mean());
 							// STAGE-2 only: resolution-terminated practice rows never receive
 							// goal-critic credit (their goal channel is structurally 0). Stage 1
-							// episodes are normal, so the blend applies everywhere.
-							if (config.steering.resolutionTermination && !combinedTraj.steerPractice.empty())
-								injected = injected * (torch::tensor(combinedTraj.steerPractice) == 0).to(torch::kFloat32);
+							// episodes are normal, so the blend applies everywhere. Groups 0 AND 3
+							// are both ordinary match rows (3 = team match, tagged only so the
+							// steering derivation can skip them).
+							if (config.steering.resolutionTermination && !combinedTraj.steerPractice.empty()) {
+								torch::Tensor tGroups = torch::tensor(combinedTraj.steerPractice);
+								injected = injected * ((tGroups == 0) | (tGroups == 3)).to(torch::kFloat32);
+							}
 							tAdvantages = tAdvantages + injected;
 							report["GoalCritic/Blend BetaEff"] = betaEff;
 							report["GoalCritic/Injected Abs Mean"] = injected.abs().mean().item<float>();
@@ -3031,8 +3064,10 @@ void GGL::Learner::Start() {
 					// STAGE-2 (resolutionTermination) semantic - stage 1 runs normal episodes,
 					// so every row is an ordinary row for both critics.
 					if (steerOn && !combinedTraj.steerPractice.empty()) {
+						torch::Tensor tGroups = torch::tensor(combinedTraj.steerPractice);
+						// Practice = groups 1 (steered) and 2 (control); group 3 is a team MATCH row
 						torch::Tensor tPractice =
-							(torch::tensor(combinedTraj.steerPractice) > 0).to(torch::kFloat32);
+							((tGroups == 1) | (tGroups == 2)).to(torch::kFloat32);
 						if (config.steering.resolutionTermination)
 							experience.data.practiceMask = tPractice;
 						report["Steer/Practice Row Frac"] = tPractice.mean().item<float>();
