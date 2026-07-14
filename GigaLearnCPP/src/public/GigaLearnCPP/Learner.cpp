@@ -276,6 +276,8 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	// crash-restarts (NaN EMA is skipped - JSON has no NaN and it just means "unseeded")
 	if (!std::isnan(steerRatingEMA))
 		j["steer_rating_ema"] = steerRatingEMA;
+	if (!std::isnan(steerRatingPeak))
+		j["steer_rating_peak"] = steerRatingPeak;
 	j["steer_rating_tripped"] = steerRatingTripped;
 
 	// Churn-telemetry vector archive, per mode (save-only; see Learner.h steerVecSave).
@@ -329,6 +331,8 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 
 	if (j.contains("steer_rating_ema"))
 		steerRatingEMA = (float)j["steer_rating_ema"];
+	if (j.contains("steer_rating_peak"))
+		steerRatingPeak = (float)j["steer_rating_peak"];
 	if (j.contains("steer_rating_tripped")) {
 		steerRatingTripped = (bool)j["steer_rating_tripped"];
 		if (steerRatingTripped)
@@ -1223,6 +1227,17 @@ void GGL::Learner::Start() {
 		// Rating drawdown guard state (steerRatingEMA / steerRatingTripped) lives on the
 		// Learner and is persisted in the checkpoint stats - a crash-restart must not
 		// silently un-latch steering (the wrapper restarts automatically and unattended)
+
+		// META slot-ownership attribution (declared here, above fnSteerUpdate, so the
+		// incumbent gate can read it). The steering slot is time-multiplexed between the
+		// incumbent commitment direction and meta cluster probes (see the scheduler in
+		// fnMetaUpdate); measurements must attribute each buffer to whoever actually
+		// steered it: applied* = the owner set at the LAST barrier apply, measured* = the
+		// owner that steered the buffer currently being processed (one apply behind in
+		// pipelined mode, the same apply in sequential mode). -1 = the incumbent owns.
+		bool metaOwnsActuation = false;
+		int appliedMetaHead = -1, appliedMetaCluster = -1;
+		int measuredMetaHead = -1, measuredMetaCluster = -1;
 		// Car-free arenas for ball-landing sims, one per ad-hoc sim thread (lazy, reused).
 		// Deliberately NOT on the shared thread pool: in pipelined mode learn-prep overlaps the
 		// collect worker, which owns the pool.
@@ -1695,7 +1710,10 @@ void GGL::Learner::Start() {
 			for (int md = 0; md < STEER_MODES; md++) {
 				if (steerBlocks[md].numSteered == 0)
 					continue;
-				if (steerLoaded && feas[md][1] >= 50 && feas[md][2] >= 50) {
+				// Accrue only from buffers the INCUMBENT steered: during meta-owned dwells
+				// the steered arenas carry a cluster direction, and grading the incumbent's
+				// possession gate on someone else's behavior would trip/clear it spuriously
+				if (steerLoaded && measuredMetaHead < 0 && feas[md][1] >= 50 && feas[md][2] >= 50) {
 					float delta = (float)possTeamWon[md][1] / feas[md][1]
 						- (float)possTeamWon[md][2] / feas[md][2];
 					steerGateDeltaEMA[md] = (steerGateIters[md] == 0)
@@ -1926,7 +1944,6 @@ void GGL::Learner::Start() {
 		int64_t metaDwellIdx = 0;
 		int metaDwellLeft = 0;
 		std::array<float, STEER_MODES> metaSigma = {};
-		bool metaPendingApply = false;
 		const bool metaOn = steerOn && config.steering.meta && reachOn;
 
 		auto fnMetaUpdate = [&](Report& report) {
@@ -2244,8 +2261,11 @@ void GGL::Learner::Start() {
 						}
 					}
 
-					// Causal effect for the ACTIVE cluster: normalized attain shift
-					if (head == metaActiveHead && c == metaActiveCluster
+					// Causal effect, attributed to the cluster that ACTUALLY STEERED this
+					// buffer (measuredMeta*, one apply behind in pipelined mode) - during
+					// incumbent-owned dwells no cluster accrues, and the steered-vs-control
+					// contrast is never charged to a cluster that wasn't applied
+					if (head == measuredMetaHead && c == measuredMetaCluster
 						&& steered.size() >= 30 && control.size() >= 30) {
 						auto fnMedIqr = [](std::vector<float>& v, float& med, float& iqr) {
 							std::sort(v.begin(), v.end());
@@ -2277,12 +2297,20 @@ void GGL::Learner::Start() {
 				}
 			}
 
-			// ---- Scheduler: one active (head, cluster); dwell + periodic exploration
+			// ---- Scheduler: TIME-MULTIPLEXED slot ownership (2026-07-14 incident fix).
+			// v1 gave meta the slot permanently: the PROVEN incumbent commitment direction
+			// (which had just driven Rating 1380 -> 1462) stopped actuating and rotating
+			// unproven cluster directions took over, while benching could never engage
+			// (150-iter warmup / 10-iter dwells). Now the incumbent is the DEFAULT actuator;
+			// every metaProbeEvery-th dwell probes one cluster (unmeasured first, then
+			// stalest - benched included, that re-probe is the unbench path), and a cluster
+			// only owns exploit dwells after its measured effect EMA clears metaPromoteMin
+			// with a full warmup: actuation is EARNED from the system's own measurements.
 			if (metaDwellLeft > 0)
 				metaDwellLeft--;
 			if (metaDwellLeft == 0) {
 				metaDwellIdx++;
-				bool explore = (metaDwellIdx % RS_MAX(1, (int64_t)cfgS.metaExploreEvery)) == 0;
+				bool probe = (metaDwellIdx % RS_MAX(1, (int64_t)cfgS.metaProbeEvery)) == 0;
 				int bestH = -1, bestC = -1;
 				float bestScore = -1e30f;
 				for (int h = 0; h < 3; h++) {
@@ -2292,12 +2320,18 @@ void GGL::Learner::Start() {
 						auto& s = metaSlots[h][c];
 						if (!s.dirEMA.defined() || s.lastPairs < cfgS.minPairsPerUpdate)
 							continue;
-						if (!explore && s.benched)
-							continue;
-						float score = explore
-							? -(float)s.lastDwellIdx            // stalest first
-							: (s.effectIters == 0 ? 1e6f        // unmeasured: probe it
-								: s.effectEMA);
+						float score;
+						if (probe) {
+							score = s.effectIters == 0 ? 1e6f - c   // unmeasured: probe first
+								: -(float)s.lastDwellIdx;           // then stalest
+						} else {
+							// Exploit dwells must be earned: warmed up, unbenched, and
+							// measurably better than not steering
+							if (s.benched || s.effectIters < cfgS.metaWarmupIters
+								|| s.effectEMA < cfgS.metaPromoteMin)
+								continue;
+							score = s.effectEMA;
+						}
 						if (score > bestScore) {
 							bestScore = score;
 							bestH = h;
@@ -2305,17 +2339,22 @@ void GGL::Learner::Start() {
 						}
 					}
 				}
-				if (bestH >= 0) {
-					if (bestH != metaActiveHead || bestC != metaActiveCluster)
-						RG_LOG("Meta steering: active cluster -> "
+				bool wasMeta = metaOwnsActuation;
+				metaOwnsActuation = bestH >= 0;
+				if (metaOwnsActuation) {
+					if (!wasMeta || bestH != metaActiveHead || bestC != metaActiveCluster)
+						RG_LOG("Meta steering: slot -> "
 							<< (bestH == 0 ? "car" : (bestH == 1 ? "ball" : "carstate")) << "/" << bestC
-							<< (explore ? " (exploration dwell)" : ""));
+							<< (probe ? " (probe dwell)" : " (earned exploit dwell)"));
 					metaActiveHead = bestH;
 					metaActiveCluster = bestC;
 					metaSlots[bestH][bestC].lastDwellIdx = metaDwellIdx;
+				} else if (wasMeta) {
+					RG_LOG("Meta steering: slot -> incumbent commitment direction");
 				}
 				metaDwellLeft = RS_MAX(1, cfgS.metaDwellIters);
 			}
+			report["Meta/Owns Slot"] = (float)metaOwnsActuation;
 			report["Meta/Active Head"] = (float)metaActiveHead;
 			report["Meta/Active Cluster"] = (float)metaActiveCluster;
 			if (metaActiveHead >= 0 && metaActiveCluster >= 0)
@@ -2340,7 +2379,6 @@ void GGL::Learner::Start() {
 								: cfgS.emaDecay * metaSigma[md] + (1 - cfgS.emaDecay) * sig;
 						}
 					}
-					metaPendingApply = true;
 				}
 			}
 		};
@@ -2356,8 +2394,11 @@ void GGL::Learner::Start() {
 			float rating = (float)report[ratingKey];
 			if (std::isnan(steerRatingEMA)) {
 				steerRatingEMA = rating;
+				steerRatingPeak = rating;
 				return;
 			}
+			if (std::isnan(steerRatingPeak))
+				steerRatingPeak = rating; // resumed from a pre-peak-latch checkpoint
 			if (!steerRatingTripped && rating < steerRatingEMA - config.steering.ratingDrawdownTrip) {
 				steerRatingTripped = true;
 				steerPendingApply = true; // push alpha=0 at the next barrier
@@ -2366,22 +2407,28 @@ void GGL::Learner::Start() {
 					<< config.steering.ratingDrawdownTrip << ") - steering, opponent styles "
 					"and frontier drills latched OFF");
 			}
+			// Peak latch: the slow EMA lags a fresh climb, so a slide off a new peak sits
+			// in its blind spot (2026-07-14: 1462 -> 1336 with the EMA guard silent the
+			// whole way down). The decaying high-water mark sees exactly that shape.
+			if (!steerRatingTripped && rating < steerRatingPeak - config.steering.ratingPeakTrip) {
+				steerRatingTripped = true;
+				steerPendingApply = true;
+				RG_LOG("STEERING RATING GUARD TRIPPED (peak drawdown): " << ratingKey << " "
+					<< rating << " vs recent peak " << steerRatingPeak << " (drawdown > "
+					<< config.steering.ratingPeakTrip << ") - steering, opponent styles "
+					"and frontier drills latched OFF");
+			}
 			steerRatingEMA = config.steering.ratingEmaDecay * steerRatingEMA
 				+ (1.f - config.steering.ratingEmaDecay) * rating;
+			steerRatingPeak = RS_MAX(rating, steerRatingPeak - config.steering.ratingPeakDecay);
 		};
 
-		// Applies the latest derived direction/gate state to the PPOLearner. ONLY call when no
-		// collect worker is in flight (barrier zone / sequential mode) - the worker reads
-		// ppo->steerVec without synchronization.
 		// Applies the META system's active cluster: its direction on all modes (dosed by
 		// each mode's own sigma), its representative goal as the rho-gate target, alphas
-		// gated by benching + the rating latch. ONLY call in the barrier zone.
+		// gated by benching + the rating latch. ONLY call in the barrier zone, and only
+		// while the scheduler has given meta the slot (fnApplySteering owns that call).
 		auto fnApplyMeta = [&]() {
-			if (!metaOn || !metaPendingApply || metaActiveHead < 0 || metaActiveCluster < 0)
-				return;
 			auto& act = metaSlots[metaActiveHead][metaActiveCluster];
-			if (!act.dirEMA.defined())
-				return;
 			std::array<torch::Tensor, PPOLearner::STEER_MODES> vecs = {};
 			std::array<float, PPOLearner::STEER_MODES> sigmas = {}, alphas = {};
 			bool any = false;
@@ -2394,11 +2441,10 @@ void GGL::Learner::Start() {
 				any = true;
 			}
 			if (!any)
-				return;
+				return false;
 			ppo->SetSteering(vecs, sigmas, alphas);
 			ppo->SetSteerGoal(act.repGoal, metaActiveHead);
 			steerLoaded = true;
-			metaPendingApply = false;
 
 			// Churn-telemetry archive: under meta, the archived vector is the ACTIVE
 			// cluster's direction (what collection actually steers with)
@@ -2409,14 +2455,47 @@ void GGL::Learner::Start() {
 					steerSigmaSave[md] = sigmas[md];
 				}
 			}
+			return true;
 		};
 
+		// Applies the latest derived direction/gate state to the PPOLearner. ONLY call when no
+		// collect worker is in flight (barrier zone / sequential mode) - the worker reads
+		// ppo->steerVec without synchronization. Under META the slot is time-multiplexed:
+		// the scheduler (fnMetaUpdate) decides the owner per dwell, this function routes the
+		// apply and keeps the measurement attribution (measured*/applied*) in step with it.
 		auto fnApplySteering = [&]() {
-			// Under META, the incumbent commitment derivation keeps running for its
-			// panels/gates but never actuates - fnApplyMeta owns the applied vectors
-			if (metaOn) {
-				fnApplyMeta();
-				return;
+			// Resolve this barrier's owner: the scheduled meta cluster if it has a direction,
+			// else the incumbent
+			int ownerHead = -1, ownerCluster = -1;
+			if (metaOn && metaOwnsActuation && metaActiveHead >= 0 && metaActiveCluster >= 0
+				&& metaSlots[metaActiveHead][metaActiveCluster].dirEMA.defined()) {
+				ownerHead = metaActiveHead;
+				ownerCluster = metaActiveCluster;
+			}
+			bool ownerChanged = ownerHead != appliedMetaHead || ownerCluster != appliedMetaCluster;
+			// Pipelined mode processes the buffer collected under the PREVIOUS apply;
+			// sequential mode collects and processes under this one
+			measuredMetaHead = pipelineOn ? appliedMetaHead : ownerHead;
+			measuredMetaCluster = pipelineOn ? appliedMetaCluster : ownerCluster;
+			appliedMetaHead = ownerHead;
+			appliedMetaCluster = ownerCluster;
+
+			if (ownerHead >= 0) {
+				if (fnApplyMeta())
+					return;
+				// No mode had a sigma yet - fall through to the incumbent so the slot
+				// never silently keeps stale vectors
+				appliedMetaHead = appliedMetaCluster = -1;
+				if (!pipelineOn)
+					measuredMetaHead = measuredMetaCluster = -1;
+				ownerChanged = true;
+			}
+			if (metaOn && ownerChanged) {
+				// Slot handed back to the incumbent: restore the contact-gate default and
+				// force a re-apply (the meta cluster's vectors are still loaded in the
+				// PPOLearner and must not keep steering under incumbent attribution)
+				ppo->SetSteerGoal(torch::Tensor(), 0);
+				steerPendingApply = true;
 			}
 			if (!steerOn || !steerPendingApply)
 				return;
@@ -2436,8 +2515,16 @@ void GGL::Learner::Start() {
 				alphas[md] = (steerGateActive[md] && !steerRatingTripped) ? config.steering.alpha : 0.f;
 				any = true;
 			}
-			if (!any)
+			if (!any) {
+				if (metaOn && ownerChanged) {
+					// No incumbent direction exists yet either (early run): clear the meta
+					// vectors outright rather than letting them steer unattributed
+					ppo->SetSteering(vecs, sigmas, alphas);
+					steerLoaded = false;
+					steerPendingApply = false;
+				}
 				return;
+			}
 			ppo->SetSteering(vecs, sigmas, alphas);
 			steerLoaded = true;
 			steerPendingApply = false;
@@ -3828,13 +3915,13 @@ void GGL::Learner::Start() {
 						for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
 							if (steerBlocks[md].numSteered == 0)
 								continue;
-							// Under META, the applied alpha is governed by the active
-							// cluster's bench state, not the incumbent possession gate
+							// The applied alpha is governed by whoever OWNS the slot this
+							// dwell: the applied meta cluster's bench state, or the
+							// incumbent's possession gate
 							bool alphaOn;
-							if (metaOn) {
+							if (metaOn && appliedMetaHead >= 0) {
 								alphaOn = steerLoaded && !steerRatingTripped
-									&& metaActiveHead >= 0 && metaActiveCluster >= 0
-									&& !metaSlots[metaActiveHead][metaActiveCluster].benched
+									&& !metaSlots[appliedMetaHead][appliedMetaCluster].benched
 									&& metaSigma[md] != 0;
 							} else {
 								alphaOn = steerLoaded && steerGateActive[md] && !steerRatingTripped
@@ -3847,6 +3934,8 @@ void GGL::Learner::Start() {
 						report["Steer/Rating Guard Tripped"] = (float)steerRatingTripped;
 						if (!std::isnan(steerRatingEMA))
 							report["Steer/Rating EMA"] = steerRatingEMA;
+						if (!std::isnan(steerRatingPeak))
+							report["Steer/Rating Peak"] = steerRatingPeak;
 						if (!oppStyles.empty() && oppIters > 0)
 							report["Steer/Opp Style Frac"] = (float)oppStyleIters / (float)oppIters;
 					}

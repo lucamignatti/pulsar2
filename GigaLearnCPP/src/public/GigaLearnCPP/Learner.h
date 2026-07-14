@@ -71,6 +71,10 @@ namespace GGL {
 		// process-local latch state would silently re-arm steering on a damaged policy
 		float steerRatingEMA = NAN;
 		bool steerRatingTripped = false;
+		// High-water mark for the peak-drawdown latch (ratingPeakTrip): the slow EMA lags
+		// a fresh climb, so a slide off a new peak is invisible to it (2026-07-14). Also
+		// persisted - a crash-restart must not forget the peak it was sliding from.
+		float steerRatingPeak = NAN;
 
 		// Churn-telemetry archive of the live steering directions (STEERING_ROADMAP
 		// "continuous items"), PER MODE (index = playersPerTeam-1): the current applied

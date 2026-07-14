@@ -59,6 +59,17 @@ namespace GGL {
 		bool carStateHead = false;
 		int carStateHerMinOffset = 1;
 		int carStateHerMaxOffset = 45;
+		// Gradient coupling of the car-state InfoNCE into the shared state-action encoder
+		// (phi -> trunk). 0 = fully detached: only psi_carstate trains, exactly the
+		// offline-validated frozen-phi regime. 2026-07-14 incident: this head shipped
+		// fully coupled (the equivalent of 1.0) while at chance level - its loss alone
+		// (~2x every other aux term combined, Reach/Aux Loss 0.5 -> 1.0+) churned the
+		// shared trunk and Rating slid ~125 across ALL modes in ~500 iterations with
+		// every behavioral guard green (this path had none). Values in (0,1] gradient-
+		// scale the coupling (value-preserving: loss magnitude unchanged, trunk/phi
+		// gradient scaled). Raising it is a one-lever experiment with the rating
+		// latches watching - never ship it coupled while the head is fresh.
+		float carStateCouple = 0.0f;
 		// The ball head only trains on episodes where the ball exceeded this speed;
 		// a dead never-touched episode would just reteach the stationary-ball manifold
 		float minBallMoveSpeed = 300;

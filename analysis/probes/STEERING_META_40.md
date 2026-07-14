@@ -105,6 +105,53 @@ the offline detector pass is the entry criterion, and it passed. Watch:
 ground-dwelling movement distribution needs training before its band means
 anything), then whether the scheduler ever dwells there. Revert = flag false.
 
+## INCIDENT 2026-07-14 — the first live deployment tanked Elo (~125, all modes)
+
+Wandb (run q8kfp6q0): the deploy restart landed at step ~61280 with Rating/1v1
+~1435 (recent peak 1462; the incumbent per-mode steering had just driven
+1380 → 1462). Within ~500 iterations Rating slid to ~1336, **2v2 and 3v3 fell in
+lockstep** (412→386, 246→227), KL/entropy normal — the shared-trunk-churn
+signature. `Reach/Aux Loss` jumped from its **0.47–0.52** multi-thousand-iteration
+baseline to **1.36 → 0.88 sustained (~2x)**. No guard fired: the slow-EMA rating
+latch was still below the fresh peak (its structural blind spot), and no guard
+watched the aux-gradient path at all.
+
+Two mechanisms, both shipped in that restart:
+
+1. **Carstate InfoNCE churned the trunk.** The fresh chance-level head's loss
+   (~2x every other aux term combined) flowed through `sa → trunkOut →
+   shared_head` from iteration 1. The policy played through a shifting
+   representation; Elo fell in every mode at once.
+2. **Meta took the steering slot permanently.** `fnApplySteering` delegated
+   wholly to `fnApplyMeta`: the proven commitment direction stopped actuating
+   and rotating unproven cluster directions replaced it, while benching was
+   mathematically inert (150-iter per-cluster warmup ÷ 10-iter dwells, accrual
+   only while active).
+
+**Fixes (same day):**
+
+- `reachability.carStateCouple = 0` (new): the carstate term trains **detached**
+  (gradient confined to psi_carstate — exactly the offline-validated frozen-phi
+  regime its detector gate passed in). Reported separately as `Reach/Car State
+  Loss`; `Reach/Aux Loss` regains its 0.5 baseline = live verification.
+- **Time-multiplexed slot ownership** (`metaProbeEvery=3`, `metaPromoteMin=0.05`,
+  `metaWarmupIters` 150→30): the incumbent is the default actuator; every 3rd
+  dwell probes one cluster (unmeasured first, then stalest — benched included,
+  that re-probe is the unbench path); a cluster owns exploit dwells only after
+  its measured effect EMA clears the promotion bar. Actuation is earned.
+- **Measurement attribution follows the slot owner** (measured*/applied* state,
+  one apply behind in pipelined mode): the incumbent possession gate no longer
+  grades meta-steered buffers and cluster effects only accrue from buffers that
+  cluster actually steered.
+- **Peak-drawdown rating latch** (`ratingPeakTrip=110`, decaying high-water
+  mark, persisted): catches exactly the slide-off-a-fresh-peak shape the slow
+  EMA missed. Panel: `Steer/Rating Peak`.
+
+**Recovery**: doctrine says restore a known-good FULL checkpoint. The golden
+archive's top-3 (best_r ~1450+) all predate the restart; quarantine the
+post-restart lineage (numbered checkpoints + policy versions newer than the
+restore point auto-quarantine at boot).
+
 ## Honest limitations
 
 - Offline effect sizes are small at this checkpoint (the 1v1 positive side has

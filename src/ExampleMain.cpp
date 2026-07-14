@@ -464,11 +464,16 @@ int main(int argc, char* argv[]) {
 	// frontier for META steering. Offline (conservative frozen-phi test): calibration
 	// DECISIVELY monotone (~7x the ball head's margin; window 45 chosen by margin across
 	// {20,45,90}); per-cluster causal steerability NOT yet demonstrated offline (0/3
-	// clusters clean - but phi was frozen there and never trained to represent car-state
-	// goals; live it co-trains). It therefore ships as a SENSE: the meta head-validity +
-	// per-cluster effect gates hold it out of actuation until it earns it live. Resume:
-	// the head initializes fresh (allowNotExist) and starts training its InfoNCE aux.
-	// Revert = false. Record: analysis/probes/carstate_head_validate.py + results/.
+	// clusters clean). Revert = false. Record: analysis/probes/carstate_head_validate.py.
+	// INCIDENT (2026-07-14, same day): the first deployment let this head's InfoNCE
+	// co-train phi AND the shared trunk while the fresh head was at chance - its loss
+	// alone (~2x every other aux term combined; Reach/Aux Loss 0.5 -> 1.0+) churned the
+	// policy's representation and Rating slid ~125 off its 1462 peak across ALL modes in
+	// ~500 iterations, with every guard green (no guard watched this gradient path). The
+	// head now trains DETACHED by default (carStateCouple = 0, PPOLearnerConfig.h): only
+	// psi_carstate gets gradients - exactly the offline-validated frozen-phi regime the
+	// detector gate passed in. Its loss reports separately (Reach/Car State Loss) so
+	// Reach/Aux Loss keeps its ~0.5 baseline = the live verification that this is fixed.
 	cfg.ppo.reachability.carStateHead = true;
 	// With the gate off, the rho/gate reads (3 full-buffer model passes/iter, the biggest single
 	// consumption cost after PPO Learn) feed only the Reach/* panels — refresh those every 16
@@ -747,9 +752,19 @@ int main(int argc, char* argv[]) {
 	// arbitrary goals), and at least one emergent cluster shows a monotone causal
 	// attainment uplift (deep-own-half high ball: -1.002 -> -0.901 across alpha 0..1)
 	// with clean canaries - plus cluster heterogeneity, the scheduler's raison d'etre.
-	// The incumbent commitment derivation keeps running for its panels; meta=false is
-	// the pinned fallback AND the pre-registered baseline: meta must beat it on Elo
-	// slope over a matched window or it reverts. Watch: Meta/* panels.
+	// INCIDENT (2026-07-14): v1 of this handed meta the steering slot PERMANENTLY - the
+	// proven incumbent commitment direction (fresh off driving Rating 1380 -> 1462)
+	// stopped actuating, rotating unproven cluster directions took its place, and
+	// benching could never engage (150-iter warmup / 10-iter dwells). Contributed to a
+	// ~125 all-mode Elo slide together with the carstate aux-loss churn (see above).
+	// The slot is now TIME-MULTIPLEXED (LearnerConfig.h metaProbeEvery/metaPromoteMin):
+	// the incumbent is the default actuator, meta probes one cluster every 3rd dwell,
+	// and a cluster only owns exploit dwells after its measured effect EMA clears the
+	// promotion bar - actuation is earned, never granted. Measurement attribution
+	// follows the slot owner (the incumbent gate no longer grades meta-steered buffers
+	// and vice versa). meta=false remains the pinned fallback AND the pre-registered
+	// baseline: meta must beat it on Elo slope over a matched window or it reverts.
+	// Watch: Meta/Owns Slot, Meta/* panels, Steer/Rating Peak.
 	cfg.steering.meta = true;
 	// Phase 1 (steered league opponents): offline-validated style directions the opponent
 	// side occasionally plays (challenge/shadow + commitment styles from the Phase-0

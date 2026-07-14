@@ -392,6 +392,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgReachCarAcc,
 		avgReachBallAcc,
 		avgReachCarStateAcc,
+		avgReachCarStateLoss,
 		avgReachLoss;
 
 	// Save parameters first
@@ -530,7 +531,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				}
 
 				// Reachability aux losses (InfoNCE on a subsample; gradient flows into the shared head)
-				torch::Tensor reachLoss;
+				torch::Tensor reachLoss, carStateLoss;
 				if (reach && batch.carHerGoals.defined()) {
 					int64_t mbRows = stop - start;
 					int64_t sub = RS_MIN((int64_t)config.reachability.infoSubSample, mbRows);
@@ -574,14 +575,29 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							}
 						}
 
-						// Car-state head (car proposer): same InfoNCE on canonical car-state HER goals.
-						// Trained on ALL rows (no move-mask - the car always has a state).
+						// Car-state head: same InfoNCE on canonical car-state HER goals, on ALL rows
+						// (no move-mask - the car always has a state). Its state-action side is
+						// DETACHED (gradient confined to psi_carstate) unless carStateCouple > 0:
+						// on 2026-07-14 this term shipped fully coupled while the fresh head was at
+						// chance, and its loss (~2x every other aux term combined) churned the
+						// shared trunk - Rating slid ~125 across all modes in ~500 iterations with
+						// every behavioral guard green. Detached is exactly the offline-validated
+						// frozen-phi regime (calibration monotone at ~7x the ball head's margin),
+						// so the head keeps its frontier-detector role at zero policy risk. Kept
+						// OUT of reachLoss so Reach/Aux Loss keeps meaning "trunk-coupled aux
+						// pressure" (its 0.5 baseline is the fix's verification signal on wandb).
 						if (reach->psiCarState && batch.carStateHerGoals.defined()) {
 							torch::Tensor subCarStateGoals = batch.carStateHerGoals.slice(0, start, stop)
 								.index_select(0, subIdx).to(device, true, true);
-							auto carStateRes = reach->ComputeInfoNCELoss(reach->psiCarState, sa, subCarStateGoals);
+							float couple = config.reachability.carStateCouple;
+							torch::Tensor saCS = couple >= 1.f ? sa
+								: (couple <= 0.f ? sa.detach()
+									: sa.detach() + (sa - sa.detach()) * couple);
+							auto carStateRes = reach->ComputeInfoNCELoss(reach->psiCarState, saCS, subCarStateGoals);
 							if (carStateRes.loss.defined()) {
-								reachLoss = reachLoss.defined() ? reachLoss + carStateRes.loss : carStateRes.loss;
+								carStateLoss = carStateRes.loss
+									* config.reachability.auxLossWeight * batchSizeRatio;
+								avgReachCarStateLoss += carStateLoss.detach().cpu().item<float>();
 								avgReachCarStateAcc += carStateRes.categoricalAccuracy;
 							}
 						}
@@ -619,6 +635,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					totalLoss = totalLoss.defined() ? totalLoss + goalCriticLoss : goalCriticLoss;
 				if (reachLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + reachLoss : reachLoss;
+				if (carStateLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + carStateLoss : carStateLoss;
 
 				if (totalLoss.defined())
 					totalLoss.backward();
@@ -678,6 +696,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Reach/Ball Accuracy"] = ballAcc;
 		if (avgReachCarStateAcc.count > 0)
 			report["Reach/Car State Accuracy"] = avgReachCarStateAcc.Get();
+		// Reported apart from Aux Loss: with carStateCouple=0 this term never touches
+		// the trunk, and folding it in is what masked the 2026-07-14 aux-pressure jump
+		if (avgReachCarStateLoss.count > 0)
+			report["Reach/Car State Loss"] = avgReachCarStateLoss.Get();
 		report["Reach/Aux Loss"] = avgReachLoss.Get();
 	}
 

@@ -105,8 +105,20 @@ namespace GGL {
 		int metaMaxRows = 4000;          // mined state rows per iteration
 		int metaGoalsPerRow = 3;         // sampled cross-episode goals per row
 		int metaDwellIters = 10;         // scheduler dwell per cluster
-		int metaExploreEvery = 4;        // every Nth dwell visits the stalest cluster
-		int metaWarmupIters = 150;       // effect-EMA iterations before benching may act
+		// The steering slot is TIME-MULTIPLEXED between the proven incumbent commitment
+		// direction (the default actuator) and meta cluster probes (2026-07-14 incident:
+		// v1 handed meta the slot permanently - the proven driver stopped applying and
+		// rotating unproven directions took over; Rating slid ~125 across all modes).
+		// Every metaProbeEvery-th dwell probes a cluster (unmeasured first, then stalest,
+		// benched included - that re-probe is the unbench path); other dwells go to the
+		// cluster with the best warmed-up effect EMA if it clears metaPromoteMin, else to
+		// the incumbent. A cluster therefore EARNS actuation from its own measurements.
+		int metaProbeEvery = 3;
+		float metaPromoteMin = 0.05f;    // effect EMA a warmed cluster must clear to own exploit dwells
+		// Effect-EMA iterations before bench/promote decisions. Counted only while the
+		// cluster is actually applied: at 150 (the incumbent gate's number, measured
+		// every iteration) benching was mathematically inert under 10-iter dwells
+		int metaWarmupIters = 30;
 		float metaEffectTrip = -0.3f;    // bench below this normalized effect EMA
 		float metaEffectReenable = -0.1f;// unbench above this (duty-cycle re-probe)
 		float metaCentroidEma = 0.7f;    // cluster-slot stability across iterations
@@ -152,6 +164,16 @@ namespace GGL {
 		bool ratingGuardEnabled = true;
 		float ratingDrawdownTrip = 75.0f;
 		float ratingEmaDecay = 0.995f;  // slow EMA (~140 rating-bearing iters half-life)
+		// Second latch on the same signal: drawdown from a slowly-decaying HIGH-WATER MARK.
+		// The slow EMA has a blind spot the 2026-07-14 incident sat in exactly: after a
+		// fast climb the EMA lags far below the peak, so a slide off that fresh peak
+		// (1462 -> 1336, ~125) never reaches 75-below-EMA until long after the damage.
+		// The peak latch sees it directly. 110 sits above the high-water mark of pure
+		// noise (max of a +-40 band reads ~+60 over the mean; trough ~-40 -> ~100 spread)
+		// and inside the incident's 125; the decay releases stale peaks so a genuine
+		// long plateau after an old spike can't trip it forever.
+		float ratingPeakTrip = 110.0f;
+		float ratingPeakDecay = 0.5f;   // high-water mark decays this much per rating eval
 
 		// Live derivation
 		float emaDecay = 0.9f;          // per-iteration EMA on the direction and sigma
