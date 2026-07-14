@@ -72,14 +72,15 @@ namespace GGL {
 		float steerRatingEMA = NAN;
 		bool steerRatingTripped = false;
 
-		// Churn-telemetry archive of the live steering direction (STEERING_ROADMAP
-		// "continuous items"): the current EMA vector + sigma are snapshotted into every
-		// checkpoint's RUNNING_STATS ("steer_vec"/"steer_sigma", ~5KB of JSON) so offline
-		// analysis gets the staleness curve for free and deployment can steer at inference.
-		// Save-only, NEVER loaded: the direction re-derives within one iteration of any
-		// restart by design (a stale vector must not outlive its trunk).
-		std::vector<float> steerVecSave;
-		float steerSigmaSave = 0;
+		// Churn-telemetry archive of the live steering directions (STEERING_ROADMAP
+		// "continuous items"), PER MODE (index = playersPerTeam-1): the current applied
+		// vector + sigma are snapshotted into every checkpoint's RUNNING_STATS
+		// ("steer_vec"/"steer_sigma" for 1v1, "steer_vec_2v2"... for teams, ~5KB each) so
+		// offline analysis gets the staleness curve for free and deployment can steer at
+		// inference. Save-only, NEVER loaded: directions re-derive within one iteration of
+		// any restart by design (a stale vector must not outlive its trunk).
+		std::array<std::vector<float>, 3> steerVecSave;
+		std::array<float, 3> steerSigmaSave = {};
 
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction

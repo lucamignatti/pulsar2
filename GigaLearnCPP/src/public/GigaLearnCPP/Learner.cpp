@@ -278,10 +278,14 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["steer_rating_ema"] = steerRatingEMA;
 	j["steer_rating_tripped"] = steerRatingTripped;
 
-	// Churn-telemetry vector archive (save-only; see Learner.h steerVecSave)
-	if (!steerVecSave.empty()) {
-		j["steer_vec"] = steerVecSave;
-		j["steer_sigma"] = steerSigmaSave;
+	// Churn-telemetry vector archive, per mode (save-only; see Learner.h steerVecSave).
+	// 1v1 keeps the legacy un-suffixed keys.
+	for (int md = 0; md < 3; md++) {
+		if (steerVecSave[md].empty())
+			continue;
+		std::string suffix = md == 0 ? "" : "_" + std::to_string(md + 1) + "v" + std::to_string(md + 1);
+		j["steer_vec" + suffix] = steerVecSave[md];
+		j["steer_sigma" + suffix] = steerSigmaSave[md];
 	}
 
 	if (versionMgr)
@@ -921,8 +925,11 @@ void GGL::Learner::Start() {
 
 			// Steered-practice rows (LearnerConfig::steering) - independent of the proposer's
 			// practiceMask above (that one is drill-window machinery; this one just marks rows
-			// from steered, resolution-terminated arenas for critic exclusion)
+			// from steered, resolution-terminated arenas for critic exclusion).
+			// steerPractice = ROLE (0 match, 1 steered, 2 control); steerMode = the row's
+			// arena team size - 1 (per-mode derivation pools, gates, and panels)
 			std::vector<uint8_t> steerPractice;
+			std::vector<uint8_t> steerMode;
 
 			void Clear() {
 				*this = Trajectory();
@@ -962,6 +969,7 @@ void GGL::Learner::Start() {
 				srcPlayer.clear();
 				srcStep.clear();
 				steerPractice.clear();
+				steerMode.clear();
 			}
 
 			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
@@ -1002,6 +1010,7 @@ void GGL::Learner::Start() {
 				}
 
 				steerPractice.reserve(rows); // cheap; populated only when steering is on
+				steerMode.reserve(rows);
 			}
 
 			void Append(const Trajectory& other) {
@@ -1025,6 +1034,7 @@ void GGL::Learner::Start() {
 				carHerGoals += other.carHerGoals;
 				ballHerGoals += other.ballHerGoals;
 				steerPractice += other.steerPractice;
+				steerMode += other.steerMode;
 				carStateHerGoals += other.carStateHerGoals;
 				ballMoved += other.ballMoved;
 
@@ -1063,7 +1073,7 @@ void GGL::Learner::Start() {
 					RG_ASSERT(srcPlayer.size() == n && srcStep.size() == n);
 				}
 				if (!steerPractice.empty())
-					RG_ASSERT(steerPractice.size() == n);
+					RG_ASSERT(steerPractice.size() == n && steerMode.size() == n);
 			}
 
 			size_t Length() const {
@@ -1095,25 +1105,63 @@ void GGL::Learner::Start() {
 		// tracked - keep the primary mode at index 0.
 		const std::string ratingKey = "Rating/" + SkillRating::GetModeName(envSet->state.gameStates[0]);
 
-		// Steered-practice collection (LearnerConfig::steering): the first numSteeredArenas
-		// arenas collect with the live-derived commitment direction added to the policy head's
-		// trunk input; the next few practice arenas stay unsteered as gate controls. All
-		// practice arenas are resolution-terminated via the user's EnvCreateFunc wiring.
+		// Steered-practice collection (LearnerConfig::steering), PER MODE (4.0 team play).
+		// The commitment frontier is mode-specific - offline census: collective declines on
+		// feasible balls grow 74% -> 88% -> 92% from 1v1 -> 2v2 -> 3v3 - so each team size
+		// gets its OWN direction, sigma, causal gate, and steered/control arena slices.
+		// Modes are CONTIGUOUS arena blocks by the ExampleMain layout (1v1 leading, team
+		// modes trailing, asserted below); each block's leading arenas become its practice
+		// slice, so every mode has a within-mode treatment and control population.
 		const bool steerOn = config.steering.enabled && !render;
+		constexpr int STEER_MODES = 3; // index = playersPerTeam - 1
+		auto fnModeName = [](int md) { return std::to_string(md + 1) + "v" + std::to_string(md + 1); };
+		struct SteerModeBlock { int first = -1, count = 0, numPractice = 0, numSteered = 0; };
+		std::array<SteerModeBlock, STEER_MODES> steerBlocks;
+		std::vector<uint8_t> arenaMode(envSet->arenas.size(), 0);   // playersPerTeam - 1
+		std::vector<uint8_t> arenaSteerRole(envSet->arenas.size(), 0); // 0 match, 1 steered, 2 control
+		for (int a = 0; a < (int)envSet->arenas.size(); a++) {
+			int ppt = (int)envSet->arenas[a]->_cars.size() / 2;
+			RG_ASSERT(ppt >= 1 && ppt <= STEER_MODES);
+			arenaMode[a] = (uint8_t)(ppt - 1);
+			auto& blk = steerBlocks[ppt - 1];
+			if (blk.first == -1)
+				blk.first = a;
+			else if (a != blk.first + blk.count)
+				RG_ERR_CLOSE("Steering: arenas of mode " << fnModeName(ppt - 1)
+					<< " are not a contiguous index block (arena " << a << " vs block ["
+					<< blk.first << ", " << blk.first + blk.count << ")) - keep each team "
+					"size contiguous in EnvCreateFunc");
+			blk.count++;
+		}
 		if (steerOn) {
-			numPracticeArenas = RS_CLAMP(
-				(int)(envSet->arenas.size() * config.steering.practiceArenaFrac),
-				0, (int)envSet->arenas.size());
-			int numControl = RS_CLAMP(
-				(int)(numPracticeArenas * config.steering.controlFracOfPractice),
-				1, numPracticeArenas);
-			numSteeredArenas = numPracticeArenas - numControl;
-			RG_LOG("Steered-practice collection: " << numSteeredArenas << " steered + "
-				<< numControl << " control practice arenas of " << envSet->arenas.size()
-				<< ", alpha " << config.steering.alpha
+			for (int md = 0; md < STEER_MODES; md++) {
+				auto& blk = steerBlocks[md];
+				if (blk.count == 0)
+					continue;
+				if (md > 0 && !config.steering.steerTeamModes)
+					continue;
+				blk.numPractice = RS_CLAMP(
+					(int)(blk.count * config.steering.practiceArenaFrac), 0, blk.count);
+				if (blk.numPractice < 2)
+					continue; // too small for a steered + control split
+				int numControl = RS_CLAMP(
+					(int)(blk.numPractice * config.steering.controlFracOfPractice),
+					1, blk.numPractice - 1);
+				blk.numSteered = blk.numPractice - numControl;
+				for (int a = blk.first; a < blk.first + blk.numPractice; a++)
+					arenaSteerRole[a] = (a < blk.first + blk.numSteered) ? 1 : 2;
+				RG_LOG("Steered-practice collection [" << fnModeName(md) << "]: "
+					<< blk.numSteered << " steered + " << numControl << " control of "
+					<< blk.count << " arenas");
+			}
+			// Legacy aggregate members (kept for the stage-2 wiring/logs)
+			numSteeredArenas = steerBlocks[0].numSteered;
+			numPracticeArenas = steerBlocks[0].numPractice;
+			RG_LOG("Steering: alpha " << config.steering.alpha
 				<< (config.steering.resolutionTermination ? ", RESOLUTION-TERMINATED" : ", normal episodes (stage 1)")
-				<< (config.steering.rhoGateEnabled ? ", rho-band gated" : "")
-				<< " (direction derived live per iteration; first iteration runs unsteered)");
+				<< (config.steering.rhoGateEnabled ? ", rho-band gated (per-mode bands)" : "")
+				<< (config.steering.steerTeamModes ? ", team modes steered" : ", team modes measurement-only")
+				<< " (directions derived live per iteration; first iteration runs unsteered)");
 
 			// Rho-band gate parameters live on the PPOLearner (it applies them at inference)
 			ppo->steerRhoGate = config.steering.rhoGateEnabled && config.ppo.reachability.enabled;
@@ -1123,40 +1171,49 @@ void GGL::Learner::Start() {
 			ppo->steerRhoK = RS_MAX(1, config.steering.rhoGateActionSamples);
 		}
 
-		// Steered-practice row group per arena: 0 match, 1 steered, 2 control, 3 TEAM match
-		// (>1 player per team - the PHASE B trailing arenas). Group 3 exists so the steering
-		// derivation can EXCLUDE team rows: the possession labels read only SELF touches vs
-		// OPPONENT-team touches, so in a team arena a teammate winning the race is mislabeled
-		// NONE ("nobody got it") and good second-man play would enter the direction contrast
-		// as "declined" - polluting the WON-vs-NONE contrast with exactly the behavior team
-		// play wants. Steered/control arenas are all 1v1 (leading indices, team arenas
-		// trailing - the ExampleMain layout contract, enforced loudly here), so a 1v1-only
-		// derivation stays exactly matched to the treatment population.
-		std::vector<uint8_t> arenaSteerGroup(envSet->arenas.size(), 0);
-		if (steerOn) {
-			for (int a = 0; a < (int)envSet->arenas.size(); a++) {
-				bool teamArena = envSet->arenas[a]->_cars.size() > 2;
-				if (a < numSteeredArenas)
-					arenaSteerGroup[a] = 1;
-				else if (a < numPracticeArenas)
-					arenaSteerGroup[a] = 2;
-				else if (teamArena)
-					arenaSteerGroup[a] = 3;
-				if (teamArena && a < numPracticeArenas)
-					RG_ERR_CLOSE("Steered/control practice arena " << a << " has "
-						<< envSet->arenas[a]->_cars.size() << " cars: the steering practice split "
-						"must stay on 1v1 arenas (keep practiceArenaFrac + team fractions from "
-						"overlapping - team arenas belong at the END of the index range)");
+		// Opponent style library (config.steering.opponentStylesFile, roadmap phase 1):
+		// offline-validated trunk directions the OPPONENT side occasionally plays with.
+		// Loaded once and immutable afterwards - the pipelined collect worker reads it
+		// without synchronization. A malformed file is a config error and fails loud.
+		struct OppStyle { std::string name; torch::Tensor vec; float sigma, aLo, aHi; };
+		std::vector<OppStyle> oppStyles;
+		if (steerOn && !config.steering.opponentStylesFile.empty()) {
+			std::ifstream sf(config.steering.opponentStylesFile);
+			if (!sf.good()) {
+				RG_LOG("Opponent styles: " << config.steering.opponentStylesFile
+					<< " not found - opponent styling off");
+			} else {
+				try {
+					nlohmann::json js = nlohmann::json::parse(sf);
+					for (auto& e : js) {
+						OppStyle s;
+						s.name = e["name"];
+						std::vector<float> v = e["vec"].get<std::vector<float>>();
+						s.vec = torch::tensor(v);
+						s.sigma = (float)e["sigma"];
+						s.aLo = (float)e["alpha_lo"];
+						s.aHi = (float)e["alpha_hi"];
+						oppStyles.push_back(std::move(s));
+					}
+				} catch (std::exception& e) {
+					RG_ERR_CLOSE("Opponent styles: failed to parse "
+						<< config.steering.opponentStylesFile << ": " << e.what());
+				}
+				RG_LOG("Opponent styles: " << oppStyles.size() << " loaded from "
+					<< config.steering.opponentStylesFile << " (chance "
+					<< config.steering.opponentStyleChance << " per opponent iteration)");
 			}
 		}
+		std::atomic<int> oppStyleIters = 0, oppIters = 0; // worker increments, report reads
 
-		// Live steering state (derived in fnSteerUpdate during learn-prep, applied in the
-		// barrier zone where no collect worker is in flight). CPU tensors.
-		torch::Tensor steerVecEMA;
-		float steerSigmaEMA = 0;
-		float steerGateDeltaEMA = 0;      // steered-minus-control engagement, EMA
-		int steerGateIters = 0;           // iterations that contributed gate data
-		bool steerGateActive = true;      // alpha drops to 0 when the causal gate trips
+		// Live per-mode steering state (derived in fnSteerUpdate during learn-prep, applied
+		// in the barrier zone where no collect worker is in flight). CPU tensors.
+		std::array<torch::Tensor, STEER_MODES> steerVecEMA;
+		std::array<float, STEER_MODES> steerSigmaEMA = {};
+		std::array<float, STEER_MODES> steerGateDeltaEMA = {}; // steered-minus-control team-possession, EMA
+		std::array<int, STEER_MODES> steerGateIters = {};      // iterations that contributed gate data
+		std::array<bool, STEER_MODES> steerGateActive;         // alpha drops to 0 when the causal gate trips
+		steerGateActive.fill(true);
 		bool steerPendingApply = false;
 		// Rating drawdown guard state (steerRatingEMA / steerRatingTripped) lives on the
 		// Learner and is persisted in the checkpoint stats - a crash-restart must not
@@ -1473,7 +1530,7 @@ void GGL::Learner::Start() {
 			const auto& states = combinedTraj.states;
 			const auto& groups = combinedTraj.steerPractice;
 			int64_t n = (int64_t)combinedTraj.Length();
-			if (n == 0 || groups.size() != (size_t)n)
+			if (n == 0 || groups.size() != (size_t)n || combinedTraj.steerMode.size() != (size_t)n)
 				return;
 			// v2 possession labels need the reach buffers' touch flags
 			if (combinedTraj.touched.size() != (size_t)n || combinedTraj.oppTouched.size() != (size_t)n
@@ -1495,10 +1552,11 @@ void GGL::Learner::Start() {
 			// 1) Candidate readings: airborne-ball rows, strided to the per-iteration cap
 			struct Reading {
 				int64_t row, epEnd;
-				uint8_t group;
+				uint8_t role, mode;
 				float land[3] = {}; // x, y, t
 				bool ok = false;
 			};
+			const auto& rowModes = combinedTraj.steerMode;
 			std::vector<Reading> readings;
 			{
 				std::vector<std::pair<int64_t, int64_t>> cand; // (row, epEnd)
@@ -1513,7 +1571,8 @@ void GGL::Learner::Start() {
 				}
 				size_t stride = RS_MAX((size_t)1, cand.size() / (size_t)RS_MAX(1, cfgS.maxReadingsPerIter));
 				for (size_t i = 0; i < cand.size(); i += stride)
-					readings.push_back({ cand[i].first, cand[i].second, groups[cand[i].first] });
+					readings.push_back({ cand[i].first, cand[i].second,
+						groups[cand[i].first], rowModes[cand[i].first] });
 			}
 			if (readings.empty())
 				return;
@@ -1560,19 +1619,23 @@ void GGL::Learner::Start() {
 					th.join();
 			}
 
-			// 3) Label feasible readings by POSSESSION OUTCOME (v2): scan the same player's
-			// subsequent rows (episodes are row-contiguous per player) from the reading to
-			// shortly past touchdown for the first touch event - self touch = WON the race,
-			// opponent touch = LOST, neither = NONE (ball went unclaimed). v1 labeled "was the
-			// car parked at the unimpeded landing spot", and the improving bot outgrew that
-			// definition (it converts via early pressure and bounce play) - the steer/gate
-			// loop chased a stale concept while pool-Elo drifted. Possession is style-proof:
-			// winning the ball first is good at every level and unfakeable by empty flight.
+			// 3) Label feasible readings by POSSESSION OUTCOME (v2), per mode: scan the same
+			// player's subsequent rows (episodes are row-contiguous per player) from the
+			// reading to shortly past touchdown for the FIRST touch - self = WON, teammate =
+			// TEAMMATE (a resolved race, not a decline), opponent = LOST, nobody = NONE (in
+			// team modes: a COLLECTIVE decline - everyone assumed someone else would go; the
+			// offline census reads 74%/88%/92% NONE for 1v1/2v2/3v3, so this is exactly the
+			// team-mode frontier). Possession is style-proof: winning the ball first is good
+			// at every level and unfakeable by empty flight.
 			struct Labeled { int64_t row; bool won; float dNow, tLand; };
-			std::vector<Labeled> pool; // direction contrast: WON vs NONE. LOST (tried, got
-			                           // beaten) is excluded - punishing lost races would
-			                           // train the hesitation right back in.
-			int feas[4] = {}, possWon[4] = {};
+			// Per-mode direction pools: WON vs NONE. LOST (tried, got beaten) and TEAMMATE
+			// (someone went) are excluded - punishing lost races trains hesitation back in,
+			// and teammate-resolved races carry no self-commitment signal.
+			std::array<std::vector<Labeled>, STEER_MODES> pools;
+			// Frontier rows for the phase-3 reset pool: feasible + collectively declined,
+			// MATCH rows only (practice arenas must never feed their own reset pool)
+			std::array<std::vector<int64_t>, STEER_MODES> frontierRows;
+			int feas[STEER_MODES][3] = {}, possTeamWon[STEER_MODES][3] = {};
 			const float raceMarginRows = 0.5f * stepsPerSec; // grace past touchdown for the race
 			for (auto& rd : readings) {
 				if (!rd.ok)
@@ -1585,126 +1648,232 @@ void GGL::Learner::Start() {
 				float dNow = sqrtf((sx - rd.land[0]) * (sx - rd.land[0]) + (sy - rd.land[1]) * (sy - rd.land[1]));
 				if (dNow / RS_MAX(rd.land[2], 1e-6f) >= FEASIBLE_SPEED)
 					continue;
-				feas[rd.group]++;
+				feas[rd.mode][rd.role]++;
 
-				// Group 3 (TEAM match rows): score the race by TEAM possession - a
-				// teammate's first touch is a WIN, not "nobody got it". Self-only labels
-				// would count good second-man play as declined; that pollution is why
-				// group 3 stays OUT of the direction pool below regardless.
-				const auto& wonFlags = (rd.group == 3) ? combinedTraj.teamTouched : combinedTraj.touched;
-				int outcome = 0; // 0 none, 1 won, 2 lost
+				int outcome = 0; // 0 none, 1 self won, 2 lost, 3 teammate won
 				int64_t scanEnd = RS_MIN(rd.epEnd, tdRow + (int64_t)raceMarginRows);
 				for (int64_t rr = rd.row + 1; rr <= scanEnd; rr++) {
-					if (wonFlags[rr]) { outcome = 1; break; }
+					if (combinedTraj.touched[rr]) { outcome = 1; break; }
+					if (combinedTraj.teamTouched[rr]) { outcome = 3; break; }
 					if (combinedTraj.oppTouched[rr]) { outcome = 2; break; }
 				}
 
-				if (outcome == 1)
-					possWon[rd.group]++;
-				if (rd.group == 0 && outcome != 2)
-					pool.push_back({ rd.row, outcome == 1, dNow, rd.land[2] });
+				// Gate/panel metric = TEAM possession (identical to self-won in 1v1):
+				// style-proof at team level, and the safety net against steered double-commits
+				if (outcome == 1 || outcome == 3)
+					possTeamWon[rd.mode][rd.role]++;
+				if (rd.role == 0 && (outcome == 0 || outcome == 1))
+					pools[rd.mode].push_back({ rd.row, outcome == 1, dNow, rd.land[2] });
+				if (rd.role == 0 && outcome == 0)
+					frontierRows[rd.mode].push_back(rd.row);
 			}
 
-			const char* groupNames[4] = { "Match", "Steered", "Control", "TeamMatch" };
-			for (int g = 0; g < 4; g++)
-				if (feas[g] >= 50)
-					report[std::string("Steer/PossWin ") + groupNames[g]] = (float)possWon[g] / feas[g];
+			// Panels: legacy un-suffixed keys stay 1v1 (wandb continuity); team modes suffixed
+			const char* roleNames[3] = { "Match", "Steered", "Control" };
+			auto fnModeKey = [&](const char* base, int md) {
+				return md == 0 ? std::string(base) : std::string(base) + " " + fnModeName(md);
+			};
+			for (int md = 0; md < STEER_MODES; md++)
+				for (int g = 0; g < 3; g++)
+					if (feas[md][g] >= 50)
+						report[fnModeKey((std::string("Steer/PossWin ") + roleNames[g]).c_str(), md)] =
+							(float)possTeamWon[md][g] / feas[md][g];
 
-			// 4) Causal auto-gate: steered arenas must WIN THE BALL on feasible aerial
-			// situations at least as often as controls (identical arenas, only steering differs)
-			if (steerLoaded && feas[1] >= 50 && feas[2] >= 50) {
-				float delta = (float)possWon[1] / feas[1] - (float)possWon[2] / feas[2];
-				steerGateDeltaEMA = (steerGateIters == 0) ? delta : 0.9f * steerGateDeltaEMA + 0.1f * delta;
-				steerGateIters++;
-				report["Steer/Gate Delta EMA"] = steerGateDeltaEMA;
-				if (steerGateIters >= cfgS.gateWarmupIters) {
-					if (steerGateActive && steerGateDeltaEMA < cfgS.gateDisableBelow) {
-						steerGateActive = false;
-						steerPendingApply = true;
-						RG_LOG("Steering causal gate TRIPPED (possession-win delta EMA "
-							<< steerGateDeltaEMA << ") - alpha -> 0, derivation continues");
-					} else if (!steerGateActive && steerGateDeltaEMA > cfgS.gateReenableAbove) {
-						steerGateActive = true;
-						steerPendingApply = true;
-						RG_LOG("Steering causal gate RE-ENGAGED (possession-win delta EMA "
-							<< steerGateDeltaEMA << ")");
+			// 4) Causal auto-gates, one per mode: that mode's steered arenas must WIN THE BALL
+			// (team possession) on feasible aerial situations at least as often as its controls
+			// (identical arenas, only steering differs)
+			for (int md = 0; md < STEER_MODES; md++) {
+				if (steerBlocks[md].numSteered == 0)
+					continue;
+				if (steerLoaded && feas[md][1] >= 50 && feas[md][2] >= 50) {
+					float delta = (float)possTeamWon[md][1] / feas[md][1]
+						- (float)possTeamWon[md][2] / feas[md][2];
+					steerGateDeltaEMA[md] = (steerGateIters[md] == 0)
+						? delta : 0.9f * steerGateDeltaEMA[md] + 0.1f * delta;
+					steerGateIters[md]++;
+					report[fnModeKey("Steer/Gate Delta EMA", md)] = steerGateDeltaEMA[md];
+					if (steerGateIters[md] >= cfgS.gateWarmupIters) {
+						if (steerGateActive[md] && steerGateDeltaEMA[md] < cfgS.gateDisableBelow) {
+							steerGateActive[md] = false;
+							steerPendingApply = true;
+							RG_LOG("Steering causal gate [" << fnModeName(md) << "] TRIPPED "
+								"(team-possession delta EMA " << steerGateDeltaEMA[md]
+								<< ") - alpha -> 0, derivation continues");
+						} else if (!steerGateActive[md] && steerGateDeltaEMA[md] > cfgS.gateReenableAbove) {
+							steerGateActive[md] = true;
+							steerPendingApply = true;
+							RG_LOG("Steering causal gate [" << fnModeName(md) << "] RE-ENGAGED "
+								"(team-possession delta EMA " << steerGateDeltaEMA[md] << ")");
+						}
 					}
 				}
+				report[fnModeKey("Steer/Gate Active", md)] = (float)steerGateActive[md];
 			}
-			report["Steer/Gate Active"] = (float)steerGateActive;
 
-			// 5) Matched difference of trunk means -> EMA direction + sigma
-			std::vector<int64_t> selWent, selDecl;
-			if ((int)pool.size() >= 2 * cfgS.minPairsPerUpdate) {
-				// quantile bin edges over the pool (5 distance bins x 3 flight-time bins)
-				auto fnEdges = [&](auto getter, int bins) {
-					FList vals;
+			// 5) Matched difference of trunk means -> per-mode EMA direction + sigma.
+			// A mode whose pool is too thin keeps its own EMA untouched; fnApplySteering
+			// falls back to the 1v1 direction for it (validated offline: the 1v1 direction
+			// TRANSFERS to 2v2 - teamWon +3.4pp at +0.5 with sign-correct air/touch shifts -
+			// while directions derived from thin weak-team pools were causally dead).
+			auto fnGatherTrunk = [&](const std::vector<int64_t>& rows) {
+				FList buf;
+				buf.reserve(rows.size() * obsSize);
+				for (int64_t r : rows)
+					for (int c = 0; c < obsSize; c++)
+						buf.push_back(states[r * (int64_t)obsSize + c]);
+				torch::Tensor obs = torch::tensor(buf).reshape({ (int64_t)rows.size(), obsSize }).to(ppo->device);
+				return ppo->models["shared_head"]->Forward(obs, false).cpu();
+			};
+			for (int md = 0; md < STEER_MODES; md++) {
+				if (steerBlocks[md].count == 0 || (md > 0 && !cfgS.steerTeamModes))
+					continue;
+				auto& pool = pools[md];
+				std::vector<int64_t> selWent, selDecl;
+				if ((int)pool.size() >= 2 * cfgS.minPairsPerUpdate) {
+					// quantile bin edges over the pool (5 distance bins x 3 flight-time bins)
+					auto fnEdges = [&](auto getter, int bins) {
+						FList vals;
+						for (auto& p : pool)
+							vals.push_back(getter(p));
+						std::sort(vals.begin(), vals.end());
+						FList edges;
+						for (int b = 1; b < bins; b++)
+							edges.push_back(vals[vals.size() * b / bins]);
+						return edges;
+					};
+					FList dEdges = fnEdges([](const Labeled& p) { return p.dNow; }, 5);
+					FList tEdges = fnEdges([](const Labeled& p) { return p.tLand; }, 3);
+					auto fnBin = [&](const Labeled& p) {
+						int db = 0, tb = 0;
+						while (db < (int)dEdges.size() && p.dNow > dEdges[db]) db++;
+						while (tb < (int)tEdges.size() && p.tLand > tEdges[tb]) tb++;
+						return db * 8 + tb;
+					};
+					std::map<int, std::pair<std::vector<int64_t>, std::vector<int64_t>>> byBin;
 					for (auto& p : pool)
-						vals.push_back(getter(p));
-					std::sort(vals.begin(), vals.end());
-					FList edges;
-					for (int b = 1; b < bins; b++)
-						edges.push_back(vals[vals.size() * b / bins]);
-					return edges;
-				};
-				FList dEdges = fnEdges([](const Labeled& p) { return p.dNow; }, 5);
-				FList tEdges = fnEdges([](const Labeled& p) { return p.tLand; }, 3);
-				auto fnBin = [&](const Labeled& p) {
-					int db = 0, tb = 0;
-					while (db < (int)dEdges.size() && p.dNow > dEdges[db]) db++;
-					while (tb < (int)tEdges.size() && p.tLand > tEdges[tb]) tb++;
-					return db * 8 + tb;
-				};
-				std::map<int, std::pair<std::vector<int64_t>, std::vector<int64_t>>> byBin;
-				for (auto& p : pool)
-					(p.won ? byBin[fnBin(p)].first : byBin[fnBin(p)].second).push_back(p.row);
-				std::mt19937 shuffleRng((unsigned)totalIterations);
-				for (auto& kv : byBin) {
-					auto& w = kv.second.first;
-					auto& d = kv.second.second;
-					std::shuffle(w.begin(), w.end(), shuffleRng);
-					std::shuffle(d.begin(), d.end(), shuffleRng);
-					size_t m = RS_MIN(w.size(), d.size());
-					selWent.insert(selWent.end(), w.begin(), w.begin() + m);
-					selDecl.insert(selDecl.end(), d.begin(), d.begin() + m);
+						(p.won ? byBin[fnBin(p)].first : byBin[fnBin(p)].second).push_back(p.row);
+					std::mt19937 shuffleRng((unsigned)(totalIterations + md * 7919));
+					for (auto& kv : byBin) {
+						auto& w = kv.second.first;
+						auto& d = kv.second.second;
+						std::shuffle(w.begin(), w.end(), shuffleRng);
+						std::shuffle(d.begin(), d.end(), shuffleRng);
+						size_t m = RS_MIN(w.size(), d.size());
+						selWent.insert(selWent.end(), w.begin(), w.begin() + m);
+						selDecl.insert(selDecl.end(), d.begin(), d.begin() + m);
+					}
+				}
+
+				if ((int)selWent.size() >= cfgS.minPairsPerUpdate) {
+					torch::Tensor vNew = (fnGatherTrunk(selWent).mean(0) - fnGatherTrunk(selDecl).mean(0));
+					vNew = vNew / vNew.norm().clamp_min(1e-8f);
+					if (steerVecEMA[md].defined()) {
+						report[fnModeKey("Steer/Dir Drift", md)] =
+							1.f - torch::dot(steerVecEMA[md], vNew).item<float>();
+						steerVecEMA[md] = cfgS.emaDecay * steerVecEMA[md] + (1.f - cfgS.emaDecay) * vNew;
+						steerVecEMA[md] = steerVecEMA[md] / steerVecEMA[md].norm().clamp_min(1e-8f);
+					} else {
+						steerVecEMA[md] = vNew;
+					}
+					report[fnModeKey("Steer/Pairs", md)] = (float)selWent.size();
+				}
+				report[fnModeKey("Steer/Dir Source Own", md)] = (float)steerVecEMA[md].defined();
+
+				// sigma of THIS mode's match-row projections onto the vector this mode will
+				// APPLY (its own EMA, or the 1v1 fallback) - so the dose alpha*sigma is
+				// calibrated to the mode's own trunk distribution either way
+				torch::Tensor applied = steerVecEMA[md].defined() ? steerVecEMA[md] : steerVecEMA[0];
+				if (applied.defined()) {
+					std::vector<int64_t> sampleRows;
+					int64_t sampleStride = RS_MAX((int64_t)1, n / 4096);
+					for (int64_t r = 0; r < n; r += sampleStride)
+						if (groups[r] == 0 && rowModes[r] == md)
+							sampleRows.push_back(r);
+					if (sampleRows.size() >= 64) {
+						float sigNew = fnGatherTrunk(sampleRows).matmul(applied).std().item<float>();
+						steerSigmaEMA[md] = (steerSigmaEMA[md] == 0) ? sigNew
+							: cfgS.emaDecay * steerSigmaEMA[md] + (1.f - cfgS.emaDecay) * sigNew;
+						steerPendingApply = true;
+					}
+					report[fnModeKey("Steer/Sigma", md)] = steerSigmaEMA[md];
 				}
 			}
 
-			if ((int)selWent.size() >= cfgS.minPairsPerUpdate) {
-				auto fnGatherTrunk = [&](const std::vector<int64_t>& rows) {
-					FList buf;
-					buf.reserve(rows.size() * obsSize);
-					for (int64_t r : rows)
-						for (int c = 0; c < obsSize; c++)
-							buf.push_back(states[r * (int64_t)obsSize + c]);
-					torch::Tensor obs = torch::tensor(buf).reshape({ (int64_t)rows.size(), obsSize }).to(ppo->device);
-					return ppo->models["shared_head"]->Forward(obs, false).cpu();
-				};
-				torch::Tensor vNew = (fnGatherTrunk(selWent).mean(0) - fnGatherTrunk(selDecl).mean(0));
-				vNew = vNew / vNew.norm().clamp_min(1e-8f);
-
-				if (steerVecEMA.defined()) {
-					report["Steer/Dir Drift"] = 1.f - torch::dot(steerVecEMA, vNew).item<float>();
-					steerVecEMA = cfgS.emaDecay * steerVecEMA + (1.f - cfgS.emaDecay) * vNew;
-					steerVecEMA = steerVecEMA / steerVecEMA.norm().clamp_min(1e-8f);
+			// 6) Frontier reset pool (roadmap phase 3): bank the collectively-declined
+			// readings as canonical-frame reset entries reconstructed from obs-visible
+			// quantities. Layout support: AdvancedObsPadded(3) (230) and plain AdvancedObs
+			// 1v1 (109); anything else skips (loudly, once).
+			if (cfgS.frontierPool) {
+				auto& fpool = cfgS.frontierPool;
+				fpool->Advance(totalIterations);
+				const bool padded = obsSize == 230, plain = obsSize == 109;
+				static bool warnedLayout = false;
+				if (!padded && !plain) {
+					if (!warnedLayout) {
+						RG_LOG("Frontier pool: unsupported obs layout (size " << obsSize
+							<< ") - pool stays empty");
+						warnedLayout = true;
+					}
 				} else {
-					steerVecEMA = vNew;
+					// Per-player block field offsets (AddPlayerToObs): pos 0, forward 3,
+					// up 6, vel 9, angVel 12, boost 24, isDemoed 27
+					auto fnCar = [&](int64_t row, int base) {
+						RLGC::FrontierPool::CarSpawn c;
+						c.pos = Vec(fnObs(row, base + 0), fnObs(row, base + 1), fnObs(row, base + 2)) * POS_SCALE;
+						c.forward = Vec(fnObs(row, base + 3), fnObs(row, base + 4), fnObs(row, base + 5));
+						c.up = Vec(fnObs(row, base + 6), fnObs(row, base + 7), fnObs(row, base + 8));
+						c.vel = Vec(fnObs(row, base + 9), fnObs(row, base + 10), fnObs(row, base + 11)) * VEL_SCALE;
+						c.angVel = Vec(fnObs(row, base + 12), fnObs(row, base + 13), fnObs(row, base + 14)) * ANGVEL_SCALE;
+						c.boost = fnObs(row, base + 24) * 100.f;
+						return c;
+					};
+					constexpr int SELF_BASE = 51, TM_SLOT0 = 80, OPP_SLOT0 = 138, PRESENCE0 = 225;
+					auto fnEntry = [&](int64_t row, int md, RLGC::FrontierPool::Entry& e) {
+						e.ball = BallState{};
+						e.ball.pos = Vec(fnObs(row, BALL_POS), fnObs(row, BALL_POS + 1), fnObs(row, BALL_POS + 2)) * POS_SCALE;
+						e.ball.vel = Vec(fnObs(row, BALL_VEL), fnObs(row, BALL_VEL + 1), fnObs(row, BALL_VEL + 2)) * VEL_SCALE;
+						e.ball.angVel = Vec(fnObs(row, BALL_ANGVEL), fnObs(row, BALL_ANGVEL + 1), fnObs(row, BALL_ANGVEL + 2)) * ANGVEL_SCALE;
+						if (fnObs(row, SELF_BASE + 27) > 0.5f)
+							return false; // self demoed: no sane spawn
+						e.blueCars.push_back(fnCar(row, SELF_BASE));
+						if (padded) {
+							for (int s = 0; s < 2; s++) {
+								if (fnObs(row, PRESENCE0 + s) <= 0.5f)
+									continue;
+								if (fnObs(row, TM_SLOT0 + s * 29 + 27) > 0.5f)
+									return false;
+								e.blueCars.push_back(fnCar(row, TM_SLOT0 + s * 29));
+							}
+							for (int s = 0; s < 3; s++) {
+								if (fnObs(row, PRESENCE0 + 2 + s) <= 0.5f)
+									continue;
+								if (fnObs(row, OPP_SLOT0 + s * 29 + 27) > 0.5f)
+									return false;
+								e.orangeCars.push_back(fnCar(row, OPP_SLOT0 + s * 29));
+							}
+						} else {
+							if (fnObs(row, 80 + 27) > 0.5f)
+								return false;
+							e.orangeCars.push_back(fnCar(row, 80));
+						}
+						return (int)e.blueCars.size() == md + 1 && (int)e.orangeCars.size() == md + 1;
+					};
+					for (int md = 0; md < STEER_MODES; md++) {
+						auto& rows = frontierRows[md];
+						if (rows.empty())
+							continue;
+						std::vector<RLGC::FrontierPool::Entry> entries;
+						entries.reserve(RS_MIN((int)rows.size(), cfgS.frontierPoolPerMode));
+						size_t stride = RS_MAX((size_t)1, rows.size() / (size_t)RS_MAX(1, cfgS.frontierPoolPerMode));
+						for (size_t i = 0; i < rows.size() && (int)entries.size() < cfgS.frontierPoolPerMode; i += stride) {
+							RLGC::FrontierPool::Entry e;
+							if (fnEntry(rows[i], md, e))
+								entries.push_back(std::move(e));
+						}
+						report[fnModeKey("Steer/Frontier Pool", md)] = (float)entries.size();
+						fpool->Fill(md, std::move(entries));
+					}
 				}
-
-				// sigma of match-row trunk projections onto the (updated) direction
-				std::vector<int64_t> sampleRows;
-				int64_t sampleStride = RS_MAX((int64_t)1, n / 4096);
-				for (int64_t r = 0; r < n; r += sampleStride)
-					if (groups[r] == 0)
-						sampleRows.push_back(r);
-				if (sampleRows.size() >= 64) {
-					float sigNew = fnGatherTrunk(sampleRows).matmul(steerVecEMA).std().item<float>();
-					steerSigmaEMA = (steerSigmaEMA == 0) ? sigNew
-						: cfgS.emaDecay * steerSigmaEMA + (1.f - cfgS.emaDecay) * sigNew;
-					steerPendingApply = true;
-				}
-				report["Steer/Pairs"] = (float)selWent.size();
-				report["Steer/Sigma"] = steerSigmaEMA;
 			}
 		};
 
@@ -1736,18 +1905,39 @@ void GGL::Learner::Start() {
 		// collect worker is in flight (barrier zone / sequential mode) - the worker reads
 		// ppo->steerVec without synchronization.
 		auto fnApplySteering = [&]() {
-			if (!steerOn || !steerPendingApply || !steerVecEMA.defined() || steerSigmaEMA == 0)
+			if (!steerOn || !steerPendingApply)
 				return;
-			bool active = steerGateActive && !steerRatingTripped;
-			ppo->SetSteering(steerVecEMA, steerSigmaEMA, active ? config.steering.alpha : 0.f);
+			// Per-mode vectors: a mode without its own direction falls back to the 1v1 one
+			// (offline-validated transfer), dosed by ITS OWN sigma. Modes stay undefined
+			// (unsteered) until a vector + sigma exist for them.
+			std::array<torch::Tensor, PPOLearner::STEER_MODES> vecs = {};
+			std::array<float, PPOLearner::STEER_MODES> sigmas = {}, alphas = {};
+			bool any = false;
+			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
+				torch::Tensor v = steerVecEMA[md].defined() ? steerVecEMA[md]
+					: (md > 0 && config.steering.steerTeamModes ? steerVecEMA[0] : torch::Tensor());
+				if (!v.defined() || steerSigmaEMA[md] == 0 || steerBlocks[md].numSteered == 0)
+					continue;
+				vecs[md] = v;
+				sigmas[md] = steerSigmaEMA[md];
+				alphas[md] = (steerGateActive[md] && !steerRatingTripped) ? config.steering.alpha : 0.f;
+				any = true;
+			}
+			if (!any)
+				return;
+			ppo->SetSteering(vecs, sigmas, alphas);
 			steerLoaded = true;
 			steerPendingApply = false;
 
 			// Snapshot for the checkpoint's churn-telemetry archive (Save() runs on this
 			// thread at the same safe point, so no synchronization is needed)
-			auto vec = steerVecEMA.contiguous();
-			steerVecSave.assign(vec.data_ptr<float>(), vec.data_ptr<float>() + vec.numel());
-			steerSigmaSave = steerSigmaEMA;
+			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
+				if (vecs[md].defined()) {
+					auto vec = vecs[md].contiguous();
+					steerVecSave[md].assign(vec.data_ptr<float>(), vec.data_ptr<float>() + vec.numel());
+					steerSigmaSave[md] = sigmas[md];
+				}
+			}
 		};
 
 		std::jthread collectThread;
@@ -1807,18 +1997,41 @@ void GGL::Learner::Start() {
 
 			int numRealPlayers = oppModels ? newPlayerIndices.size() : envSet->state.numPlayers;
 
-			// Steered-practice row mask for the CURRENT-POLICY inference calls below. Control
+			// Opponent style draw (roadmap phase 1): with opponentStyleChance, this
+			// iteration's opponent additionally plays a validated style direction at an
+			// alpha from its dose window. Applied on the OPPONENT inference call only.
+			torch::Tensor oppStyleVec = {};
+			float oppStyleCoef = 0;
+			if (oppModels) {
+				oppIters++;
+				if (!oppStyles.empty()
+					&& RocketSim::Math::RandFloat() < config.steering.opponentStyleChance) {
+					auto& st = oppStyles[RocketSim::Math::RandInt(0, (int)oppStyles.size())];
+					oppStyleVec = st.vec;
+					oppStyleCoef = RocketSim::Math::RandFloat(st.aLo, st.aHi) * st.sigma;
+					oppStyleIters++;
+				}
+			}
+
+			// Steered-practice row mask + per-row mode for the CURRENT-POLICY inference calls
+			// below (the mode index selects that row's direction on the PPOLearner). Control
 			// practice arenas, old-version and league opponents are never steered. Static
 			// across the iteration: arena assignment and the practice split don't change
 			// mid-collect.
-			torch::Tensor tSteerMask = {};
-			if (steerOn && steerLoaded && numSteeredArenas > 0) {
+			torch::Tensor tSteerMask = {}, tSteerModes = {};
+			if (steerOn && steerLoaded) {
 				auto steerRows = std::vector<uint8_t>(numPlayers);
-				for (int i = 0; i < numPlayers; i++)
-					steerRows[i] = playerArenaIdx[i] < numSteeredArenas;
+				auto steerModes = std::vector<int64_t>(numPlayers);
+				for (int i = 0; i < numPlayers; i++) {
+					steerRows[i] = arenaSteerRole[playerArenaIdx[i]] == 1;
+					steerModes[i] = arenaMode[playerArenaIdx[i]];
+				}
 				tSteerMask = torch::tensor(steerRows).to(torch::kBool);
-				if (oppModels)
+				tSteerModes = torch::tensor(steerModes);
+				if (oppModels) {
 					tSteerMask = tSteerMask.index_select(0, tNewPlayerIndices);
+					tSteerModes = tSteerModes.index_select(0, tNewPlayerIndices);
+				}
 			}
 
 			collectSteps = 0;
@@ -1886,7 +2099,7 @@ void GGL::Learner::Start() {
 							// TODO: This samples from old versions too
 							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 							for (int i = 0; i < numSamples; i++) {
-								int idx = Math::RandInt(0, envSet->state.numPlayers);
+								int idx = RocketSim::Math::RandInt(0, envSet->state.numPlayers);
 								obsStat->IncrementRow(&envSet->state.obs.At(idx, 0));
 							}
 
@@ -1952,8 +2165,9 @@ void GGL::Learner::Start() {
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, tSteerMask);
-							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes);
+							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels,
+								{}, {}, oppStyleVec, oppStyleCoef);
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
@@ -1961,7 +2175,7 @@ void GGL::Learner::Start() {
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr, tSteerMask);
+							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes);
 							tActions = tActions.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
@@ -1989,11 +2203,11 @@ void GGL::Learner::Start() {
 						}
 
 						// Calc average rewards
-						if (config.addRewardsToMetrics && (Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
+						if (config.addRewardsToMetrics && (RocketSim::Math::RandInt(0, config.rewardSampleRandInterval) == 0)) {
 							int numSamples = RS_MIN(envSet->arenas.size(), config.maxRewardSamples);
 							std::unordered_map<std::string, AvgTracker> avgRewards = {};
 							for (int i = 0; i < numSamples; i++) {
-								int arenaIdx = Math::RandInt(0, envSet->arenas.size());
+								int arenaIdx = RocketSim::Math::RandInt(0, envSet->arenas.size());
 								auto& prevRewards = envSet->state.lastRewards[arenaIdx];
 
 								for (int j = 0; j < envSet->rewards[arenaIdx].size(); j++) {
@@ -2050,14 +2264,15 @@ void GGL::Learner::Start() {
 							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
 							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
 
-							// Steered-practice row tag (0 = match, 1 = steered practice, 2 =
-							// control practice, 3 = TEAM match - excluded from derivation).
-							// Tagged by ARENA, not by whether a vector is active: the
-							// resolution-terminated returns are what poison the critic,
-							// steered or not; the 1-vs-2 split feeds the causal gate.
-							if (steerOn)
-								trajectories[newPlayerIdx].steerPractice.push_back(
-									arenaSteerGroup[playerArenaIdx[newPlayerIdx]]);
+							// Steered-practice row tags: ROLE (0 match, 1 steered, 2 control)
+							// + MODE (team size - 1). Tagged by ARENA, not by whether a vector
+							// is active: the resolution-terminated returns are what poison the
+							// critic, steered or not; the 1-vs-2 split feeds the causal gates.
+							if (steerOn) {
+								int arena = playerArenaIdx[newPlayerIdx];
+								trajectories[newPlayerIdx].steerPractice.push_back(arenaSteerRole[arena]);
+								trajectories[newPlayerIdx].steerMode.push_back(arenaMode[arena]);
+							}
 
 							if (goalCriticOn) {
 								// Goal-only channel, straight from game outcomes (same convention as
@@ -3024,12 +3239,11 @@ void GGL::Learner::Start() {
 							torch::Tensor injected = betaEff * (tGoalAdvantages - tGoalAdvantages.mean());
 							// STAGE-2 only: resolution-terminated practice rows never receive
 							// goal-critic credit (their goal channel is structurally 0). Stage 1
-							// episodes are normal, so the blend applies everywhere. Groups 0 AND 3
-							// are both ordinary match rows (3 = team match, tagged only so the
-							// steering derivation can skip them).
+							// episodes are normal, so the blend applies everywhere. steerPractice
+							// is the ROLE tag (0 = match in any mode).
 							if (config.steering.resolutionTermination && !combinedTraj.steerPractice.empty()) {
 								torch::Tensor tGroups = torch::tensor(combinedTraj.steerPractice);
-								injected = injected * ((tGroups == 0) | (tGroups == 3)).to(torch::kFloat32);
+								injected = injected * (tGroups == 0).to(torch::kFloat32);
 							}
 							tAdvantages = tAdvantages + injected;
 							report["GoalCritic/Blend BetaEff"] = betaEff;
@@ -3089,19 +3303,26 @@ void GGL::Learner::Start() {
 					// so every row is an ordinary row for both critics.
 					if (steerOn && !combinedTraj.steerPractice.empty()) {
 						torch::Tensor tGroups = torch::tensor(combinedTraj.steerPractice);
-						// Practice = groups 1 (steered) and 2 (control); group 3 is a team MATCH row
-						torch::Tensor tPractice =
-							((tGroups == 1) | (tGroups == 2)).to(torch::kFloat32);
+						// Practice = roles 1 (steered) and 2 (control), any mode
+						torch::Tensor tPractice = (tGroups > 0).to(torch::kFloat32);
 						if (config.steering.resolutionTermination)
 							experience.data.practiceMask = tPractice;
 						report["Steer/Practice Row Frac"] = tPractice.mean().item<float>();
 						report["Steer/Vector Active"] = (float)steerLoaded;
-						bool alphaOn = steerLoaded && steerGateActive && !steerRatingTripped;
-						report["Steer/Alpha"] = alphaOn ? config.steering.alpha : 0.f;
+						for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
+							if (steerBlocks[md].numSteered == 0)
+								continue;
+							bool alphaOn = steerLoaded && steerGateActive[md] && !steerRatingTripped
+								&& (steerVecEMA[md].defined() || (md > 0 && steerVecEMA[0].defined()));
+							std::string key = md == 0 ? "Steer/Alpha" : "Steer/Alpha " + fnModeName(md);
+							report[key] = alphaOn ? config.steering.alpha : 0.f;
+						}
 						report["Steer/RhoGate In-Band Frac"] = ppo->lastRhoGateFrac;
 						report["Steer/Rating Guard Tripped"] = (float)steerRatingTripped;
 						if (!std::isnan(steerRatingEMA))
 							report["Steer/Rating EMA"] = steerRatingEMA;
+						if (!oppStyles.empty() && oppIters > 0)
+							report["Steer/Opp Style Frac"] = (float)oppStyleIters / (float)oppIters;
 					}
 
 					// Derive/refresh the steering direction from THIS buffer's match-arena rows,

@@ -56,18 +56,26 @@ namespace GGL {
 			ModelSet& outModels
 		);
 		
-		// Steered-practice collection (LearnerConfig::steering): unit commitment direction on
-		// this->device + its projection std + strength. Applied ONLY where InferActions gets a
-		// row mask - the learn pass, value preds, and old-version inference never pass one.
-		torch::Tensor steerVec;
-		float steerSigma = 0, steerAlpha = 0;
-		void SetSteering(torch::Tensor vecCpu, float sigma, float alpha);
+		// Steered-practice collection (LearnerConfig::steering), PER-MODE (4.0 team play):
+		// one unit commitment direction per team size (index = playersPerTeam-1), each with
+		// its own projection std and strength - the commitment frontier is mode-specific
+		// (offline: collective declines on feasible balls grow 74%->88%->92% from 1v1->3v3).
+		// Applied ONLY where InferActions gets a row mask + row modes - the learn pass, value
+		// preds, and old-version inference never pass them.
+		static constexpr int STEER_MODES = 3;
+		std::array<torch::Tensor, STEER_MODES> steerVecs; // unit, on this->device (undefined = mode off)
+		std::array<float, STEER_MODES> steerSigmas = {}, steerAlphas = {};
+		void SetSteering(const std::array<torch::Tensor, STEER_MODES>& vecsCpu,
+			const std::array<float, STEER_MODES>& sigmas,
+			const std::array<float, STEER_MODES>& alphas);
 
 		// Rho-band gate on the steering delta (LearnerConfig::CollectSteeringConfig): steer a
-		// row only when its scoring-reachability sits in the middle band of the current
-		// batch's rho distribution. Set by the Learner at startup; reads phi/psi from the
-		// SAME ModelSet as the policy (the pipelined worker's snapshot includes them, so no
-		// concurrent read of live weights).
+		// row only when its contact-reachability sits in the middle band of the current
+		// batch's rho distribution. Bands are computed PER MODE (rho distributions differ
+		// across team sizes; a mixed-mode quantile would skew the band toward the dominant
+		// mode). Set by the Learner at startup; reads phi/psi from the SAME ModelSet as the
+		// policy (the pipelined worker's snapshot includes them, so no concurrent read of
+		// live weights).
 		bool steerRhoGate = false;
 		bool steerRhoContact = true; // gate on the car head's contact reachability (races)
 		float steerRhoLo = 0.2f, steerRhoHi = 0.8f;
@@ -75,8 +83,13 @@ namespace GGL {
 		float lastRhoGateFrac = 0; // metric: fraction of eligible rows steered last call
 
 		// If models is null, this->models will be used. steerRowMask (optional, [n] bool, any
-		// device): rows to steer with steerAlpha*steerSigma*steerVec added to the trunk output.
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {});
+		// device): rows eligible for steering; steerRowModes ([n] int64, REQUIRED when the
+		// mask is passed): each row's mode index (playersPerTeam-1) selecting the direction.
+		// styleVec/styleCoef (optional): OPPONENT-side style steering (league phase 1/2) -
+		// coef * vec added to the trunk output of EVERY row of this call, ungated (style is
+		// a whole-game disposition, not a frontier read). Callers pass it only on the
+		// old-version/league-opponent inference call, never on the trained policy's.
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {}, torch::Tensor steerRowModes = {}, torch::Tensor styleVec = {}, float styleCoef = 0);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);

@@ -113,6 +113,7 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	constexpr float ACTION_MIN_PROB = 1e-11f;
 	constexpr float ACTION_DISABLED_LOGIT = -1e10f;
 
+	torch::Tensor rawObs = obs; // kept for the non-finite diagnostic below
 	if (models["shared_head"])
 		obs = models["shared_head"]->Forward(obs, halfPrec);
 
@@ -125,6 +126,34 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	}
 
 	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
+
+	// A non-finite logit row would crash multinomial downstream with an opaque assert
+	// ("probability tensor contains inf/nan") - identify the SOURCE here instead. Cheap:
+	// one fused reduction per inference batch.
+	if (!logits.isfinite().all().item<bool>()) {
+		bool trunkOutFinite = obs.isfinite().all().item<bool>(); // post-trunk (+delta)
+		auto rawBadRows = (~rawObs.isfinite().all(-1)).nonzero().flatten();
+		bool policyWFinite = true, trunkWFinite = true;
+		for (auto& p : models["policy"]->parameters())
+			policyWFinite &= p.isfinite().all().item<bool>();
+		if (models["shared_head"])
+			for (auto& p : models["shared_head"]->parameters())
+				trunkWFinite &= p.isfinite().all().item<bool>();
+		std::ostringstream rows;
+		for (int64_t i = 0; i < RS_MIN((int64_t)8, rawBadRows.numel()); i++)
+			rows << rawBadRows[i].item<int64_t>() << " ";
+		RG_ERR_CLOSE("InferPolicyProbsFromModels: non-finite logits ("
+			<< (~logits.isfinite().all(-1)).sum().item<int64_t>() << " of " << logits.size(0)
+			<< " rows). RAW obs non-finite rows: " << rawBadRows.numel()
+			<< " (first: " << rows.str() << "), trunk out finite: " << trunkOutFinite
+			<< ", trunk weights finite: " << trunkWFinite
+			<< ", policy weights finite: " << policyWFinite
+			<< ", steerDelta " << (steerDelta.defined()
+				? (steerDelta.isfinite().all().item<bool>() ? "DEFINED-finite" : "DEFINED-NONFINITE")
+				: "none")
+			<< ", logits absmax " << logits.abs().max().item<float>()
+			<< ", halfPrec " << halfPrec);
+	}
 
 	auto result = torch::softmax(logits + ACTION_DISABLED_LOGIT * actionMasks.logical_not(), -1);
 	return result.view({ -1, models["policy"]->config.numOutputs }).clamp(ACTION_MIN_PROB, 1);
@@ -154,37 +183,72 @@ void GGL::PPOLearner::InferActionsFromModels(
 	}
 }
 
-void GGL::PPOLearner::SetSteering(torch::Tensor vecCpu, float sigma, float alpha) {
-	RG_ASSERT(vecCpu.dim() == 1);
+void GGL::PPOLearner::SetSteering(const std::array<torch::Tensor, STEER_MODES>& vecsCpu,
+	const std::array<float, STEER_MODES>& sigmas,
+	const std::array<float, STEER_MODES>& alphas) {
 	Model* sharedHead = models["shared_head"];
-	RG_ASSERT(sharedHead); // the commitment direction lives in trunk-output space
+	RG_ASSERT(sharedHead); // the commitment directions live in trunk-output space
 	// Belt and braces vs Model::config quirks: the trunk's output width is its last hidden
 	// layer when it has no output layer (the normal case)
 	int64_t trunkOut = sharedHead->config.addOutputLayer
 		? (int64_t)sharedHead->config.numOutputs
 		: (int64_t)sharedHead->config.layerSizes.back();
-	if (vecCpu.size(0) != trunkOut)
-		RG_ERR_CLOSE("SetSteering: vector dim " << vecCpu.size(0)
-			<< " != trunk output size " << trunkOut
-			<< " (direction derived against a different architecture?)");
-	// Store unit-norm on the inference device; the delta is alpha * sigma * v per steered row
-	steerVec = (vecCpu / vecCpu.norm().clamp_min(1e-8f)).to(device).to(torch::kFloat32);
-	steerSigma = sigma;
-	steerAlpha = alpha;
+	for (int m = 0; m < STEER_MODES; m++) {
+		if (!vecsCpu[m].defined()) {
+			steerVecs[m] = torch::Tensor();
+			steerSigmas[m] = steerAlphas[m] = 0;
+			continue;
+		}
+		RG_ASSERT(vecsCpu[m].dim() == 1);
+		if (vecsCpu[m].size(0) != trunkOut)
+			RG_ERR_CLOSE("SetSteering: mode " << (m + 1) << "v" << (m + 1) << " vector dim "
+				<< vecsCpu[m].size(0) << " != trunk output size " << trunkOut
+				<< " (direction derived against a different architecture?)");
+		// Store unit-norm on the inference device; the delta is alpha * sigma * v per steered row
+		steerVecs[m] = (vecsCpu[m] / vecsCpu[m].norm().clamp_min(1e-8f)).to(device).to(torch::kFloat32);
+		steerSigmas[m] = sigmas[m];
+		steerAlphas[m] = alphas[m];
+	}
 }
 
-void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask) {
+void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask, torch::Tensor steerRowModes, torch::Tensor styleVec, float styleCoef) {
 	ModelSet& m = models ? *models : this->models;
 
-	torch::Tensor steerDelta = {};
-	if (steerRowMask.defined() && steerVec.defined() && steerAlpha != 0) {
-		auto maskF = steerRowMask.to(device).to(torch::kFloat32); // [n]
+	bool anyActive = false;
+	int64_t trunkOut = 0;
+	for (int md = 0; md < STEER_MODES; md++) {
+		if (steerVecs[md].defined()) {
+			trunkOut = steerVecs[md].size(0);
+			anyActive |= steerAlphas[md] != 0;
+		}
+	}
 
-		// Rho-band gate: among the arena-eligible rows, keep only those whose scoring-
-		// reachability sits in the batch's middle band - hard-but-plausible plays toward
-		// the net, by the bot's own estimate. Uses phi/psiBall from the SAME ModelSet as
-		// the policy when present (the pipelined snapshot carries them), so the worker
-		// never reads weights that Learn is concurrently updating.
+	torch::Tensor steerDelta = {};
+	if (steerRowMask.defined() && anyActive) {
+		RG_ASSERT(steerRowModes.defined()); // per-row mode index selects the direction
+		auto maskF = steerRowMask.to(device).to(torch::kFloat32); // [n]
+		auto modes = steerRowModes.to(device).to(torch::kLong);   // [n]
+
+		// Per-mode coefficient (alpha*sigma; 0 = mode inactive) and direction matrix
+		torch::Tensor coef = torch::zeros({ STEER_MODES }, torch::TensorOptions().device(device));
+		torch::Tensor vecMat = torch::zeros({ STEER_MODES, trunkOut }, torch::TensorOptions().device(device));
+		for (int md = 0; md < STEER_MODES; md++) {
+			if (steerVecs[md].defined()) {
+				coef[md] = steerAlphas[md] * steerSigmas[md];
+				vecMat[md] = steerVecs[md];
+			}
+		}
+		auto rowCoef = coef.index_select(0, modes);               // [n]
+		maskF = maskF * (rowCoef != 0).to(torch::kFloat32);
+
+		// Rho-band gate: among the arena-eligible rows, keep only those whose contact-
+		// reachability sits in the middle band of the batch's rho distribution - the
+		// coin-flip races, by the bot's own estimate. The band is computed PER MODE
+		// (mixed-mode quantiles would skew toward the dominant mode); a mode with < 16
+		// eligible rows fails CLOSED (steer nothing there - the gate's contract is
+		// "steer ONLY in-band rows"). Uses phi/psi from the SAME ModelSet as the policy
+		// when present (the pipelined snapshot carries them), so the worker never reads
+		// weights that Learn is concurrently updating.
 		Model* phi = m["reach_phi"] ? m["reach_phi"] : (reach ? reach->phi : NULL);
 		Model* psiB;
 		if (steerRhoContact)
@@ -222,24 +286,40 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 
 				auto rho = sa.matmul(g.squeeze(0)).view({ idx.numel(), steerRhoK })
 					.mean(-1) / rc.tau;                                             // [s]
-				auto lo = rho.quantile(steerRhoLo);
-				auto hi = rho.quantile(steerRhoHi);
-				auto inBand = ((rho >= lo) & (rho <= hi)).to(torch::kFloat32);      // [s]
+
+				// Per-mode quantile band over this batch's eligible rows of that mode
+				auto modesSel = modes.index_select(0, idx);                         // [s]
+				auto inBand = torch::zeros_like(rho);
+				for (int md = 0; md < STEER_MODES; md++) {
+					auto mIdx = (modesSel == md).nonzero().flatten();
+					if (mIdx.numel() < 16)
+						continue; // fail closed for this mode
+					auto rhoM = rho.index_select(0, mIdx);
+					auto lo = rhoM.quantile(steerRhoLo);
+					auto hi = rhoM.quantile(steerRhoHi);
+					inBand.index_copy_(0, mIdx, ((rhoM >= lo) & (rhoM <= hi)).to(torch::kFloat32));
+				}
 
 				auto gated = torch::zeros_like(maskF);
 				gated.index_copy_(0, idx, inBand);
 				maskF = gated;
 				lastRhoGateFrac = inBand.mean().item<float>();
 			} else {
-				// Too few eligible rows to estimate the band quantiles: fail CLOSED
-				// (steer nothing) — the gate's contract is "steer ONLY in-band rows"
 				maskF = torch::zeros_like(maskF);
 				lastRhoGateFrac = 0;
 			}
 		}
 
-		steerDelta = maskF.unsqueeze(-1) * (steerAlpha * steerSigma) * steerVec.unsqueeze(0); // [n,trunkOut]
+		steerDelta = (maskF * rowCoef).unsqueeze(-1) * vecMat.index_select(0, modes); // [n,trunkOut]
 	}
+
+	// Opponent-side style delta: uniform over all rows of this call ([1,trunkOut] broadcast)
+	if (styleVec.defined() && styleCoef != 0) {
+		auto style = (styleVec / styleVec.norm().clamp_min(1e-8f))
+			.to(device).to(torch::kFloat32).unsqueeze(0) * styleCoef;
+		steerDelta = steerDelta.defined() ? steerDelta + style : style;
+	}
+
 	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
 }
 

@@ -16,6 +16,7 @@
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/AirDrillState.h>
+#include <RLGymCPP/StateSetters/FrontierDrillState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
@@ -183,6 +184,15 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 // two sites agree by construction). 0 = feature off = every arena is a normal match arena.
 static int g_NumPracticeArenas = 0;
 
+// Frontier reset pool (STEERING_ROADMAP phase 3): the Learner banks feasible-but-declined
+// readings; FrontierDrillState resets PRACTICE arenas into perturbed copies. Created in
+// main() when steering is on (never in render mode). The practice-slice arithmetic in
+// IsPracticeArena (below the team-split globals) MUST match the Learner's per-mode
+// steerBlocks computation (leading practiceArenaFrac of each mode's contiguous arena
+// block, >= 2 or none).
+static std::shared_ptr<RLGC::FrontierPool> g_FrontierPool;
+static float g_PracticeArenaFrac = 0.f;
+
 // Team-mode arena split (set in main(): zero in PHASE A, the PHASE_B_FRAC_* fractions once
 // the phase marker exists). Team arenas occupy the END of the index range — see the
 // PHASE_B_FRAC_2V2 comment for why.
@@ -202,6 +212,21 @@ static int g_SkillArenas3v3 = 0;
 // Phase-B trigger state (iteration callback below)
 static bool g_PhaseB = false;
 static int g_PhaseBStreak = 0;
+
+// Per-mode practice-slice membership - MUST mirror Learner.cpp's steerBlocks arithmetic
+// (per-mode contiguous blocks, leading practiceArenaFrac slice, none when < 2)
+static bool IsPracticeArena(int index) {
+	int n2 = g_NumArenas2v2, n3 = g_NumArenas3v3, n1 = g_NumGames - n2 - n3;
+	int starts[3] = { 0, n1, n1 + n2 }, counts[3] = { n1, n2, n3 };
+	for (int md = 0; md < 3; md++) {
+		int numPractice = RS_CLAMP((int)(counts[md] * g_PracticeArenaFrac), 0, counts[md]);
+		if (numPractice < 2)
+			continue;
+		if (index >= starts[md] && index < starts[md] + numPractice)
+			return true;
+	}
+	return false;
+}
 
 // Render mode only (GGL_RENDER_TEAM_SIZE, set in main()): the viewer's single arena plays
 // this team size regardless of the curriculum split. 0 = not in render mode. The padded obs
@@ -274,7 +299,14 @@ EnvCreateResult EnvCreateFunc(int index) {
 		playersPerTeam = 3;
 	else if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3 - g_NumArenas2v2)
 		playersPerTeam = 2;
-	return MakeEnv(playersPerTeam, index < g_NumPracticeArenas);
+	EnvCreateResult result = MakeEnv(playersPerTeam, index < g_NumPracticeArenas);
+	// Phase 3: practice arenas draw a share of their resets from the frontier pool
+	// (perturbed copies of feasible-but-declined readings; offline-validated dose:
+	// useFrac 0.35, pos/vel noise 250). Falls back to the normal mix while the pool
+	// is empty or stale, so cold boots and quiet iterations behave exactly as before.
+	if (g_FrontierPool && IsPracticeArena(index))
+		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.35f, 250, 250);
+	return result;
 }
 
 // Create-func for the skill tracker's eval fleet: the same trailing-team layout, scaled to
@@ -394,6 +426,29 @@ int main(int argc, char* argv[]) {
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
 	cfg.ppo.useHalfPrecision = true;
+
+	// GGL_SMOKE=1: shrink the fleet + iteration so an offline sandbox (Mac CPU, resuming a
+	// COPY of the real checkpoints with WANDB_MODE=offline) can complete iterations in
+	// tens of seconds and exercise the full loop - env creation, checkpoint resume, boot
+	// probe, steering derivation/gates, metric send. Everything else stays production.
+	// NEVER set on the training box.
+	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0") {
+		cfg.numGames = 128;
+		int smokeTs = 25'000;
+		cfg.ppo.tsPerItr = smokeTs;
+		cfg.ppo.batchSize = smokeTs;
+		cfg.ppo.miniBatchSize = smokeTs;
+		// bf16 is a CUDA fast path; on CPU (the smoke device) it hits conversion-per-op
+		// slow paths that stretch one iteration into tens of minutes
+		cfg.ppo.useHalfPrecision = false;
+		// Sequential collection: (a) a smoke should be deterministic; (b) torch-cpu on
+		// macOS produced non-finite trunk outputs from FINITE weights+obs exactly when the
+		// learn pass started overlapping the collect worker's inference (concurrent
+		// Accelerate GEMMs from two threads) - an environment bug this box's CUDA build
+		// does not have. Diagnosed 2026-07-14 via the InferPolicyProbsFromModels probe.
+		cfg.pipelinedCollection = false;
+		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential (offline sandbox smoke)");
+	}
 
 	cfg.ppo.epochs = 2;
 	cfg.ppo.entropyScale = 0.035f;
@@ -666,8 +721,22 @@ int main(int argc, char* argv[]) {
 	// compounded into an Elo bleed despite real head-to-head gains. A smaller push keeps the
 	// induced ratios mostly inside the clip window so both outcome signs teach.
 	cfg.steering.alpha = 0.5f;
-	cfg.steering.practiceArenaFrac = 0.18f;      // ~184 arenas: ~156 steered + ~27 control
+	cfg.steering.practiceArenaFrac = 0.18f;      // of EACH mode's arenas (leading slice per block)
 	cfg.steering.resolutionTermination = false;  // STAGE 1: normal episodes, no exceptions
+	// PER-MODE steering (2026-07-14): 2v2/3v3 arenas get their own steered/control slices,
+	// gates, and sigmas; a team mode applies the 1v1 direction (offline-validated transfer,
+	// teamWon +3.4pp @ +0.5 in 2v2) until its own WON-vs-NONE pool is rich enough to derive
+	// one. The commitment frontier is much larger in team modes (collective declines:
+	// 74%/88%/92% of feasible balls for 1v1/2v2/3v3). Revert = false (team arenas revert
+	// to measurement-only panels).
+	cfg.steering.steerTeamModes = true;
+	// Phase 1 (steered league opponents): offline-validated style directions the opponent
+	// side occasionally plays (challenge/shadow + commitment styles from the Phase-0
+	// program; exploiter styles FAILED their offline bar and are absent until re-derived
+	// with bigger cross-play samples). The trainer runs from build/, so the file lives at
+	// the repo root; produced by analysis/probes/export_styles.py. Missing file = off.
+	cfg.steering.opponentStylesFile = "../steering_styles.json";
+	cfg.steering.opponentStyleChance = 0.25f;
 	// AttemptResolutionCondition is a STAGE-2 semantic; only attach it when termination is on
 	// (and only ever together with a dedicated practice-value baseline - see post-mortems).
 	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
@@ -697,6 +766,16 @@ int main(int argc, char* argv[]) {
 		RG_LOG("Skill tracker eval fleet: "
 			<< (g_SkillNumArenas - g_SkillArenas2v2 - g_SkillArenas3v3) << " 1v1 / "
 			<< g_SkillArenas2v2 << " 2v2 / " << g_SkillArenas3v3 << " 3v3 arenas");
+
+	// Phase 3 (frontier resets): the pool is shared between the Learner (writer, learn-prep)
+	// and the practice arenas' FrontierDrillState (readers, env threads). Never in render
+	// mode - the viewer's single arena would otherwise land in the 1v1 practice slice and
+	// draw drill resets. Must exist before the Learner is built (EnvCreateFunc reads it).
+	if (cfg.steering.enabled && !cfg.renderMode) {
+		g_FrontierPool = std::make_shared<RLGC::FrontierPool>();
+		cfg.steering.frontierPool = g_FrontierPool;
+		g_PracticeArenaFrac = cfg.steering.practiceArenaFrac;
+	}
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

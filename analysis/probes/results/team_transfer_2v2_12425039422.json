@@ -1,0 +1,69 @@
+{
+  "checkpoint": 12425039422,
+  "mode": "2v2",
+  "direction": "1v1-derived",
+  "rows": 120000,
+  "alphas": {
+    "0.0": {
+      "self_won": 0.08563311688311688,
+      "teammate_won": 0.032873376623376624,
+      "lost": 0.0864448051948052,
+      "none": 0.7950487012987013,
+      "team_won": 0.1185064935064935,
+      "team_won_se": 0.043231113012579196,
+      "n_feasible_readings": 2464,
+      "n_reading_episodes": 43,
+      "aerial_touch_ratio": 8.333333333333334e-06,
+      "touch_ratio": 0.0011,
+      "in_air_ratio": 0.7906916666666667,
+      "goals_per_episode": 0.12280701754385964,
+      "kickoff_first_touch_s": 2.7666666666666666
+    },
+    "0.5": {
+      "self_won": 0.07753254102999434,
+      "teammate_won": 0.07526881720430108,
+      "lost": 0.0690435766836446,
+      "none": 0.77815506508206,
+      "team_won": 0.15280135823429541,
+      "team_won_se": 0.04933031095987667,
+      "n_feasible_readings": 1767,
+      "n_reading_episodes": 34,
+      "aerial_touch_ratio": 4.1666666666666665e-05,
+      "touch_ratio": 0.0013833333333333334,
+      "in_air_ratio": 0.770875,
+      "goals_per_episode": 0.1568627450980392,
+      "kickoff_first_touch_s": 2.7666666666666666
+    },
+    "1.0": {
+      "self_won": 0.08701854493580599,
+      "teammate_won": 0.04184498335710889,
+      "lost": 0.04232049453162149,
+      "none": 0.8288159771754636,
+      "team_won": 0.1288635282929149,
+      "team_won_se": 0.041989211186468554,
+      "n_feasible_readings": 2103,
+      "n_reading_episodes": 49,
+      "aerial_touch_ratio": 5e-05,
+      "touch_ratio": 0.00145,
+      "in_air_ratio": 0.744725,
+      "goals_per_episode": 0.09090909090909091,
+      "kickoff_first_touch_s": 2.533333333333333
+    },
+    "2.0": {
+      "self_won": 0.07865168539325842,
+      "teammate_won": 0.048220973782771535,
+      "lost": 0.09691011235955056,
+      "none": 0.7762172284644194,
+      "team_won": 0.12687265917602997,
+      "team_won_se": 0.03824861558248797,
+      "n_feasible_readings": 2136,
+      "n_reading_episodes": 41,
+      "aerial_touch_ratio": 5e-05,
+      "touch_ratio": 0.0013583333333333334,
+      "in_air_ratio": 0.709225,
+      "goals_per_episode": 0.1320754716981132,
+      "kickoff_first_touch_s": 2.6833333333333336
+    }
+  },
+  "runtime_s": 138.9
+}

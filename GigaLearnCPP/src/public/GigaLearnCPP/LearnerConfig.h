@@ -1,8 +1,11 @@
 #pragma once
 #include <RLGymCPP/BasicTypes/Lists.h>
+#include <RLGymCPP/StateSetters/FrontierDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
 #include "PSDConfig.h"
+
+#include <memory>
 
 namespace GGL {
 	enum class LearnerDeviceType {
@@ -50,8 +53,43 @@ namespace GGL {
 	struct CollectSteeringConfig {
 		bool enabled = false;
 		float alpha = 1.0f;             // strength, in units of sigma (trunk projection std, live-estimated)
-		float practiceArenaFrac = 0.2f; // fraction of arenas that are practice (steered + control)
+		float practiceArenaFrac = 0.2f; // fraction of EACH MODE's arenas that are practice (steered + control)
 		float controlFracOfPractice = 0.15f; // fraction of practice arenas kept unsteered as gate controls
+
+		// PER-MODE steering (4.0 team play): every team size present in the fleet gets its
+		// own direction, sigma, causal gate, and steered/control arena slices (leading
+		// arenas of each mode's contiguous block). The commitment frontier is mode-specific
+		// (offline census: collective declines on feasible balls are 74%/88%/92% for
+		// 1v1/2v2/3v3), but a mode derives its OWN direction only once its WON-vs-NONE
+		// pool clears minPairsPerUpdate - until then it applies the 1v1 direction dosed by
+		// its own sigma (offline-validated transfer: teamWon +3.4pp @ +0.5 in 2v2, while
+		// thin weak-team-derived directions were causally dead). false = team arenas are
+		// measurement-only (Steer/PossWin panels, no treatment).
+		bool steerTeamModes = true;
+
+		// OPPONENT-side style steering (roadmap phase 1/2): on opponent iterations
+		// (old-version or league member), with this chance the opponent additionally plays
+		// a STYLE - an offline-validated trunk direction applied to every opponent row,
+		// ungated, at an alpha sampled from the style's own dose window. Styles cost
+		// nothing to store (512 floats) and diversify the training distribution the way
+		// descendOpponentFrac does, but along behavioral axes instead of history.
+		// stylesFile: JSON list of {name, vec[trunk], sigma, alpha_lo, alpha_hi} produced
+		// by analysis/probes/export_styles.py from causally-validated directions ONLY
+		// (challenge/shadow and commitment pass; exploiter directions failed their
+		// pre-registered bar offline - re-derive with bigger cross-play samples before
+		// adding them). Empty path = feature off. Revert = empty the file or the path.
+		std::filesystem::path opponentStylesFile;
+		float opponentStyleChance = 0.25f;
+
+		// Frontier reset pool (roadmap phase 3): when set, the learner banks each
+		// iteration's feasible-but-declined MATCH readings (reconstructed from obs) into
+		// this pool, and the user's EnvCreateFunc wraps the PRACTICE arenas' setter in a
+		// FrontierDrillState drawing from it - practice reps start AT the frontier
+		// instead of paying the approach. The pool object is shared between the Learner
+		// (writer, learn-prep) and the setters (readers, env threads); it locks
+		// internally. NULL = feature off. Revert = stop wrapping the setter (config).
+		std::shared_ptr<RLGC::FrontierPool> frontierPool;
+		int frontierPoolPerMode = 256; // banked entries per mode per iteration
 
 		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
 		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no
