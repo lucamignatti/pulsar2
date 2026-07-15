@@ -1180,45 +1180,41 @@ void GGL::Learner::Start() {
 			ppo->steerRhoK = RS_MAX(1, config.steering.rhoGateActionSamples);
 		}
 
-		// Opponent style library (config.steering.opponentStylesFile, roadmap phase 1):
-		// offline-validated trunk directions the OPPONENT side occasionally plays with.
-		// Loaded once and immutable afterwards - the pipelined collect worker reads it
-		// without synchronization. A malformed file is a config error and fails loud.
-		struct OppStyle { std::string name; torch::Tensor vec; float sigma, aLo, aHi; };
-		std::vector<OppStyle> oppStyles;
-		if (steerOn && !config.steering.opponentStylesFile.empty()) {
-			std::ifstream sf(config.steering.opponentStylesFile);
-			if (!sf.good()) {
-				RG_LOG("Opponent styles: " << config.steering.opponentStylesFile
-					<< " not found - opponent styling off");
-			} else {
-				try {
-					nlohmann::json js = nlohmann::json::parse(sf);
-					for (auto& e : js) {
-						OppStyle s;
-						s.name = e["name"];
-						std::vector<float> v = e["vec"].get<std::vector<float>>();
-						s.vec = torch::tensor(v);
-						s.sigma = (float)e["sigma"];
-						s.aLo = (float)e["alpha_lo"];
-						s.aHi = (float)e["alpha_hi"];
-						oppStyles.push_back(std::move(s));
-					}
-				} catch (std::exception& e) {
-					RG_ERR_CLOSE("Opponent styles: failed to parse "
-						<< config.steering.opponentStylesFile << ": " << e.what());
-				}
-				RG_LOG("Opponent styles: " << oppStyles.size() << " loaded from "
-					<< config.steering.opponentStylesFile << " (chance "
-					<< config.steering.opponentStyleChance << " per opponent iteration)");
-			}
-		}
+		// Opponent style library (roadmap phase 1), synthesized LIVE - nothing on disk.
+		// hesitant/overcommit are the commitment direction at negative / mild positive
+		// dose; shadow is a live challenge-vs-shadow contrast (derived in fnSteerUpdate).
+		// The frozen steering_styles.json era ended 2026-07-15: pinned vectors rot
+		// (measured +7pp -> -11pp within ~75M steps for the commitment direction), so a
+		// checkpoint-stale file is diversity in name only. Dose windows keep their
+		// offline-validated values (STEERING_PHASE0_40: hesitant suppresses race-winning
+		// ~2.7 sigma at -2..-1; shadow cuts challenge rate 44%->24% at -2..-1; overcommit
+		// has clean canaries at +0.5..+1) and are in units of the LIVE projection sigma,
+		// so they self-calibrate as the trunk drifts. The vectors the draw reads are
+		// barrier-swapped copies (same discipline as ppo->steerVec): written only in
+		// fnApplySteering with the collect worker joined.
+		struct OppStyle { const char* name; bool challengeSrc; float aLo, aHi; };
+		static constexpr OppStyle OPP_STYLES[3] = {
+			{ "hesitant",   false, -2.0f, -1.0f },
+			{ "overcommit", false, +0.5f, +1.0f },
+			{ "shadow",     true,  -2.0f, -1.0f },
+		};
+		const bool oppStylesOn = steerOn && config.steering.opponentStyleChance > 0;
+		torch::Tensor oppStyleCommitVec, oppStyleChallengeVec;   // barrier-swapped copies
+		float oppStyleCommitSigma = 0, oppStyleChallengeSigma = 0;
+		if (oppStylesOn)
+			RG_LOG("Opponent styles: live-synthesized (hesitant/overcommit <- commitment "
+				"direction, shadow <- challenge contrast; chance "
+				<< config.steering.opponentStyleChance << " per opponent iteration)");
 		std::atomic<int> oppStyleIters = 0, oppIters = 0; // worker increments, report reads
 
 		// Live per-mode steering state (derived in fnSteerUpdate during learn-prep, applied
 		// in the barrier zone where no collect worker is in flight). CPU tensors.
 		std::array<torch::Tensor, STEER_MODES> steerVecEMA;
 		std::array<float, STEER_MODES> steerSigmaEMA = {};
+		// Challenge-vs-shadow contrast for the live "shadow" opponent style (1v1 match
+		// rows; same EMA discipline as the commitment direction)
+		torch::Tensor challengeVecEMA;
+		float challengeSigmaEMA = 0;
 		std::array<float, STEER_MODES> steerGateDeltaEMA = {}; // steered-minus-control team-possession, EMA
 		std::array<int, STEER_MODES> steerGateIters = {};      // iterations that contributed gate data
 		std::array<bool, STEER_MODES> steerGateActive;         // alpha drops to 0 when the causal gate trips
@@ -1824,6 +1820,119 @@ void GGL::Learner::Start() {
 						steerPendingApply = true;
 					}
 					report[fnModeKey("Steer/Sigma", md)] = steerSigmaEMA[md];
+				}
+			}
+
+			// 5b) LIVE "shadow" style ingredient: the challenge-vs-shadow contrast, ported
+			// from the offline label (style_contrasts.label_challenge, causally validated
+			// in STEERING_PHASE0_40: negative dose cut challenge rate 44%->24% with clean
+			// canaries). Readings = 1v1 MATCH rows under OPPONENT possession (their touch
+			// within the last 2s, none of ours since, current gap >= 600uu); challenge =
+			// within 1.5s the player got within 600uu of the ball or closed half the gap;
+			// shadow = stayed farther AND goal-side (canonical self y < ball y). Matched
+			// on (distance x canonical-ball-y) quantile bins, EMA'd like the commitment
+			// direction. hesitant/overcommit need nothing here - they reuse steerVecEMA[0].
+			if (oppStylesOn) {
+				constexpr float POSSESSION_S = 2.0f, LOOKAHEAD_S = 1.5f, CHALLENGE_DIST = 600.f;
+				const int lookRows = (int)roundf(LOOKAHEAD_S * stepsPerSec);
+				const int possRows = (int)roundf(POSSESSION_S * stepsPerSec);
+				struct ChRow { int64_t row; bool challenge; float dNow, ballY; };
+				std::vector<ChRow> chPool;
+				{
+					int64_t epStart = 0;
+					for (int64_t epEnd = 0; epEnd < n; epEnd++) {
+						if (!combinedTraj.terminals[epEnd])
+							continue;
+						int64_t lastOpp = -1, lastOurs = -1;
+						for (int64_t r = epStart; r + lookRows <= epEnd; r++) {
+							if (combinedTraj.oppTouched[r]) lastOpp = r;
+							if (combinedTraj.touched[r] || combinedTraj.teamTouched[r]) lastOurs = r;
+							if (groups[r] != 0 || rowModes[r] != 0)
+								continue; // 1v1 match rows only (thin/weak team pools, E2)
+							if (lastOpp < 0 || r - lastOpp > possRows || lastOurs > lastOpp)
+								continue; // not under opponent possession
+							float bx = fnObs(r, BALL_POS) * POS_SCALE, by = fnObs(r, BALL_POS + 1) * POS_SCALE;
+							float sx = fnObs(r, SELF_POS) * POS_SCALE, sy = fnObs(r, SELF_POS + 1) * POS_SCALE;
+							float dNow = sqrtf((sx - bx) * (sx - bx) + (sy - by) * (sy - by));
+							if (dNow < CHALLENGE_DIST)
+								continue; // already engaged: neither label
+							bool challenge = false;
+							for (int64_t rr = r + 1; rr <= r + lookRows; rr++) {
+								float bx2 = fnObs(rr, BALL_POS) * POS_SCALE, by2 = fnObs(rr, BALL_POS + 1) * POS_SCALE;
+								float sx2 = fnObs(rr, SELF_POS) * POS_SCALE, sy2 = fnObs(rr, SELF_POS + 1) * POS_SCALE;
+								float d2 = sqrtf((sx2 - bx2) * (sx2 - bx2) + (sy2 - by2) * (sy2 - by2));
+								if (d2 < CHALLENGE_DIST || d2 < 0.5f * dNow) { challenge = true; break; }
+							}
+							if (!challenge && sy >= by)
+								continue; // neither challenging nor goal-side shadowing
+							chPool.push_back({ r, challenge, dNow, by });
+						}
+						epStart = epEnd + 1;
+					}
+				}
+				// Stride to the reading budget (trunk gathers below are the real cost)
+				if ((int)chPool.size() > cfgS.maxReadingsPerIter) {
+					size_t stride = chPool.size() / (size_t)cfgS.maxReadingsPerIter + 1;
+					std::vector<ChRow> strided;
+					for (size_t i = 0; i < chPool.size(); i += stride)
+						strided.push_back(chPool[i]);
+					chPool = std::move(strided);
+				}
+				if (!chPool.empty())
+					report["Steer/Challenge Rate"] = (float)std::count_if(chPool.begin(),
+						chPool.end(), [](const ChRow& c) { return c.challenge; }) / chPool.size();
+
+				// Matched (distance x ball-y) selection, same recipe as the commitment pools
+				std::vector<int64_t> selCh, selSh;
+				if ((int)chPool.size() >= 2 * cfgS.minPairsPerUpdate) {
+					auto fnEdges = [&](auto getter, int bins) {
+						FList vals;
+						for (auto& c : chPool)
+							vals.push_back(getter(c));
+						std::sort(vals.begin(), vals.end());
+						FList edges;
+						for (int b = 1; b < bins; b++)
+							edges.push_back(vals[vals.size() * b / bins]);
+						return edges;
+					};
+					FList dEdges = fnEdges([](const ChRow& c) { return c.dNow; }, 5);
+					FList yEdges = fnEdges([](const ChRow& c) { return c.ballY; }, 3);
+					std::map<int, std::pair<std::vector<int64_t>, std::vector<int64_t>>> byBin;
+					for (auto& c : chPool) {
+						int db = 0, yb = 0;
+						while (db < (int)dEdges.size() && c.dNow > dEdges[db]) db++;
+						while (yb < (int)yEdges.size() && c.ballY > yEdges[yb]) yb++;
+						(c.challenge ? byBin[db * 8 + yb].first : byBin[db * 8 + yb].second).push_back(c.row);
+					}
+					std::mt19937 shuffleRng((unsigned)(totalIterations * 31 + 17));
+					for (auto& kv : byBin) {
+						auto& a = kv.second.first;
+						auto& b = kv.second.second;
+						std::shuffle(a.begin(), a.end(), shuffleRng);
+						std::shuffle(b.begin(), b.end(), shuffleRng);
+						size_t m = RS_MIN(a.size(), b.size());
+						selCh.insert(selCh.end(), a.begin(), a.begin() + m);
+						selSh.insert(selSh.end(), b.begin(), b.begin() + m);
+					}
+				}
+				if ((int)selCh.size() >= cfgS.minPairsPerUpdate) {
+					torch::Tensor Hc = fnGatherTrunk(selCh), Hs = fnGatherTrunk(selSh);
+					torch::Tensor vNew = Hc.mean(0) - Hs.mean(0);
+					vNew = vNew / vNew.norm().clamp_min(1e-8f);
+					if (challengeVecEMA.defined()) {
+						report["Steer/Challenge Dir Drift"] =
+							1.f - torch::dot(challengeVecEMA, vNew).item<float>();
+						challengeVecEMA = cfgS.emaDecay * challengeVecEMA + (1.f - cfgS.emaDecay) * vNew;
+						challengeVecEMA = challengeVecEMA / challengeVecEMA.norm().clamp_min(1e-8f);
+					} else {
+						challengeVecEMA = vNew;
+					}
+					// sigma of the pool rows' projections onto the vector actually applied
+					torch::Tensor proj = torch::cat({ Hc, Hs }, 0).matmul(challengeVecEMA);
+					float sigNew = proj.std().item<float>();
+					challengeSigmaEMA = challengeSigmaEMA == 0
+						? sigNew : cfgS.emaDecay * challengeSigmaEMA + (1.f - cfgS.emaDecay) * sigNew;
+					report["Steer/Challenge Pairs"] = (float)selCh.size();
 				}
 			}
 
@@ -2464,6 +2573,15 @@ void GGL::Learner::Start() {
 		// the scheduler (fnMetaUpdate) decides the owner per dwell, this function routes the
 		// apply and keeps the measurement attribution (measured*/applied*) in step with it.
 		auto fnApplySteering = [&]() {
+			// Live opponent-style vectors: swap in the freshest EMAs while the worker is
+			// joined (it reads these without synchronization). EMA updates rebind rather
+			// than mutate tensors, so a copy the worker still holds stays valid.
+			if (oppStylesOn) {
+				oppStyleCommitVec = steerVecEMA[0];
+				oppStyleCommitSigma = steerSigmaEMA[0];
+				oppStyleChallengeVec = challengeVecEMA;
+				oppStyleChallengeSigma = challengeSigmaEMA;
+			}
 			// Resolve this barrier's owner: the scheduled meta cluster if it has a direction,
 			// else the incumbent
 			int ownerHead = -1, ownerCluster = -1;
@@ -2606,13 +2724,19 @@ void GGL::Learner::Start() {
 				oppIters++;
 				// steerRatingTripped: written only in the barrier zone (fnRatingGuard), read
 				// here on the collect thread - same discipline as ppo->steerVec. Latched OFF
-				// means the WHOLE steering intervention, styles included.
-				if (!oppStyles.empty() && !steerRatingTripped
+				// means the WHOLE steering intervention, styles included. A style whose live
+				// source vector hasn't been derived yet (first iterations after boot) simply
+				// doesn't fire - no file, no stale fallback.
+				if (oppStylesOn && !steerRatingTripped
 					&& RocketSim::Math::RandFloat() < config.steering.opponentStyleChance) {
-					auto& st = oppStyles[RocketSim::Math::RandInt(0, (int)oppStyles.size())];
-					oppStyleVec = st.vec;
-					oppStyleCoef = RocketSim::Math::RandFloat(st.aLo, st.aHi) * st.sigma;
-					oppStyleIters++;
+					auto& st = OPP_STYLES[RocketSim::Math::RandInt(0, 3)];
+					torch::Tensor v = st.challengeSrc ? oppStyleChallengeVec : oppStyleCommitVec;
+					float sig = st.challengeSrc ? oppStyleChallengeSigma : oppStyleCommitSigma;
+					if (v.defined() && sig > 0) {
+						oppStyleVec = v;
+						oppStyleCoef = RocketSim::Math::RandFloat(st.aLo, st.aHi) * sig;
+						oppStyleIters++;
+					}
 				}
 			}
 
@@ -3936,7 +4060,7 @@ void GGL::Learner::Start() {
 							report["Steer/Rating EMA"] = steerRatingEMA;
 						if (!std::isnan(steerRatingPeak))
 							report["Steer/Rating Peak"] = steerRatingPeak;
-						if (!oppStyles.empty() && oppIters > 0)
+						if (oppStylesOn && oppIters > 0)
 							report["Steer/Opp Style Frac"] = (float)oppStyleIters / (float)oppIters;
 					}
 

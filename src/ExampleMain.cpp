@@ -773,12 +773,13 @@ int main(int argc, char* argv[]) {
 	// latch armed. (The meta machinery, banks and panels are all still built and the
 	// probe/promote scheduler smoke-passed - this flag is the only thing holding it.)
 	cfg.steering.meta = false;
-	// Phase 1 (steered league opponents): offline-validated style directions the opponent
-	// side occasionally plays (challenge/shadow + commitment styles from the Phase-0
-	// program; exploiter styles FAILED their offline bar and are absent until re-derived
-	// with bigger cross-play samples). The trainer runs from build/, so the file lives at
-	// the repo root; produced by analysis/probes/export_styles.py. Missing file = off.
-	cfg.steering.opponentStylesFile = "../steering_styles.json";
+	// Phase 1 (steered league opponents): style directions the opponent side occasionally
+	// plays - hesitant/overcommit (commitment direction at offline-validated negative /
+	// mild positive dose) and shadow (live challenge-vs-shadow contrast). Synthesized
+	// LIVE in the trainer from the same per-iteration derivations that drive collection
+	// steering (2026-07-15, replacing the frozen steering_styles.json: pinned vectors rot
+	// within ~75M steps, so a checkpoint-stale file was diversity in name only; exploiter
+	// styles FAILED their offline bar and remain absent). Set chance 0 to turn off.
 	cfg.steering.opponentStyleChance = 0.25f;
 	// AttemptResolutionCondition is a STAGE-2 semantic; only attach it when termination is on
 	// (and only ever together with a dedicated practice-value baseline - see post-mortems).

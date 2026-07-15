@@ -69,16 +69,17 @@ namespace GGL {
 
 		// OPPONENT-side style steering (roadmap phase 1/2): on opponent iterations
 		// (old-version or league member), with this chance the opponent additionally plays
-		// a STYLE - an offline-validated trunk direction applied to every opponent row,
-		// ungated, at an alpha sampled from the style's own dose window. Styles cost
-		// nothing to store (512 floats) and diversify the training distribution the way
-		// descendOpponentFrac does, but along behavioral axes instead of history.
-		// stylesFile: JSON list of {name, vec[trunk], sigma, alpha_lo, alpha_hi} produced
-		// by analysis/probes/export_styles.py from causally-validated directions ONLY
-		// (challenge/shadow and commitment pass; exploiter directions failed their
-		// pre-registered bar offline - re-derive with bigger cross-play samples before
-		// adding them). Empty path = feature off. Revert = empty the file or the path.
-		std::filesystem::path opponentStylesFile;
+		// a STYLE - a trunk direction applied to every opponent row, ungated, at an alpha
+		// sampled from the style's dose window. Diversifies the training distribution the
+		// way descendOpponentFrac does, but along behavioral axes instead of history.
+		// Styles are synthesized LIVE each iteration from the same derivations that drive
+		// collection steering - hesitant/overcommit from the commitment direction (negative
+		// / mild positive dose), shadow from a live challenge-vs-shadow contrast. NO file:
+		// the frozen steering_styles.json era ended 2026-07-15 - pinned vectors rot
+		// (measured +7pp -> -11pp within ~75M steps), so a stale file is diversity in name
+		// only. The dose windows keep their offline-validated values (STEERING_PHASE0_40)
+		// and are in units of the LIVE projection sigma, so they self-calibrate as the
+		// trunk drifts. Chance 0 = feature off. Styles obey the rating latch.
 		float opponentStyleChance = 0.25f;
 
 		// ===== META frontier steering (roadmap phase 4, prior-free) =====
