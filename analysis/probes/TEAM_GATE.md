@@ -153,6 +153,82 @@ per-step multiply into tSteerMask before InferActions (team rows only, 1v1
 unaffected). Guards unchanged: per-mode possession gates, rating latch, branch
 backup ritual.
 
-### Confirmation results
+### Confirmation results (`results/team_gate_confirm_27550023244.json`)
 
-*(to be filled after the run; bars above are frozen)*
+Directions: own 136 pairs σ5.23 | bp 491 pairs σ4.16 | cos +0.74 (recipe-stable:
+the bp pool is ~3.6× richer and reproducibly distinct from the unconditioned one).
+
+| arm | teamWon ± SE | Δ vs B0 | NONE | vs bars |
+|---|---|---|---|---|
+| B0 | 11.6% ± 1.2% | — | 78.0% | |
+| B1 own+prox | 13.6% ± 1.4% | +2.0pp (1.1σ) | 76.7% | gate alone: nothing |
+| B2 bp ungated | **16.1% ± 2.0%** | **+4.5pp (1.93σ)** | **72.9%** | ≥4pp ✓, NONE −5.1 ✓, 2σ ✗ (1.93) |
+| B3 bp+prox | 15.0% ± 1.8% | +3.4pp (1.57σ) | 76.6% | registered deploy arm: FAIL |
+
+**VERDICT: the registered bar (defined on B3) FAILS — no deploy from this round.**
+Attribution is nonetheless clear: the prox gate is inert-to-negative on top of
+the direction (B1 weak, B3 < B2); the ACTIVE ingredient is the best-placed
+derivation conditioning (B2), which met the effect-size and NONE bars and missed
+significance by 0.07σ. Across two independent eval seeds, every bp-conditioned
+arm beat baseline (+7.6, +4.5, +3.4pp).
+
+## Replication round (pre-registered 2026-07-15 BEFORE running; sequential test,
+final — pass deploys, fail kills the candidate)
+
+`team_gate_replicate.py`: fresh derivation seed AND fresh eval seed, TWO arms
+only — R0 baseline, R2 = bp-conditioned direction @ +0.5 UNGATED (the B2
+recipe verbatim), 1.2M rows/arm.
+
+Frozen bars: teamWon(R2) − teamWon(R0) ≥ +3pp at ≥ 2× SE_diff, AND
+NONE(R2) ≤ NONE(R0) − 2pp, AND canaries clean (same definitions as above).
+
+PASS → deploy ONLY the derivation conditioning (team-mode steering pools
+require reqSelf ≤ min present-teammate required speed, read from the reading
+row's own obs teammate slots) behind a config flag; no application gate; all
+existing guards unchanged. FAIL → candidate dead, record, stop.
+
+### Replication results (`results/team_gate_replicate_27550023244.json`)
+
+Direction: 425 matched pairs, σ 3.34 (pool richness replicates). 1.2M rows/arm:
+
+| arm | teamWon ± SE | NONE |
+|---|---|---|
+| R0 | 12.6% ± 1.2% | 79.5% |
+| R2 | 14.8% ± 1.7% | 76.0% |
+
+Δ teamWon **+2.2pp (1.04σ)** vs the ≥3pp / ≥2σ bar → **FAIL. The candidate is
+dead per protocol; nothing deploys.**
+
+## Final verdict and what it means
+
+Point estimates across the three independent eval seeds: +7.6 → +4.5 → +2.2pp
+(classic winner's-curse decay). Inverse-variance pool: **+3.7pp ± 1.5 (≈2.5σ)**
+— the best-placed-conditioned direction very likely has a REAL but MODEST
+acute effect, consistently reducing collective decline (NONE −5.9/−5.1/−3.5pp
+in every round), but it converts too few of those declines into possession
+wins to clear a deploy bar honestly.
+
+Combined with the main sweep (transfer dead, 2v2-own dead, gates inert or
+harmful), the conclusion is structural: **acute team-mode steering has hit the
+same positive-side saturation 1v1 hit one era earlier** (STEERING_PHASE0_40
+0a). The whiff tax provably persists at the belief level (INTERP_SWEEP2 B3),
+but pushing the trunk along linear axes no longer buys possession at
+measurement-worthy size.
+
+Standing knowledge for whoever picks this up next:
+
+1. **Best-placed pool conditioning** is the strongest surviving candidate and
+   the recorded reason: unconditioned team pools count "correctly deferred to
+   the better-placed teammate" as a decline, diluting the WON-vs-NONE contrast
+   (conditioned pools are ~3× richer, 425-491 vs 136-175 pairs, and the
+   direction is reproducibly ~cos 0.74-0.91 from the unconditioned one). If
+   revisited, test it as a LIVE derivation-semantics change judged on
+   training-time metrics (Steer/Gate Delta EMA 2v2, Rating/2v2 slope over a
+   matched window), not on acute offline rollouts — the acute channel is
+   saturated, but the live mechanism trains through the clipping asymmetry,
+   which offline rollouts cannot see. Requires its own pre-registration.
+2. **Do not steer by self-model comparison** (rho-gap gating halves teamWon).
+3. The other lever classes for the team whiff tax remain untested at this
+   checkpoint: frontier-drill dose for team modes (training-time; needs a
+   live A/B protocol), and the dedicated practice-value head (heavy, stage-2
+   adjacent). Neither has measurement conviction yet.
