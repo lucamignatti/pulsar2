@@ -837,12 +837,19 @@ int main(int argc, char* argv[]) {
 		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
 		// Steer/Frontier Pool sizes, and the next offline decline census.
 		cfg.steering.frontierFearMining = true;
-		// AirDrill altitude annealing (AERIAL_GAP.md): D starts at 0 = identical to the
-		// classic drill, and only ramps toward grounded-takeoff spawns while the aerial-
-		// conversion EMA stays healthy. Watch: Curriculum/AirDrill D + Aerial Conv EMA.
-		// Revert = don't create the object (setters fall back to the classic spawn).
-		g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
-		cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
+		// AirDrill altitude annealing: REVERTED 2026-07-15 ~2.5h after deploy (see
+		// AERIAL_GAP.md incident record). The v1 controller's feedback metric
+		// (match-play aerial conversion) moves on a DAYS timescale while the ratchet
+		// adjusted every 50 iterations - with no effective feedback it annealed
+		// D 0 -> 0.9 in ~3h, turning ~20% of ALL resets (INCLUDING the skill-tracker
+		// eval fleet, which was wrongly sharing the curriculum) into grounded-takeoff
+		// states the bot converts at 0%. Rating slid 1657 -> 1546 in lockstep.
+		// A v2 needs, before any re-enable (own pre-registration): (1) drill-outcome
+		// attribution as the feedback signal (not match conversion), (2) a
+		// non-refreshing baseline floor, (3) eval-fleet exclusion, (4) rating-latch
+		// coverage, (5) a schema tag so stale persisted D is discarded on load.
+		// g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
+		// cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
 	}
 
 	// Make the learner with the environment creation function and the config we just made
