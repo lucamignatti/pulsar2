@@ -83,7 +83,8 @@ def decline_readings(rec, max_readings=MAX_READINGS):
 
     keys = ("row", "episode", "outcome", "d_now", "t_land", "req_self", "req_tm",
             "feas_self", "feas_tm", "best_placed", "margin",
-            "pursued_self", "pursued_tm", "tm_pursues15", "decline")
+            "pursued_self", "pursued_tm", "tm_pursues15", "decline",
+            "land_x", "land_y")
     out = {k: [] for k in keys}
 
     for r in cand:
@@ -164,6 +165,8 @@ def decline_readings(rec, max_readings=MAX_READINGS):
         out["pursued_tm"].append(bool(pursued_tm))
         out["tm_pursues15"].append(bool(tm_pursues15))
         out["decline"].append(bool(not pursued_self and not pursued_tm))
+        out["land_x"].append(float(lx))
+        out["land_y"].append(float(ly))
     return {k: np.array(v) for k, v in out.items()}
 
 

@@ -290,6 +290,14 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["steer_sigma" + suffix] = steerSigmaSave[md];
 	}
 
+	// Fear panel (in-trainer census): persisted so the probe set stays FIXED across
+	// restarts - longitudinal by construction (~700KB in the stats JSON, saved every
+	// tsPerSave; acceptable)
+	if (!fearPanelObs.empty()) {
+		j["fear_panel_obs"] = fearPanelObs;
+		j["fear_panel_timestep"] = fearPanelTimestep;
+	}
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -340,6 +348,11 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 				"opponent styles and frontier drills stay latched OFF (a human decides; clear "
 				"steer_rating_tripped in the checkpoint's running-stats JSON or restore an "
 				"untripped checkpoint to re-enable)");
+	}
+
+	if (j.contains("fear_panel_obs")) {
+		fearPanelObs = j["fear_panel_obs"].get<std::vector<float>>();
+		fearPanelTimestep = j.value("fear_panel_timestep", (int64_t)0);
 	}
 
 	if (versionMgr)
@@ -1559,14 +1572,18 @@ void GGL::Learner::Start() {
 			// tensor is missing or degenerate.
 			torch::Tensor tVz, tGz;
 			bool dzOk = false;
+			float dzVMean = 0, dzVStd = 1, dzGMean = 0, dzGStd = 1; // census panel needs the raw scales
 			if (cfgS.frontierFearMining && tValPredsIn.defined() && tGoalValPredsIn.defined()
 				&& tValPredsIn.numel() == n && tGoalValPredsIn.numel() == n) {
 				tVz = tValPredsIn.to(torch::kFloat32).flatten().contiguous();
 				tGz = tGoalValPredsIn.to(torch::kFloat32).flatten().contiguous();
-				float vStd = tVz.std().item<float>(), gStd = tGz.std().item<float>();
-				if (vStd > 1e-6f && gStd > 1e-6f) {
-					tVz = (tVz - tVz.mean()) / vStd;
-					tGz = (tGz - tGz.mean()) / gStd;
+				dzVMean = tVz.mean().item<float>();
+				dzVStd = tVz.std().item<float>();
+				dzGMean = tGz.mean().item<float>();
+				dzGStd = tGz.std().item<float>();
+				if (dzVStd > 1e-6f && dzGStd > 1e-6f) {
+					tVz = (tVz - dzVMean) / dzVStd;
+					tGz = (tGz - dzGMean) / dzGStd;
 					dzOk = true;
 				}
 			}
@@ -1678,6 +1695,10 @@ void GGL::Learner::Start() {
 			// frontierDz is row-aligned with frontierRows (FEAR_MINE ranking; 0 when off).
 			std::array<std::vector<int64_t>, STEER_MODES> frontierRows;
 			std::array<std::vector<float>, STEER_MODES> frontierDz;
+			// Census: per-mode MATCH-row outcome counts (0 none/1 won/2 lost/3 teammate)
+			// and the Dz of WON readings (scared-tail reference distribution)
+			int censusOutcome[STEER_MODES][4] = {};
+			std::array<std::vector<float>, STEER_MODES> censusWonDz;
 			int feas[STEER_MODES][3] = {}, possTeamWon[STEER_MODES][3] = {};
 			const float raceMarginRows = 0.5f * stepsPerSec; // grace past touchdown for the race
 			for (auto& rd : readings) {
@@ -1705,6 +1726,11 @@ void GGL::Learner::Start() {
 				// style-proof at team level, and the safety net against steered double-commits
 				if (outcome == 1 || outcome == 3)
 					possTeamWon[rd.mode][rd.role]++;
+				if (rd.role == 0) {
+					censusOutcome[rd.mode][outcome]++;
+					if (outcome == 1 && dzOk)
+						censusWonDz[rd.mode].push_back(fnDz(rd.row));
+				}
 				if (rd.role == 0 && (outcome == 0 || outcome == 1))
 					pools[rd.mode].push_back({ rd.row, outcome == 1, dNow, rd.land[2] });
 				if (rd.role == 0 && outcome == 0) {
@@ -2070,6 +2096,22 @@ void GGL::Learner::Start() {
 							rows = std::move(sortedRows);
 							dzs = std::move(sortedDz);
 						}
+						// Freeze the longitudinal fear panel ONCE: the first full 2v2 Dz
+						// ranking after enablement becomes the fixed probe set (persisted
+						// via RUNNING_STATS so it stays fixed across restarts)
+						constexpr int FEAR_PANEL_K = 128;
+						if (md == 1 && ranked && fearPanelObs.empty()
+							&& (int)rows.size() >= FEAR_PANEL_K) {
+							fearPanelObs.resize((size_t)FEAR_PANEL_K * obsSize);
+							for (int i = 0; i < FEAR_PANEL_K; i++)
+								memcpy(&fearPanelObs[(size_t)i * obsSize],
+									&states[rows[i] * (int64_t)obsSize],
+									obsSize * sizeof(float));
+							fearPanelTimestep = totalTimesteps;
+							RG_LOG("Fear panel frozen: " << FEAR_PANEL_K
+								<< " top-Dz 2v2 decline states at ts " << totalTimesteps
+								<< " (Steer/Fear Panel * panels now live)");
+						}
 						std::vector<RLGC::FrontierPool::Entry> entries;
 						entries.reserve(RS_MIN((int)rows.size(), cfgS.frontierPoolPerMode));
 						size_t stride = ranked ? 1
@@ -2090,6 +2132,45 @@ void GGL::Learner::Start() {
 						fpool->Fill(md, std::move(entries));
 					}
 				}
+			}
+
+			// 7) In-trainer census (C++-only; the offline python census is a manual
+			// research tool, never automation): decline mix, scared tail, and the frozen
+			// fear-panel valuation - the longitudinal readout of whether the fear-mined
+			// drills are closing the critic's mis-pricing. All inputs are already in
+			// hand this iteration; cost is one 128-row forward.
+			for (int md = 0; md < STEER_MODES; md++) {
+				int tot = censusOutcome[md][0] + censusOutcome[md][1]
+					+ censusOutcome[md][2] + censusOutcome[md][3];
+				if (tot >= 50)
+					report[fnModeKey("Steer/Census NONE Frac", md)] = (float)censusOutcome[md][0] / tot;
+				// Scared tail: fraction of best-placed declines (the frontierDz candidate
+				// pool) whose Dz exceeds the WON readings' median (live proxy for the
+				// offline "pursued median" - touch-based, computable every iteration)
+				if (md > 0 && dzOk && censusWonDz[md].size() >= 20 && frontierDz[md].size() >= 20) {
+					auto won = censusWonDz[md];
+					std::nth_element(won.begin(), won.begin() + won.size() / 2, won.end());
+					float wonMed = won[won.size() / 2];
+					int above = 0;
+					for (float d : frontierDz[md])
+						if (d > wonMed) above++;
+					report[fnModeKey("Steer/Census Scared Tail", md)] = (float)above / frontierDz[md].size();
+				}
+			}
+			if (!fearPanelObs.empty() && dzOk && obsSize > 0
+				&& fearPanelObs.size() % (size_t)obsSize == 0) {
+				RG_NO_GRAD;
+				int64_t k = (int64_t)(fearPanelObs.size() / (size_t)obsSize);
+				torch::Tensor pObs = torch::from_blob(fearPanelObs.data(),
+					{ k, (int64_t)obsSize }, torch::kFloat32).to(ppo->device);
+				float pv = (ppo->InferCritic(pObs).to(torch::kFloat32).mean().item<float>()
+					- dzVMean) / dzVStd;
+				float pg = (ppo->InferGoalCritic(pObs).to(torch::kFloat32).mean().item<float>()
+					- dzGMean) / dzGStd;
+				report["Steer/Fear Panel zV"] = pv;
+				report["Steer/Fear Panel zG"] = pg;
+				report["Steer/Fear Panel Dz"] = pg - pv;
+				report["Steer/Fear Panel Age Bsteps"] = (float)((totalTimesteps - fearPanelTimestep) / 1e9);
 			}
 		};
 

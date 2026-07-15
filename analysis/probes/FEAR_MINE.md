@@ -59,6 +59,21 @@ The critic's fear is a TEAM-MODE phenomenon — the 1v1 disposition gap was
 largely closed by the steering era; remaining 1v1 declines are correct or
 capability-limited. The deployed team-only scope is confirmed as the right one.
 
+## The census (in-trainer, C++ — user rule: no python automation)
+
+The standing instrument judging this deploy lives in the trainer itself
+(fnSteerUpdate section 7; ~zero cost, everything already in hand per
+iteration): `Steer/Census NONE Frac` per mode, `Steer/Census Scared Tail`
+2v2/3v3 (fraction of best-placed declines with Δz above the WON-readings
+median), and the **longitudinal fear panel** — 128 top-Δz 2v2 decline obs rows
+frozen ONCE at first ranking after enablement, persisted through
+RUNNING_STATS, re-valued by the current critics every iteration
+(`Steer/Fear Panel zV / zG / Dz / Age Bsteps`). zV rising toward 0 across
+checkpoints = the critic unlearning its fear = this deploy working.
+`analysis/probes/fear_census.py` remains as a MANUAL research tool (its
+forced-contest selector-calibration check is the one piece too heavy to run
+in-trainer); it is not scheduled anywhere.
+
 ## Characterization (reported regardless, feeds the reward-diagnostic program)
 
 Median Δz of pursued vs declined best-placed readings and the size of the

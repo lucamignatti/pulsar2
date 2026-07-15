@@ -86,6 +86,17 @@ namespace GGL {
 		std::array<std::vector<float>, 3> steerVecSave;
 		std::array<float, 3> steerSigmaSave = {};
 
+		// FEAR PANEL (in-trainer census, FEAR_MINE.md): a frozen set of high-
+		// disagreement 2v2 decline obs rows, captured ONCE when fear mining first
+		// produces a full ranking, then persisted through RUNNING_STATS and re-valued
+		// by the CURRENT critic + goal critic every iteration (Steer/Fear Panel zV /
+		// zG / Dz panels). zV rising toward 0 across checkpoints = the critic
+		// unlearning its fear = the drill deploy working. Unlike steerVecSave this IS
+		// loaded: the panel must stay FIXED to be longitudinal (it is measurement
+		// state, not an actuator - nothing reads it but the report).
+		std::vector<float> fearPanelObs;   // flattened [k, obsSize]
+		int64_t fearPanelTimestep = 0;     // totalTimesteps at freeze
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 
