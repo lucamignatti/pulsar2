@@ -819,6 +819,15 @@ int main(int argc, char* argv[]) {
 		g_FrontierPool = std::make_shared<RLGC::FrontierPool>();
 		cfg.steering.frontierPool = g_FrontierPool;
 		g_PracticeArenaFrac = cfg.steering.practiceArenaFrac;
+		// FEAR_MINE (2026-07-15): team-mode pools bank the highest critic/goal-critic
+		// disagreement declines by the best-placed teammate ("states it thinks could be
+		// good but is too scared to commit to" - the dataset-quality lever). Conviction
+		// and offline drill validation (all four pre-registered bars passed):
+		// analysis/probes/CREDIT_PROBE.md + FEAR_MINE.md. useFrac/noise/dose untouched;
+		// obeys the rating latch + pool staleness like all frontier mining.
+		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
+		// Steer/Frontier Pool sizes, and the next offline decline census.
+		cfg.steering.frontierFearMining = true;
 	}
 
 	// Make the learner with the environment creation function and the config we just made

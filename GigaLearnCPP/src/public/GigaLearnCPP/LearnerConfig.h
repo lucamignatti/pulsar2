@@ -133,6 +133,20 @@ namespace GGL {
 		// internally. NULL = feature off. Revert = stop wrapping the setter (config).
 		std::shared_ptr<RLGC::FrontierPool> frontierPool;
 		int frontierPoolPerMode = 256; // banked entries per mode per iteration
+		// FEAR_MINE (2026-07-15): TEAM-mode pools bank the highest critic/goal-critic
+		// DISAGREEMENT declines instead of a uniform stride - Dz = z(goalCritic) - z(critic)
+		// ranks "states the long-horizon evaluator likes but the baselining critic is
+		// scared of", restricted to readings where the decliner was the BEST-PLACED
+		// teammate (an obs-local check; a better-placed teammate's ball is their decline,
+		// not ours). Conviction: CREDIT_PROBE (the critic prices declining ABOVE pursuing
+		// at matched best-placed frontier states while the long-horizon goal critic
+		// disagrees, 2.9 sigma). Offline drill validation: FEAR_MINE.md, all four bars
+		// passed (100% playable, coin-flip races 50/50, resolution matched, selector
+		// median Dz +2.0 vs -0.3 for the old criterion). Validated in 2v2; 3v3 rides the
+		// identical mechanism (watch Steer/Frontier Dz). 1v1 pools keep the original
+		// criterion. Falls back to the uniform stride whenever value tensors are
+		// unavailable. false = original mining everywhere.
+		bool frontierFearMining = false;
 
 		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
 		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no

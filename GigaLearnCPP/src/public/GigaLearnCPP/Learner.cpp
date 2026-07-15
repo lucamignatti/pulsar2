@@ -1546,13 +1546,33 @@ void GGL::Learner::Start() {
 		// The updated direction is applied in the barrier zone (fnApplySteering), never while a
 		// collect worker is in flight. Rows of one player's episode are CONTIGUOUS in
 		// combinedTraj (episodes are appended whole at finalize), so lookahead is row + k.
-		auto fnSteerUpdate = [&](Report& report) {
+		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn) {
 			const auto& cfgS = config.steering;
 			const auto& states = combinedTraj.states;
 			const auto& groups = combinedTraj.steerPractice;
 			int64_t n = (int64_t)combinedTraj.Length();
 			if (n == 0 || groups.size() != (size_t)n || combinedTraj.steerMode.size() != (size_t)n)
 				return;
+
+			// FEAR_MINE: Dz = z(goalCritic) - z(critic) per row (see LearnerConfig.h).
+			// Fail-open to 0 (uniform-stride fallback at the Fill site) when either value
+			// tensor is missing or degenerate.
+			torch::Tensor tVz, tGz;
+			bool dzOk = false;
+			if (cfgS.frontierFearMining && tValPredsIn.defined() && tGoalValPredsIn.defined()
+				&& tValPredsIn.numel() == n && tGoalValPredsIn.numel() == n) {
+				tVz = tValPredsIn.to(torch::kFloat32).flatten().contiguous();
+				tGz = tGoalValPredsIn.to(torch::kFloat32).flatten().contiguous();
+				float vStd = tVz.std().item<float>(), gStd = tGz.std().item<float>();
+				if (vStd > 1e-6f && gStd > 1e-6f) {
+					tVz = (tVz - tVz.mean()) / vStd;
+					tGz = (tGz - tGz.mean()) / gStd;
+					dzOk = true;
+				}
+			}
+			const float* vzPtr = dzOk ? tVz.data_ptr<float>() : NULL;
+			const float* gzPtr = dzOk ? tGz.data_ptr<float>() : NULL;
+			auto fnDz = [&](int64_t row) { return dzOk ? gzPtr[row] - vzPtr[row] : 0.f; };
 			// v2 possession labels need the reach buffers' touch flags
 			if (combinedTraj.touched.size() != (size_t)n || combinedTraj.oppTouched.size() != (size_t)n
 				|| combinedTraj.teamTouched.size() != (size_t)n)
@@ -1654,8 +1674,10 @@ void GGL::Learner::Start() {
 			// and teammate-resolved races carry no self-commitment signal.
 			std::array<std::vector<Labeled>, STEER_MODES> pools;
 			// Frontier rows for the phase-3 reset pool: feasible + collectively declined,
-			// MATCH rows only (practice arenas must never feed their own reset pool)
+			// MATCH rows only (practice arenas must never feed their own reset pool).
+			// frontierDz is row-aligned with frontierRows (FEAR_MINE ranking; 0 when off).
 			std::array<std::vector<int64_t>, STEER_MODES> frontierRows;
+			std::array<std::vector<float>, STEER_MODES> frontierDz;
 			int feas[STEER_MODES][3] = {}, possTeamWon[STEER_MODES][3] = {};
 			const float raceMarginRows = 0.5f * stepsPerSec; // grace past touchdown for the race
 			for (auto& rd : readings) {
@@ -1685,8 +1707,31 @@ void GGL::Learner::Start() {
 					possTeamWon[rd.mode][rd.role]++;
 				if (rd.role == 0 && (outcome == 0 || outcome == 1))
 					pools[rd.mode].push_back({ rd.row, outcome == 1, dNow, rd.land[2] });
-				if (rd.role == 0 && outcome == 0)
-					frontierRows[rd.mode].push_back(rd.row);
+				if (rd.role == 0 && outcome == 0) {
+					// FEAR_MINE conditioning (team modes, padded obs only): bank a decline
+					// only if THIS player was the best-placed teammate for the landing -
+					// a better-placed teammate's unclaimed ball is their decline, not ours
+					// (INTERP_SWEEP2 B1: unconditioned pools count correct deferrals as
+					// declines). Teammate blocks at 80 + s*29, presence flags at 225 + s.
+					bool bank = true;
+					if (cfgS.frontierFearMining && rd.mode > 0 && obsSize == 230) {
+						float reqSelf = dNow / RS_MAX(rd.land[2], 1e-6f);
+						for (int s = 0; s < 2 && bank; s++) {
+							if (fnObs(rd.row, 225 + s) <= 0.5f)
+								continue;
+							float tx = fnObs(rd.row, 80 + s * 29) * POS_SCALE;
+							float ty = fnObs(rd.row, 80 + s * 29 + 1) * POS_SCALE;
+							float dTm = sqrtf((tx - rd.land[0]) * (tx - rd.land[0])
+								+ (ty - rd.land[1]) * (ty - rd.land[1]));
+							if (dTm / RS_MAX(rd.land[2], 1e-6f) < reqSelf)
+								bank = false;
+						}
+					}
+					if (bank) {
+						frontierRows[rd.mode].push_back(rd.row);
+						frontierDz[rd.mode].push_back(fnDz(rd.row));
+					}
+				}
 			}
 
 			// Panels: legacy un-suffixed keys stay 1v1 (wandb continuity); team modes suffixed
@@ -2003,15 +2048,45 @@ void GGL::Learner::Start() {
 						auto& rows = frontierRows[md];
 						if (rows.empty())
 							continue;
+						// FEAR_MINE: team modes bank the highest-disagreement declines
+						// (Dz desc, stride 1) instead of a uniform stride over everything.
+						// 1v1 (and any Dz-unavailable iteration) keeps the original sampling.
+						bool ranked = cfgS.frontierFearMining && md > 0 && dzOk && rows.size() > 1;
+						auto& dzs = frontierDz[md];
+						if (ranked) {
+							std::vector<size_t> order(rows.size());
+							for (size_t i = 0; i < order.size(); i++)
+								order[i] = i;
+							std::sort(order.begin(), order.end(),
+								[&](size_t a, size_t b) { return dzs[a] > dzs[b]; });
+							std::vector<int64_t> sortedRows;
+							std::vector<float> sortedDz;
+							sortedRows.reserve(rows.size());
+							sortedDz.reserve(rows.size());
+							for (size_t i : order) {
+								sortedRows.push_back(rows[i]);
+								sortedDz.push_back(dzs[i]);
+							}
+							rows = std::move(sortedRows);
+							dzs = std::move(sortedDz);
+						}
 						std::vector<RLGC::FrontierPool::Entry> entries;
 						entries.reserve(RS_MIN((int)rows.size(), cfgS.frontierPoolPerMode));
-						size_t stride = RS_MAX((size_t)1, rows.size() / (size_t)RS_MAX(1, cfgS.frontierPoolPerMode));
+						size_t stride = ranked ? 1
+							: RS_MAX((size_t)1, rows.size() / (size_t)RS_MAX(1, cfgS.frontierPoolPerMode));
+						float dzBankedSum = 0;
+						int dzBanked = 0;
 						for (size_t i = 0; i < rows.size() && (int)entries.size() < cfgS.frontierPoolPerMode; i += stride) {
 							RLGC::FrontierPool::Entry e;
-							if (fnEntry(rows[i], md, e))
+							if (fnEntry(rows[i], md, e)) {
 								entries.push_back(std::move(e));
+								dzBankedSum += dzs[i];
+								dzBanked++;
+							}
 						}
 						report[fnModeKey("Steer/Frontier Pool", md)] = (float)entries.size();
+						if (ranked && dzBanked > 0)
+							report[fnModeKey("Steer/Frontier Dz", md)] = dzBankedSum / dzBanked;
 						fpool->Fill(md, std::move(entries));
 					}
 				}
@@ -4067,7 +4142,7 @@ void GGL::Learner::Start() {
 					// Derive/refresh the steering direction from THIS buffer's match-arena rows,
 					// and feed the causal gate from the steered-vs-control practice split
 					if (steerOn)
-						fnSteerUpdate(report);
+						fnSteerUpdate(report, tValPreds, tGoalValPreds);
 						fnMetaUpdate(report);
 				}
 
