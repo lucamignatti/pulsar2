@@ -1,54 +1,54 @@
 {
-  "n_readings": 26242,
-  "censored": 556,
-  "contested_frac": 0.010978743284279373,
+  "n_readings": 26934,
+  "censored": 880,
+  "contested_frac": 0.04452291394795425,
   "params": {
     "know_err_uu": 500.0,
     "attend_radius_uu": 500.0,
     "contest_dev_uu": 300.0,
     "feasible_speed": 1300.0
   },
-  "feasible_free_landings": 6943,
-  "p_unattended_given_knows": 0.525938566552901,
-  "n_knows": 2930,
-  "p_unattended_given_not_knows": 0.6660852230251681,
-  "n_not_knows": 4013,
+  "feasible_free_landings": 6267,
+  "p_unattended_given_knows": 0.8190003104625893,
+  "n_knows": 3221,
+  "p_unattended_given_not_knows": 0.8191070256073539,
+  "n_not_knows": 3046,
   "by_knowledge_quartile": [
     {
-      "know_err_max": 360.95659558486426,
-      "n": 1736,
-      "p_unattended": 0.5034562211981567,
-      "median_d_self": 502.6766357421875,
-      "median_approach": 123.30134227861647
+      "know_err_max": 317.34342411966196,
+      "n": 1567,
+      "p_unattended": 0.8347160178685387,
+      "median_d_self": 1003.1675415039062,
+      "median_approach": -72.46411033815954
     },
     {
-      "know_err_max": 567.8383215705146,
-      "n": 1735,
-      "p_unattended": 0.5579250720461095,
-      "median_d_self": 584.5374145507812,
-      "median_approach": 187.61632502269626
+      "know_err_max": 487.72162841565375,
+      "n": 1566,
+      "p_unattended": 0.8039591315453385,
+      "median_d_self": 1003.1675415039062,
+      "median_approach": -51.698824740600415
     },
     {
-      "know_err_max": 875.9751446785053,
-      "n": 1736,
-      "p_unattended": 0.6399769585253456,
-      "median_d_self": 640.98095703125,
-      "median_approach": 188.10709654453944
+      "know_err_max": 715.0877278355891,
+      "n": 1567,
+      "p_unattended": 0.8028079132099554,
+      "median_d_self": 976.416259765625,
+      "median_approach": 34.1979441777708
     },
     {
-      "know_err_max": 3699.0844206827933,
-      "n": 1736,
-      "p_unattended": 0.7263824884792627,
-      "median_d_self": 1007.4934997558594,
-      "median_approach": 159.94883927523398
+      "know_err_max": 3693.6947596171976,
+      "n": 1567,
+      "p_unattended": 0.8347160178685387,
+      "median_d_self": 1262.628173828125,
+      "median_approach": 96.37775481215824
     }
   ],
   "danger_slice": {
-    "n": 686,
-    "p_self_unattended": 0.7230320699708455
+    "n": 227,
+    "p_self_unattended": 1.0
   },
   "aerial_passivity": {
-    "n": 3222,
-    "p_never_airborne": 0.42830540037243947
+    "n": 3897,
+    "p_never_airborne": 0.07800872465999487
   }
 }

@@ -324,7 +324,8 @@ class SteeredPolicyRho(PulsarPolicy):
 
 
 def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
-                 want_states=False, want_masks=False, want_goals=False):
+                 want_states=False, want_masks=False, want_goals=False,
+                 want_obs=False):
     """policies: one policy for all rows, or (blue_policy, orange_policy) for
     cross-play. Records the interleaved per-player rows. want_states banks the FULL
     physical state per arena-step (ball 9 + per-car 17: pos vel angVel forward up
@@ -391,6 +392,8 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
 
         obs_b = torch.from_numpy(np.concatenate(obs_list))
         mask_b = torch.from_numpy(np.concatenate(mask_list))
+        if want_obs and "obs" not in rec:
+            rec["obs"] = np.empty((n_rows, obs_b.shape[1]), np.float16)
         if per_team:
             slots = torch.arange(obs_b.shape[0]) % npl
             h2 = torch.empty(obs_b.shape[0], 512)
@@ -423,6 +426,8 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
                 rec["kickoff"][row] = is_kick
                 if want_h2:
                     rec["h2"][row] = h2[npl * i + p].numpy()
+                if want_obs:
+                    rec["obs"][row] = obs_b[npl * i + p].numpy()
                 if want_masks:
                     rec["masks"][row] = mask_b[npl * i + p].numpy()
                 if want_goals:
