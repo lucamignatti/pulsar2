@@ -48,6 +48,17 @@ PASS all four → deploy ONE lever: the live Fill ranking switches to
 untouched, existing latch + staleness bounds cover it, branch backup ritual).
 FAIL any → record, no deploy; the mining criterion stays as is.
 
+## 1v1 extension (2026-07-15, same frozen bars): FAIL — 1v1 stays on the original criterion
+
+`FEAR_PPT=1`, raw: `results/fear_mine_1v1_27550023244.json`. Elicitation FAILS
+(FEAR resolution 9.3% vs CURRENT 16.7% — the bot re-declines fear states even
+when reset into them) and balance FAILS (reader-first 75% when resolved — easy
+ignored balls, not coin-flips). Root difference: 1v1 shows NO decline-pessimism
+split (median Δz pursued −0.20 vs declined −0.10, against 2v2's +0.09/−0.47).
+The critic's fear is a TEAM-MODE phenomenon — the 1v1 disposition gap was
+largely closed by the steering era; remaining 1v1 declines are correct or
+capability-limited. The deployed team-only scope is confirmed as the right one.
+
 ## Characterization (reported regardless, feeds the reward-diagnostic program)
 
 Median Δz of pursued vs declined best-placed readings and the size of the

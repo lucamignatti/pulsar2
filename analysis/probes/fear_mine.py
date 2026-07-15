@@ -2,6 +2,7 @@
 FEAR_MINE.md."""
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from team_decline_probe import decline_readings
 HERE = Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
 SEED = 20260725
-PPT = 2
+PPT = int(os.environ.get("FEAR_PPT", 2))   # 1 = 1v1 extension validation
 NPL = 2 * PPT
 ROWS = 900_000
 N_ARENAS = 24
@@ -152,7 +153,8 @@ def main():
     print(f"bars: {res['bars']} -> {'PASS' if res['PASS'] else 'FAIL'}", flush=True)
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    out = RESULTS_DIR / f"fear_mine_{ckpt.name}.json"
+    out = RESULTS_DIR / (f"fear_mine_{ckpt.name}.json" if PPT == 2
+                         else f"fear_mine_{PPT}v{PPT}_{ckpt.name}.json")
     out.write_text(json.dumps(res, indent=1))
     print(f"saved {out}  ({time.time()-t0:.0f}s total)", flush=True)
 
