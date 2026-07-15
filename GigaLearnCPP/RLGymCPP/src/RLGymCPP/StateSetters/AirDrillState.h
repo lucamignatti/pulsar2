@@ -2,6 +2,9 @@
 #include "StateSetter.h"
 #include "../Math.h"
 
+#include <atomic>
+#include <memory>
+
 namespace RLGC {
 	// Reverse-curriculum aerial drill.
 	//
@@ -22,6 +25,15 @@ namespace RLGC {
 	// the ball, at rest. The old behavior launched all 4-6 cars at one ball — a midair scrum
 	// teaching simultaneous full-team commitment. With one car per team the climber path is
 	// exactly the old placement, so 1v1 arenas are unaffected.
+	// ALTITUDE ANNEALING (AERIAL_GAP.md, 2026-07-15): shared difficulty knob written by
+	// the learner's controller (learn-prep) and read by every AirDrillState at reset
+	// (env threads) - the FrontierPool sharing pattern. difficulty 0 = the classic
+	// airborne-climbing spawn; 1 = grounded takeoff (the measured missing skill:
+	// jump-1s 98% but car z>500 only 9%, aerial touch 0/300 from the ground).
+	struct AirDrillCurriculum {
+		std::atomic<float> difficulty{ 0.f };
+	};
+
 	class AirDrillState : public StateSetter {
 	public:
 		float minBallZ, maxBallZ;   // overhead ball height
@@ -30,6 +42,7 @@ namespace RLGC {
 		float minSpeed, maxSpeed;   // car climb speed toward the ball
 		float minBoost;
 		float supportMinDist, supportMaxDist; // Team play: grounded non-climber spawn ring (goal-side arc)
+		std::shared_ptr<AirDrillCurriculum> curriculum; // NULL = fixed classic behavior
 
 		AirDrillState(
 			float minBallZ = 900, float maxBallZ = 1500,
@@ -94,15 +107,38 @@ namespace RLGC {
 				}
 				placed.push_back(carPos);
 
+				// ALTITUDE ANNEALING: difficulty D lerps the spawn from the classic
+				// airborne-climbing placement (D=0) down to a grounded takeoff (D=1) -
+				// the measured missing skill (AERIAL_GAP.md M4: 0/300 aerial touches
+				// from the ground). The controller in the Learner only raises D while
+				// the aerial-conversion metric stays healthy.
+				float D = curriculum ? RS_CLAMP(curriculum->difficulty.load(), 0.f, 1.f) : 0.f;
+				carPos.z = carPos.z + (17.f - carPos.z) * D;
+
 				cs.pos = carPos;
 
-				// Nose pointed at the ball, roof toward world-up (wheels down). LookAt orthogonalizes
-				// the up hint, so a steep-but-not-vertical climb angle stays well-defined.
-				Vec toBall = bs.pos - carPos;
-				cs.rotMat = RotMat::LookAt(toBall.Normalized(), Vec(0, 0, 1));
-
-				// Climbing toward the ball; boost-fed so the aerial is completable.
-				cs.vel = toBall.Normalized() * RandFloat(minSpeed, maxSpeed);
+				if (carPos.z > 60) {
+					// Airborne: nose pointed at the ball, roof toward world-up (wheels
+					// down). LookAt orthogonalizes the up hint, so a steep-but-not-
+					// vertical climb angle stays well-defined.
+					Vec toBall = bs.pos - carPos;
+					cs.rotMat = RotMat::LookAt(toBall.Normalized(), Vec(0, 0, 1));
+					// Climbing toward the ball; boost-fed so the aerial is completable.
+					// The climb speed eases off with D so late-curriculum airborne spawns
+					// don't hand over the whole approach for free.
+					cs.vel = toBall.Normalized() * (RandFloat(minSpeed, maxSpeed) * (1.f - 0.3f * D));
+					cs.isOnGround = false;
+				} else {
+					// Grounded takeoff: on wheels under/near the ball, facing its shadow,
+					// rolling at it - the M4 probe geometry. The jump, boost-pitch and
+					// climb are all the policy's to produce.
+					cs.pos.z = 17;
+					Vec toShadow = Vec(bs.pos.x, bs.pos.y, 0) - Vec(carPos.x, carPos.y, 0);
+					float yaw = atan2f(toShadow.y, toShadow.x);
+					cs.rotMat = Angle(yaw, 0, 0).ToRotMat();
+					cs.vel = toShadow.Normalized() * RandFloat(600, 1000);
+					cs.isOnGround = true;
+				}
 				cs.boost = RandFloat(minBoost, 100);
 
 				car->SetState(cs);

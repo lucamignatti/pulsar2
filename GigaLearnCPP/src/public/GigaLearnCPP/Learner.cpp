@@ -298,6 +298,14 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["fear_panel_timestep"] = fearPanelTimestep;
 	}
 
+	// AirDrill altitude-annealing controller (AERIAL_GAP.md): the curriculum must
+	// never reset on a crash-restart
+	j["air_drill_d"] = airDrillD;
+	if (airDrillConvEMA >= 0) {
+		j["air_drill_conv_ema"] = airDrillConvEMA;
+		j["air_drill_conv_ref"] = airDrillConvRef;
+	}
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -353,6 +361,14 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (j.contains("fear_panel_obs")) {
 		fearPanelObs = j["fear_panel_obs"].get<std::vector<float>>();
 		fearPanelTimestep = j.value("fear_panel_timestep", (int64_t)0);
+	}
+
+	if (j.contains("air_drill_d")) {
+		airDrillD = RS_CLAMP((float)j["air_drill_d"], 0.f, 1.f);
+		airDrillConvEMA = j.value("air_drill_conv_ema", -1.f);
+		airDrillConvRef = j.value("air_drill_conv_ref", -1.f);
+		if (config.steering.airDrillCurriculum)
+			config.steering.airDrillCurriculum->difficulty = airDrillD;
 	}
 
 	if (versionMgr)
@@ -1699,6 +1715,10 @@ void GGL::Learner::Start() {
 			// and the Dz of WON readings (scared-tail reference distribution)
 			int censusOutcome[STEER_MODES][4] = {};
 			std::array<std::vector<float>, STEER_MODES> censusWonDz;
+			// Aerial conversion (AirDrill annealing controller + census): high feasible
+			// readings whose FIRST touch happened above goal height
+			int aerialHighN = 0, aerialConvN = 0;
+			const float GOAL_H = RLGC::CommonValues::GOAL_HEIGHT;
 			int feas[STEER_MODES][3] = {}, possTeamWon[STEER_MODES][3] = {};
 			const float raceMarginRows = 0.5f * stepsPerSec; // grace past touchdown for the race
 			for (auto& rd : readings) {
@@ -1715,11 +1735,22 @@ void GGL::Learner::Start() {
 				feas[rd.mode][rd.role]++;
 
 				int outcome = 0; // 0 none, 1 self won, 2 lost, 3 teammate won
+				bool aerialConv = false;
 				int64_t scanEnd = RS_MIN(rd.epEnd, tdRow + (int64_t)raceMarginRows);
 				for (int64_t rr = rd.row + 1; rr <= scanEnd; rr++) {
-					if (combinedTraj.touched[rr]) { outcome = 1; break; }
-					if (combinedTraj.teamTouched[rr]) { outcome = 3; break; }
-					if (combinedTraj.oppTouched[rr]) { outcome = 2; break; }
+					int o = combinedTraj.touched[rr] ? 1
+						: combinedTraj.teamTouched[rr] ? 3
+						: combinedTraj.oppTouched[rr] ? 2 : 0;
+					if (o) {
+						outcome = o;
+						aerialConv = fnObs(rr, BALL_POS + 2) * POS_SCALE > GOAL_H;
+						break;
+					}
+				}
+				if (rd.role == 0 && fnObs(rd.row, BALL_POS + 2) * POS_SCALE > GOAL_H) {
+					aerialHighN++;
+					if (aerialConv)
+						aerialConvN++;
 				}
 
 				// Gate/panel metric = TEAM possession (identical to self-won in 1v1):
@@ -2157,6 +2188,36 @@ void GGL::Learner::Start() {
 					report[fnModeKey("Steer/Census Scared Tail", md)] = (float)above / frontierDz[md].size();
 				}
 			}
+			// AirDrill altitude annealing (AERIAL_GAP.md): metric-gated hill-climb on
+			// the shared difficulty knob. Lives here because the readings live here;
+			// if steering is ever disabled the curriculum freezes in place (safe).
+			// Known v1 limitation (accepted): the reference refreshes on every
+			// adjustment, so a slow (<backoffFrac per window) degradation can ratchet
+			// D upward - the offline takeoff-probe bars and the rating latch backstop it.
+			if (config.steering.airDrillCurriculum) {
+				if (aerialHighN >= 30) {
+					float conv = (float)aerialConvN / aerialHighN;
+					airDrillConvEMA = (airDrillConvEMA < 0) ? conv
+						: cfgS.airDrillConvEmaDecay * airDrillConvEMA
+						+ (1.f - cfgS.airDrillConvEmaDecay) * conv;
+				}
+				if (airDrillConvEMA >= 0
+					&& totalIterations - airDrillLastAdjustIter >= cfgS.airDrillAdjustEvery) {
+					if (airDrillConvRef < 0)
+						airDrillConvRef = airDrillConvEMA;
+					if (airDrillConvEMA >= airDrillConvRef * (1.f - cfgS.airDrillBackoffFrac))
+						airDrillD = RS_MIN(1.f, airDrillD + cfgS.airDrillStep);
+					else
+						airDrillD = RS_MAX(0.f, airDrillD - cfgS.airDrillStep);
+					airDrillConvRef = airDrillConvEMA;
+					airDrillLastAdjustIter = totalIterations;
+					config.steering.airDrillCurriculum->difficulty = airDrillD;
+				}
+				report["Curriculum/AirDrill D"] = airDrillD;
+				if (airDrillConvEMA >= 0)
+					report["Curriculum/Aerial Conv EMA"] = airDrillConvEMA;
+			}
+
 			if (!fearPanelObs.empty() && dzOk && obsSize > 0
 				&& fearPanelObs.size() % (size_t)obsSize == 0) {
 				RG_NO_GRAD;

@@ -1,6 +1,7 @@
 #pragma once
 #include <RLGymCPP/BasicTypes/Lists.h>
 #include <RLGymCPP/StateSetters/FrontierDrillState.h>
+#include <RLGymCPP/StateSetters/AirDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
 #include "PSDConfig.h"
@@ -147,6 +148,25 @@ namespace GGL {
 		// criterion. Falls back to the uniform stride whenever value tensors are
 		// unavailable. false = original mining everywhere.
 		bool frontierFearMining = false;
+
+		// AERIAL ALTITUDE ANNEALING (AERIAL_GAP.md, 2026-07-15): when set, the learner
+		// drives the shared AirDrill difficulty D (0 = classic airborne spawn, 1 =
+		// grounded takeoff) with a metric-gated hill-climb: every
+		// airDrillAdjustEvery iterations, D rises by airDrillStep if the aerial-
+		// conversion EMA (high feasible readings converted by an above-goal-height
+		// touch; style-proof) has not degraded more than airDrillBackoffFrac relative
+		// to the last adjustment's reference, else D falls by one step (automatic
+		// backoff). Conviction: takeoff probe at 30.3B - jump 98%, car z>500 9%,
+		// aerial touch 0/300 from the ground; the drill never taught the climb.
+		// D starts at 0 (deploy = behavioral no-op that ramps only while healthy) and
+		// persists in RUNNING_STATS. The controller lives in the learn-prep census
+		// (steering must be enabled; if steering is ever disabled D freezes - safe).
+		// NULL curriculum = feature off, classic fixed drill.
+		std::shared_ptr<RLGC::AirDrillCurriculum> airDrillCurriculum;
+		int airDrillAdjustEvery = 50;
+		float airDrillStep = 0.05f;
+		float airDrillBackoffFrac = 0.20f;
+		float airDrillConvEmaDecay = 0.97f;
 
 		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
 		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no

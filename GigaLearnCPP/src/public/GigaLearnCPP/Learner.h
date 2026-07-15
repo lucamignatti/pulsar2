@@ -97,6 +97,13 @@ namespace GGL {
 		std::vector<float> fearPanelObs;   // flattened [k, obsSize]
 		int64_t fearPanelTimestep = 0;     // totalTimesteps at freeze
 
+		// AirDrill altitude-annealing controller state (AERIAL_GAP.md); persisted in
+		// RUNNING_STATS so the curriculum never resets on restart
+		float airDrillD = 0.f;             // current difficulty (mirrored into the shared knob)
+		float airDrillConvEMA = -1.f;      // aerial-conversion EMA (-1 = unseeded)
+		float airDrillConvRef = -1.f;      // reference EMA at the last adjustment
+		int64_t airDrillLastAdjustIter = 0;
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 

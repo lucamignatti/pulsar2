@@ -192,6 +192,10 @@ static int g_NumPracticeArenas = 0;
 // block, >= 2 or none).
 static std::shared_ptr<RLGC::FrontierPool> g_FrontierPool;
 static float g_PracticeArenaFrac = 0.f;
+// AirDrill altitude annealing (AERIAL_GAP.md): shared difficulty knob, written by
+// the Learner's controller, read by every AirDrillState at reset. NULL (render
+// mode) = the classic fixed airborne spawn.
+static std::shared_ptr<RLGC::AirDrillCurriculum> g_AirDrillCurriculum;
 
 // Team-mode arena split (set in main(): zero in PHASE A, the PHASE_B_FRAC_* fractions once
 // the phase marker exists). Team arenas occupy the END of the index range — see the
@@ -264,16 +268,21 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	result.obsBuilder = new AdvancedObsPadded(MAX_PLAYERS_PER_TEAM);
 	// The proven cf993b7 reset mix - effective near-ball share 0.55 (0.35 ground + 0.20 aerial
 	// drill), no drill-replay slice (that came with the drill bank in the regression).
+	// Aerial drill, REVERSE CURRICULUM: classically the car spawns ALREADY AIRBORNE and
+	// climbing at an overhead ball, boost-fed, so it only has to COMPLETE the touch
+	// (replaced the old ground-ring drill that let the bot wait the ball down - 0.1%
+	// aerial touches after 17B steps). ALTITUDE ANNEALING (2026-07-15, AERIAL_GAP.md):
+	// that curriculum stopped one stage early - at 30.3B the bot completes from mid-air
+	// (44%, touches above goal height) but from the GROUND converts 0/300 (jumps 98%,
+	// reaches z>500 only 9%): the jump->boost-climb transition was never in the training
+	// distribution. g_AirDrillCurriculum lets the Learner anneal the spawn from airborne
+	// (D=0) toward grounded takeoff (D=1), gated on the live aerial-conversion EMA.
+	AirDrillState* airDrill = new AirDrillState();
+	airDrill->curriculum = g_AirDrillCurriculum; // NULL in render mode = classic spawn
 	result.stateSetter = new CombinedState({
 		// Ground touch bootstrap - the proven anti-freeze state
 		{ new BallNearCarState(600, 900), 0.35f },
-		// Aerial drill, REVERSE CURRICULUM: car spawns ALREADY AIRBORNE and climbing at an overhead
-		// ball, boost-fed, so it only has to COMPLETE the touch. Replaces the old ground-ring drill
-		// (ball overhead but both cars grounded + ball descending), which let the bot wait for the
-		// ball to fall and hit it on the ground -> no aerial ever required (0.1% aerial touches after
-		// 17B steps). Now that AerialTouch/AirInterceptPotential pay for the airborne touch, this
-		// gives the exposure the reward alone can't buy.
-		{ new AirDrillState(), 0.20f },
+		{ airDrill, 0.20f },
 		{ new KickoffState(), 0.15f },
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to corners/goal lines)
 		{ new RandomState(true, true, false), 0.30f },
@@ -828,6 +837,12 @@ int main(int argc, char* argv[]) {
 		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
 		// Steer/Frontier Pool sizes, and the next offline decline census.
 		cfg.steering.frontierFearMining = true;
+		// AirDrill altitude annealing (AERIAL_GAP.md): D starts at 0 = identical to the
+		// classic drill, and only ramps toward grounded-takeoff spawns while the aerial-
+		// conversion EMA stays healthy. Watch: Curriculum/AirDrill D + Aerial Conv EMA.
+		// Revert = don't create the object (setters fall back to the classic spawn).
+		g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
+		cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
 	}
 
 	// Make the learner with the environment creation function and the config we just made
