@@ -88,6 +88,36 @@ car z>500 ≥ 40% and aerial touch ≥ 15% at whatever D the controller reached
 (≥0.5 expected); live aerial-conversion EMA not below its deploy value. Fail →
 flag off, record, rethink (candidate: dedicated takeoff reward term).
 
-## Results — curriculum deployment
+## Results — curriculum deployment: REVERTED after ~2.5h (incident record)
 
-*(post-deploy tracking; bars above are frozen)*
+Deployed 30.48B (ff2b22a), reverted 30.75B (c69fd9c). What happened:
+
+- The controller's feedback metric — MATCH-play aerial conversion — changes on
+  the timescale the POLICY changes (days). The ratchet adjusted every 50
+  iterations (~minutes). Result: the backoff never fired (EMA slid 0.120 →
+  0.108, under 20% per window, reference refreshing each time — the documented
+  v1 flaw at full speed), and **D annealed 0 → 0.90 in ~3 hours.**
+- At D=0.9, ~20% of all resets became grounded-takeoff states the bot converts
+  at 0% — dead training data. Worse, the SKILL-TRACKER EVAL FLEET shared the
+  curriculum object (MakeEnv is common), so the Rating instrument itself was
+  measuring on a shifted distribution.
+- Rating: ATH 1657 (30.55B) → 1546 (30.73B), in lockstep with D's climb. The
+  drawdown monitor fired at the ATH−110 floor; the steering latch (EMA−75)
+  did not trip. Reverted by flag; no checkpoint restore (data-quality damage,
+  not update-side corruption — watching for organic recovery, branch backup
+  30450225120 standing by if it doesn't).
+
+**v1 controller: convicted. Requirements for any v2 (own pre-registration):**
+1. Feedback = DRILL-OUTCOME attribution (completion of drill episodes
+   themselves), not match conversion — needs a reset-tag channel from the
+   setter to the learner (the missing plumbing that made v1 blind).
+2. Non-refreshing baseline floor (advance only while conv ≥ 0.8 × the D=0
+   baseline, captured once).
+3. Eval fleet EXCLUDED from the curriculum (fixed D=0 spawns) so Rating stays
+   comparable across time.
+4. Rating-latch coverage (trip → D resets to 0).
+5. Schema tag in RUNNING_STATS so stale persisted D is discarded on load.
+6. Anneal budget sized in wall-clock: full traversal ≥ several days, not hours.
+
+The DIAGNOSIS stands unchanged (takeoff is the missing skill; the drill never
+taught it); only this controller design is dead.
