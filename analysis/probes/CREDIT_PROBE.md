@@ -84,3 +84,11 @@ stage-2-adjacent caution applies to anything row-conditional near the critic).
 Correlational caveat (registered up front) stands: matching covers labeled
 difficulty only. The internal-inconsistency finding (analysis 1 vs 2) partly
 defuses it — both branches share whatever confounds the matching misses.
+
+**CORRECTION (2026-07-15, post CRITIC_DUEL):** the user challenged the implicit
+"goal critic as arbiter" framing, and the follow-up test proved them right —
+the goal critic is nearly outcome-blind locally (AUC 0.41 on resolved races,
+zero incremental information beyond V). Analysis 3's conclusion survives ONLY
+in its weak form: V is internally inconsistent on the frontier, and Δz is a
+behaviorally-calibrated fear detector (forced-contest validation, +30pp).
+Read CRITIC_DUEL.md before building anything else on the goal critic.
