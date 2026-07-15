@@ -1,0 +1,30 @@
+{
+ "checkpoint": 31775139386,
+ "n_ep": 200,
+ "temps": {
+  "1.0": {
+   "jump_1s": 1.0,
+   "carz500": 0.055,
+   "aerial_touch": 0.0,
+   "mean_entropy": 3.429999326467514
+  },
+  "1.5": {
+   "jump_1s": 1.0,
+   "carz500": 0.1,
+   "aerial_touch": 0.0,
+   "mean_entropy": 3.6169674932956695
+  },
+  "2.0": {
+   "jump_1s": 1.0,
+   "carz500": 0.125,
+   "aerial_touch": 0.0,
+   "mean_entropy": 3.6933390402793886
+  },
+  "3.0": {
+   "jump_1s": 1.0,
+   "carz500": 0.14,
+   "aerial_touch": 0.0,
+   "mean_entropy": 3.764474651813507
+  }
+ }
+}
