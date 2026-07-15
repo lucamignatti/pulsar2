@@ -28,8 +28,20 @@ and what survives. Checkpoints ~30.3-32.0B.
 | class | blocker | evidence | targeted fix |
 |---|---|---|---|
 | aerial takeoff (long chain, 0% success) | circuit absent; below break-even; drills never contained the chain start | temp probe 0/300 at any T; AERIAL_GAP M4 vs M3 | approved: takeoff drill v2 (break-even-gated stages) + enlarged height-scaled non-PBRS AerialTouch; practice-value head fixes the pricing side |
-| short precision mechanics (wavedash, flip timing) | REFINEMENT plateau at high attempt rate — suspected INTERFACE CEILING: tickSkip 4 + actionDelay 3 gives ±4-tick timing precision | 11.2% success flat for ~billions of steps despite +4σ value signal | OPEN: oracle executor (`oracle_wavedash.py`) must first measure the ceiling; v1 is self-refuting (0.5% < bot's 11.2% — dodge-state setup bug, needs tick-level debugging). If ceiling ≈ bot's rate → structural (tickSkip/actionDelay), a FRESH-RUN parameter, untrainable. If ceiling high → refinement curriculum. |
+| short precision mechanics (wavedash, flip timing) | REFINEMENT starves on SAMPLE ECONOMICS: per-instance SNR ~0.18, ~80 fragments/iteration, benefit already baselined (majority behavior) → integrated gradient slower than churn | 11.2% success flat for ~billions of steps despite +4σ value signal | densify: pre-landing reset slice (above break-even → practice TEACHES). The interface-ceiling hypothesis is DEAD (user counter-example 2026-07-15: Nexto wavedashes at tickSkip 8 — a COARSER interface; consistent actionDelay is prediction-compensable). Oracle v1 (`oracle_wavedash.py`) remains buggy and moot. |
 | flicks (prerequisite-gated) | dribble-state density ~7/100k — the prerequisite never gets practiced | census | dribble-state density (drill or replay) BEFORE any flick work |
+
+## The unified frame (post-correction)
+
+Skill learning rate = f(success rate vs BREAK-EVEN, sample DENSITY at the
+skill states, per-sample SNR). Below break-even, added density anti-teaches
+(punished attempts); above it, density is the cure for SNR starvation. Nexto's
+tickSkip 8 is a skill-acquisition ADVANTAGE under this frame (halves chain
+length in decision-space, doubles per-decision SNR) and its batch scale
+crushes variance — tickSkip 4 is a recorded structural headwind for mechanics
+in this lineage (fresh-run consideration only). Per-mechanic placement:
+aerial BELOW break-even (seed first), wavedash ABOVE (densify now), flicks =
+prerequisite density.
 
 ## Standing conclusions
 
