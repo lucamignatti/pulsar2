@@ -178,10 +178,10 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// full farm-proof): total mechanical energy as exact PBRS - instant local
 		// credit for momentum decisions, loop-farming impossible by telescoping,
 		// climbs untaxed (PE in the sum), ball half already covered by TouchAccel.
-		// STAGED, NOT YET ACTIVE: uncomment after RC1's attribution window (one lever
-		// per window - EMERGENCE.md). Weight 6 = boost-economy scale, deliberately
-		// modest for a credit-shaping term.
-		// { new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 6.f },
+		// ACTIVE since 2026-07-16 (user-directed, deployed in the overnight EMERGENCE
+		// sequence a few hours behind RC1). Weight 6 = boost-economy scale,
+		// deliberately modest for a credit-shaping term.
+		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 6.f },
 
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
