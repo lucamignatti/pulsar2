@@ -850,6 +850,12 @@ int main(int argc, char* argv[]) {
 		// coverage, (5) a schema tag so stale persisted D is discarded on load.
 		// g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
 		// cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
+		// EMERGENCE RC2 Stage O (2026-07-16, analysis/probes/EMERGENCE.md): the
+		// learning-progress miner, OBSERVER ONLY - characterization panels (Miner/*)
+		// must show it rediscovering the hand-found state families unprompted before
+		// any actuation is registered. Watch: Miner/PreLanding Frac vs Base (bar:
+		// >=3x), Miner/Dz Mean (bar: > +0.5 on banked declines), Miner/GroundedHighBall.
+		cfg.steering.emergenceMiner = true;
 	}
 
 	// Make the learner with the environment creation function and the config we just made

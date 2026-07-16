@@ -168,6 +168,18 @@ namespace GGL {
 		float airDrillBackoffFrac = 0.20f;
 		float airDrillConvEmaDecay = 0.97f;
 
+		// EMERGENCE RC2 Stage O (EMERGENCE.md, 2026-07-16): learning-progress miner,
+		// OBSERVER ONLY. Mines top-|z-scored GAE-advantage| rows (both signs, spaced)
+		// each iteration - the general "surprise" statistic, no skill or outcome ever
+		// named - and reports characterization panels (Miner/*) testing the
+		// pre-registered rediscovery bars: the miner must find the hand-discovered
+		// state families (pre-landing, fear-tail, aerial-attempt) UNPROMPTED before
+		// it is ever allowed to feed resets. A rolling 64-row obs sample lands in
+		// RUNNING_STATS for offline inspection. Actuates nothing in this stage.
+		bool emergenceMiner = false;
+		int emergenceMinerTopK = 256;
+		int emergenceMinerSpacing = 128;   // min row distance between picks (episode-dedupe proxy)
+
 		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
 		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no
 		// goal-critic masking, no blend guard; the whiff tax stays and reality does the

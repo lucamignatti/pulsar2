@@ -298,6 +298,10 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["fear_panel_timestep"] = fearPanelTimestep;
 	}
 
+	// EMERGENCE RC2 observer: rolling miner sample for offline inspection (save-only)
+	if (!minerSampleObs.empty())
+		j["miner_sample_obs"] = minerSampleObs;
+
 	// AirDrill altitude-annealing controller (AERIAL_GAP.md): the curriculum must
 	// never reset on a crash-restart
 	j["air_drill_d"] = airDrillD;
@@ -1575,7 +1579,7 @@ void GGL::Learner::Start() {
 		// The updated direction is applied in the barrier zone (fnApplySteering), never while a
 		// collect worker is in flight. Rows of one player's episode are CONTIGUOUS in
 		// combinedTraj (episodes are appended whole at finalize), so lookahead is row + k.
-		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn) {
+		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn, const torch::Tensor& tAdvIn) {
 			const auto& cfgS = config.steering;
 			const auto& states = combinedTraj.states;
 			const auto& groups = combinedTraj.steerPractice;
@@ -2232,6 +2236,89 @@ void GGL::Learner::Start() {
 				report["Steer/Fear Panel zG"] = pg;
 				report["Steer/Fear Panel Dz"] = pg - pv;
 				report["Steer/Fear Panel Age Bsteps"] = (float)((totalTimesteps - fearPanelTimestep) / 1e9);
+			}
+
+			// 8) EMERGENCE RC2 Stage O - learning-progress miner, OBSERVER ONLY
+			// (analysis/probes/EMERGENCE.md). Picks top-|z-scored advantage| rows,
+			// both signs, spaced emergenceMinerSpacing apart (episodes are row-
+			// contiguous, so spacing is an episode-dedupe proxy). Panels test the
+			// pre-registered rediscovery bars against the same-iteration base rates;
+			// nothing downstream reads the picks in this stage.
+			if (cfgS.emergenceMiner && tAdvIn.defined() && tAdvIn.numel() == n) {
+				auto tA = tAdvIn.to(torch::kFloat32).flatten().contiguous();
+				float aStd = tA.std().item<float>();
+				if (aStd > 1e-6f) {
+					auto tZ = ((tA - tA.mean()) / aStd).abs();
+					const float* zPtr = tZ.data_ptr<float>();
+					const float* aPtr = tA.data_ptr<float>();
+					int k = RS_CLAMP(cfgS.emergenceMinerTopK, 1, (int)n);
+					float thresh = std::get<0>(tZ.kthvalue(RS_MAX((int64_t)1, n - k))).item<float>();
+
+					constexpr int SELF = 51;
+					auto fnChar = [&](int64_t r, float& ballZ, bool& preLand, bool& groundHigh,
+						float& boost) {
+						ballZ = fnObs(r, BALL_POS + 2) * POS_SCALE;
+						float sz = fnObs(r, SELF + 2) * POS_SCALE;
+						float vz = fnObs(r, SELF + 11) * VEL_SCALE;
+						bool ground = fnObs(r, SELF + 25) > 0.5f;
+						boost = fnObs(r, SELF + 24) * 100.f;
+						preLand = !ground && sz < 300.f && vz < 0;
+						float dx = (fnObs(r, BALL_POS) - fnObs(r, SELF)) * POS_SCALE;
+						float dy = (fnObs(r, BALL_POS + 1) - fnObs(r, SELF + 1)) * POS_SCALE;
+						groundHigh = ground && ballZ > GOAL_H && sqrtf(dx * dx + dy * dy) < 1200.f;
+					};
+
+					int picked = 0, posN = 0, preN = 0, ghN = 0;
+					float ballZSum = 0, boostSum = 0, dzSum = 0;
+					minerSampleObs.clear();
+					int64_t lastPick = -(int64_t)cfgS.emergenceMinerSpacing;
+					for (int64_t r = 0; r < n && picked < k; r++) {
+						if (zPtr[r] < thresh || r - lastPick < cfgS.emergenceMinerSpacing)
+							continue;
+						lastPick = r;
+						picked++;
+						float ballZ, boost;
+						bool preLand, groundHigh;
+						fnChar(r, ballZ, preLand, groundHigh, boost);
+						posN += aPtr[r] > 0;
+						preN += preLand;
+						ghN += groundHigh;
+						ballZSum += ballZ;
+						boostSum += boost;
+						dzSum += fnDz(r);
+						if ((int)(minerSampleObs.size() / obsSize) < 64) {
+							size_t base = minerSampleObs.size();
+							minerSampleObs.resize(base + obsSize);
+							memcpy(&minerSampleObs[base], &states[r * (int64_t)obsSize],
+								obsSize * sizeof(float));
+						}
+					}
+
+					// same-iteration base rates for the rediscovery comparison
+					int baseN = 0, basePre = 0, baseGh = 0;
+					for (int64_t r = 0; r < n; r += 64) {
+						float ballZ, boost;
+						bool preLand, groundHigh;
+						fnChar(r, ballZ, preLand, groundHigh, boost);
+						baseN++;
+						basePre += preLand;
+						baseGh += groundHigh;
+					}
+					if (picked > 0) {
+						report["Miner/Picked"] = (float)picked;
+						report["Miner/Pos Adv Frac"] = (float)posN / picked;
+						report["Miner/PreLanding Frac"] = (float)preN / picked;
+						report["Miner/GroundedHighBall Frac"] = (float)ghN / picked;
+						report["Miner/Ball Z Mean"] = ballZSum / picked;
+						report["Miner/Boost Mean"] = boostSum / picked;
+						if (dzOk)
+							report["Miner/Dz Mean"] = dzSum / picked;
+					}
+					if (baseN > 0) {
+						report["Miner/PreLanding Base"] = (float)basePre / baseN;
+						report["Miner/GroundedHighBall Base"] = (float)baseGh / baseN;
+					}
+				}
 			}
 		};
 
@@ -4284,7 +4371,7 @@ void GGL::Learner::Start() {
 					// Derive/refresh the steering direction from THIS buffer's match-arena rows,
 					// and feed the causal gate from the steered-vs-control practice split
 					if (steerOn)
-						fnSteerUpdate(report, tValPreds, tGoalValPreds);
+						fnSteerUpdate(report, tValPreds, tGoalValPreds, tAdvantages);
 						fnMetaUpdate(report);
 				}
 

@@ -104,6 +104,10 @@ namespace GGL {
 		float airDrillConvRef = -1.f;      // reference EMA at the last adjustment
 		int64_t airDrillLastAdjustIter = 0;
 
+		// EMERGENCE RC2 observer: rolling sample of the miner's picked obs rows
+		// (save-only, refreshed each iteration - offline inspection channel)
+		std::vector<float> minerSampleObs;
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 
