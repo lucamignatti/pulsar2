@@ -129,6 +129,40 @@ namespace RLGC {
 		}
 	};
 
+	// TEMPO CREDIT (2026-07-16, user-directed "energy reward"): the player's total
+	// MECHANICAL energy as an exact PBRS potential — Phi ~ (0.5|v|^2 + g*z), r =
+	// gamma*Phi(s') - Phi(s). The farmability the raw form invites is removed by
+	// construction, not by tuning: telescoping makes every energy-pump loop worth
+	// exactly zero (speed up / flip about / slow down nets 0), the ZeroSum wrapper
+	// kills co-farming, and gamma MUST match the learner's gaeGamma (stack rule).
+	// What it buys is INSTANT, LOCAL credit for momentum decisions: a flip that dies
+	// in place prices negative within a step instead of diffusing across the horizon
+	// (the measured wavedash-class SNR starvation, MECHANICS.md). PE is included so
+	// KE->PE conversion (jumping, climbing) is energy-neutral — this term must never
+	// tax aerials. Ball energy is deliberately absent: TouchAccel IS the ball-energy
+	// reward. Boost pickups convert to energy via thrust, which is the point.
+	class CarEnergyPotentialReward : public Reward {
+	public:
+		float gamma;
+		CarEnergyPotentialReward(float gamma = 0.99f) : gamma(gamma) {}
+
+		static float Phi(const Player& p) {
+			constexpr float KE_NORM = 0.5f * 2300.f * 2300.f; // KE at supersonic ~ 1.0
+			float ke = 0.5f * p.vel.LengthSq();
+			float pe = 650.f * RS_MAX(0.f, p.pos.z - 17.f);   // g = 650 uu/s^2
+			return (ke + pe) / KE_NORM;
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if (!state.prev || !player.prev)
+				return 0;
+			// Demo/respawn teleports are not the player's action
+			if (player.isDemoed || player.isDemoed != player.prev->isDemoed)
+				return 0;
+			return gamma * Phi(player) - Phi(*player.prev);
+		}
+	};
+
 	// True-potential form of ball->goal progress (Nexto's goal-dist state quality):
 	// Phi = 0.5*(exp(-dOpp/CAR_MAX_SPEED) - exp(-dOwn/CAR_MAX_SPEED)), r = gamma*Phi(s') - Phi(s).
 	// Blue's Phi is the exact negative of orange's, so this is already zero-sum — do NOT
