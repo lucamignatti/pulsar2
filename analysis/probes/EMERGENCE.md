@@ -113,3 +113,38 @@ OFF", the acquisition-frontier signal (targets skill DISCOVERY, not outcome
 swing; cheap — logProbs already stored). Same rediscovery bars, now read as
 enrichment ratio > 1 on ≥2 of {pre-landing, grounded-high-ball, proto-dribble}.
 Still observer-only; still actuates nothing.
+
+### RC2 Stage O v2 — FAIL on live data (2026-07-16, ~34.9B); scalar mining RETIRED
+
+4,100 iterations of live observation. Enrichment (picked ÷ base):
+pre-landing **0.67×**, grounded-high-ball **0.68×** — BOTH de-enriched; fear-tail
+Δz +0.41 (< +0.5). The acquisition statistic robustly AVOIDS mechanic-attempt
+states, same as v1. Persistent robust signal across both statistics:
+`Boost Mean ~10`, `Ball Z ~230` — the advantage/surprise frontier is low-boost
+GROUND play, not mechanics.
+
+**Decision (delegated by user): RC2 scalar reset-mining is DEAD; the actuator
+(Stage A) will NOT be built.** General mechanistic reason: mechanic-acquisition
+states are LOW-BASE-RATE with MODEST per-attempt advantage, so any scalar built
+on advantage/surprise is dominated by high-variance ground scrambles. You
+cannot LOCATE the acquisition frontier by mining outcome statistics — it is
+defined by low SUCCESS, not high SURPRISE. (This is why FEAR_MINE works — it
+mines the high-value DECLINE frontier — and this cannot.) The observer,
+deployed before any actuator, caught this with zero resets drawn. The Miner
+observer stays on as free low-cost telemetry; nothing reads its picks.
+
+Implication for the program: don't try to FIND the frontier by mining — PRICE
+optimism onto it by NOVELTY/DENSITY, which is orthogonal to advantage-surprise
+(mechanic states are low-DENSITY even though low-ADVANTAGE). That is RC1, now
+the load-bearing fix. Gated offline first (RC1_NOVELTY below) per the RC2
+lesson.
+
+## RC1 offline novelty gate (before any live advantage change)
+
+`rnd_novelty_probe.py`: RND (predictor trained toward a frozen random projection
+of trunk⊕action over a rollout) → novelty = prediction error. Bar (frozen):
+novelty ENRICHES (> 1.3×) on ≥2 of {pre-landing, grounded-high-ball,
+proto-dribble} — i.e. the bonus RC1 would inject lands ON mechanic states, not
+on ground scrambles. PASS → RC1 has a green light for a careful, latch-covered,
+conservative-weight live deploy. FAIL → RC1's premise is also wrong; report and
+rethink before any actuation.
