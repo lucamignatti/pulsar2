@@ -265,8 +265,14 @@ static int g_RenderTeamSize = 0;
 // overwrites eval rewards/state setters/terminal conditions anyway — for eval arenas only
 // the arena's team size, the obs builder and the action parser matter).
 static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
+	// NoTouch 10 -> 20 (2026-07-16, user hypothesis): the timeout truncation was
+	// cutting dead-play episodes before RECOVERY could ever be experienced - the
+	// re-enter-play trajectory never existed in the data (same shape as the takeoff
+	// finding: states past the cut can't be learned). 20s doubles the recovery
+	// window and lets TimeCost's idle penalty accumulate into a real signal, while
+	// keeping the anti-freeze bound and the reset/curriculum throughput.
 	std::vector<TerminalCondition*> terminalConditions = {
-		new NoTouchCondition(10),
+		new NoTouchCondition(20),
 		new GoalScoreCondition()
 	};
 
@@ -323,9 +329,20 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 // trailing indices — the padded obs keeps the net identical either way, so the phase switch
 // is checkpoint-compatible.
 EnvCreateResult EnvCreateFunc(int index) {
-	// Render viewer: one arena, team size picked by GGL_RENDER_TEAM_SIZE (never a practice arena)
-	if (g_RenderTeamSize > 0)
-		return MakeEnv(g_RenderTeamSize, false);
+	// Render viewer: one arena, team size picked by GGL_RENDER_TEAM_SIZE (never a
+	// practice arena). MATCH-LIKE VIZ (2026-07-16, user request): kickoff-only
+	// resets and goal-only terminals - no drill-mix spawns, no NoTouch cutoff - so
+	// the viewer shows continuous real games incl. dead-play recovery, instead of
+	// the training reset mix truncating every stall.
+	if (g_RenderTeamSize > 0) {
+		EnvCreateResult r = MakeEnv(g_RenderTeamSize, false);
+		delete r.stateSetter;
+		r.stateSetter = new KickoffState();
+		for (TerminalCondition* tc : r.terminalConditions)
+			delete tc;
+		r.terminalConditions = { new GoalScoreCondition() };
+		return r;
+	}
 	int playersPerTeam = 1;
 	if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3)
 		playersPerTeam = 3;
