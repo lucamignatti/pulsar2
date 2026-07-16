@@ -858,6 +858,19 @@ int main(int argc, char* argv[]) {
 		cfg.steering.emergenceMiner = true;
 	}
 
+	// EMERGENCE RC1 (2026-07-16, user-directed): frontier optimism - RND novelty as a
+	// mean-zero std-matched advantage adjustment. The RND predictor is the agent's own
+	// familiarity self-model; its error is the acquisition frontier (offline gate:
+	// enriches grounded-high-ball 2.77x, proto-dribble 3.42x - exactly the mechanic
+	// states advantage-mining avoided). Conservative dose (0.1 std/z), warmup
+	// train-only, obeys the rating latch, anneals itself as the predictor learns.
+	// Watch: RND/Loss (falling), RND/Injected Abs Mean (~0.08*advStd), RND/Novelty
+	// Std; Rating vs the drawdown monitor; mechanic census in ~3 days for emergence.
+	// Revert = false + restart (nets simply stop being consulted; checkpoints keep
+	// carrying them harmlessly). Rollback anchor: checkpoints_4.0_branch_backup.
+	if (!cfg.renderMode)
+		cfg.rndOptimism.enabled = true;
+
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
 

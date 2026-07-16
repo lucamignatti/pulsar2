@@ -108,6 +108,11 @@ namespace GGL {
 		// (save-only, refreshed each iteration - offline inspection channel)
 		std::vector<float> minerSampleObs;
 
+		// EMERGENCE RC1: RND frontier-optimism state (opaque - torch types stay out
+		// of this header; defined in Learner.cpp). Lazily built at first use, loaded
+		// from RND_PRED.lt/RND_TARGET.lt when the checkpoint carries them.
+		std::shared_ptr<struct RndState> rnd;
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 

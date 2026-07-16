@@ -5,6 +5,7 @@
 
 #include <torch/cuda.h>
 #include <torch/mps.h>
+#include <torch/serialize.h>
 #include <nlohmann/json.hpp>
 #include <pybind11/embed.h>
 
@@ -29,6 +30,43 @@
 
 using namespace RLGC;
 
+// EMERGENCE RC1 (LearnerConfig.h RndOptimismConfig): the RND self-model.
+// target = FROZEN random projection of (trunk ⊕ onehot(action)); pred chases it;
+// prediction error = novelty = the acquisition frontier. Persisted with every
+// checkpoint (RND_PRED.lt / RND_TARGET.lt) - the annealing state IS the model.
+struct GGL::RndState {
+	torch::nn::Sequential target{ nullptr }, pred{ nullptr };
+	std::shared_ptr<torch::optim::Adam> optim;
+	std::filesystem::path loadFrom; // set by the checkpoint loader, consumed at lazy build
+	int64_t updates = 0;
+
+	void Build(int64_t featIn, torch::Device device, float lr) {
+		target = torch::nn::Sequential(
+			torch::nn::Linear(featIn, 256), torch::nn::LeakyReLU(),
+			torch::nn::Linear(256, 128));
+		pred = torch::nn::Sequential(
+			torch::nn::Linear(featIn, 256), torch::nn::LeakyReLU(),
+			torch::nn::Linear(256, 256), torch::nn::LeakyReLU(),
+			torch::nn::Linear(256, 128));
+		if (!loadFrom.empty() && std::filesystem::exists(loadFrom / "RND_PRED.lt")) {
+			try {
+				torch::load(pred, (loadFrom / "RND_PRED.lt").string());
+				torch::load(target, (loadFrom / "RND_TARGET.lt").string());
+				updates = 1000; // trained state loaded: past warmup by construction
+				RG_LOG("RND self-model loaded from " << loadFrom);
+			} catch (const std::exception& e) {
+				RG_LOG("RND self-model load failed (" << e.what() << ") - starting fresh");
+			}
+		}
+		loadFrom.clear();
+		target->to(device);
+		pred->to(device);
+		for (auto& p : target->parameters())
+			p.requires_grad_(false);
+		optim = std::make_shared<torch::optim::Adam>(pred->parameters(), lr);
+	}
+};
+
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
 {
@@ -43,6 +81,11 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	if (config.tsPerSave == 0)
 		config.tsPerSave = config.ppo.tsPerItr;
+
+	// EMERGENCE RC1: state shell exists from boot (nets lazily built at first use so
+	// the feature width comes from the real trunk output, not a config guess)
+	if (config.rndOptimism.enabled)
+		rnd = std::make_shared<RndState>();
 
 	RG_LOG("Learner::Learner():");
 
@@ -474,6 +517,11 @@ void GGL::Learner::Save() {
 	RG_LOG("Saving to folder " << finalFolder << "...");
 	SaveStats(saveFolder / STATS_FILE_NAME);
 	ppo->SaveTo(saveFolder);
+	// EMERGENCE RC1: the RND self-model rides in every checkpoint
+	if (rnd && rnd->pred) {
+		torch::save(rnd->pred, (saveFolder / "RND_PRED.lt").string());
+		torch::save(rnd->target, (saveFolder / "RND_TARGET.lt").string());
+	}
 	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
 	std::filesystem::rename(saveFolder, finalFolder);
 
@@ -556,6 +604,9 @@ void GGL::Learner::Load() {
 	auto fnTryLoad = [&](const std::filesystem::path& loadFolder) {
 		LoadStats(loadFolder / STATS_FILE_NAME);
 		ppo->LoadFrom(loadFolder);
+		// EMERGENCE RC1: remember where the RND self-model lives; consumed at lazy build
+		if (config.rndOptimism.enabled && rnd)
+			rnd->loadFrom = loadFolder;
 
 		if (config.bootSanityCheckEnabled) {
 			float claimedRating = 0;
@@ -4323,6 +4374,89 @@ void GGL::Learner::Start() {
 						tAdvantages = tAdvantages + betaEff * tPropCarAInt;
 						report["Proposer/Car Shaping BetaEff"] = betaEff;
 						report["Proposer/Car Shaping Injected Abs Mean"] = (betaEff * tPropCarAInt).abs().mean().item<float>();
+					}
+
+					// ===== EMERGENCE RC1: frontier optimism (RND novelty -> advantages) =====
+					// See LearnerConfig.h RndOptimismConfig for the full rationale. Shape:
+					// novelty = frozen-target prediction error over (trunk, action); the
+					// mean-zero z-scored novelty adds weight*std(A) per z to the advantages
+					// (actor-only: value/goal targets, eval paths and reward accounting are
+					// untouched), then the predictor trains one subsample pass so novelty
+					// anneals as states become familiar. Latch-covered; warmup train-only.
+					if (rnd && (int64_t)combinedTraj.Length() > 0) {
+						const auto& rc = config.rndOptimism;
+						Timer rndTimer = {};
+						int64_t nAll = combinedTraj.Length();
+						int64_t chunk = RS_MAX((int64_t)8192, (int64_t)ppo->config.miniBatchSize);
+						auto tActD = tActions.to(ppo->device).to(torch::kLong);
+
+						// per-row novelty, chunked (nothing large stays resident)
+						torch::Tensor tNov = torch::empty({ nAll });
+						{
+							RG_NO_GRAD;
+							for (int64_t i = 0; i < nAll; i += chunk) {
+								int64_t end = RS_MIN(i + chunk, nAll);
+								auto h2 = ppo->models["shared_head"]->Forward(
+									tStates.slice(0, i, end).to(ppo->device, true), false);
+								if (!rnd->pred)
+									rnd->Build(h2.size(1) + 90, ppo->device, rc.lr);
+								auto x = torch::cat({ h2,
+									torch::one_hot(tActD.slice(0, i, end), 90).to(torch::kFloat32) }, -1);
+								tNov.slice(0, i, end).copy_(
+									(rnd->pred->forward(x) - rnd->target->forward(x))
+										.pow(2).mean(-1).cpu());
+							}
+						}
+
+						float novStd = tNov.std().item<float>();
+						if (novStd > 1e-9f && rnd->updates >= rc.warmupIters && !steerRatingTripped) {
+							auto tZ = ((tNov - tNov.mean()) / novStd).clamp(-rc.clampZ, rc.clampZ);
+							float advStd = tAdvantages.std().item<float>();
+							auto injected = (rc.weight * advStd) * tZ;
+							tAdvantages = tAdvantages + injected;
+							report["RND/Injected Abs Mean"] = injected.abs().mean().item<float>();
+						}
+						report["RND/Novelty Mean"] = tNov.mean().item<float>();
+						report["RND/Novelty Std"] = novStd;
+
+						// one training pass over a subsample; annealing = the whole point.
+						// Learn-prep runs under an outer no-grad guard - re-enable grad
+						// locally so the predictor's loss has a graph (smoke-caught bug).
+						{
+							torch::AutoGradMode _rndGradOn(true);
+							auto perm = torch::randperm(nAll,
+								torch::TensorOptions().dtype(torch::kLong))
+								.slice(0, 0, RS_MIN((int64_t)rc.trainRows, nAll));
+							float lossSum = 0;
+							int lossN = 0;
+							for (int64_t i = 0; i < perm.size(0); i += chunk) {
+								auto idx = perm.slice(0, i, RS_MIN(i + chunk, perm.size(0)));
+								torch::Tensor x;
+								{
+									RG_NO_GRAD;
+									auto h2 = ppo->models["shared_head"]->Forward(
+										tStates.index_select(0, idx).to(ppo->device, true), false);
+									x = torch::cat({ h2, torch::one_hot(
+										tActD.index_select(0, idx.to(ppo->device)), 90)
+										.to(torch::kFloat32) }, -1);
+								}
+								rnd->optim->zero_grad();
+								torch::Tensor tgt;
+								{
+									RG_NO_GRAD;
+									tgt = rnd->target->forward(x);
+								}
+								auto loss = (rnd->pred->forward(x) - tgt).pow(2).mean();
+								loss.backward();
+								rnd->optim->step();
+								lossSum += loss.item<float>();
+								lossN++;
+							}
+							rnd->updates++;
+							if (lossN > 0)
+								report["RND/Loss"] = lossSum / lossN;
+						}
+						report["RND/Time"] = rndTimer.Elapsed();
 					}
 
 					// Set experience buffer

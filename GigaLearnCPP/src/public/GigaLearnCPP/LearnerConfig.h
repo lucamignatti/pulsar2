@@ -239,6 +239,29 @@ namespace GGL {
 		float gateReenableAbove = -0.01f; // decay path back to probing
 	};
 
+	// EMERGENCE RC1 (2026-07-16, analysis/probes/EMERGENCE.md): frontier optimism via
+	// RND novelty. The RND predictor is a trained SELF-MODEL of familiarity over
+	// (trunk output, action); its prediction error DEFINES the acquisition frontier,
+	// and a small mean-zero, std-matched adjustment prices optimism onto the
+	// ADVANTAGES. Never a reward: aux frontier rewards are the meta-system trap
+	// (fakeable outcomes) and break the zero-sum stack; the advantage side touches
+	// only what the actor optimizes, keeps PSD/league fitness accounting clean
+	// (precedent: the goal-critic beta blend), and SELF-ANNEALS as the predictor
+	// catches up to the policy. Offline gate PASSED (rnd_novelty_probe.py): novelty
+	// enriches grounded-high-ball 2.77x / proto-dribble 3.42x - it lands on exactly
+	// the mechanic states advantage-surprise mining (RC2, retired) avoided.
+	// Injection obeys the rating latch; revert = enabled false. Nets persist as
+	// RND_PRED.lt / RND_TARGET.lt in every checkpoint (a fresh predictor after a
+	// restart would misprice novelty for hours - the annealing state IS the model).
+	struct RndOptimismConfig {
+		bool enabled = false;
+		float weight = 0.1f;      // injected advantage-std fraction per 1z of novelty
+		float clampZ = 3.f;       // outlier clamp on the z-scored novelty
+		int warmupIters = 10;     // train-only iterations before the first injection
+		int trainRows = 98304;    // predictor training subsample per iteration
+		float lr = 1e-4f;
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
 	struct LearnerConfig {
 		int numGames = 300;
@@ -339,6 +362,9 @@ namespace GGL {
 
 		// Steered-practice collection; additive and default-OFF (see struct comment above)
 		CollectSteeringConfig steering = {};
+
+		// Frontier optimism (EMERGENCE RC1); additive and default-OFF (see struct above)
+		RndOptimismConfig rndOptimism = {};
 
 		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
 		// unchanged unless psd.enabled / league.enabled are set.
