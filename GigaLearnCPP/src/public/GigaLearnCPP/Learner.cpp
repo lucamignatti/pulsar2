@@ -1579,7 +1579,7 @@ void GGL::Learner::Start() {
 		// The updated direction is applied in the barrier zone (fnApplySteering), never while a
 		// collect worker is in flight. Rows of one player's episode are CONTIGUOUS in
 		// combinedTraj (episodes are appended whole at finalize), so lookahead is row + k.
-		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn, const torch::Tensor& tAdvIn) {
+		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn, const torch::Tensor& tAdvIn, const torch::Tensor& tLogProbIn) {
 			const auto& cfgS = config.steering;
 			const auto& states = combinedTraj.states;
 			const auto& groups = combinedTraj.steerPractice;
@@ -2244,11 +2244,18 @@ void GGL::Learner::Start() {
 			// contiguous, so spacing is an episode-dedupe proxy). Panels test the
 			// pre-registered rediscovery bars against the same-iteration base rates;
 			// nothing downstream reads the picks in this stage.
-			if (cfgS.emergenceMiner && tAdvIn.defined() && tAdvIn.numel() == n) {
+			if (cfgS.emergenceMiner && tAdvIn.defined() && tAdvIn.numel() == n
+				&& tLogProbIn.defined() && tLogProbIn.numel() == n) {
 				auto tA = tAdvIn.to(torch::kFloat32).flatten().contiguous();
 				float aStd = tA.std().item<float>();
 				if (aStd > 1e-6f) {
-					auto tZ = ((tA - tA.mean()) / aStd).abs();
+					// v2 (EMERGENCE.md): acquisition-frontier priority =
+					// relu(z-advantage) * clamp(-logProb, 0, 10) - "an UNLIKELY action
+					// that PAID OFF", i.e. skill DISCOVERY, not raw outcome swing (v1's
+					// |z-advantage| measured outcome variance and anti-found skills).
+					auto zAdv = (tA - tA.mean()) / aStd;
+					auto surprise = (-tLogProbIn.to(torch::kFloat32).flatten()).clamp(0.f, 10.f);
+					auto tZ = torch::relu(zAdv) * surprise;
 					const float* zPtr = tZ.data_ptr<float>();
 					const float* aPtr = tA.data_ptr<float>();
 					int k = RS_CLAMP(cfgS.emergenceMinerTopK, 1, (int)n);
@@ -2315,8 +2322,15 @@ void GGL::Learner::Start() {
 							report["Miner/Dz Mean"] = dzSum / picked;
 					}
 					if (baseN > 0) {
-						report["Miner/PreLanding Base"] = (float)basePre / baseN;
-						report["Miner/GroundedHighBall Base"] = (float)baseGh / baseN;
+						float basePreF = (float)basePre / baseN, baseGhF = (float)baseGh / baseN;
+						report["Miner/PreLanding Base"] = basePreF;
+						report["Miner/GroundedHighBall Base"] = baseGhF;
+						// Enrichment ratios: the rediscovery bar reads directly (> 1 = the
+						// miner concentrates on that family vs the base distribution)
+						if (picked > 0 && basePreF > 1e-4f)
+							report["Miner/PreLanding Enrich"] = ((float)preN / picked) / basePreF;
+						if (picked > 0 && baseGhF > 1e-4f)
+							report["Miner/GroundedHighBall Enrich"] = ((float)ghN / picked) / baseGhF;
 					}
 				}
 			}
@@ -4371,7 +4385,7 @@ void GGL::Learner::Start() {
 					// Derive/refresh the steering direction from THIS buffer's match-arena rows,
 					// and feed the causal gate from the steered-vs-control practice split
 					if (steerOn)
-						fnSteerUpdate(report, tValPreds, tGoalValPreds, tAdvantages);
+						fnSteerUpdate(report, tValPreds, tGoalValPreds, tAdvantages, tLogProbs);
 						fnMetaUpdate(report);
 				}
 

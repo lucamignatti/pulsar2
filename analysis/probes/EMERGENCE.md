@@ -85,4 +85,31 @@ checkpoint or nothing).
 
 ## Results
 
-*(per-stage; bars above are frozen)*
+### RC2 Stage O v1 (|z-advantage|) — FAIL, observer worked (2026-07-16, ~33.6B)
+
+Miner enrichment ratios (picked share ÷ same-iteration base share), read off
+`Miner/*` panels over ~800M steps of observation:
+
+| family | picked | base | enrichment |
+|---|---|---|---|
+| pre-landing | 0.315 | 0.428 | **0.74× (de-enriched)** |
+| grounded-high-ball | 0.018 | 0.021 | **0.85× (de-enriched)** |
+| fear-tail (Δz mean) | −0.04 | — | no concentration |
+
+**|advantage| magnitude = OUTCOME VARIANCE, not learning-progress.** It
+concentrates on high-swing outcome states (goals, bounces) and actively AVOIDS
+moderate-variance skill states — the same failure that retracted rare-event
+replay, now measured directly. The observer-before-actuator staging caught it
+with zero resets drawn. (Bar-spec erratum: the "≥3× base" pre-landing bar was
+numerically impossible at a 43% base rate; enrichment-ratio > 1 is the correct
+test and also fails.) Incidental win: `Miner/Boost Mean` ≈ 7 — even the wrong
+statistic rediscovered the low-boost fear frontier (FEAR_DECOMP).
+
+### RC2 Stage O v2 (positive-advantage × action-surprise) — deployed 2026-07-16
+
+Frozen rule on v1 fail = iterate the statistic, do not actuate. v2 ranks by
+`relu(z(advantage)) × clamp(−logProb, 0, 10)` — "an UNLIKELY action that PAID
+OFF", the acquisition-frontier signal (targets skill DISCOVERY, not outcome
+swing; cheap — logProbs already stored). Same rediscovery bars, now read as
+enrichment ratio > 1 on ≥2 of {pre-landing, grounded-high-ball, proto-dribble}.
+Still observer-only; still actuates nothing.
