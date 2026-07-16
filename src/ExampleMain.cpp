@@ -195,6 +195,10 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// so the weight is a pure credit-density knob).
 		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 15.f },
 
+		// ESCALATE-1 (2026-07-16, user-directed): small time cost - urgency vs the
+		// measured stall/hover pathology. 0.01 -> ~9 per 30s episode, 6% of a goal.
+		{ new TimeCostReward(), 0.01f },
+
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
 	};
@@ -335,7 +339,9 @@ EnvCreateResult EnvCreateFunc(int index) {
 	// useFrac 0.35, pos/vel noise 250). Falls back to the normal mix while the pool
 	// is empty or stale, so cold boots and quiet iterations behave exactly as before.
 	if (g_FrontierPool && IsPracticeArena(index))
-		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.35f, 250, 250);
+		// ESCALATE-1: useFrac 0.35 -> 0.60 (with practiceArenaFrac 0.30, fear drills
+		// now ~18% of team resets vs the ~6% that measurably did nothing)
+		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.60f, 250, 250);
 	return result;
 }
 
@@ -766,7 +772,10 @@ int main(int argc, char* argv[]) {
 	// compounded into an Elo bleed despite real head-to-head gains. A smaller push keeps the
 	// induced ratios mostly inside the clip window so both outcome signs teach.
 	cfg.steering.alpha = 0.5f;
-	cfg.steering.practiceArenaFrac = 0.18f;      // of EACH mode's arenas (leading slice per block)
+	// ESCALATE-1 (2026-07-16): 0.18 -> 0.30 - the fear-drill dose was ~6% of team
+	// resets and 10B steps moved neither Fear Panel zV nor Census NONE; this lineage
+	// is end-of-life (cold start decided), so it gets one full-dose final experiment.
+	cfg.steering.practiceArenaFrac = 0.30f;      // of EACH mode's arenas (leading slice per block)
 	cfg.steering.resolutionTermination = false;  // STAGE 1: normal episodes, no exceptions
 	// PER-MODE steering (2026-07-14): 2v2/3v3 arenas get their own steered/control slices,
 	// gates, and sigmas; a team mode applies the 1v1 direction (offline-validated transfer,
@@ -889,8 +898,13 @@ int main(int argc, char* argv[]) {
 	// Std; Rating vs the drawdown monitor; mechanic census in ~3 days for emergence.
 	// Revert = false + restart (nets simply stop being consulted; checkpoints keep
 	// carrying them harmlessly). Rollback anchor: checkpoints_4.0_branch_backup.
-	if (!cfg.renderMode)
+	if (!cfg.renderMode) {
 		cfg.rndOptimism.enabled = true;
+		// ESCALATE-1: 0.1 -> 0.3 sigma/z. The conservative dose produced only a
+		// suggestive aerial-touch uptick over 4B steps against a matured-equilibrium
+		// attractor; final-experiment dosing on an end-of-life lineage.
+		cfg.rndOptimism.weight = 0.3f;
+	}
 
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);

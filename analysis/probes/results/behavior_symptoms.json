@@ -1,0 +1,42 @@
+{
+ "pre_35.0B_1v1": {
+  "far_frac": 0.265710628425137,
+  "far_dead_frac": 0.08707188558524652,
+  "far_mean_speed": 921.6476440429688,
+  "nearunc_frac": 0.05299961998479939,
+  "nearunc_jump_rate": 0.038067833388367375,
+  "nearunc_airborne_frac": 0.7329119298080098,
+  "nearunc_touch_1_5s": 0.1099056603773585,
+  "touch_ratio": 0.001845073802952118
+ },
+ "pre_35.0B_2v2": {
+  "far_frac": 0.23670537285965754,
+  "far_dead_frac": 0.10063696958813526,
+  "far_mean_speed": 910.2015991210938,
+  "nearunc_frac": 0.024156365018402945,
+  "nearunc_jump_rate": 0.03622813373356795,
+  "nearunc_airborne_frac": 0.6588344891833143,
+  "nearunc_touch_1_5s": 0.1440695508176361,
+  "touch_ratio": 0.0018052888462153944
+ },
+ "post_39.2B_1v1": {
+  "far_frac": 0.2469623784951398,
+  "far_dead_frac": 0.08370030673915024,
+  "far_mean_speed": 925.2530517578125,
+  "nearunc_frac": 0.05076953078123125,
+  "nearunc_jump_rate": 0.038558132663613534,
+  "nearunc_airborne_frac": 0.7810114738760033,
+  "nearunc_touch_1_5s": 0.14204825209256525,
+  "touch_ratio": 0.0015100604024160967
+ },
+ "post_39.2B_2v2": {
+  "far_frac": 0.21014862377980476,
+  "far_dead_frac": 0.09348452038169573,
+  "far_mean_speed": 956.8116455078125,
+  "nearunc_frac": 0.01707023123699792,
+  "nearunc_jump_rate": 0.03412919291050242,
+  "nearunc_airborne_frac": 0.7354621356379083,
+  "nearunc_touch_1_5s": 0.180899370147942,
+  "touch_ratio": 0.0016727676428228517
+ }
+}

@@ -129,6 +129,21 @@ namespace RLGC {
 		}
 	};
 
+	// TIME COST (2026-07-16, user-directed): a small constant per-step penalty -
+	// urgency pressure that taxes stalling (the measured 73%-airborne hover next to
+	// uncontested balls) and slow play generally. NOT zero-sum in the strict sum
+	// (both players pay), but a uniform constant CANCELS in every competitive margin
+	// (PSD/league fitness = return DIFFERENCES), so fitness purity holds. The weight
+	// must stay small vs GoalReward: at weight w a 30s episode costs 900w
+	// undiscounted - keep 900w << 150 or ending episodes (including CONCEDING)
+	// becomes attractive.
+	class TimeCostReward : public Reward {
+	public:
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			return -1.f;
+		}
+	};
+
 	// TEMPO CREDIT (2026-07-16, user-directed "energy reward"): the player's total
 	// MECHANICAL energy as an exact PBRS potential — Phi ~ (0.5|v|^2 + g*z), r =
 	// gamma*Phi(s') - Phi(s). The farmability the raw form invites is removed by
