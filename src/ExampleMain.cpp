@@ -83,7 +83,14 @@ static constexpr const char* PHASE_B_MARKER = "PHASE_B_ENGAGED";
 //   Watch: Rating/2v2 + Rating/3v3 slope vs the pre-change trend; teammate-proximity /
 //   double-commit behavior in the 2v2 viz. Revert = set back to 0.0 (resume-compatible,
 //   nothing checkpointed depends on it). Escalate toward 0.5 only as its own change.
-static constexpr float TEAM_SPIRIT = 0.3f;
+// REBALANCE-1 (2026-07-16, user-directed): 0.3 -> 0.6 - "force complete trust" via
+// shared fate: majority-pooled teammate rewards make deferring to the better-placed
+// teammate payoff-neutral instead of a 70%-personal-credit loss. Trust steering
+// failed its bars (TRUST_PAIR.md: the belief axis produces upfield drift, not
+// cover); this makes the belief unnecessary rather than pushing it. Known cost:
+// free-rider pressure grows with spirit (why 0.6, not 1.0). Judge: rotation/
+// back-fill observations + Census NONE 2v2 + Rating/2v2 slope over its window.
+static constexpr float TEAM_SPIRIT = 0.6f;
 
 // 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
 // (fast) codebase.
@@ -161,12 +168,16 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// genuinely-high ball, impulse-scaled, ~0.8s refire cooldown. Pays exactly 0 for everything
 		// the bot currently does (ground strikes, wall pins, 193uu hop-pokes). UNGATED: the gate
 		// structurally discounts never-achieved states and made the old ZS pair net-negative.
-		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 25.f },
+		// REBALANCE-1: 25 -> 50 (user: 4B steps of RND moved aerial-touch share only
+		// +2.9pp - the success payoff must clear the acquisition valley faster now
+		// that RND supplies the attempts)
+		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 50.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
 		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
-		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 10.f },
+		// REBALANCE-1: 10 -> 20 (denser pre-touch climb credit, same PBRS guarantees)
+		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 20.f },
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
@@ -179,9 +190,10 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// credit for momentum decisions, loop-farming impossible by telescoping,
 		// climbs untaxed (PE in the sum), ball half already covered by TouchAccel.
 		// ACTIVE since 2026-07-16 (user-directed, deployed in the overnight EMERGENCE
-		// sequence a few hours behind RC1). Weight 6 = boost-economy scale,
-		// deliberately modest for a credit-shaping term.
-		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 6.f },
+		// sequence a few hours behind RC1). REBALANCE-1: 6 -> 15 (pace unmoved at
+		// weight 6 over 4B steps - emergence_check.json; farm-proof by telescoping,
+		// so the weight is a pure credit-density knob).
+		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 15.f },
 
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
