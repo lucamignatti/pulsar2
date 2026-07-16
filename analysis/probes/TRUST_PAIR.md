@@ -43,6 +43,27 @@ role gate; own deploy window AFTER RC1's). FAIL → recorded; trust axis joins
 the dead-candidate list and rotation waits on commitment reliability
 (FEAR_MINE) + RC1.
 
-## Results
+## Results (2026-07-16, checkpoint 35125030294; raw: `results/trust_pair_35125030294.json`)
 
-*(to be filled; bars frozen)*
+Directions: commit 413 pairs σ4.29, trust 453 pairs σ4.53, cos +0.33 (a
+genuinely distinct axis, as B3 promised).
+
+| arm | teamWon | NONE | back-fill (uu toward own goal) |
+|---|---|---|---|
+| B0 | 13.8% ± 2.3% | 77.1% | +53 ± 41 |
+| C (commit only) | 11.7% ± 1.7% | 76.7% | −197 ± 109 |
+| T (trust only) | 12.7% ± 1.3% | 75.4% | −11 ± 42 |
+| P (paired) | 14.9% ± 1.6% | **72.1%** | **−46 ± 86** |
+
+**VERDICT: FAIL both bars — trust steering is NOT deployed.**
+- Pairing bar: P − B0 = +1.1pp (0.4σ) vs the ≥4pp/2σ bar. P does beat both
+  solo arms point-wise and cuts NONE by 5pp (engagement genuinely rises under
+  pairing — the interaction is real), but conversion stays at acute-saturation
+  scale, like every team-steering variant this week.
+- Rotation bar: back-fill INVERTED (−46 vs +53) — the trust axis produces
+  upfield drift, not covering movement. It encodes "the ball will be handled",
+  not "cover behind the play". Steering it cannot create rotation.
+
+Standing conclusion: rotation remains gated on commitment RELIABILITY
+(FEAR_MINE) + acquisition pricing (RC1), not on any belief-axis push. The
+trust direction joins the dead-candidate list with the mechanism recorded.

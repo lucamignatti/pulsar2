@@ -139,6 +139,24 @@ optimism onto it by NOVELTY/DENSITY, which is orthogonal to advantage-surprise
 the load-bearing fix. Gated offline first (RC1_NOVELTY below) per the RC2
 lesson.
 
+## Overnight deploy record (2026-07-16, user-delegated)
+
+- **RC1 LIVE at 35.1B** (2fbe806). Smoke caught + fixed a no-grad bug in the
+  predictor pass. First live hour: RND/Loss 0.021 → 0.0006, novelty std
+  annealing 0.0074 → 0.0002, injection ~15% of advantage scale, rating in-band,
+  no trips. Persistence proven on the next restart ("RND self-model loaded").
+- **Energy PBRS LIVE at 35.25B** (def0661, weight 6): CarEnergyPotentialReward,
+  total mechanical energy as exact PBRS (loop-farm impossible by telescoping,
+  ZeroSum-wrapped, gamma-matched, PE included so aerials untaxed; ball half =
+  TouchAccel). Smoke clean; boot clean.
+- **Trust steering: FAILED its bars, NOT deployed** (TRUST_PAIR.md): pairing
+  +1.1pp (0.4σ) vs the 4pp/2σ bar; back-fill inverted — the axis produces
+  upfield drift, not rotation. Dead-candidate list.
+- Backups: 35025088660 (pre-RC1), 35250141800-adjacent (pre-energy), golden
+  best_r1753. Morning watch list: RND/* (loss falling, injection stable),
+  Rating vs the drawdown floor, Steer/Fear Panel zV, Census NONE 2v2, and the
+  first pace census (energy term's proximate metric) after ~a day.
+
 ## RC1 offline novelty gate (before any live advantage change)
 
 `rnd_novelty_probe.py`: RND (predictor trained toward a frozen random projection
