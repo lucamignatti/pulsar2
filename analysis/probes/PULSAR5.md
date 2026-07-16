@@ -67,7 +67,7 @@ instruments are born WITH the run this time.
 ## Success criteria (measurable, with 4.0 as the baseline curve)
 
 The 4.0 record gives waypoint curves we never had before. 5.0 targets, checked
-by the same census scripts: aerial-touch share > 4.0's at matched steps by 5B;
+by the same census scripts: aerial-touch share > 4.0's at matched steps by 5B (SCAFFOLD weights: AerialTouch 120 / AirIntercept 40 for the formative window - anneal toward 50/20 once established);
 takeoff-probe conversion > 0 by 10B (4.0: 0/300 at 32B); wavedash success
 > 20% by 15B (4.0: 11% plateau); decline census NONE < 4.0's matched-step
 value through PHASE B. Rating comparisons are lineage-internal only.

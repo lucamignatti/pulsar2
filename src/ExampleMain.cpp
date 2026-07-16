@@ -166,16 +166,21 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// genuinely-high ball, impulse-scaled, ~0.8s refire cooldown. Pays exactly 0 for everything
 		// the bot currently does (ground strikes, wall pins, 193uu hop-pokes). UNGATED: the gate
 		// structurally discounts never-achieved states and made the old ZS pair net-negative.
-		// REBALANCE-1: 25 -> 50 (user: 4B steps of RND moved aerial-touch share only
-		// +2.9pp - the success payoff must clear the acquisition valley faster now
-		// that RND supplies the attempts)
-		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 50.f },
+		// 5.0 SCAFFOLD WEIGHT (2026-07-16, user-directed "massively incentivize"):
+		// 50 -> 120, near goal-scale (deliberately < Goal 150). On a fresh run the
+		// drills produce accidental aerial touches from birth; this weight decides
+		// how hard each accident is reinforced during the formative window. Zero-sum,
+		// impulse-scaled, 0.8s cooldown - bounded and unfarmable in sum. ANNEAL LATER:
+		// once aerial-touch share establishes (PULSAR5.md), step back toward 50 so the
+		// mature style isn't permanently air-warped.
+		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 120.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
 		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
-		// REBALANCE-1: 10 -> 20 (denser pre-touch climb credit, same PBRS guarantees)
-		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 20.f },
+		// 5.0 SCAFFOLD: 20 -> 40 (denser pre-touch climb credit for the formative
+		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
+		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 40.f },
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
