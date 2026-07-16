@@ -22,11 +22,16 @@ from advanced_obs import ACTION_TABLE, build_obs_padded, build_pad_index_map, ge
 from label_landing import simulate_landing
 from load_checkpoint import PulsarPolicy
 
-TICK_SKIP = 4
-ACTION_DELAY = 3
+# 5.0 MIGRATION (2026-07-16): tickSkip 8, actionDelay 0 (PULSAR5.md). Rollouts of a
+# 5.0 policy through the old 4+3 dynamics are INVALID - the policy was trained at
+# 15Hz with zero latency. DT and every consumer deriving windows from it update
+# automatically; scripts with hardcoded 30Hz literals must be audited before reuse
+# on 5.0 checkpoints. For 4.0-era archaeology, set these back to 4/3.
+TICK_SKIP = 8
+ACTION_DELAY = 0
 NO_TOUCH_TERMINAL_S = 10.0
 EPISODE_CAP_S = 30.0
-DT = 1 / 30.0
+DT = TICK_SKIP / 120.0
 
 ARM_Z = 300.0
 FEASIBLE_SPEED = 1300.0
@@ -262,7 +267,8 @@ class TeamArenaEnv:
         return np.stack(obs), np.stack(masks), phys, states
 
     def step(self, action_indices):
-        self.arena.step(ACTION_DELAY)
+        if ACTION_DELAY:
+            self.arena.step(ACTION_DELAY)
         for p, act_idx in enumerate(action_indices):
             elems = ACTION_TABLE[act_idx]
             ctrl = rs.CarControls()

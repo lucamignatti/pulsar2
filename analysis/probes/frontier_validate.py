@@ -82,12 +82,13 @@ def reconstruct(env, entry, rng, pos_noise, vel_noise):
 def roll_and_judge(env, policy, seconds):
     """Roll the policy; return (first_touch_team or None, all_finite)."""
     import torch as th
+    from steer_team import ACTION_DELAY, ACTION_TABLE, DT, TICK_SKIP
     start_tick = env.arena.tick_count
-    for _ in range(int(seconds * 30)):
+    for _ in range(int(seconds / DT)):
         obs, masks, phys, states = env.observe()
         _, actions = policy.act(th.from_numpy(obs), th.from_numpy(masks))
-        env.arena.step(3)
-        from steer_team import ACTION_TABLE
+        if ACTION_DELAY:
+            env.arena.step(ACTION_DELAY)
         for p, act_idx in enumerate(actions.tolist()):
             e = ACTION_TABLE[act_idx]
             ctrl = rs.CarControls()
@@ -96,7 +97,7 @@ def roll_and_judge(env, policy, seconds):
             ctrl.jump, ctrl.boost, ctrl.handbrake = bool(e[5]), bool(e[6]), bool(e[7])
             env.cars[p].set_controls(ctrl)
             env.prev_actions[p] = e
-        env.arena.step(1)
+        env.arena.step(TICK_SKIP - ACTION_DELAY)
         for p, car in enumerate(env.cars):
             st = car.get_state()
             if not np.isfinite(st.pos.as_tuple()).all():

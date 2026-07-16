@@ -75,14 +75,17 @@ def opportunity_conversion(rec, ppt):
 
 def roll_track(env, policy, seconds, track_car=0):
     """Roll; track car `track_car`: (jumped_1s, max_car_z, touch_ball_z or None)."""
+    from steer_team import ACTION_DELAY, DT, TICK_SKIP
     start = env.arena.tick_count
     jumped_1s = False
     max_z = 0.0
     touch_z = None
-    for step in range(int(seconds * 30)):
+    steps_1s = int(1 / DT)
+    for step in range(int(seconds / DT)):
         obs, masks, phys, states = env.observe()
         _, actions = policy.act(torch.from_numpy(obs), torch.from_numpy(masks))
-        env.arena.step(3)
+        if ACTION_DELAY:
+            env.arena.step(ACTION_DELAY)
         for p, ai in enumerate(actions.tolist()):
             e = ACTION_TABLE[ai]
             c = rs.CarControls()
@@ -91,7 +94,7 @@ def roll_track(env, policy, seconds, track_car=0):
             c.jump, c.boost, c.handbrake = bool(e[5]), bool(e[6]), bool(e[7])
             env.cars[p].set_controls(c)
             env.prev_actions[p] = e
-        env.arena.step(1)
+        env.arena.step(TICK_SKIP - ACTION_DELAY)
         st = env.cars[track_car].get_state()
         max_z = max(max_z, float(st.pos.z))
         if not st.is_on_ground and step < 30:
