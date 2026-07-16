@@ -24,10 +24,10 @@ using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
 
 // Discount factor, shared by the learner's GAE and every PBRS reward (they MUST match or the
-// potential terms stop telescoping against GAE). tickSkip 4 => 30 actions/sec, so 0.9985 gives a
-// ~15s half-life (462 steps) — a deliberately long horizon so full scoring/defensive possessions
-// reach the value target. If you change tickSkip, re-derive this: half-life_s = ln2 / (-ln gamma) / (120/tickSkip).
-static constexpr float TRAIN_GAMMA = 0.9985f;
+// potential terms stop telescoping against GAE). 5.0: tickSkip 8 => 15 actions/sec, so 0.9969
+// keeps the ~15s half-life (225 steps). If you change tickSkip, re-derive:
+// half-life_s = ln2 / (-ln gamma) / (120/tickSkip).
+static constexpr float TRAIN_GAMMA = 0.9969f;
 
 // ---- 4.0: one net for 1v1/2v2/3v3 (team-play program) ------------------------------------
 // The 4.0 lineage trains a SINGLE policy across team sizes via a padded obs
@@ -83,14 +83,12 @@ static constexpr const char* PHASE_B_MARKER = "PHASE_B_ENGAGED";
 //   Watch: Rating/2v2 + Rating/3v3 slope vs the pre-change trend; teammate-proximity /
 //   double-commit behavior in the 2v2 viz. Revert = set back to 0.0 (resume-compatible,
 //   nothing checkpointed depends on it). Escalate toward 0.5 only as its own change.
-// REBALANCE-1 (2026-07-16, user-directed): 0.3 -> 0.6 - "force complete trust" via
-// shared fate: majority-pooled teammate rewards make deferring to the better-placed
-// teammate payoff-neutral instead of a 70%-personal-credit loss. Trust steering
-// failed its bars (TRUST_PAIR.md: the belief axis produces upfield drift, not
-// cover); this makes the belief unnecessary rather than pushing it. Known cost:
-// free-rider pressure grows with spirit (why 0.6, not 1.0). Judge: rotation/
-// back-fill observations + Census NONE 2v2 + Rating/2v2 slope over its window.
-static constexpr float TEAM_SPIRIT = 0.6f;
+// 5.0: PHASE-SCHEDULED (PULSAR5.md) - 0.3 while 1v1 dominates (individual credit
+// for skill formation, free-rider bounded), 0.6 from PHASE B (shared fate makes
+// deferring to the better-placed teammate payoff-neutral - the trust forcing;
+// steering the belief failed, TRUST_PAIR.md). Set in main() after the phase
+// marker is read, before the envs (and their reward stacks) are built.
+static float TEAM_SPIRIT = 0.3f;
 
 // 2.6: a faithful revert to the last GOOD state of run 9uz761ua's lineage, on the current
 // (fast) codebase.
@@ -425,12 +423,16 @@ int main(int argc, char* argv[]) {
 		else                                     cfg.deviceType = LearnerDeviceType::GPU_CUDA;
 	}
 
-	// tickSkip 4 (30 actions/sec vs the old 15): finer control for mechanics — the biggest ceiling
-	// lever for aerials/dribbles/speed-flips. Halves game-time throughput per policy-step, so it is
-	// paired with a fresh run (not a resume) and the longer-horizon gamma below (halving tickSkip
-	// halves game-time horizon at fixed gamma, so gamma is raised to keep it).
-	cfg.tickSkip = 4;
-	cfg.actionDelay = cfg.tickSkip - 1; // Normal value in other RLGym frameworks
+	// 5.0: tickSkip 8, actionDelay 0 (from 4.0's tickSkip 4 + delay 3). The 4.0 choice
+	// optimized the CONTROL CEILING; the 4.0 record settled that the binding constraint
+	// is LEARNABILITY: ts8 halves every action chain in decision-space and doubles
+	// per-decision consequence mass (MECHANICS.md sample-economics — wavedash stuck at
+	// 11% for billions of steps at ts4, per-instance SNR ~0.18), and Nexto-class bots
+	// developed wavedashes/speedflips AT ts8. Zero delay = max action-effect
+	// correlation for precision mechanics (revisit only if RLBot sim-to-real matters).
+	// Gamma re-derived above; fresh run required (obs prevAction + dynamics semantics).
+	cfg.tickSkip = 8;
+	cfg.actionDelay = 0;
 
 	cfg.numGames = 1024;
 
@@ -532,7 +534,7 @@ int main(int argc, char* argv[]) {
 	// VALIDATION: GoalCritic/Value-Outcome Corr and Adv-Outcome Corr must be POSITIVE once goals flow;
 	// negative = channel/sign bug -> set beta = 0 (critic still trains, no blend) and investigate.
 	cfg.ppo.goalCritic.enabled = true;
-	cfg.ppo.goalCritic.gamma = 0.9997f;   // ~77s half-life at 30Hz ("huge distance", per plan)
+	cfg.ppo.goalCritic.gamma = 0.9994f;   // ~77s half-life at 15Hz (5.0 tickSkip 8; re-derived)
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
 	cfg.ppo.goalCritic.model.layerSizes = { 512, 512, 512 };
@@ -593,7 +595,7 @@ int main(int argc, char* argv[]) {
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).
-	cfg.checkpointFolder = "checkpoints_4.0";
+	cfg.checkpointFolder = "checkpoints_5.0"; // COLD START 2026-07-16 (PULSAR5.md); 4.0 archived in place
 	cfg.metricsRunName = "4.0-team";
 
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
@@ -829,6 +831,7 @@ int main(int argc, char* argv[]) {
 	// PHASE_B_RATING_TRIGGER comment). Must be set before the Learner is built -
 	// EnvCreateFunc reads these.
 	g_PhaseB = std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
+	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
 	g_NumGames = cfg.numGames;
 	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
 	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
@@ -900,10 +903,10 @@ int main(int argc, char* argv[]) {
 	// carrying them harmlessly). Rollback anchor: checkpoints_4.0_branch_backup.
 	if (!cfg.renderMode) {
 		cfg.rndOptimism.enabled = true;
-		// ESCALATE-1: 0.1 -> 0.3 sigma/z. The conservative dose produced only a
-		// suggestive aerial-touch uptick over 4B steps against a matured-equilibrium
-		// attractor; final-experiment dosing on an end-of-life lineage.
-		cfg.rndOptimism.weight = 0.3f;
+		// 5.0: formative dose from step 0 (PULSAR5.md) - novelty pressure during the
+		// high-entropy window is the point; the 4.0 escalation to 0.3 was end-of-life
+		// dosing against a matured attractor, not the steady-state design.
+		cfg.rndOptimism.weight = 0.1f;
 	}
 
 	// Make the learner with the environment creation function and the config we just made

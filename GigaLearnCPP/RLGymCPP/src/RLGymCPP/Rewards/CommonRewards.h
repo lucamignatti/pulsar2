@@ -101,12 +101,19 @@ namespace RLGC {
 		float gamma;
 		BallProximityPotentialReward(float gamma = 0.99f) : gamma(gamma) {}
 
-		// Closest ALIVE team car's proximity; 0 if the whole team is demoed (no car = no coverage)
+		// Closest ALIVE team car's proximity; 0 if the whole team is demoed (no car = no coverage).
+		// 5.0 FAR-FIELD TERM (PULSAR5.md): the pure exp saturates beyond ~2000uu - the
+		// measured "gradient desert" behind ~9% dead far-field frames (behavior_symptoms).
+		// A small linear component gives the potential a nonzero slope everywhere; still
+		// an exact potential (any Phi is), so still unfarmable and policy-invariant.
 		static float TeamPhi(const GameState& state, Team team) {
 			float best = 0;
 			for (const Player& p : state.players)
-				if (p.team == team && !p.isDemoed)
-					best = RS_MAX(best, expf(-(state.ball.pos - p.pos).Length() / LIU_DIST_SCALE));
+				if (p.team == team && !p.isDemoed) {
+					float d = (state.ball.pos - p.pos).Length();
+					float phi = expf(-d / LIU_DIST_SCALE) + 0.08f * RS_MAX(0.f, 1.f - d / 12000.f);
+					best = RS_MAX(best, phi);
+				}
 			return best;
 		}
 

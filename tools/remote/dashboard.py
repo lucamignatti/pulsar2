@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAINERCTL = REPO_ROOT / "tools" / "trainerctl"
 LOG_DIR = Path(os.environ.get("RUN_TRAINER_LOG_DIR", REPO_ROOT / "run_logs"))
 BUILD_DIR = Path(os.environ.get("TRAINERCTL_BUILD_DIR", REPO_ROOT / "build"))
-CKPT_DIR = Path(os.environ.get("TRAINERCTL_CKPT_DIR", BUILD_DIR / "checkpoints_4.0"))
+CKPT_DIR = Path(os.environ.get("TRAINERCTL_CKPT_DIR", BUILD_DIR / "checkpoints_5.0"))
 
 CONF_DIR = Path.home() / ".config" / "pulsar-remote"
 STATE_DIR = Path.home() / ".local" / "state" / "pulsar-remote"
