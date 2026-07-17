@@ -135,23 +135,28 @@ pub fn init_from_mem(
         for (i, entry) in byte_mesh_files.into_iter().enumerate() {
             let mesh_file = CollisionMeshFile::read_from_bytes(&entry)?;
             let hash = mesh_file.get_hash();
-            let Some(hash_count) = target_hashes.get_mut(&hash) else {
-                warn!(
-                    "Collision mesh [{i}] does not match any known {} collision mesh ({hash:#x}), \
-                    make sure they were dumped form a normal {} arena.",
-                    game_mode.name(),
+            // VENDOR PATCH (pulsar 2026-07-17): upstream SKIPS unknown-hash meshes,
+            // but C++ RocketSim v2 (RocketSim.cpp MeshHashSet path) warns and LOADS
+            // them anyway - and this project's meshes have never been on the canonical
+            // list (verified: v2's own hash algo yields the same unknown hashes, e.g.
+            // 0xf2bfc83d). Skipping left ZERO soccar meshes -> panic + crash loop.
+            // Restore v2 semantics: warn-but-load, so the arena geometry is
+            // bit-identical to what every prior lineage trained on.
+            match target_hashes.get_mut(&hash) {
+                Some(hash_count) => {
+                    if *hash_count > 0 {
+                        error!(
+                            "Collision mesh [{i}] is a duplicate ({hash:#x}), already loaded a mesh with the same hash."
+                        );
+                    }
+                    *hash_count += 1;
+                }
+                None => warn!(
+                    "Collision mesh [{i}] does not match any known {} collision mesh ({hash:#x}) - \
+                    loading it anyway (v2-compat semantics).",
                     game_mode.name()
-                );
-                continue;
-            };
-
-            if *hash_count > 0 {
-                error!(
-                    "Collision mesh [{i}] is a duplicate ({hash:#x}), already loaded a mesh with the same hash."
-                );
+                ),
             }
-
-            *hash_count += 1;
 
             let tri_mesh = mesh_file.make_bullet_mesh();
             let bvt_mesh = BvhTriangleMeshShape::new(tri_mesh);
