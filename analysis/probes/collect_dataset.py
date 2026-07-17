@@ -1,11 +1,12 @@
 """Roll out the frozen checkpoint policy in RocketSim (self-play, CPU) and record
 per-frame activations + physics for probing.
 
-Replicates the trainer's env loop (EnvSet.cpp):
-  - tickSkip 4, actionDelay 3: each decision step = 3 ticks with the PREVIOUS controls,
-    set new controls, 1 more tick, then build obs (whose prevAction = the just-set action).
+Replicates the trainer's env loop (EnvSet.cpp), 5.0 dynamics (PULSAR5.md):
+  - tickSkip 8, actionDelay 0: set new controls, then 8 ticks, then build obs (whose
+    prevAction = the just-set action). 4.0 was tickSkip 4 + actionDelay 3: 3 ticks
+    with the PREVIOUS controls, set new controls, 1 more tick.
   - stochastic sampling with DefaultAction masking (InferActionsFromModels parity)
-  - terminals: goal scored, 10s without any ball touch (NoTouchCondition(10)), 30s cap
+  - terminals: goal scored, 20s without any ball touch (NoTouchCondition(20)), 30s cap
   - reset mix: TRAINER PARITY (ExampleMain MakeEnv): 35% BallNearCarState(600,900) /
     20% AirDrillState / 15% kickoff / 30% RandomState(randBall, randCar, air).
     The earlier kickoff+random-only mix starved ball interactions ~10x vs the trainer
@@ -19,8 +20,9 @@ raw physics of ball + both cars, and episode/arena ids for leakage-safe CV split
 Differences from the training collector, accepted + noted in REPORT.md:
   - RocketSim pip bindings v2.2.1 vs in-repo v2.1.1
   - fp32 inference (trainer collects in bf16)
-  - after an arena reset the first 3 ticks run zeroed controls (the C++ EnvSet carries
-    the pre-reset controls for those ticks)
+  - (4.0-era dynamics only, ACTION_DELAY > 0) after an arena reset the first
+    ACTION_DELAY ticks run zeroed controls (the C++ EnvSet carries the pre-reset
+    controls for those ticks); moot at 5.0's actionDelay 0
 """
 
 import os
@@ -53,10 +55,16 @@ def cur_obs_size() -> int:
     return _OBS_SIZE
 TARGET_FRAMES = int(os.environ.get("PROBE_FRAMES", 100_000))  # player-frames (2 per arena-step)
 
-TICK_SKIP = 4
-ACTION_DELAY = 3
-NO_TOUCH_TERMINAL_S = 10.0
+# 5.0 MIGRATION (2026-07-16): tickSkip 8, actionDelay 0, NoTouch 20s - keep in
+# lockstep with steer_team.py's block and the trainer's ExampleMain. Collecting
+# through the old 4+3 dynamics against a 5.0 checkpoint breaks obs/action/step
+# parity, and every consumer of dataset.npz (label_landing / train_probes /
+# knowing_doing) inherits the skew. For 4.0-era archaeology, set back to 4/3/10.
+TICK_SKIP = 8
+ACTION_DELAY = 0
+NO_TOUCH_TERMINAL_S = 20.0
 EPISODE_CAP_S = 30.0
+DT = TICK_SKIP / 120.0
 # Trainer-parity reset mix (ExampleMain MakeEnv): cumulative weights over
 # (ball_near_car, air_drill, kickoff, random)
 RESET_MIX = [(0.35, "near"), (0.55, "air"), (0.70, "kickoff"), (1.01, "random")]
@@ -287,8 +295,11 @@ class ArenaEnv:
         return obs, masks, phys
 
     def step(self, action_indices):
-        """3 ticks old controls -> set new controls -> 1 tick. Returns True if the episode ended."""
-        self.arena.step(ACTION_DELAY)
+        """ACTION_DELAY ticks old controls -> set new controls -> the remaining
+        TICK_SKIP - ACTION_DELAY ticks (5.0: delay 0 = set, then 8 ticks).
+        Returns True if the episode ended."""
+        if ACTION_DELAY:
+            self.arena.step(ACTION_DELAY)
         for p, act_idx in enumerate(action_indices):
             elems = ACTION_TABLE[act_idx]
             ctrl = rs.CarControls()
@@ -381,7 +392,8 @@ def main():
     print(f"frames with car near ball (<300uu): {touch_frac:.1%}")
 
     DATA_DIR.mkdir(exist_ok=True)
-    np.savez(DATA_DIR / "dataset.npz", checkpoint=int(ckpt_dir.name), seed=SEED, **out)
+    np.savez(DATA_DIR / "dataset.npz", checkpoint=int(ckpt_dir.name), seed=SEED,
+             tick_skip=TICK_SKIP, action_delay=ACTION_DELAY, **out)
     print(f"saved {DATA_DIR / 'dataset.npz'}")
 
 

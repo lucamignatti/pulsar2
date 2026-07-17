@@ -30,7 +30,6 @@ HERE = Path(__file__).resolve().parent
 DATA = HERE / "data" / "dataset.npz"
 RESULTS_DIR = HERE / "results"
 SEED = 20260719
-DT = 1 / 30.0
 TOUCH_PROXY_UU = 250.0
 MAX_ROWS = 60_000       # subsample cap for the sklearn fits
 
@@ -57,6 +56,9 @@ def cv_ridge_multi(X, Y, groups, seed=0):
 def main():
     t0 = time.time()
     d = np.load(DATA)
+    # decision-step seconds of the rollout that wrote dataset.npz (tick_skip saved
+    # by collect_dataset since the 5.0 migration; older archives = tickSkip 4)
+    dt = (float(d["tick_skip"]) if "tick_skip" in d.files else 4.0) / 120.0
     ckpt = int(d["checkpoint"])
     phys, team, episode = d["phys"], d["team"].astype(int), d["episode"]
     h2 = d["h2"].astype(np.float32)
@@ -77,7 +79,7 @@ def main():
     canon = np.stack([flip, flip, np.ones(n)], axis=1)
 
     def future_rows(horiz_s):
-        k = int(round(horiz_s / DT))
+        k = int(round(horiz_s / dt))
         fq = row_pos + 2 * k
         valid = fq < ep_len
         fr = np.full(n, -1, np.int64)
@@ -112,8 +114,8 @@ def main():
               f"(n={len(sel)})", flush=True)
 
     # ---- touch-proxy scan for C2 / A3 ----------------------------------------
-    k2 = int(round(2.0 / DT))
-    k1 = int(round(1.0 / DT))
+    k2 = int(round(2.0 / dt))
+    k1 = int(round(1.0 / dt))
     self_first = np.full(n, -1, np.int8)   # -1 unresolved, 0 opp first, 1 self first
     self_reach1 = np.zeros(n, bool)
     d_ball_now = np.linalg.norm(

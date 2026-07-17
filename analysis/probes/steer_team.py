@@ -26,10 +26,12 @@ from load_checkpoint import PulsarPolicy
 # 5.0 policy through the old 4+3 dynamics are INVALID - the policy was trained at
 # 15Hz with zero latency. DT and every consumer deriving windows from it update
 # automatically; scripts with hardcoded 30Hz literals must be audited before reuse
-# on 5.0 checkpoints. For 4.0-era archaeology, set these back to 4/3.
+# on 5.0 checkpoints. NoTouch 10 -> 20 tracks the trainer (NoTouchCondition(20),
+# ExampleMain 2026-07-16 recovery-window change). For 4.0-era archaeology, set
+# these back to 4/3/10.
 TICK_SKIP = 8
 ACTION_DELAY = 0
-NO_TOUCH_TERMINAL_S = 10.0
+NO_TOUCH_TERMINAL_S = 20.0
 EPISODE_CAP_S = 30.0
 DT = TICK_SKIP / 120.0
 

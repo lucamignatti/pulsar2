@@ -20,9 +20,10 @@ from pathlib import Path
 import numpy as np
 
 import RocketSim as rs
+from collect_dataset import TICK_SKIP
 from label_landing import simulate_landing
 
-DT = 1 / 30.0
+DT = TICK_SKIP / 120.0  # decision-step seconds, follows collect_dataset's dynamics
 ARM_Z = 300.0
 FEASIBLE_SPEED = 1300.0
 RACE_MARGIN_S = 0.5          # grace past touchdown for the race (trainer parity)

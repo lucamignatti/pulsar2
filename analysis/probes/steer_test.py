@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 import RocketSim as rs
-from collect_dataset import NUM_ARENAS, ArenaEnv
+from collect_dataset import NUM_ARENAS, TICK_SKIP, ArenaEnv
 from label_landing import simulate_landing
 from load_checkpoint import PulsarPolicy, copy_checkpoint, load_models
 
@@ -42,7 +42,7 @@ SEED = 4242
 BASE_ROWS = 60_000
 STEER_ROWS = 80_000
 ALPHAS = [-2.0, -1.0, 0.0, 1.0, 2.0]
-DT = 1 / 30.0
+DT = TICK_SKIP / 120.0  # decision-step seconds, follows collect_dataset's dynamics
 AIRBORNE_Z = 300.0
 ATTEND_RADIUS = 500.0
 FEASIBLE_SPEED = 1300.0

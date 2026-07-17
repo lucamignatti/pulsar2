@@ -199,7 +199,8 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 15.f },
 
 		// ESCALATE-1 (2026-07-16, user-directed): small time cost - urgency vs the
-		// measured stall/hover pathology. 0.01 -> ~9 per 30s episode, 6% of a goal.
+		// measured stall/hover pathology. 0.01 -> ~4.5 per 30s episode (15Hz steps
+		// at tickSkip 8), 3% of a goal.
 		{ new TimeCostReward(), 0.01f },
 
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
@@ -549,7 +550,7 @@ int main(int argc, char* argv[]) {
 	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
 	cfg.ppo.rewardClipRange = 50;
 
-	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~15s half-life at 30Hz; MUST match the PBRS reward gammas above
+	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~15s half-life at 15Hz (5.0 tickSkip 8); MUST match the PBRS reward gammas above
 
 	// Secondary goal-only critic: long-horizon credit on the one unfarmable signal. Independent net,
 	// raw obs in; advantages blended at beta = 25% of dense-advantage scale (std-matched, centered).
@@ -612,8 +613,9 @@ int main(int argc, char* argv[]) {
 	cfg.skillTracker.enabled = true;
 
 	// FRESH RUN (4.0): the team-play lineage - padded 230-dim obs (AdvancedObsPadded(3)),
-	// PHASE A all-1v1 curriculum, otherwise the proven 3.1 config (tickSkip 4, 512-wide,
-	// gamma 0.9985, secondary goal critic). Its own checkpoint folder + wandb run name so it
+	// PHASE A all-1v1 curriculum, otherwise the proven 3.1 config (512-wide, secondary
+	// goal critic; the 5.0 cold start re-timed it: tickSkip 4 -> 8, gamma 0.9985 ->
+	// 0.9969, see TRAIN_GAMMA). Its own checkpoint folder + wandb run name so it
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).

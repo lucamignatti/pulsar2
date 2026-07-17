@@ -72,6 +72,13 @@ takeoff-probe conversion > 0 by 10B (4.0: 0/300 at 32B); wavedash success
 > 20% by 15B (4.0: 11% plateau); decline census NONE < 4.0's matched-step
 value through PHASE B. Rating comparisons are lineage-internal only.
 
+Cross-lineage counter caveat: emergence_check.py's per-100k-STEP mechanic
+counters (takeoff_attempts, airborne_jump, proto_dribble) count decision
+steps, and a 5.0 step (tickSkip 8) spans 2x the sim-time of a 4.0 step
+(tickSkip 4 + actionDelay 3) — divide 5.0 counters by 2 (or double the 4.0
+curve) before comparing against 4.0 waypoints. Fractions (aerial_touch_frac
+and the other *_frac metrics) are per-step-invariant and safe.
+
 ## Launch sequence
 
 1. ESCALATE-1 window concludes on the 4.0 run (final data + any surprises).

@@ -33,13 +33,15 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[2]
-# Root preference: $PULSAR_CKPT_ROOT > the 4.0 offline copy (scp'd from the training
-# box; already safe to read in place, but we still copy-first out of habit/uniformity)
-# > the 3.1 live folder (older setups).
+# Root preference: $PULSAR_CKPT_ROOT > the 5.0 lineage (checkpoints_5.0, the live
+# PULSAR5.md folder; -copy = an scp'd offline copy, same convention as 4.0) > the
+# 4.0 offline copy (scp'd from the training box; already safe to read in place, but
+# we still copy-first out of habit/uniformity) > the 3.1 live folder (older setups).
 def _default_root() -> Path:
     if env := os.environ.get("PULSAR_CKPT_ROOT"):
         return Path(env)
-    for cand in ["checkpoints_4.0-copy", "checkpoints_4.0", "checkpoints_3.1"]:
+    for cand in ["checkpoints_5.0-copy", "checkpoints_5.0",
+                 "checkpoints_4.0-copy", "checkpoints_4.0", "checkpoints_3.1"]:
         if (REPO / "build" / cand).is_dir():
             return REPO / "build" / cand
     return REPO / "build" / "checkpoints_3.1"

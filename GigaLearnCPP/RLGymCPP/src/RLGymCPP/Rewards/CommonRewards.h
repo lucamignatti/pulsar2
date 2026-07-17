@@ -141,9 +141,9 @@ namespace RLGC {
 	// uncontested balls) and slow play generally. NOT zero-sum in the strict sum
 	// (both players pay), but a uniform constant CANCELS in every competitive margin
 	// (PSD/league fitness = return DIFFERENCES), so fitness purity holds. The weight
-	// must stay small vs GoalReward: at weight w a 30s episode costs 900w
-	// undiscounted - keep 900w << 150 or ending episodes (including CONCEDING)
-	// becomes attractive.
+	// must stay small vs GoalReward: at weight w a 30s episode costs 450w
+	// (15Hz steps at tickSkip 8; re-derive if tickSkip changes) undiscounted -
+	// keep 450w << 150 or ending episodes (including CONCEDING) becomes attractive.
 	class TimeCostReward : public Reward {
 	public:
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
@@ -371,14 +371,15 @@ namespace RLGC {
 	// walls, so wall-pinned touches pay exactly 0; the ball-height ramp starts
 	// at 150uu (rest ball = 93, current mean touch = 193 -> pays ~0). The
 	// impulse factor kills carry annuities; the refire cooldown caps juggle
-	// self-rally at ~1.25 payouts/s. Wrap in ZeroSumReward(_, 0). Do NOT gate.
+	// self-rally at ~1.25 payouts/s (1 / the 0.8s cooldown, tickSkip-invariant).
+	// Wrap in ZeroSumReward(_, 0). Do NOT gate.
 	class AerialTouchReward : public Reward {
 	public:
 		constexpr static float BALL_MIN_Z = 150;            // below this pays 0
 		constexpr static float BALL_FULL_Z = 1450;           // full height credit at/above
 		constexpr static float MAX_CREDIT_AIR_TIME = 1.75f;  // seconds of flight for full air credit
 		constexpr static float FULL_CREDIT_DELTA_V = 500;    // uu/s of ball delta-v for full credit
-		constexpr static int REFIRE_COOLDOWN_STEPS = 24;     // ~0.8s at tickSkip 4 (30Hz steps); re-derive if tickSkip changes
+		constexpr static int REFIRE_COOLDOWN_STEPS = 12;     // ~0.8s at tickSkip 8 (15Hz steps); re-derive if tickSkip changes
 
 		std::vector<int> stepsSincePay; // per player.index; per-arena instance, so safe
 

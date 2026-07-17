@@ -15,7 +15,9 @@ vs P(unattended | trunk didn't know).
     exploration bottleneck -> optimism levers (drills, attempt-paying PBRS).
 
 Frames are stored step-major (arena, then player), so within one episode the sorted
-rows alternate blue/orange; step index = position // 2, dt = 1/30 s. All geometry here
+rows alternate blue/orange; step index = position // 2, dt = the dataset's decision
+step (tick_skip/120, saved by collect_dataset since the 5.0 migration; older archives
+lack the field and were all collected at tickSkip 4 = 1/30 s). All geometry here
 is WORLD frame (labels are world-frame; probe predictions are de-canonicalized).
 
 phys columns: ball pos 0:3 vel 3:6 angVel 6:9 | blue pos 9:12 vel 12:15 angVel 15:18
@@ -38,16 +40,23 @@ DATA_DIR = HERE / "data"
 RESULTS_DIR = HERE / "results"
 PLOTS_DIR = RESULTS_DIR / "plots"
 
-DT = 1 / 30.0
 KNOW_ERR_UU = 500.0        # trunk "knows" if OOF landing prediction within this
 ATTEND_RADIUS_UU = 500.0   # car within this of the landing point at touchdown = attended
 CONTEST_DEV_UU = 300.0     # actual ball deviates this much from ball-only landing = touched in flight
 FEASIBLE_SPEED = 1300.0    # uu/s straight-line budget (< non-boost max 1410) to call arrival feasible
 
 
+def dataset_dt(data) -> float:
+    """Decision-step seconds of the rollout that wrote dataset.npz. 5.0 datasets
+    carry tick_skip (collect_dataset saves it); older archives predate the field
+    and were all collected at tickSkip 4 + actionDelay 3 => 1/30 s."""
+    return (float(data["tick_skip"]) if "tick_skip" in data.files else 4.0) / 120.0
+
+
 def main():
     data = np.load(DATA_DIR / "dataset.npz")
     lab = np.load(DATA_DIR / "labels.npz")
+    dt = dataset_dt(data)
     team, episode = data["team"], data["episode"]
     phys = data["phys"]
     valid = lab["valid"]
@@ -93,7 +102,7 @@ def main():
         s0 = row_step[r]
         L = labels[r, :2]
         t_land = labels[r, 2]
-        s_land = s0 + int(round(t_land / DT))
+        s_land = s0 + int(round(t_land / dt))
         if s_land >= len(rows_b):
             censored[k] = True
             continue

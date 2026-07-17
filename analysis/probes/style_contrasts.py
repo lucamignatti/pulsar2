@@ -37,8 +37,8 @@ RESULTS_DIR = HERE / "results"
 
 SEED = 20260716
 ALPHAS = [-2.0, -1.0, 1.0, 2.0]
-ROWS_PER_S = 60          # interleaved rows per second (2 players x 30Hz)
-DT = 1 / 30.0
+DT = cd.TICK_SKIP / 120.0            # decision-step seconds, follows collect_dataset
+ROWS_PER_S = int(round(2 / DT))      # interleaved rows per second (2 players x 1/DT)
 
 
 def _episode_index(rec):

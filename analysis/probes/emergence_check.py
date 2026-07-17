@@ -3,6 +3,13 @@
 For each checkpoint: mechanic-fragment rates (the RND leading indicators),
 pace metrics (the energy-PBRS judge), and PLASTICITY measurements (dormant
 trunk units + activation effective rank - the 'can it still learn?' answer).
+
+CROSS-LINEAGE CAVEAT (5.0 dynamics, 2026-07-16): the per-100k-STEP counters
+(takeoff_attempts, airborne_jump, proto_dribble) count decision steps, and a
+5.0 step (tickSkip 8) spans 2x the sim-time of a 4.0 step (tickSkip 4 +
+actionDelay 3). To compare against 4.0-era curves, divide the 5.0 counter by
+2 (or double the 4.0 value). Fractions (aerial_touch_frac, *_frac) are
+per-step-invariant and safe either way.
 """
 
 import json

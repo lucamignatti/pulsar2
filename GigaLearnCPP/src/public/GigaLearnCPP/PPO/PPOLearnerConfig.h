@@ -37,14 +37,15 @@ namespace GGL {
 
 		// HER goal sampling
 		int ballHerMinOffset = 1;
-		int ballHerMaxOffset = 90;
+		int ballHerMaxOffset = 45;  // ~3s at tickSkip 8 (15Hz steps) - a REAL-TIME window; re-derive if tickSkip changes (was 90 at ts4)
 		float ballHerShortBiasPower = 2;
 		// Chance of targeting the most-goalward achieved state in the window instead of a
 		// short-biased random one, so near-net states populate the goal space and the fixed
 		// scoring query goal stays in-distribution
 		float ballHerGoalwardBias = 0.5f;
 		int carHerMinOffset = 1;
-		int carHerMaxOffset = 20;
+		int carHerMaxOffset = 10;   // ~0.67s at tickSkip 8 - REAL-TIME window feeding the steering rho-band contact
+		                            // gate ("commit where the race is a coin-flip"); re-derive if tickSkip changes (was 20 at ts4)
 		float carHerShortBiasPower = 2;
 		// Third goal-space head: canonical CAR pos+vel ("where can my car be, moving
 		// how") - the movement-capability frontier for the META steering system. The
@@ -53,12 +54,16 @@ namespace GGL {
 		// analysis/probes/carstate_head_validate.py): its calibration curve is monotone
 		// with ~7x the ball head's margin at every candidate window - the sharpest
 		// frontier detector of the three heads. The window below was chosen BY
-		// calibration margin across {20,45,90}, not by hand. Actuation stays gated
+		// calibration margin across {20,45,90}, not by hand - AT tickSkip 4; that
+		// calibration is VOID at ts8. Deliberately HELD at 45 (2026-07-17): it is an
+		// empirical choice, not a real-time design like the two windows above, so it
+		// waits for a carstate_head_validate.py re-run on ts8 data instead of blind
+		// halving. Actuation stays gated
 		// live (meta head-validity + per-cluster causal gates). Resume-safe: a missing
 		// reach_psi_carstate.lt initializes fresh (ModelSet::Load allowNotExist).
 		bool carStateHead = false;
 		int carStateHerMinOffset = 1;
-		int carStateHerMaxOffset = 45;
+		int carStateHerMaxOffset = 45; // ts4-calibrated (void at ts8); re-calibration pending, see comment above
 		// Gradient coupling of the car-state InfoNCE into the shared state-action encoder
 		// (phi -> trunk). 0 = fully detached: only psi_carstate trains, exactly the
 		// offline-validated frozen-phi regime. 2026-07-14 incident: this head shipped
@@ -214,7 +219,8 @@ namespace GGL {
 	// sign bug reads negative there within minutes on a goal-dense checkpoint.
 	struct GoalCriticConfig {
 		bool enabled = false;
-		float gamma = 0.9997f;      // ~77s half-life at 30Hz (tickSkip 4) — the "huge distance" horizon
+		float gamma = 0.9997f;      // STEP-denominated "huge distance" horizon: ~77s at tickSkip 4 (30Hz) but ~154s at
+		                            // tickSkip 8 (15Hz) — re-derive per tickSkip in your main (5.0 overrides to 0.9994 ≈ 77s at 15Hz)
 		float beta = 0.25f;         // blended advantage fraction (std-matched); 0 = train critic, no blend
 		float lr = 1.5e-4f;
 		PartialModelConfig model;   // independent net, raw obs -> 1; set layerSizes in your main

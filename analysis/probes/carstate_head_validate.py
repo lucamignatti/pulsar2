@@ -39,7 +39,10 @@ HERE = Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
 SEED = 20260723
 TAU = 0.02          # ReachabilityConfig::tau
-WINDOWS = [20, 45, 90]
+# ts8 re-calibration (2026-07-17): the ts4-era family {20,45,90} is void at 15Hz.
+# {10,22,45} = the real-time equivalents of ts4 {20,45,90}; 20 kept as the
+# same-step-count bridge to the ts4 result; 90 = the long tail (6s).
+WINDOWS = [10, 20, 22, 45, 90]
 SWEEP_ALPHAS = [0.0, 0.5, 1.0]
 
 

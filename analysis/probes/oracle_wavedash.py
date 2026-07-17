@@ -1,6 +1,12 @@
 """ORACLE wavedash — what success rate can a PERFECT policy achieve through our
 control interface (tickSkip 4, actionDelay 3, 90-action table)?
 
+PINNED 4.0 DYNAMICS - INTENTIONALLY NOT MIGRATED to 5.0 (2026-07-16): the ts4
+interface ceiling IS the question this oracle answered (arena.step(4) + 30Hz
+decision constants throughout; result recorded vs the 4.0 bot's 11.2%). Asking
+the same question of the 5.0 interface (tickSkip 8, actionDelay 0) is a NEW
+experiment - re-derive every decision-count constant, don't just rerun this.
+
 Car spawned falling forward (dodge available), scripted executor issues the
 forward-flip action at trigger offset k decisions before predicted touchdown;
 success = the same detector the census/probe used (horizontal speed gain

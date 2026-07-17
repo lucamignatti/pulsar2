@@ -11,7 +11,7 @@ import torch
 import RocketSim as rs
 from fear_decomp import copy_newest
 from load_checkpoint import load_models
-from steer_team import (NONE, TEAMMATE, WON, SteeredPolicyRho,
+from steer_team import (DT, NONE, TEAMMATE, WON, SteeredPolicyRho,
                         derive_team_direction, rollout_team, team_metrics)
 from team_decline_probe import decline_readings, cluster_boot_diff
 from team_gate_validate import TeamGatedPolicy, fmt
@@ -62,7 +62,7 @@ def backfill_metric(rec, rd):
     row_pos = np.empty(len(slot), np.int64)
     for rows in ep_rows.values():
         row_pos[rows] = np.arange(len(rows))
-    k = int(round(1.5 * 30))
+    k = int(round(1.5 / DT))
     vals, eps = [], []
     sub = np.flatnonzero(rd["feas_self"] & rd["best_placed"] & rd["pursued_self"])
     for i in sub:

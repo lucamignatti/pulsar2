@@ -10,7 +10,7 @@ import torch
 
 import RocketSim as rs
 from load_checkpoint import copy_checkpoint, load_models
-from steer_team import (NONE, WON, SteeredPolicyRho, derive_team_direction,
+from steer_team import (DT, NONE, WON, SteeredPolicyRho, derive_team_direction,
                         rollout_team, team_metrics, team_possession_readings)
 from team_decline_probe import decline_readings
 from team_gate_validate import TeamGatedPolicy, fmt
@@ -32,7 +32,7 @@ def premeditation_direction(rec, rng, max_rows=120_000):
     row_pos = np.empty(len(slot), np.int64)
     for rows in ep_rows.values():
         row_pos[rows] = np.arange(len(rows))
-    k = int(round(TOUCH_HORIZON_S * 30))
+    k = int(round(TOUCH_HORIZON_S / DT))
 
     n = len(slot)
     idx = rng.permutation(n)[:max_rows]

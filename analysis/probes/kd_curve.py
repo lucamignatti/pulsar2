@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 import RocketSim as rs
-from collect_dataset import NUM_ARENAS, ArenaEnv
+from collect_dataset import NUM_ARENAS, TICK_SKIP, ArenaEnv
 from label_landing import simulate_landing
 from load_checkpoint import PulsarPolicy, load_models
 from sklearn.linear_model import RidgeCV
@@ -32,7 +32,10 @@ CACHE = HERE / "data" / "version_cache"
 SEED = 99
 ROWS = 40_000
 N_POINTS = 7
-DT = 1 / 30.0
+# Follows collect_dataset's dynamics. NB: the 3.1 policy_versions this script
+# replays were trained at tickSkip 4 + actionDelay 3 - for faithful archaeology
+# set collect_dataset back to 4/3/10 (see its migration comment).
+DT = TICK_SKIP / 120.0
 KNOW_ERR = 500.0
 ATTEND = 500.0
 FEASIBLE_SPEED = 1300.0

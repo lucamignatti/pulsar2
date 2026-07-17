@@ -11,7 +11,7 @@ import torch
 import RocketSim as rs
 from fear_decomp import copy_newest
 from load_checkpoint import load_models
-from steer_team import (ACTION_TABLE, BACK_WALL_Y, SIDE_WALL_X,
+from steer_team import (ACTION_TABLE, BACK_WALL_Y, DT, SIDE_WALL_X,
                         SteeredPolicyRho, TeamArenaEnv, rollout_team,
                         set_team_air_drill, _face_ball)
 from team_decline_probe import decline_readings
@@ -53,7 +53,7 @@ def opportunity_conversion(rec, ppt):
         r = int(rd["row"][i])
         rows = ep_rows[int(episode[r])]
         q = int(row_pos[r])
-        q_land = q + npl * int(round(rd["t_land"][i] * 30))
+        q_land = q + npl * int(round(rd["t_land"][i] / DT))
         got_air = False
         got_touch = False
         for qq in range(q, min(len(rows), q_land + 1), npl):
@@ -97,7 +97,7 @@ def roll_track(env, policy, seconds, track_car=0):
         env.arena.step(TICK_SKIP - ACTION_DELAY)
         st = env.cars[track_car].get_state()
         max_z = max(max_z, float(st.pos.z))
-        if not st.is_on_ground and step < 30:
+        if not st.is_on_ground and step < steps_1s:
             jumped_1s = True
         bhi = st.ball_hit_info
         if bhi.is_valid and bhi.tick_count_when_hit > start and touch_z is None:

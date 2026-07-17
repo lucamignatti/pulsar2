@@ -14,7 +14,7 @@ import torch
 import RocketSim as rs
 from advanced_obs import ACTION_TABLE
 from load_checkpoint import load_models
-from steer_team import SteeredPolicyRho, rollout_team
+from steer_team import DT, SteeredPolicyRho, rollout_team
 
 HERE = Path(__file__).resolve().parent
 SEED = 20260737
@@ -49,7 +49,7 @@ def analyze(models, ppt):
     row_pos = np.empty(n, np.int64)
     for rows in ep_rows.values():
         row_pos[rows] = np.arange(len(rows))
-    k = int(1.5 * 30)
+    k = int(round(1.5 / DT))
     conv = []
     nu_idx = np.flatnonzero(near_unc)
     stride = max(1, len(nu_idx) // 4000)

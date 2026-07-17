@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
 
 SEED = 20260715
-DT = 1 / 30.0
+DT = cd.TICK_SKIP / 120.0  # decision-step seconds, follows collect_dataset's dynamics
 ARM_Z = 300.0
 FEASIBLE_SPEED = 1300.0
 ATTEND_RADIUS = 500.0
