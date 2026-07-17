@@ -619,7 +619,9 @@ int main(int argc, char* argv[]) {
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).
-	cfg.checkpointFolder = "checkpoints_5.0"; // COLD START 2026-07-16 (PULSAR5.md); 4.0 archived in place
+	cfg.checkpointFolder = "checkpoints_5.0v3"; // v3-ENGINE COLD START 2026-07-17: the engine swap invalidates
+	                                            // v2-physics checkpoints, so the v2 5.0 lineage stays archived in
+	                                            // checkpoints_5.0 and this run starts fresh (PULSAR5.md design unchanged)
 	cfg.metricsRunName = "4.0-team";
 
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
