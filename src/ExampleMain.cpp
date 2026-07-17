@@ -793,6 +793,13 @@ int main(int argc, char* argv[]) {
 	// possession-win rate steered-vs-control. Unfakeable by empty flight; doesn't age with
 	// style. League old-style exposure raised below to patch the measured exploitability.
 	cfg.steering.enabled = true;
+	// YOUNG-RUN GUARD BAND (2026-07-17): the default peak-drawdown trip (110) was
+	// tuned for the mature 4.0 noise band (+-30-50); a formative-phase run
+	// legitimately oscillates +-80 around a steep climb and tripped the latch three
+	// times on pure volatility (2x post-flip on 5.0, 1x at 2.7B on 5.0v3 - trend
+	// rising, no pathology each time). 200 stays outside young-run noise while
+	// still catching a real collapse. TIGHTEN back toward 110 at maturity.
+	cfg.steering.ratingPeakTrip = 200.0f;
 	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
 	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
 	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
