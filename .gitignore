@@ -77,3 +77,9 @@ run_logs/
 analysis/probes/data/
 __pycache__/
 analysis/probes/wandb/
+
+# Serena MCP tool cache
+.serena/
+
+# RocketSimV3 cargo build output
+GigaLearnCPP/RLGymCPP/RocketSimV3/target/

@@ -17,9 +17,19 @@ if(NOT MSVC)
     target_compile_options(RLGymCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
 endif()
 
-# Include RocketSim
-add_subdirectory("RocketSim")
-target_link_libraries(RLGymCPP RocketSim)
+# Engine selection: v3 (vendored Rust engine + compat facade, the default since
+# the 2026-07-17 switch) vs the legacy vendored C++ v2.1.1. The v3 compat layer
+# still reuses v2's math/constants headers, so the RocketSim/ tree must stay
+# present either way.
+option(GGL_ROCKETSIM_V3 "Use the vendored v3 Rust engine via the compat layer" ON)
+if(GGL_ROCKETSIM_V3)
+    add_subdirectory("RocketSimV3")
+    target_link_libraries(RLGymCPP RocketSimV3)
+    target_compile_definitions(RLGymCPP PUBLIC RG_ROCKETSIM_V3)
+else()
+    add_subdirectory("RocketSim")
+    target_link_libraries(RLGymCPP RocketSim)
+endif()
 
 # Include thread pool library (https://github.com/DeveloperPaul123/thread-pool)
 target_include_directories(RLGymCPP PUBLIC "thread_pool")

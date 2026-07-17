@@ -1,7 +1,13 @@
 #pragma once
 
+#ifdef RG_ROCKETSIM_V3
+// v3 Rust engine behind the v2-compatible facade (see RocketSimV3/README.md)
+#include "../RocketSimV3/compat/RocketSim.h"
+#include "../RocketSimV3/compat/GameEventTracker.h"
+#else
 #include "../RocketSim/src/RocketSim.h"
 #include "../RocketSim/src/Sim/GameEventTracker/GameEventTracker.h"
+#endif
 
 // Use RocketSim namespace
 using namespace RocketSim;

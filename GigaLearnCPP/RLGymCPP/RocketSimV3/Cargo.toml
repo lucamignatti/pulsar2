@@ -1,0 +1,27 @@
+[workspace]
+package.version = "0.2.0"
+package.license-file = "LICENSE.rocketsim"
+resolver = "3"
+members = [
+  "rocketsim",
+  "rocketsim_derive",
+  "rocketsim_ffi",
+]
+
+[workspace.dependencies]
+glam = { version = "0.33.0", features = ["debug-glam-assert"] }
+rustc-hash = "2.1.2"
+
+[profile.dev]
+opt-level = 1
+
+# lto + panic=abort mirror upstream; abort is also required for FFI soundness
+# (a Rust panic must never unwind into the C++ trainer).
+[profile.release]
+debug = false
+lto = true
+panic = "abort"
+
+[profile.test]
+opt-level = 0
+debug = true

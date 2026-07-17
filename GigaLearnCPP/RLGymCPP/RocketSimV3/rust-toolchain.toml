@@ -1,0 +1,6 @@
+# The vendored engine uses const-generic inference (generic_arg_infer) not yet
+# available on older stable; pinned to the nightly this migration was validated on.
+# rustup auto-installs this channel on first `cargo` invocation in this tree.
+[toolchain]
+channel = "nightly-2026-07-16"
+profile = "minimal"

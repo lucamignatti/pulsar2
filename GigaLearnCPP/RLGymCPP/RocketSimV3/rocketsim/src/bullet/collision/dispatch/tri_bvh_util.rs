@@ -1,0 +1,52 @@
+use glam::Vec4;
+
+use crate::{
+    bullet::collision::shapes::{
+        triangle_callback::{ProcessQuadRayTriangle, ProcessTriangle},
+        triangle_mesh::TriangleMesh,
+        triangle_shape::TriangleShape,
+    },
+    shared::bvh::{ProcessNode, ProcessQuadRayNode},
+};
+
+pub struct NodeOverlapCallback<'a, T: ProcessTriangle> {
+    tris: &'a [TriangleShape],
+    callback: &'a mut T,
+}
+
+impl<'a, T: ProcessTriangle> NodeOverlapCallback<'a, T> {
+    pub fn new(mesh_interface: &'a TriangleMesh, callback: &'a mut T) -> Self {
+        Self {
+            tris: mesh_interface.get_tris(),
+            callback,
+        }
+    }
+}
+
+impl<T: ProcessTriangle> ProcessNode for NodeOverlapCallback<'_, T> {
+    fn process_node(&mut self, node_triangle_idx: usize) {
+        self.callback
+            .process_triangle(&self.tris[node_triangle_idx], node_triangle_idx);
+    }
+}
+
+pub struct QuadRayNodeOverlapCallback<'a, T: ProcessQuadRayTriangle> {
+    tris: &'a [TriangleShape],
+    callback: &'a mut T,
+}
+
+impl<'a, T: ProcessQuadRayTriangle> QuadRayNodeOverlapCallback<'a, T> {
+    pub fn new(mesh_interface: &'a TriangleMesh, callback: &'a mut T) -> Self {
+        Self {
+            tris: mesh_interface.get_tris(),
+            callback,
+        }
+    }
+}
+
+impl<T: ProcessQuadRayTriangle> ProcessQuadRayNode for QuadRayNodeOverlapCallback<'_, T> {
+    fn process_node(&mut self, triangle_idx: usize, active_mask: u8, lambda_max: &mut Vec4) {
+        self.callback
+            .process_node(&self.tris[triangle_idx], active_mask, lambda_max);
+    }
+}

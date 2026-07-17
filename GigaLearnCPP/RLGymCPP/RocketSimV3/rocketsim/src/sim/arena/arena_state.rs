@@ -1,0 +1,40 @@
+use crate::{BallState, BoostPadConfig, BoostPadState, CarInfo, CarState, GameMode, TileStates};
+
+#[derive(Debug, Clone)]
+pub struct ArenaState {
+    pub(crate) game_mode: GameMode,
+    pub tick_count: u64,
+    pub cars: Vec<(CarInfo, CarState)>,
+    pub ball: BallState,
+    pub boost_pads: Vec<(BoostPadConfig, BoostPadState)>,
+    pub tile_states: Option<TileStates>,
+}
+
+impl ArenaState {
+    #[must_use]
+    pub const fn game_mode(&self) -> GameMode {
+        self.game_mode
+    }
+
+    #[must_use]
+    pub fn new_empty(game_mode: GameMode) -> Self {
+        Self {
+            game_mode,
+            tick_count: 0,
+            cars: Vec::new(),
+            ball: BallState::default(),
+            boost_pads: Vec::new(),
+            tile_states: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn num_cars(&self) -> usize {
+        self.cars.len()
+    }
+
+    #[must_use]
+    pub const fn num_boost_pads(&self) -> usize {
+        self.boost_pads.len()
+    }
+}

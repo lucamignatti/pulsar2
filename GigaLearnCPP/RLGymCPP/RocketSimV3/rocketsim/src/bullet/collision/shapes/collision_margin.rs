@@ -1,0 +1,1 @@
+pub const CONVEX_DISTANCE_MARGIN: f32 = 0.04;
