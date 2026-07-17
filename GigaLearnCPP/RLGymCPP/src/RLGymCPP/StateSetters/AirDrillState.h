@@ -42,6 +42,7 @@ namespace RLGC {
 		float minSpeed, maxSpeed;   // car climb speed toward the ball
 		float minBoost;
 		float supportMinDist, supportMaxDist; // Team play: grounded non-climber spawn ring (goal-side arc)
+		float soloFrac = 0.5f; // chance the drill is UNCONTESTED (see solo-completion comment below)
 		std::shared_ptr<AirDrillCurriculum> curriculum; // NULL = fixed classic behavior
 
 		AirDrillState(
@@ -192,10 +193,26 @@ namespace RLGC {
 				if (teamCars[t].size() > 1)
 					climberIdx[t] = RandInt(0, (int)teamCars[t].size());
 
+			// SOLO-COMPLETION VARIANT (2026-07-17, break-even seeding): with soloFrac
+			// chance, only ONE team's climber contests - the other's spawns as a far
+			// grounded support. Measured mechanism (aerial_gap census 575M->4B on
+			// 5.0v3): contested drills reach a MUTUAL-BAIL equilibrium (completion
+			// 33%->12% while ground skill grows; zero-sum self-play never punishes
+			// symmetric bailing - the collective-decline structure inside the drill).
+			// A free completion always pays (TouchAccel + AerialTouch, no race lost),
+			// putting attempts unconditionally above break-even until the skill exists
+			// to win contested versions.
+			bool solo = RandFloat(0, 1) < soloFrac;
+			int soloTeam = RandInt(0, 2);
+
 			// Climbers first so the aerial contest is never crowded out by support placement
 			for (int t = 0; t < 2; t++)
-				if (!teamCars[t].empty())
-					fnSetClimber(teamCars[t][climberIdx[t]]);
+				if (!teamCars[t].empty()) {
+					if (solo && t != soloTeam)
+						fnSetSupport(teamCars[t][climberIdx[t]], (Team)t);
+					else
+						fnSetClimber(teamCars[t][climberIdx[t]]);
+				}
 
 			for (int t = 0; t < 2; t++)
 				for (int i = 0; i < (int)teamCars[t].size(); i++)
