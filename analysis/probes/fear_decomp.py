@@ -16,7 +16,7 @@ from team_decline_probe import decline_readings
 
 HERE = Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
-LIVE_ROOT = HERE.parents[1] / "build" / "checkpoints_5.0"
+LIVE_ROOT = HERE.parents[1] / "build" / "checkpoints_5.0v3"
 SEED = 20260728
 PPT = 2
 NPL = 2 * PPT
