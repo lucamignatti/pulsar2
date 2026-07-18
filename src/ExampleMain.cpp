@@ -800,6 +800,9 @@ int main(int argc, char* argv[]) {
 	// rising, no pathology each time). 200 stays outside young-run noise while
 	// still catching a real collapse. TIGHTEN back toward 110 at maturity.
 	cfg.steering.ratingPeakTrip = 200.0f;
+	// ...and the EMA variant likewise (75 -> 150; it tripped on the same +-80
+	// young-run wobble at 14B). Both tighten together at maturity.
+	cfg.steering.ratingDrawdownTrip = 150.0f;
 	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
 	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
 	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
