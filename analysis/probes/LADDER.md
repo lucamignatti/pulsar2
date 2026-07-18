@@ -36,3 +36,21 @@ economies - the Muon/carstate lessons), 2 (map never touches trunk), 4
 (probes detached), 6 (wire+drive together), 7 (off=identical). Law 5 note:
 our retired steering WAS a direction-conditioning-adjacent mechanism; the
 ladder replaces it, consistent with the user's Stage-2 protocol.
+
+## AUTHORIZATION (user, 2026-07-18): IMPLEMENT IN FULL
+
+"This is all tested and working. go ahead and implement it in full."
+- The mechanism is validated in the source codebase; the spec's V1-V4 staged
+  validation is WAIVED as a gate (upstream evidence stands). Retain only this
+  repo's own deployment ritual: V0 invariant unit checks (esp. the truncation
+  -boundary mask audit on the existing drive), compile-check tree, CPU smoke,
+  branch backup, deploy, panels, latch coverage, revert flag.
+- Build in one session, in this order: map nets + own optimizer (Laws 1/2) ->
+  banks + V_metric calibration -> gap_PK + combined drive Phi=-(gKD+gPK) with
+  all masks incl. impossible-control rows -> 5-input wire with zero-init
+  policy-head extension (517) computed fused at collection, re-derived at learn
+  with collection-time bank embeddings + calibration snapshot (spec 2.5) ->
+  impossible-control drill family + probe telemetry -> smoke -> deploy.
+- Steering actuation stays OFF (already done). Fear drills/census/telemetry
+  stay ON. Rollback anchor: checkpoints_5.0v3_branch_backup/15300219140 +
+  golden archive.
