@@ -67,6 +67,36 @@ struct GGL::RndState {
 	}
 };
 
+// Introspective frontier drive, Stage-1 SENSOR (LearnerConfig.h GapSensorConfig):
+// expectile twin of the critic on DETACHED trunk output, same GAE value targets,
+// asymmetric loss -> converges to the tau-expectile ("returns when it goes well").
+// Observer only in this stage; persisted as GAP_EXP.lt.
+struct GGL::GapState {
+	torch::nn::Sequential exp{ nullptr };
+	std::shared_ptr<torch::optim::Adam> optim;
+	std::filesystem::path loadFrom;
+	int64_t updates = 0;
+
+	void Build(int64_t featIn, torch::Device device, float lr) {
+		exp = torch::nn::Sequential(
+			torch::nn::Linear(featIn, 256), torch::nn::LeakyReLU(),
+			torch::nn::Linear(256, 256), torch::nn::LeakyReLU(),
+			torch::nn::Linear(256, 1));
+		if (!loadFrom.empty() && std::filesystem::exists(loadFrom / "GAP_EXP.lt")) {
+			try {
+				torch::load(exp, (loadFrom / "GAP_EXP.lt").string());
+				updates = 1000;
+				RG_LOG("Gap sensor loaded from " << loadFrom);
+			} catch (const std::exception& e) {
+				RG_LOG("Gap sensor load failed (" << e.what() << ") - starting fresh");
+			}
+		}
+		loadFrom.clear();
+		exp->to(device);
+		optim = std::make_shared<torch::optim::Adam>(exp->parameters(), lr);
+	}
+};
+
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
 {
@@ -86,6 +116,8 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	// the feature width comes from the real trunk output, not a config guess)
 	if (config.rndOptimism.enabled)
 		rnd = std::make_shared<RndState>();
+	if (config.gapSensor.enabled)
+		gapSensor = std::make_shared<GapState>();
 
 	RG_LOG("Learner::Learner():");
 
@@ -522,6 +554,8 @@ void GGL::Learner::Save() {
 		torch::save(rnd->pred, (saveFolder / "RND_PRED.lt").string());
 		torch::save(rnd->target, (saveFolder / "RND_TARGET.lt").string());
 	}
+	if (gapSensor && gapSensor->exp)
+		torch::save(gapSensor->exp, (saveFolder / "GAP_EXP.lt").string());
 	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
 	std::filesystem::rename(saveFolder, finalFolder);
 
@@ -607,6 +641,8 @@ void GGL::Learner::Load() {
 		// EMERGENCE RC1: remember where the RND self-model lives; consumed at lazy build
 		if (config.rndOptimism.enabled && rnd)
 			rnd->loadFrom = loadFolder;
+		if (config.gapSensor.enabled && gapSensor)
+			gapSensor->loadFrom = loadFolder;
 
 		if (config.bootSanityCheckEnabled) {
 			float claimedRating = 0;
@@ -4457,6 +4493,82 @@ void GGL::Learner::Start() {
 								report["RND/Loss"] = lossSum / lossN;
 						}
 						report["RND/Time"] = rndTimer.Elapsed();
+					}
+
+					// ===== INTROSPECTIVE FRONTIER DRIVE, Stage 1: gap sensor (observer) =====
+					// Expectile twin on DETACHED trunk output, trained on the same GAE value
+					// targets. gap = relu(V_exp - V_real). Panels only; the live bridge test
+					// evaluates the gap on the frozen FEAR PANEL states - agreement of two
+					// independently built frontier detectors gates Stage 2 (wire + potential).
+					if (gapSensor && (int64_t)combinedTraj.Length() > 0 && tTargetVals.defined()) {
+						const auto& gc = config.gapSensor;
+						Timer gapTimer = {};
+						int64_t nAll = combinedTraj.Length();
+						int64_t chunk = RS_MAX((int64_t)8192, (int64_t)ppo->config.miniBatchSize);
+						auto tTgt = tTargetVals.to(torch::kFloat32).flatten();
+
+						// train one subsample pass (grad locally re-enabled; expectile loss)
+						{
+							torch::AutoGradMode _gapGradOn(true);
+							auto perm = torch::randperm(nAll,
+								torch::TensorOptions().dtype(torch::kLong))
+								.slice(0, 0, RS_MIN((int64_t)gc.trainRows, nAll));
+							float lossSum = 0; int lossN = 0;
+							for (int64_t i = 0; i < perm.size(0); i += chunk) {
+								auto idx = perm.slice(0, i, RS_MIN(i + chunk, perm.size(0)));
+								torch::Tensor h2;
+								{
+									RG_NO_GRAD;
+									h2 = ppo->models["shared_head"]->Forward(
+										tStates.index_select(0, idx).to(ppo->device, true), false);
+								}
+								if (!gapSensor->exp)
+									gapSensor->Build(h2.size(1), ppo->device, gc.lr);
+								gapSensor->optim->zero_grad();
+								auto pred = gapSensor->exp->forward(h2).flatten();
+								auto u = tTgt.index_select(0, idx).to(ppo->device) - pred;
+								auto w = torch::where(u > 0,
+									torch::full_like(u, gc.tau), torch::full_like(u, 1.f - gc.tau));
+								auto loss = (w * u * u).mean();
+								loss.backward();
+								gapSensor->optim->step();
+								lossSum += loss.item<float>(); lossN++;
+							}
+							gapSensor->updates++;
+							if (lossN > 0)
+								report["Gap/Loss"] = lossSum / lossN;
+						}
+
+						// buffer-wide gap panels (no-grad, chunked, subsampled)
+						if (gapSensor->exp && gapSensor->updates >= 5) {
+							RG_NO_GRAD;
+							int64_t sample = RS_MIN((int64_t)65536, nAll);
+							auto idx = torch::randperm(nAll,
+								torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, sample);
+							auto h2 = ppo->models["shared_head"]->Forward(
+								tStates.index_select(0, idx).to(ppo->device, true), false);
+							auto vExp = gapSensor->exp->forward(h2).flatten().cpu();
+							auto vReal = tValPreds.to(torch::kFloat32).flatten().index_select(0, idx);
+							auto gap = torch::relu(vExp - vReal);
+							report["Gap/Mean"] = gap.mean().item<float>();
+							report["Gap/P90"] = gap.quantile(0.9).item<float>();
+							report["Gap/VExp Mean"] = vExp.mean().item<float>();
+							report["Gap/VReal Mean"] = vReal.mean().item<float>();
+
+							// the bridge: gap on the frozen fear-panel states
+							if (!fearPanelObs.empty() && obsSize > 0
+								&& fearPanelObs.size() % (size_t)obsSize == 0) {
+								int64_t k = (int64_t)(fearPanelObs.size() / (size_t)obsSize);
+								torch::Tensor pObs = torch::from_blob(fearPanelObs.data(),
+									{ k, (int64_t)obsSize }, torch::kFloat32).to(ppo->device);
+								auto ph2 = ppo->models["shared_head"]->Forward(pObs, false);
+								auto pExp = gapSensor->exp->forward(ph2).flatten();
+								auto pReal = ppo->InferCritic(pObs).to(torch::kFloat32).flatten();
+								report["Gap/Fear Panel"] =
+									torch::relu(pExp - pReal).mean().item<float>();
+							}
+						}
+						report["Gap/Time"] = gapTimer.Elapsed();
 					}
 
 					// Set experience buffer

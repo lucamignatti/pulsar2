@@ -113,6 +113,9 @@ namespace GGL {
 		// from RND_PRED.lt/RND_TARGET.lt when the checkpoint carries them.
 		std::shared_ptr<struct RndState> rnd;
 
+		// Introspective frontier drive, Stage-1 gap sensor (opaque; GAP_EXP.lt)
+		std::shared_ptr<struct GapState> gapSensor;
+
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction
 

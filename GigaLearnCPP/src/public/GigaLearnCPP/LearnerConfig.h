@@ -253,6 +253,25 @@ namespace GGL {
 	// Injection obeys the rating latch; revert = enabled false. Nets persist as
 	// RND_PRED.lt / RND_TARGET.lt in every checkpoint (a fresh predictor after a
 	// restart would misprice novelty for hours - the annealing state IS the model).
+	// INTROSPECTIVE FRONTIER DRIVE, Stage 1 (2026-07-18, user-directed port of the
+	// reviewed v2 spec): the GAP SENSOR only, as a detached OBSERVER. An expectile
+	// twin of the critic (tau, asymmetric loss) trained on the SAME GAE value
+	// targets, reading the trunk through detach() (pure probe - cannot reshape what
+	// it measures, per both the spec's v2 default and this repo's carstate-aux
+	// lesson). gap = relu(V_exp - V_real) is the network's own knowing-doing
+	// readout, validated in the source program at AUROC 0.75 (label-free failure
+	// prediction) + convergent validity vs an independent frontier detector.
+	// Stage 1 actuates NOTHING: panels only, including the live bridge test -
+	// gap evaluated on the frozen FEAR PANEL states (Gap/Fear Panel vs Gap/Mean;
+	// agreement of two independently built frontier detectors on OUR data is the
+	// pre-registered gate for Stage 2 = wire + gap-closing potential as one lever).
+	struct GapSensorConfig {
+		bool enabled = false;
+		float tau = 0.8f;        // expectile: "returns when it goes well"
+		float lr = 1e-4f;
+		int trainRows = 98304;
+	};
+
 	struct RndOptimismConfig {
 		bool enabled = false;
 		float weight = 0.1f;      // injected advantage-std fraction per 1z of novelty
@@ -365,6 +384,9 @@ namespace GGL {
 
 		// Frontier optimism (EMERGENCE RC1); additive and default-OFF (see struct above)
 		RndOptimismConfig rndOptimism = {};
+
+		// Introspective frontier drive, Stage-1 sensor; additive and default-OFF
+		GapSensorConfig gapSensor = {};
 
 		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
 		// unchanged unless psd.enabled / league.enabled are set.

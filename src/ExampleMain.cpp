@@ -940,6 +940,12 @@ int main(int argc, char* argv[]) {
 		// high-entropy window is the point; the 4.0 escalation to 0.3 was end-of-life
 		// dosing against a matured attractor, not the steady-state design.
 		cfg.rndOptimism.weight = 0.1f;
+		// INTROSPECTIVE FRONTIER DRIVE Stage 1 (2026-07-18, user-directed port): the
+		// detached gap sensor, observer-only. Watch: Gap/Loss falling, Gap/Mean,
+		// and the BRIDGE - Gap/Fear Panel vs Gap/Mean (two independent frontier
+		// detectors agreeing on our data gates Stage 2: wire + gap-closing
+		// potential as one lever, per the spec's ship-together rule).
+		cfg.gapSensor.enabled = true;
 	}
 
 	// Make the learner with the environment creation function and the config we just made
