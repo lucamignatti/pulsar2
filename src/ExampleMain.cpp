@@ -809,7 +809,10 @@ int main(int argc, char* argv[]) {
 	// punished failures are discarded. That one-way ratchet is how overcommit-then-concede
 	// compounded into an Elo bleed despite real head-to-head gains. A smaller push keeps the
 	// induced ratios mostly inside the clip window so both outcome signs teach.
-	cfg.steering.alpha = 0.5f;
+	// STAGE-2 PROTOCOL ACTIVE (2026-07-18): the gap drive replaces commitment
+	// steering - actuation OFF (alpha 0, styles 0 below), machinery/telemetry/drills
+	// stay up. Restore alpha 0.5 only if the drive is reverted.
+	cfg.steering.alpha = 0.0f;
 	// ESCALATE-1 (2026-07-16): 0.18 -> 0.30 - the fear-drill dose was ~6% of team
 	// resets and 10B steps moved neither Fear Panel zV nor Census NONE; this lineage
 	// is end-of-life (cold start decided), so it gets one full-dose final experiment.
@@ -857,7 +860,7 @@ int main(int argc, char* argv[]) {
 	// steering (2026-07-15, replacing the frozen steering_styles.json: pinned vectors rot
 	// within ~75M steps, so a checkpoint-stale file was diversity in name only; exploiter
 	// styles FAILED their offline bar and remain absent). Set chance 0 to turn off.
-	cfg.steering.opponentStyleChance = 0.25f;
+	cfg.steering.opponentStyleChance = 0.0f; // Stage-2 protocol (was 0.25)
 	// AttemptResolutionCondition is a STAGE-2 semantic; only attach it when termination is on
 	// (and only ever together with a dedicated practice-value baseline - see post-mortems).
 	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
@@ -960,6 +963,9 @@ int main(int argc, char* argv[]) {
 		// sensor learns the general form). Re-open only if a Gap/Rho Corr panel
 		// shows rho carrying frontier signal the gap misses.
 		cfg.gapSensor.enabled = true;
+		// STAGE 2a LIVE (user: "build it now", 2026-07-18): the gap-closing DRIVE at
+		// the spec's beta. Wire (2b) ships next session (policy-head surgery).
+		cfg.gapSensor.driveBeta = 0.05f;
 	}
 
 	// Make the learner with the environment creation function and the config we just made

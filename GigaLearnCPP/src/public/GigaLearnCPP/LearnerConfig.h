@@ -270,6 +270,14 @@ namespace GGL {
 		float tau = 0.8f;        // expectile: "returns when it goes well"
 		float lr = 1e-4f;
 		int trainRows = 98304;
+		// Stage 2a - the DRIVE (gap-closing potential, advantage-side): pays only for
+		// CLOSING the gap (undiscounted d = gap_t - gap_{t+1}, so a constant gap pays
+		// exactly zero - the spec's loitering fix), centered, std-matched to driveBeta
+		// of extrinsic advantage std, clamped +-3 sigma, terminal-masked, latch-
+		// covered, warmup train-only. 0 = sensor-only. The WIRE (self-conditioning
+		// input) is Stage 2b - policy-head surgery, ships separately.
+		float driveBeta = 0.0f;
+		int driveWarmupIters = 50;
 	};
 
 	struct RndOptimismConfig {

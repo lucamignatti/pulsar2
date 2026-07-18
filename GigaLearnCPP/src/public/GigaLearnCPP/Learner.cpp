@@ -4568,6 +4568,37 @@ void GGL::Learner::Start() {
 									torch::relu(pExp - pReal).mean().item<float>();
 							}
 						}
+						// Stage 2a DRIVE: gap-closing potential into the advantages
+						if (gapSensor->exp && gc.driveBeta > 0
+							&& gapSensor->updates >= gc.driveWarmupIters && !steerRatingTripped) {
+							RG_NO_GRAD;
+							torch::Tensor tGapAll = torch::empty({ nAll });
+							auto tVR = tValPreds.to(torch::kFloat32).flatten();
+							for (int64_t i = 0; i < nAll; i += chunk) {
+								int64_t end = RS_MIN(i + chunk, nAll);
+								auto h2 = ppo->models["shared_head"]->Forward(
+									tStates.slice(0, i, end).to(ppo->device, true), false);
+								tGapAll.slice(0, i, end).copy_(torch::relu(
+									gapSensor->exp->forward(h2).flatten().cpu()
+									- tVR.slice(0, i, end)));
+							}
+							// undiscounted closure, zeroed at episode boundaries
+							auto d = torch::zeros({ nAll });
+							d.slice(0, 0, nAll - 1) =
+								tGapAll.slice(0, 0, nAll - 1) - tGapAll.slice(0, 1, nAll);
+							auto notTerm = (tTerminals.to(torch::kFloat32).flatten() == 0)
+								.to(torch::kFloat32);
+							d = d * notTerm;
+							d = d - d.mean();
+							float advStd = tAdvantages.std().item<float>();
+							float dStd = d.std().item<float>();
+							if (dStd > 1e-8f && advStd > 1e-8f) {
+								auto inj = ((gc.driveBeta * advStd / dStd) * d)
+									.clamp(-3.f * advStd, 3.f * advStd);
+								tAdvantages = tAdvantages + inj;
+								report["Gap/Drive Inj Abs Mean"] = inj.abs().mean().item<float>();
+							}
+						}
 						report["Gap/Time"] = gapTimer.Elapsed();
 					}
 
