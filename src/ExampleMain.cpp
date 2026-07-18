@@ -945,6 +945,17 @@ int main(int argc, char* argv[]) {
 		// and the BRIDGE - Gap/Fear Panel vs Gap/Mean (two independent frontier
 		// detectors agreeing on our data gates Stage 2: wire + gap-closing
 		// potential as one lever, per the spec's ship-together rule).
+		// STAGE-2 PROTOCOL (user-directed 2026-07-18): when the drive (wire +
+		// potential) is enabled, STEERING ACTUATION goes OFF - alpha = 0 and
+		// opponentStyleChance = 0 - while steering.enabled stays TRUE so the fear
+		// drills, census, fear panel, and miner telemetry keep running (they live in
+		// the same code path but are orthogonal to steering pushes). The drive is
+		// the principled successor to commitment steering; running both would
+		// double-dose one axis and destroy attribution.
+		// Goal-reachability advantage: considered and DEFERRED (rho is coarse -
+		// AUC 0.7, bin-only doctrine; B2G pays goal progress reward-side; the gap
+		// sensor learns the general form). Re-open only if a Gap/Rho Corr panel
+		// shows rho carrying frontier signal the gap misses.
 		cfg.gapSensor.enabled = true;
 	}
 
