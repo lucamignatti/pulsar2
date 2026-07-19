@@ -61,8 +61,40 @@ void LeagueArchive::LoadInto(ModelSet& set, const std::vector<torch::Tensor>& pa
 	int i = 0;
 	for (const char* name : SCRATCH_MODELS) {
 		if (!set[name]) continue;
-		nn::utils::vector_to_parameters(params[i].to(device), set[name]->parameters());
-		set[name]->_seqHalfOutdated = true;
+		Model* mdl = set[name];
+		torch::Tensor p = params[i];
+
+		// Ladder wire migration for archived members: elites stored as flat vectors
+		// before the policy head gained its wire columns come up short by exactly
+		// out x expand elements of the FIRST Linear's weight. Zero-pad those columns
+		// row-wise (flat layout is row-major: weight rows first) - behaviorally
+		// exact, same rule as Model::Load.
+		auto cur = mdl->parameters();
+		int64_t curTotal = 0;
+		for (auto& c : cur)
+			curTotal += c.numel();
+		if (p.numel() != curTotal && mdl->allowInputExpand > 0
+			&& !cur.empty() && cur[0].dim() == 2) {
+			int64_t out = cur[0].size(0), inNew = cur[0].size(1);
+			int64_t inOld = inNew - mdl->allowInputExpand;
+			if (inOld > 0 && p.numel() == curTotal - out * mdl->allowInputExpand) {
+				auto w = p.slice(0, 0, out * inOld).view({ out, inOld });
+				auto wPad = torch::cat({ w,
+					torch::zeros({ out, (int64_t)mdl->allowInputExpand }, w.options()) }, 1)
+					.contiguous().flatten();
+				p = torch::cat({ wPad, p.slice(0, out * inOld) });
+				static bool loggedOnce = false;
+				if (!loggedOnce) {
+					loggedOnce = true;
+					RG_LOG("League: migrating pre-wire member vectors ("
+						<< inOld << " -> " << inNew << " policy inputs, zero-pad; "
+						"logged once, applies to every archived elite)");
+				}
+			}
+		}
+
+		nn::utils::vector_to_parameters(p.to(device), cur);
+		mdl->_seqHalfOutdated = true;
 		i++;
 	}
 }

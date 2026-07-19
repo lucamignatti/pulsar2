@@ -16,7 +16,8 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.batchSize % config.miniBatchSize != 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
 
-	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
+	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models,
+		config.extraPolicyInputs);
 
 	// Secondary goal-only critic: a fully independent net (raw obs in, no shared trunk) so its
 	// gradients can't touch the proven policy/critic path. Lives in `models` so it checkpoints and
@@ -63,17 +64,19 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	if (config.useGuidingPolicy) {
 		RG_LOG("Guiding policy enabled, loading from " << config.guidingPolicyPath << "...");
-		MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, guidingPolicyModels);
+		MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, guidingPolicyModels,
+			config.extraPolicyInputs);
 		guidingPolicyModels.Load(config.guidingPolicyPath, false, false);
 	}
 }
 
 void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
-	int obsSize, int numActions, 
+	int obsSize, int numActions,
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
-	torch::Device device, 
-	ModelSet& outModels) {
+	torch::Device device,
+	ModelSet& outModels,
+	int extraPolicyInputs) {
 
 	ModelConfig fullPolicyConfig = policyConfig;
 	fullPolicyConfig.numInputs = obsSize;
@@ -97,17 +100,65 @@ void GGL::PPOLearner::MakeModels(
 		outModels.Add(new Model("shared_head", fullSharedHeadConfig, device));
 	}
 
-	outModels.Add(new Model("policy", fullPolicyConfig, device));
+	// Ladder wire: the policy head reads trunk ++ wire; only the POLICY widens
+	// (critic/trunk untouched - the wire is policy perception, not value input)
+	fullPolicyConfig.numInputs += extraPolicyInputs;
+	Model* policyModel = new Model("policy", fullPolicyConfig, device);
+	policyModel->allowInputExpand = extraPolicyInputs; // pre-wire checkpoints zero-pad at load
+	outModels.Add(policyModel);
 
 	if (makeCritic)
 		outModels.Add(new Model("critic", fullCriticConfig, device));
+}
+
+torch::Tensor GGL::PPOLearner::MinBankDist(torch::Tensor emb, torch::Tensor bank, float dClamp) {
+	// d(x, y) = sum_j relu(x_j - y_j): nonneg, d(x,x)=0, triangle inequality,
+	// ASYMMETRIC by construction. The [chunk, bank, dims] broadcast is bounded to
+	// ~1M pair rows so a full-buffer call never materializes n x k x 32 at once.
+	int64_t n = emb.size(0), k = bank.size(0);
+	auto out = torch::empty({ n }, emb.options());
+	int64_t chunk = RS_MAX((int64_t)1, (int64_t)(1 << 20) / RS_MAX((int64_t)1, k));
+	for (int64_t i = 0; i < n; i += chunk) {
+		int64_t end = RS_MIN(i + chunk, n);
+		auto d = torch::relu(emb.slice(0, i, end).unsqueeze(1) - bank.unsqueeze(0)).sum(-1); // [c,k]
+		out.slice(0, i, end).copy_(std::get<0>(d.min(1)));
+	}
+	return out.clamp_max(dClamp);
+}
+
+torch::Tensor GGL::PPOLearner::ComputeWire(ModelSet& models, const LadderWire& lw,
+	torch::Tensor rawObs, torch::Tensor trunkOut, bool halfPrec) {
+	// The wire is an OBSERVATION: computed no-grad, detached - no gradient may reach
+	// the critic, the sensor, or the map through the policy input (Laws 2/4).
+	torch::NoGradGuard noGrad;
+	RG_ASSERT(models["critic"]); // V_real reads the same generation as the policy
+	// Non-const handles to the shared module impls (ModuleHolder shares, forward()
+	// is non-const; the guard above makes these reads mutation-free regardless)
+	torch::nn::Sequential exp = lw.exp, mapE = lw.mapE, mapF = lw.mapF;
+	auto trunkDet = trunkOut.detach();
+	auto vReal = models["critic"]->Forward(trunkDet, halfPrec).flatten().to(torch::kFloat32);
+	auto vExp = exp->forward(trunkDet).flatten().to(torch::kFloat32);
+	torch::Tensor vMet;
+	if (lw.banksReady) {
+		auto e = mapF->forward(mapE->forward(rawObs.detach().to(torch::kFloat32)));
+		auto dg = MinBankDist(e, lw.bankG, lw.dClamp);
+		auto dc = MinBankDist(e, lw.bankC, lw.dClamp);
+		// gamma^d in fp32 (the one numerically delicate op in the wire)
+		vMet = lw.a * torch::pow(lw.gamma, dg) + lw.a2 * torch::pow(lw.gamma, dc) + lw.b;
+	} else {
+		vMet = vExp; // neutral: gap_PK = 0 until both banks are seeded
+	}
+	auto gKD = torch::relu(vExp - vReal);
+	auto gPK = torch::relu(vMet - vExp);
+	return torch::tanh(torch::stack({ vReal, vExp, gKD, vMet, gPK }, -1) / lw.scale);
 }
 
 torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
 	float temperature, bool halfPrec,
-	torch::Tensor steerDelta) {
+	torch::Tensor steerDelta,
+	const LadderWire* ladder) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -124,6 +175,20 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	if (steerDelta.defined()) {
 		RG_ASSERT(models["shared_head"]); // the direction lives in trunk-output space
 		obs = obs + steerDelta.to(obs.device());
+	}
+
+	// Ladder wire: when the policy head carries extra input columns, fill them -
+	// live values on the trained-policy collection/learn paths, exact zeros
+	// everywhere else (eval/opponents/render/boot probe: both sides of any eval get
+	// the same zeros, and the zero-init migration makes zeros the identity input).
+	int64_t wireDims = (int64_t)models["policy"]->config.numInputs - obs.size(-1);
+	if (wireDims > 0) {
+		torch::Tensor wire;
+		if (ladder && ladder->active)
+			wire = ComputeWire(models, *ladder, rawObs, obs, halfPrec);
+		else
+			wire = torch::zeros({ obs.size(0), wireDims }, obs.options());
+		obs = torch::cat({ obs, wire.detach() }, -1);
 	}
 
 	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
@@ -165,9 +230,10 @@ void GGL::PPOLearner::InferActionsFromModels(
 	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor steerDelta) {
+	torch::Tensor steerDelta,
+	const LadderWire* ladder) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta, ladder);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -223,7 +289,7 @@ void GGL::PPOLearner::SetSteerGoal(torch::Tensor goal6Cpu, int head) {
 	steerGoalOverrideHead = head;
 }
 
-void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask, torch::Tensor steerRowModes, torch::Tensor styleVec, float styleCoef) {
+void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor steerRowMask, torch::Tensor steerRowModes, torch::Tensor styleVec, float styleCoef, const LadderWire* ladder) {
 	ModelSet& m = models ? *models : this->models;
 
 	bool anyActive = false;
@@ -342,7 +408,7 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 		steerDelta = steerDelta.defined() ? steerDelta + style : style;
 	}
 
-	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
+	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta, ladder);
 }
 
 torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
@@ -379,6 +445,17 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration) {
 	auto mseLoss = torch::nn::MSELoss();
 
+	// Ladder wire: a wired policy may NEVER learn against a silently-defaulted wire
+	// (a learn-time input differing from the collection-time input biases the PPO
+	// ratio - the spec's one hard rule for the re-derivation path). The Learner must
+	// set ladderLearn every iteration; consumed-once so staleness can't hide.
+	const bool ladderWired = config.extraPolicyInputs > 0;
+	if (ladderWired && !ladderLearnSet)
+		RG_ERR_CLOSE("PPOLearner::Learn(): policy carries " << config.extraPolicyInputs
+			<< " wire inputs but ladderLearn was not set this iteration - refusing to learn "
+			"against a defaulted wire (biased ratio). This is a bug in the Learner's "
+			"ladder handoff, not a recoverable state.");
+
 	MutAvgTracker
 		avgEntropy,
 		avgDivergence,
@@ -393,7 +470,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgReachBallAcc,
 		avgReachCarStateAcc,
 		avgReachCarStateLoss,
-		avgReachLoss;
+		avgReachLoss,
+		avgWireColGrad;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
@@ -444,7 +522,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// Get policy log probs and entropy
 					float curEntropy;
 					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
+						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false,
+							{}, ladderWired ? &ladderLearn : NULL);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
 						curEntropy = entropy.detach().cpu().item<float>();
@@ -654,6 +733,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				}
 			}
 
+			// Wire-column gradient watch (Law 6 under Muon: orthogonalizing optimizers
+			// can amplify near-null input columns into a random walk - this panel is
+			// how that would be seen). Read pre-clip: it's the raw pressure.
+			if (ladderWired && trainPolicy) {
+				auto params = models["policy"]->seq->parameters();
+				if (!params.empty() && params[0].dim() == 2 && params[0].grad().defined()) {
+					int64_t in = params[0].size(1);
+					avgWireColGrad += params[0].grad()
+						.slice(1, in - config.extraPolicyInputs, in).norm().item<float>();
+				}
+			}
+
 			if (trainPolicy)
 				nn::utils::clip_grad_norm_(models["policy"]->parameters(), 0.5f);
 			if (trainCritic)
@@ -721,6 +812,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["SB3 Clip Fraction"] = avgClip.Get();
 		report["Policy Update Magnitude"] = policyUpdateMagnitude;
 		report["Critic Update Magnitude"] = criticUpdateMagnitude;
+	}
+
+	if (ladderWired) {
+		if (avgWireColGrad.count > 0)
+			report["Ladder/Wire Col Grad"] = avgWireColGrad.Get();
+		ladderLearnSet = false; // consumed: the Learner must re-arm next iteration
 	}
 }
 

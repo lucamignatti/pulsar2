@@ -17,6 +17,7 @@
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include <RLGymCPP/StateSetters/FrontierDrillState.h>
+#include <RLGymCPP/StateSetters/ImpossibleInterceptState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
@@ -266,6 +267,18 @@ static bool IsPracticeArena(int index) {
 // makes any size checkpoint-compatible, so the viewer can watch 1v1/2v2/3v3 off the same run.
 static int g_RenderTeamSize = 0;
 
+// Optimistic-Critic Ladder: impossible-control drill family (LADDER.md 3.2) on the
+// LAST N arenas of the 1v1 block - the SAME rule the Learner uses for row tagging
+// and the injection mask, so the two sites agree by construction. Trailing indices
+// keep the league's low-index eval clones and the leading practice slice clear.
+static int g_NumImpossibleArenas = 0;
+static bool IsImpossibleArena(int index) {
+	if (g_NumImpossibleArenas <= 0)
+		return false;
+	int n1 = g_NumGames - g_NumArenas2v2 - g_NumArenas3v3; // 1v1 block = [0, n1)
+	return index >= n1 - g_NumImpossibleArenas && index < n1;
+}
+
 // Shared env body for the training and skill-eval create-funcs: everything except the
 // team size and the practice-terminal decision is identical (and the skill tracker
 // overwrites eval rewards/state setters/terminal conditions anyway — for eval arenas only
@@ -363,6 +376,15 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// ESCALATE-1: useFrac 0.35 -> 0.60 (with practiceArenaFrac 0.30, fear drills
 		// now ~18% of team resets vs the ~6% that measurably did nothing)
 		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.60f, 250, 250);
+	// Ladder impossible-control family: every reset in these arenas is a certified
+	// unachievable intercept (the ladder's standing falsification regression). The
+	// normal terminal conditions stay - GoalScoreCondition ends each episode when
+	// the unreachable ball scores (~1s), which is also what feeds the concede bank's
+	// doom anchor for these states.
+	if (IsImpossibleArena(index)) {
+		delete result.stateSetter;
+		result.stateSetter = new ImpossibleInterceptState();
+	}
 	return result;
 }
 
@@ -508,7 +530,13 @@ int main(int argc, char* argv[]) {
 		// Accelerate GEMMs from two threads) - an environment bug this box's CUDA build
 		// does not have. Diagnosed 2026-07-14 via the InferPolicyProbsFromModels probe.
 		cfg.pipelinedCollection = false;
-		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential (offline sandbox smoke)");
+		// Ladder warmups collapsed so a few smoke iterations reach the FULL path
+		// (map trained, banks seeded, calibration fit, gap_PK live, wire active) -
+		// production warmups would need 50+ CPU iterations to exercise any of it
+		cfg.gapSensor.driveWarmupIters = 2;
+		cfg.gapSensor.mapWarmupIters = 2;
+		cfg.gapSensor.bankMinFill = 4;
+		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential, ladder warmups collapsed (offline sandbox smoke)");
 	}
 
 	cfg.ppo.epochs = 2;
@@ -964,8 +992,30 @@ int main(int argc, char* argv[]) {
 		// shows rho carrying frontier signal the gap misses.
 		cfg.gapSensor.enabled = true;
 		// STAGE 2a LIVE (user: "build it now", 2026-07-18): the gap-closing DRIVE at
-		// the spec's beta. Wire (2b) ships next session (policy-head surgery).
+		// the spec's beta.
 		cfg.gapSensor.driveBeta = 0.05f;
+		// ===== FULL LADDER (user: "this is all tested and working. go ahead and
+		// impliment it in full.", 2026-07-18; spec + build order in LADDER.md) =====
+		// Quasimetric map + goal/concede banks -> V_metric -> gap_PK; drive becomes
+		// Phi = -(gap_KD + gap_PK); 5-input wire extends the policy head 512 -> 517
+		// (zero-init columns at load = behaviorally exact migration; policy Muon
+		// state resets once - a logged, accepted one-time transient). Upstream's
+		// staged V1-V4 gates are WAIVED per the user's authorization; retained here:
+		// the V0 invariants (masked rows pay zero - audited; truncation codes are
+		// nonzero terminals and episodes only enter the buffer whole), the latch
+		// coverage (drive obeys steerRatingTripped), branch backup, and the revert
+		// paths: mapEnabled=false kills gap_PK (drive degrades to the proven
+		// gap_KD-only form), driveBeta=0 kills the drive+wire together (Law 6), and
+		// the WIRE architecture itself reverts only via the branch backup - the
+		// 517-wide policy head is a one-way migration for checkpoints saved after it.
+		// Watch: Ladder/* panels (Map Local Loss ~0.01 target, Lambda, Bank fills,
+		// Calib A>0/A2<0, GapPK Mean self-limiting, Retention Viol flat, Wire Col
+		// Grad, Imp Touches == 0 forever, Imp GapPK Spawn < Fear GapPK, Inj Mean Imp
+		// == 0), Gap/Drive Inj Abs Mean, and Rating vs the drawdown monitor.
+		cfg.gapSensor.mapEnabled = true;
+		cfg.gapSensor.wireEnabled = true;
+		cfg.gapSensor.impossibleArenas = 8;
+		g_NumImpossibleArenas = cfg.gapSensor.impossibleArenas;
 	}
 
 	// Make the learner with the environment creation function and the config we just made

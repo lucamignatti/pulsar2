@@ -278,6 +278,44 @@ namespace GGL {
 		// input) is Stage 2b - policy-head surgery, ships separately.
 		float driveBeta = 0.0f;
 		int driveWarmupIters = 50;
+
+		// ===== OPTIMISTIC-CRITIC LADDER (analysis/probes/LADDER.md; upstream-validated
+		// spec, user-authorized full build 2026-07-18). Third rung: a quasimetric map
+		// over raw obs (d(x,y) = sum_j relu(f(E(x))_j - f(E(y))_j): triangle inequality
+		// + asymmetry by construction, units ~ policy steps) with goal/concede obs
+		// banks -> V_metric = a*g^d_goal + a2*g^d_concede + b, the geometry's claim of
+		// what is collectible from here; gap_PK = relu(V_metric - V_exp). The drive
+		// potential becomes Phi = -(gap_KD + gap_PK); the 5-input WIRE
+		// (tanh([V_real, V_exp, gKD, V_met, gPK]/scale)) extends the policy head's
+		// input (zero-init new columns at load = behaviorally exact migration).
+		// LAWS (each violated form produced a broken system upstream): the map has its
+		// OWN Adam + clip group and never touches the trunk; the sensor/map are
+		// detached probes on extrinsic targets only; wire and drive ship TOGETHER
+		// (Muon policy: near-null input columns are a stability liability); all gates
+		// off = the pre-ladder learner.
+		bool mapEnabled = false;      // train the quasimetric map (LADDER_QM)
+		float mapLr = 1e-3f;          // own optimizer (Law 1)
+		int mapLocalPairs = 512;      // consecutive same-agent pairs per iteration
+		int mapSpreadPairs = 512;     // random pairs per iteration
+		int mapWarmupIters = 50;      // map train-only iterations before gap_PK counts
+		float lambdaLr = 0.01f;       // dual ascent: l += lr*(L_local - target)
+		float lambdaTarget = 0.01f;
+		float lambdaMin = 0.1f, lambdaMax = 100.f;
+		float dClampMult = 3.f;       // D_CLAMP = mult x EMA(mean episode steps)
+		int bankCapacity = 1024;      // goal/concede obs ring buffers (per side)
+		int bankMinFill = 32;         // below this on EITHER side: V_metric = V_exp
+		float calibEma = 0.9f;        // EMA into (a, a2, b) after each OLS refit
+		int calibRows = 8192;         // OLS subsample per iteration
+		int preGoalWindowSteps = 0;   // rows banked before each goal; 0 = auto (~1s)
+		bool wireEnabled = false;     // 5-input wire (REQUIRES driveBeta > 0 - Law 6)
+		float wireScale = 3.f;        // tanh(v / scale); typical V must land linear-ish
+		// Standing falsification family: certified-unachievable intercept drills on
+		// the LAST N arenas of the 1v1 block (ImpossibleInterceptState; the required
+		// average car speed exceeds 1.6x the hard 2300uu/s cap, re-checked per
+		// jittered spawn for every car). Rows are masked from the injection;
+		// acceptance (checked continuously via Ladder/Imp* panels): zero touches
+		// ever, V_exp deflating toward V_real, gap_PK below feasible peaks. 0 = off.
+		int impossibleArenas = 0;
 	};
 
 	struct RndOptimismConfig {

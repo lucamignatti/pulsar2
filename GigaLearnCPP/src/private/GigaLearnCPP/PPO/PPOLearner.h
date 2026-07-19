@@ -17,6 +17,27 @@
 
 namespace GGL {
 
+	// Optimistic-Critic Ladder WIRE state (LADDER.md; one generation of everything
+	// needed to compute the policy's 5 extra inputs for a batch of rows):
+	//   wire = tanh([V_real, V_exp, gap_KD, V_metric, gap_PK] / scale)
+	// V_real comes from the SAME ModelSet as the policy forward (the pipelined
+	// snapshot carries the critic when the wire is on, so the worker never reads
+	// weights Learn is updating). exp/mapE/mapF here are either snapshot copies
+	// (collection generation) or the live nets (learn generation); bankG/bankC are
+	// the bank obs' map embeddings and a/a2/b the V_metric calibration - at learn
+	// time these stay the COLLECTION-time snapshot while the heads are current (the
+	// spec's tested re-derivation rule; storing floats is the contingent fallback).
+	// Everything is read no-grad and detached: the wire is semantically an
+	// observation, never a gradient path (Laws 2/4).
+	struct LadderWire {
+		bool active = false;       // false = wire feeds exact zeros (pre-warmup / eval)
+		bool banksReady = false;   // false = V_metric := V_exp (gap_PK = 0)
+		torch::nn::Sequential exp{ nullptr }, mapE{ nullptr }, mapF{ nullptr };
+		torch::Tensor bankG, bankC; // [k, 32] map embeddings of the bank obs, on device
+		float a = 0, a2 = 0, b = 0; // V_metric calibration snapshot
+		float gamma = 1, dClamp = 1, scale = 3;
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	class PPOLearner {
 	public:
@@ -49,12 +70,24 @@ namespace GGL {
 		);
 
 		static void MakeModels(
-			bool makeCritic, 
-			int obsSize, int numActions, 
+			bool makeCritic,
+			int obsSize, int numActions,
 			PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
 			torch::Device device,
-			ModelSet& outModels
+			ModelSet& outModels,
+			int extraPolicyInputs = 0 // Ladder wire columns appended to the policy head input
 		);
+
+		// Ladder wire generations (owned by the Learner's gap state, assigned each
+		// iteration): `ladderCollect` is what the collection forward uses (snapshot
+		// nets + snapshot banks; passed explicitly by the collection call site);
+		// `ladderLearn` is what Learn()'s re-derivation uses (live nets + the
+		// collection generation's banks/calibration). When the policy carries wire
+		// columns, Learn() REFUSES to run unless ladderLearn was set this iteration -
+		// a silently-zeroed wire biases the PPO ratio (the spec's no-silent-fallback
+		// rule; the one hard bug class of the tested configuration).
+		LadderWire ladderCollect, ladderLearn;
+		bool ladderLearnSet = false;
 		
 		// Steered-practice collection (LearnerConfig::steering), PER-MODE (4.0 team play):
 		// one unit commitment direction per team size (index = playersPerTeam-1), each with
@@ -97,7 +130,7 @@ namespace GGL {
 		// coef * vec added to the trunk output of EVERY row of this call, ungated (style is
 		// a whole-game disposition, not a frontier read). Callers pass it only on the
 		// old-version/league-opponent inference call, never on the trained policy's.
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {}, torch::Tensor steerRowModes = {}, torch::Tensor styleVec = {}, float styleCoef = 0);
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {}, torch::Tensor steerRowModes = {}, torch::Tensor styleVec = {}, float styleCoef = 0, const LadderWire* ladder = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);
@@ -110,15 +143,29 @@ namespace GGL {
 			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
 			bool halfPrec,
-			torch::Tensor steerDelta = {}
+			torch::Tensor steerDelta = {},
+			// Wire source when the policy head carries extra input columns. NULL (or
+			// inactive) = exact zeros: correct for eval/opponent/render paths (Rating
+			// measures the raw policy; both sides of an eval get the same zeros) and
+			// for pre-warmup collection. The LEARN path never passes NULL - see
+			// ladderLearnSet.
+			const LadderWire* ladder = NULL
 		);
 		static void InferActionsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
-			torch::Tensor steerDelta = {}
+			torch::Tensor steerDelta = {},
+			const LadderWire* ladder = NULL
 		);
+		// d(x, bank) = min over bank rows of sum_j relu(x_j - bank_j), clamped;
+		// chunked so the [rows, bank, dims] broadcast never materializes at full n.
+		static torch::Tensor MinBankDist(torch::Tensor emb, torch::Tensor bank, float dClamp);
+		// The 5 wire values for a batch: rawObs feeds the map encoder, trunkOut feeds
+		// critic/expectile. Detached, fp32 for the gamma^d map (bf16-safe upstream).
+		static torch::Tensor ComputeWire(ModelSet& models, const LadderWire& lw,
+			torch::Tensor rawObs, torch::Tensor trunkOut, bool halfPrec);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
 
