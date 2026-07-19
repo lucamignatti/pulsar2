@@ -1024,6 +1024,20 @@ int main(int argc, char* argv[]) {
 		// precision rule. Revisit upward only with a measured SPS budget.
 		cfg.gapSensor.bankCapacity = 256;
 		g_NumImpossibleArenas = cfg.gapSensor.impossibleArenas;
+	} else {
+		// VIZ FIX (2026-07-18, same evening as ladder deploy): render mode was
+		// skipped by the whole block above, so it never set wireEnabled - the
+		// render policy stayed 512-wide while saved checkpoints are now 517-wide
+		// (LoadFrom's total-size check rejects most of them; the one archive entry
+		// that slipped past crashed at inference on the real shape mismatch). The
+		// Learner ctor already exempts render from the driveBeta>0 requirement
+		// (Law 6 is about training dynamics, not architecture) for exactly this
+		// case. Match the architecture ONLY: gapSensor stays otherwise inert in
+		// render (Learn() never runs there, so gapSensor->exp/mapE/mapF are never
+		// built and ladderCollect.active stays false) - the wire is fed zeros,
+		// same convention as every other eval/opponent path.
+		cfg.gapSensor.enabled = true;
+		cfg.gapSensor.wireEnabled = true;
 	}
 
 	// Make the learner with the environment creation function and the config we just made
