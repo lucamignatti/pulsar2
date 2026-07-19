@@ -162,7 +162,9 @@ namespace RLGC {
 	// (the measured wavedash-class SNR starvation, MECHANICS.md). PE is included so
 	// KE->PE conversion (jumping, climbing) is energy-neutral — this term must never
 	// tax aerials. Ball energy is deliberately absent: TouchAccel IS the ball-energy
-	// reward. Boost pickups convert to energy via thrust, which is the point.
+	// reward. STORED BOOST is in the sum since 2026-07-19 (see Phi): fuel is energy,
+	// so the potential is indifferent between holding and spending it — the dump-
+	// into-ground-speed incentive the boost-free form created is gone.
 	class CarEnergyPotentialReward : public Reward {
 	public:
 		float gamma;
@@ -172,7 +174,22 @@ namespace RLGC {
 			constexpr float KE_NORM = 0.5f * 2300.f * 2300.f; // KE at supersonic ~ 1.0
 			float ke = 0.5f * p.vel.LengthSq();
 			float pe = 650.f * RS_MAX(0.f, p.pos.z - 17.f);   // g = 650 uu/s^2
-			return (ke + pe) / KE_NORM;
+			// STORED BOOST IS ENERGY (2026-07-19, measured fix): without this term the
+			// potential valued fuel at zero, so dumping boost into ground speed was free
+			// energy gain and holding it was worthless - and the 29.3B aerial census
+			// caught the consequence: mean boost at aerial opportunities collapsed
+			// 54 -> 18 while takeoff ATTEMPTS rose 8x (the bot wants to go up, arrives
+			// empty). SQRT-shaped (RLGym-PPO guide's scarcity curve, adopted same day):
+			// the marginal value of fuel is highest near empty - exactly where the
+			// census caught the failure - and cheap near full, so the term defends a
+			// working reserve without paying for hoarding, and small pads become
+			// automatically worth detouring for when low. Full tank = 1.0 = supersonic
+			// KE. Still exact PBRS: ANY Phi telescopes - unfarmable; pad pickups are
+			// real player actions (the demo-respawn tank stays guarded in GetReward).
+			// Pickup credit intentionally overlaps GuardedPickupBoost - this term adds
+			// the SPEND side of the ledger, which a pickup reward cannot express.
+			float be = sqrtf(0.01f * p.boost) * KE_NORM;      // boost 0-100 -> 0..KE_NORM, concave
+			return (ke + pe + be) / KE_NORM;
 		}
 
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
@@ -182,6 +199,36 @@ namespace RLGC {
 			if (player.isDemoed || player.isDemoed != player.prev->isDemoed)
 				return 0;
 			return gamma * Phi(player) - Phi(*player.prev);
+		}
+	};
+
+	// TEAM PRESSURE (2026-07-19, user-directed, RLGym-PPO-guide item): -1 per step
+	// while NO alive teammate (self included) is pressuring the ball - "pressuring"
+	// = within nearDist of it, OR closing on it at closeSpeed+ from within closeDist.
+	// nearDist is deliberately wide (2500) so shadow defense COUNTS as pressure: the
+	// penalty fires only on genuine collective disengagement (everyone far, nobody
+	// approaching) - the measured dead-play / collective-decline pathology - never on
+	// defensive shape. Wrap in ZeroSumReward like every event term; mutual
+	// non-pressure then cancels (a zero-sum stack cannot charge symmetric passivity -
+	// accepted, TimeCost still taxes both sides; real states are asymmetric).
+	class TeamPressureReward : public Reward {
+	public:
+		float nearDist, closeDist, closeSpeed;
+		TeamPressureReward(float nearDist = 2500, float closeDist = 4000, float closeSpeed = 500)
+			: nearDist(nearDist), closeDist(closeDist), closeSpeed(closeSpeed) {}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			for (auto& p : state.players) {
+				if (p.team != player.team || p.isDemoed)
+					continue;
+				Vec to = state.ball.pos - p.pos;
+				float d = to.Length();
+				if (d < nearDist)
+					return 0;
+				if (d < closeDist && p.vel.Dot(to * (1.f / RS_MAX(d, 1.f))) > closeSpeed)
+					return 0;
+			}
+			return -1;
 		}
 	};
 

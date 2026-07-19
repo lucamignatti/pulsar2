@@ -204,6 +204,16 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// at tickSkip 8), 3% of a goal.
 		{ new TimeCostReward(), 0.01f },
 
+		// TEAM PRESSURE (2026-07-19, user-directed; RLGym-PPO-guide item): someone
+		// must be on the ball. -0.15/step (~ -2.25/s; a 5s collective lapse costs
+		// ~7% of a goal) while no alive teammate is near the ball or closing on it
+		// (see TeamPressureReward - shadow defense counts as pressure by
+		// construction, so this bites only on genuine collective disengagement).
+		// Zero-sum: charged relative to the opponent's own pressure state; mutual
+		// passivity cancels (accepted - TimeCost still taxes it). Watch
+		// Rewards/TeamPressureReward and the next aerial-census conversion read.
+		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.15f },
+
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
 	};
