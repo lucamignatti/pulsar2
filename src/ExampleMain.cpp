@@ -1015,6 +1015,14 @@ int main(int argc, char* argv[]) {
 		cfg.gapSensor.mapEnabled = true;
 		cfg.gapSensor.wireEnabled = true;
 		cfg.gapSensor.impossibleArenas = 8;
+		// Bank 1024 -> 256 (2026-07-18, same evening as deploy): the per-STEP wire
+		// bank-distance broadcast at 1024 anchors/side took collection inference
+		// 0.16s -> 2.5s per iteration (overall SPS halved). Capacity is one of the
+		// spec's explicitly-adaptable scale knobs (Law 8a list); 256 diverse
+		// pre-goal anchors keep the min-distance estimator honest at 1/4 the
+		// traffic, and MinBankDist now runs bf16 on GPU per the spec's own
+		// precision rule. Revisit upward only with a measured SPS budget.
+		cfg.gapSensor.bankCapacity = 256;
 		g_NumImpossibleArenas = cfg.gapSensor.impossibleArenas;
 	}
 

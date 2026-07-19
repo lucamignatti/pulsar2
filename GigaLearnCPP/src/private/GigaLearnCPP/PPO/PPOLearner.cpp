@@ -113,15 +113,22 @@ void GGL::PPOLearner::MakeModels(
 
 torch::Tensor GGL::PPOLearner::MinBankDist(torch::Tensor emb, torch::Tensor bank, float dClamp) {
 	// d(x, y) = sum_j relu(x_j - y_j): nonneg, d(x,x)=0, triangle inequality,
-	// ASYMMETRIC by construction. The [chunk, bank, dims] broadcast is bounded to
-	// ~1M pair rows so a full-buffer call never materializes n x k x 32 at once.
+	// ASYMMETRIC by construction. The [chunk, bank, dims] broadcast is the wire's
+	// dominant memory traffic (it runs per collection STEP), so on GPU it runs in
+	// bf16 - the spec's own rule: "bank distances are bf16-safe up to the gamma^d
+	// map which should run fp32" (distances are O(100)-O(1000) sums of 32 relu
+	// terms; bf16's ~2-3 significant digits shift gamma^d negligibly vs the
+	// calibration EMA's own noise floor). fp32 on CPU (smoke path, cheap anyway).
 	int64_t n = emb.size(0), k = bank.size(0);
-	auto out = torch::empty({ n }, emb.options());
-	int64_t chunk = RS_MAX((int64_t)1, (int64_t)(1 << 20) / RS_MAX((int64_t)1, k));
+	bool bf16 = emb.is_cuda();
+	auto e = bf16 ? emb.to(torch::kBFloat16) : emb;
+	auto b = bf16 ? bank.to(torch::kBFloat16) : bank;
+	auto out = torch::empty({ n }, emb.options().dtype(torch::kFloat32));
+	int64_t chunk = RS_MAX((int64_t)1, (int64_t)(1 << 22) / RS_MAX((int64_t)1, k));
 	for (int64_t i = 0; i < n; i += chunk) {
 		int64_t end = RS_MIN(i + chunk, n);
-		auto d = torch::relu(emb.slice(0, i, end).unsqueeze(1) - bank.unsqueeze(0)).sum(-1); // [c,k]
-		out.slice(0, i, end).copy_(std::get<0>(d.min(1)));
+		auto d = torch::relu(e.slice(0, i, end).unsqueeze(1) - b.unsqueeze(0)).sum(-1); // [c,k]
+		out.slice(0, i, end).copy_(std::get<0>(d.min(1)).to(torch::kFloat32));
 	}
 	return out.clamp_max(dClamp);
 }
