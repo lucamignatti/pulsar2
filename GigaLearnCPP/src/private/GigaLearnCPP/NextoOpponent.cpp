@@ -38,14 +38,40 @@ static std::vector<std::array<float, 8>> MakeNextoLookup() {
 }
 
 GGL::NextoOpponent::NextoOpponent(const std::string& modelPath, torch::Device device)
-	: device(device) {
+	: device(torch::kCPU) {
 
 	try {
-		model = torch::jit::load(modelPath, device);
+		model = torch::jit::load(modelPath, torch::kCPU);
 		model.eval();
 	} catch (const std::exception& e) {
 		RG_ERR_CLOSE("NextoOpponent: failed to load TorchScript model from \"" << modelPath
 			<< "\": " << e.what());
+	}
+
+	// Device probe (2026-07-20 crash-loop fix): the trace was authored on CPU and
+	// TorchScript graphs can carry baked-in device constants that only surface as
+	// a runtime_error at forward - which, on the pipelined collect worker, is an
+	// unprintable std::terminate (the exact live-crash signature; the CPU-
+	// sequential smoke couldn't see it). Probe the requested device with a dummy
+	// forward at BOOT, where failure is loud and cheap, and fall back to CPU.
+	if (device.is_cuda()) {
+		try {
+			auto trial = torch::jit::load(modelPath, device);
+			trial.eval();
+			torch::NoGradGuard noGrad;
+			auto tQ = torch::zeros({ 2, 1, 32 }, torch::TensorOptions().device(device));
+			auto tKv = torch::zeros({ 2, 37, 24 }, torch::TensorOptions().device(device));
+			auto tM = torch::zeros({ 2, 37 }, torch::TensorOptions().device(device));
+			auto out = trial.forward({ std::make_tuple(tQ, tKv, tM) }).toTuple();
+			auto logits = out->elements()[0].toTensor();
+			if (!logits.isfinite().all().item<bool>())
+				throw std::runtime_error("non-finite probe logits");
+			model = trial;
+			this->device = device;
+		} catch (const std::exception& e) {
+			RG_LOG("NextoOpponent: CUDA probe failed (" << e.what()
+				<< ") - serving on CPU instead");
+		}
 	}
 
 	lookup = MakeNextoLookup();
@@ -217,8 +243,17 @@ void GGL::NextoOpponent::Act(const std::vector<RLGC::GameState>& states,
 		auto tKv = torch::from_blob(kvBuf[mode].data(), { b, nEnt, KV_W }, torch::kFloat32).to(device);
 		auto tM = torch::zeros({ b, nEnt }, torch::TensorOptions().device(device));
 
-		auto out = model.forward({ std::make_tuple(tQ, tKv, tM) }).toTuple();
-		auto logits = out->elements()[0].toTensor(); // [b, 90]
+		// try/catch so a worker-thread failure PRINTS before the process dies -
+		// an uncaught exception on the collect worker is a bare std::terminate
+		// with no message (learned from the 2026-07-20 crash loop)
+		torch::Tensor logits;
+		try {
+			auto out = model.forward({ std::make_tuple(tQ, tKv, tM) }).toTuple();
+			logits = out->elements()[0].toTensor(); // [b, 90]
+		} catch (const std::exception& e) {
+			RG_ERR_CLOSE("NextoOpponent::Act: forward failed (mode " << mode
+				<< ", batch " << b << ", device " << device << "): " << e.what());
+		}
 		auto picks = logits.argmax(-1).cpu();
 		auto pickAcc = picks.accessor<int64_t, 1>();
 
