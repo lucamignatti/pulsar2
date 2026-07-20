@@ -234,6 +234,15 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// Rewards/TeamPressureReward and the next aerial-census conversion read.
 		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.15f },
 
+		// KICKOFF RACE (2026-07-20, user-directed: net losses come from conceded
+		// kickoff goals). Zero-sum, time-decayed first-touch reward, GATED on the
+		// kickoff being contested (see KickoffRaceReward) so an opponent's delay
+		// kickoff can't farm us into committing. Fires once per kickoff episode
+		// (~the KickoffState reset slice), inert otherwise. Weight 25 (~1/6 of a
+		// goal for a fast contested win) - meaningful on kickoffs, small in the
+		// stack average since it only fires on kickoff resets.
+		{ new ZeroSumReward(new KickoffRaceReward(), TEAM_SPIRIT), 25.f },
+
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
 	};
