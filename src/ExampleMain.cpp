@@ -16,6 +16,7 @@
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/AirDrillState.h>
+#include <RLGymCPP/StateSetters/AirPlayState.h>
 #include <RLGymCPP/StateSetters/FrontierDrillState.h>
 #include <RLGymCPP/StateSetters/ImpossibleInterceptState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
@@ -193,6 +194,15 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
 		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 40.f },
 
+		// FLIP RESET (2026-07-20, user-directed): a gradient for the reset event,
+		// paired with AirPlayState's FLIP_RESET_READY seeding (reward + exposure -
+		// a zero-rate mechanic needs both). Gated hard (genuine airborne wheel
+		// reset, high ball, ~1s cooldown - see FlipResetReward); the residual
+		// ceiling-juggle farm advances the ball nowhere so B2G/Goal dominate it.
+		// SCAFFOLD 40 (== AirIntercept, < AerialTouch 120): a precursor, not the
+		// finish. Anneal once mechanic_census shows a stable flip-reset rate.
+		{ new ZeroSumReward(new FlipResetReward(), TEAM_SPIRIT), 40.f },
+
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
 		// - phantom-farmable). UNGATED - the gate's attack-oriented level is lowest exactly in the
@@ -349,11 +359,18 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	airDrill->curriculum = g_AirDrillCurriculum; // NULL in render mode = classic spawn
 	result.stateSetter = new CombinedState({
 		// Ground touch bootstrap - the proven anti-freeze state
-		{ new BallNearCarState(600, 900), 0.35f },
+		{ new BallNearCarState(600, 900), 0.30f },
+		// Aerial takeoff/climb-to-touch drill (the completion rung)
 		{ airDrill, 0.20f },
-		{ new KickoffState(), 0.15f },
+		// ADVANCED-AIR SEEDING (2026-07-20, user-directed): flip-reset-ready +
+		// air-carry setups so the ZERO-RATE mechanics get VISITED - reward alone
+		// can't shape unentered states. Strong 0.15 slice (biggest single air-
+		// exposure lever this run has had); paired with FlipResetReward. Carved
+		// from RandomState (0.30->0.25) and Kickoff (0.15->0.10).
+		{ new AirPlayState(), 0.15f },
+		{ new KickoffState(), 0.10f },
 		// Sole source of chaotic/defensive/air-recovery states (bounds widened to corners/goal lines)
-		{ new RandomState(true, true, false), 0.30f },
+		{ new RandomState(true, true, false), 0.25f },
 	});
 	result.terminalConditions = terminalConditions;
 	result.rewards = BuildRewards(TRAIN_GAMMA);

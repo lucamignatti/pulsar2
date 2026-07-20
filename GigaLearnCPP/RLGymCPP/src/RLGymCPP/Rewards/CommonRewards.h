@@ -459,6 +459,64 @@ namespace RLGC {
 		}
 	};
 
+	// FLIP RESET (2026-07-20, user-directed: a ZERO-RATE mechanic - the bot never
+	// enters the precursor state, so amplification can't help and it needs both
+	// SEEDING (AirPlayState) and this gradient). A flip reset = restoring your flip
+	// by contacting the ball with your WHEELS while airborne. There is no honest PBRS
+	// potential for it (its value is purely instrumental - the flick AFTER the
+	// reset), so it is a gated EVENT reward, farm-hardened four ways: (1) a GENUINE
+	// reset only - the engine's own HasFlipReset() must transition false->true via a
+	// ball touch this step; (2) roof pointing at the ball (rotMat.up . toBall > 0.3),
+	// i.e. wheels-first contact, not a nose poke; (3) ball genuinely high; (4) ~1s
+	// cooldown so a tight juggle can't rack it up. Zero-sum wrapped like every event
+	// term. The residual farm (ceiling-ball juggling for resets) advances the ball
+	// nowhere, so B2G/Goal/TimeCost dominate its gradient once scoring exists.
+	// SCAFFOLD weight - anneal once mechanic_census shows a stable flip-reset rate.
+	class FlipResetReward : public Reward {
+	public:
+		constexpr static float BALL_MIN_Z = 500;             // genuinely aerial
+		constexpr static float BALL_FULL_Z = 1400;
+		constexpr static float ROOF_TO_BALL_MIN = 0.3f;      // wheels-toward-ball geometry
+		constexpr static int   COOLDOWN_STEPS = 15;          // ~1s at 15Hz (tickSkip 8)
+		std::vector<int> sincePay; // per player.index; per-arena instance, safe
+
+		virtual void Reset(const GameState& initialState) override {
+			sincePay.assign(initialState.players.size(), COOLDOWN_STEPS + 1);
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if ((size_t)player.index >= sincePay.size())
+				sincePay.resize(player.index + 1, COOLDOWN_STEPS + 1);
+			int& sp = sincePay[player.index];
+			sp++;
+
+			if (!state.prev || !player.prev)
+				return 0;
+			// The reset EVENT: touched the ball, airborne, flip restored THIS step
+			// (transition), not the whole airborne-reset window.
+			if (!player.ballTouchedStep || player.isOnGround)
+				return 0;
+			if (!player.HasFlipReset() || player.prev->HasFlipReset())
+				return 0;
+			if (sp <= COOLDOWN_STEPS)
+				return 0;
+
+			Vec toBall = state.ball.pos - player.pos;
+			float d = toBall.Length();
+			if (d < 1e-3f)
+				return 0;
+			// Roof toward ball = wheels made the contact (the reset geometry)
+			if (player.rotMat.up.Dot(toBall * (1.f / d)) < ROOF_TO_BALL_MIN)
+				return 0;
+
+			float ballFrac = RS_CLAMP((state.ball.pos.z - BALL_MIN_Z) / (BALL_FULL_Z - BALL_MIN_Z), 0, 1);
+			if (ballFrac <= 0)
+				return 0;
+			sp = 0;
+			return ballFrac;
+		}
+	};
+
 	// Pre-touch aerial-approach potential - the gradient BEFORE the first air
 	// touch ever lands. Phi = ballHighFrac * carUpFrac * exp(-dist/LIU_DIST_SCALE);
 	// r = gamma*Phi(s') - Phi(s). Phi is 0 whenever the car is grounded or the
