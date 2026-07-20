@@ -121,3 +121,33 @@ Deployed 30.48B (ff2b22a), reverted 30.75B (c69fd9c). What happened:
 
 The DIAGNOSIS stands unchanged (takeoff is the missing skill; the drill never
 taught it); only this controller design is dead.
+
+## 29.3B census (2026-07-19, ladder era) — the bottleneck moved to FUEL
+
+vs the 9.35B read (same lineage, aerial_gap_29300033904.json /
+mechanic_census_29300033904.json):
+
+- Drill completion 38.7% -> 61.7% (ATH), touch_z median 1174. Takeoff probe
+  0.0% -> 0.67% aerial touches (2/300) - FIRST nonzero ground takeoff ever
+  measured, any lineage.
+- Free play: grounded jumps at high balls 19 -> 159 /100k (8x), high-ball
+  step share 9% -> 21%, proto-dribble fragments 7 -> 291 /100k (40x),
+  wavedash-like 82 -> 165 /100k. Jumpable-height touch share 1.4% -> 12%.
+- BUT opportunity conversion stalled (12.8% -> 9.5% 1v1) while attempts
+  soared, and mean_boost_at_opp COLLAPSED 54 -> 18: the style the energy
+  PBRS + TimeCost taught (dump fuel into ground speed) leaves the tank
+  empty exactly when a high ball appears. Feasibility, not incentive.
+
+DEPLOYED FIX (one lever): stored boost added to CarEnergyPotentialReward's
+potential (full tank = 1.0 = supersonic KE). The boost-free form paid boost
+-> KE conversion but valued stored fuel at zero - dumping was free profit,
+holding was worthless. With fuel in the sum the potential is indifferent
+between stored and spent energy; burning at supersonic (capped v, zero KE
+gain) or from standstill now prices as waste. Exact PBRS throughout.
+
+SUCCESS CRITERIA (next census, ~2-3 days): mean_boost_at_opp recovering
+toward ~40+, opportunity conversion following upward, Player/Boost avg up;
+Rating vs the drawdown monitor as always. If boost recovers but conversion
+does not, the residual gap is takeoff SKILL -> AirDrill altitude-anneal v2
+(its 5 pre-registration requirements are recorded in ExampleMain), NOT a
+touch-streak PBRS (corner-jugglable, rejected 2026-07-19).

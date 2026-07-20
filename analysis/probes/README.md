@@ -37,3 +37,27 @@ Run everything thread-capped and niced so the live trainer keeps the box, e.g.
 grabs every core).
 
 Findings and caveats: `REPORT.md`.
+
+## Honest progress measurement (2026-07-19)
+
+**Do not read `Rating/1v1` as absolute progress.** It is measured against a
+rolling 800M-step pool of recent selves that drifts with the policy; measured
+overstatement is ~6x (claimed +187 Elo over 8.6B steps; real match-play gain
++31). Use the fixed-anchor battery instead:
+
+```
+tools/archive_anchor.sh [--list|--seed DIR]   # permanent spaced checkpoint anchors
+                                              # (systemd --user timer: pulsar-anchor.timer)
+analysis/probes/anchor_battery.py             # real match-play Elo vs those anchors
+analysis/probes/match_play_eval.py A B        # one pairing, match rules (kickoff->goal)
+```
+
+Protocol note that matters: `compare_checkpoints.py` cross-play runs on the
+TRAINER reset mix (drill/random spawns) and biases AGAINST the current policy —
+it read 48% where match play read 54% for the same pair. For "is it actually
+better", use match play.
+
+Incident record: `H2_TRUNCATION.md` (the offline loader dropped the trunk's
+trailing LeakyReLU — every pre-2026-07-19 offline behavioral result used
+pre-activation h2; fixed and oracle-verified). League fix spec awaiting review:
+`LEAGUE_ANCHORS.md`.

@@ -18,8 +18,8 @@ import numpy as np
 import torch
 
 import RocketSim as rs
-from collect_dataset import NUM_ARENAS, ArenaEnv
-from load_checkpoint import load_models
+from collect_dataset import NUM_ARENAS, ArenaEnv, set_obs_size
+from load_checkpoint import PulsarPolicy, load_models
 from steer_test import SteeredPolicy, landing_behavior, metrics_of, rollout
 
 HERE = Path(__file__).resolve().parent
@@ -131,7 +131,13 @@ def main():
 
     base = load_models(base_dir)
     treat = load_models(treat_dir)
-    print(f"baseline {base_dir.name} vs treated {treat_dir.name}\n")
+    # 5.0 lineage is 230-dim padded obs; ArenaEnv builds 109-dim unless told (steer_test
+    # /compare predate the 4.0/5.0 padded lineage and never called set_obs_size). Both
+    # policies share the same arenas, so their trunk obs width must match.
+    b_obs, t_obs = PulsarPolicy(base).obs_size, PulsarPolicy(treat).obs_size
+    assert b_obs == t_obs, f"obs width mismatch {b_obs} vs {t_obs} - can't share arenas"
+    set_obs_size(b_obs)
+    print(f"baseline {base_dir.name} vs treated {treat_dir.name}  (obs {b_obs})\n")
 
     results = {"baseline": base_dir.name, "treated": treat_dir.name}
 

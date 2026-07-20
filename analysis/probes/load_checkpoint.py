@@ -33,14 +33,18 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[2]
-# Root preference: $PULSAR_CKPT_ROOT > the 5.0 lineage (checkpoints_5.0, the live
-# PULSAR5.md folder; -copy = an scp'd offline copy, same convention as 4.0) > the
-# 4.0 offline copy (scp'd from the training box; already safe to read in place, but
-# we still copy-first out of habit/uniformity) > the 3.1 live folder (older setups).
+# Root preference: $PULSAR_CKPT_ROOT > the LIVE 5.0v3 lineage (checkpoints_5.0v3,
+# the RocketSim-v3 cold start; -copy = an scp'd offline copy) > the frozen pre-v3
+# 5.0 lineage > the 4.0 offline copy > the 3.1 live folder (older setups).
+# NOTE: checkpoints_5.0v3 MUST lead - the v3 engine switch forked a fresh lineage,
+# and reading checkpoints_5.0 by default silently analyzed the frozen <=11.75B run
+# (the "every reading is stale" trap). Override with PULSAR_CKPT_ROOT for a specific
+# copied-out checkpoint (e.g. a golden or branch backup).
 def _default_root() -> Path:
     if env := os.environ.get("PULSAR_CKPT_ROOT"):
         return Path(env)
-    for cand in ["checkpoints_5.0-copy", "checkpoints_5.0",
+    for cand in ["checkpoints_5.0v3-copy", "checkpoints_5.0v3",
+                 "checkpoints_5.0-copy", "checkpoints_5.0",
                  "checkpoints_4.0-copy", "checkpoints_4.0", "checkpoints_3.1"]:
         if (REPO / "build" / cand).is_dir():
             return REPO / "build" / cand
@@ -50,10 +54,13 @@ CHECKPOINT_ROOT = _default_root()
 
 MODEL_FILES = ["SHARED_HEAD", "POLICY", "CRITIC", "REACH_PHI", "REACH_PSI_BALL", "REACH_PSI_CAR"]
 
-def expected_shapes(obs_size: int) -> dict:
+def expected_shapes(obs_size: int, policy_in: int = 512) -> dict:
+    # policy_in = 512 (pre-Ladder) or 517 (+5 self-conditioning wire columns, live 5.0v3).
+    # Only the policy head's FIRST Linear widens; the trunk and critic are untouched.
     return {
         "SHARED_HEAD": [(512, obs_size), (512,), (512,), (512,), (512, 512), (512,), (512,), (512,)],
-        "POLICY": [(512, 512), (512,), (512,), (512,)] * 3 + [(90, 512), (90,)],
+        "POLICY": [(512, policy_in), (512,), (512,), (512,)]
+                  + [(512, 512), (512,), (512,), (512,)] * 2 + [(90, 512), (90,)],
         "CRITIC": [(512, 512), (512,), (512,), (512,)] * 3 + [(1, 512), (1,)],
         "REACH_PHI": [(256, 602), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
         "REACH_PSI_BALL": [(256, 6), (256,), (256,), (256,), (256, 256), (256,), (256,), (256,), (128, 256), (128,)],
@@ -93,12 +100,22 @@ def copy_checkpoint(dest_root: Path | None = None) -> Path:
     raise RuntimeError(f"no complete checkpoint could be copied from {CHECKPOINT_ROOT}")
 
 
-def rebuild_sequential(jit_module) -> torch.nn.Sequential:
+def rebuild_sequential(jit_module, trailing_activations: int = 0) -> torch.nn.Sequential:
     """Reconstruct the C++ torch::nn::Sequential as an eager nn.Sequential.
 
     Param names are '<idx>.weight' / '<idx>.bias' where idx is the position in the
     C++ Sequential; 2-D weight => Linear, 1-D => LayerNorm; index gaps are the
     parameterless LeakyReLU modules.
+
+    trailing_activations: parameterless modules AFTER the last parameterized index
+    are invisible in the archive (nothing marks them), so the caller must say how
+    many to append. THE 2026-07-19 BUG: SHARED_HEAD ends [.., Linear, LN, LReLU] -
+    this function silently dropped that final LReLU, so every consumer of "h2" got
+    the PRE-ACTIVATION trunk output. Heads with internal LayerNorms (policy/critic)
+    largely absorbed it - the un-normalized GAP_EXP head exposed it (V_exp read -8
+    where the live trainer read V_real+0.15). Verified against the C++ loader via
+    a GGL_SMOKE CPU oracle on the same checkpoint. Output heads ending in a bare
+    Linear need trailing_activations=0 (the default).
     """
     params = dict(jit_module.named_parameters())
     by_idx = {}
@@ -107,7 +124,7 @@ def rebuild_sequential(jit_module) -> torch.nn.Sequential:
         by_idx.setdefault(int(idx), {})[kind] = p.detach().clone()
 
     layers = []
-    for i in range(max(by_idx) + 1):
+    for i in range(max(by_idx) + 1 + trailing_activations):
         if i not in by_idx:
             layers.append(torch.nn.LeakyReLU())  # default slope 0.01 matches torch::nn::LeakyReLU()
             continue
@@ -135,7 +152,16 @@ def load_models(ckpt_dir: Path, names=None) -> dict[str, torch.nn.Sequential]:
     # Detect obs width first so every shape check uses the right lineage
     head = torch.jit.load(str(ckpt_dir / "SHARED_HEAD.lt"), map_location="cpu")
     obs_size = dict(head.named_parameters())["0.weight"].shape[1]
-    shapes_for = expected_shapes(obs_size)
+    # Policy-head input width: 512 (pre-Ladder) or 517 (+5 Ladder wire columns, live
+    # 5.0v3). Auto-detect from POLICY.lt so both widths load; the offline harness feeds
+    # the 5 wire values as ZEROS (eval/render/boot parity - Rating scores the wire-zeroed
+    # policy, so probes and head-to-heads match how the trainer measures it).
+    policy_in = 512
+    pol_path = ckpt_dir / "POLICY.lt"
+    if "POLICY" in names and pol_path.exists():
+        pol = torch.jit.load(str(pol_path), map_location="cpu")
+        policy_in = dict(pol.named_parameters())["0.weight"].shape[1]
+    shapes_for = expected_shapes(obs_size, policy_in)
 
     models = {}
     for name in names:
@@ -155,7 +181,12 @@ def load_models(ckpt_dir: Path, names=None) -> dict[str, torch.nn.Sequential]:
         if any((g + 1) % 3 for g in gaps):
             raise RuntimeError(f"{name}: activation gaps at unexpected indices {gaps}")
 
-        models[name] = rebuild_sequential(jit_mod)
+        # SHARED_HEAD is the one archive that ENDS in an activation ([Lin,LN,LReLU]x2,
+        # no output layer) - the trailing LReLU is invisible to the gap scan and must
+        # be appended explicitly or h2 comes out pre-activation (the 2026-07-19 bug).
+        # Every head (policy/critic/reach/gap) ends in a bare output Linear: 0.
+        models[name] = rebuild_sequential(jit_mod,
+                                          trailing_activations=1 if name == "SHARED_HEAD" else 0)
     return models
 
 
@@ -177,7 +208,12 @@ class PulsarPolicy:
         self.policy = models["POLICY"]
         self.critic = models.get("CRITIC")
         self.phi = models.get("REACH_PHI")
-        self.obs_size = self.trunk[0].in_features  # 109 = 3.1, 230 = 4.0 padded
+        self.obs_size = self.trunk[0].in_features  # 109 = 3.1, 230 = 4.0/5.0 padded
+        # Policy-head input: 512 (pre-Ladder) or 517 (+5 Ladder self-conditioning wire).
+        # We feed the wire as zeros (eval/render parity), so trunk_out is right-padded
+        # by wire_pad before the policy forward. Trunk taps + phi are wire-independent.
+        self.policy_in = self.policy[0].in_features
+        self.wire_pad = self.policy_in - 512
         # trunk = [Lin, LN, Act, Lin, LN, Act]; h1 taps after index 2
         self.trunk_block1 = self.trunk[:3]
         self.trunk_block2 = self.trunk[3:]
@@ -190,6 +226,13 @@ class PulsarPolicy:
 
     @torch.no_grad()
     def action_probs(self, trunk_out: torch.Tensor, action_masks: torch.Tensor):
+        # Ladder wire [V_real,V_exp,gap_KD,V_metric,gap_PK] is not reconstructable
+        # offline (banks unpersisted) - fed as zeros exactly as eval/render/boot do.
+        # This is the ONLY policy-head forward, so every caller (sample_actions,
+        # SteeredPolicy.act, compare_checkpoints) inherits the padding.
+        if self.wire_pad:
+            trunk_out = torch.cat(
+                [trunk_out, trunk_out.new_zeros(trunk_out.shape[0], self.wire_pad)], -1)
         logits = self.policy(trunk_out)
         logits = logits + self.ACTION_DISABLED_LOGIT * (~action_masks.bool()).float()
         return torch.softmax(logits, -1).clamp(self.ACTION_MIN_PROB, 1)

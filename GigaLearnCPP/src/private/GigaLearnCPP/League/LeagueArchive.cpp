@@ -39,6 +39,123 @@ LeagueArchive::LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::Env
 
 	if (!checkpointFolder.empty())
 		leagueDir = checkpointFolder / "league";
+
+	// Permanent spaced anchors (LEAGUE_ANCHORS.md): loaded from disk at boot, never
+	// from the checkpoint's league JSON - they are inputs, not archive state.
+	// NOTE: `cfg` here is the ctor PARAMETER (const&) which shadows the member - write
+	// through this->cfg so the default survives into LoadAnchors().
+	if (this->cfg.anchorFrac > 0) {
+		if (this->cfg.anchorDir.empty() && !checkpointFolder.empty())
+			this->cfg.anchorDir = checkpointFolder.string() + "_anchors";
+		LoadAnchors();
+	}
+}
+
+// Keep a LOG-SPACED span when the archive has more anchors than we serve: repeatedly
+// drop the anchor whose removal least widens the largest gap in the retained timeline.
+// FIFO would keep a moving RECENT window - which is precisely the pool myopia anchors
+// exist to cure - so decimation is load-bearing, not a nicety.
+static std::vector<size_t> DecimateSpaced(const std::vector<long long>& ts, size_t keep) {
+	std::vector<size_t> idx(ts.size());
+	for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+	while (idx.size() > keep) {
+		size_t bestPos = 1; double bestCost = 1e300;
+		for (size_t p = 1; p + 1 < idx.size(); p++) { // never drop the oldest or newest
+			double cost = (double)(ts[idx[p + 1]] - ts[idx[p - 1]]);
+			if (cost < bestCost) { bestCost = cost; bestPos = p; }
+		}
+		idx.erase(idx.begin() + bestPos);
+	}
+	return idx;
+}
+
+void LeagueArchive::LoadAnchors() {
+	RG_NO_GRAD;
+	anchors.clear();
+	anchorTs.clear();
+	std::filesystem::path dir(cfg.anchorDir);
+	if (cfg.anchorDir.empty() || !std::filesystem::is_directory(dir)) {
+		RG_LOG("League anchors: no anchor dir at \"" << cfg.anchorDir << "\" - anchors DISABLED");
+		return;
+	}
+
+	// Numeric subdirs = timesteps, ascending.
+	std::vector<long long> found;
+	for (auto& e : std::filesystem::directory_iterator(dir)) {
+		if (!e.is_directory()) continue;
+		std::string n = e.path().filename().string();
+		if (n.empty() || !std::all_of(n.begin(), n.end(), ::isdigit)) continue;
+		found.push_back(std::stoll(n));
+	}
+	std::sort(found.begin(), found.end());
+	if (found.empty()) {
+		RG_LOG("League anchors: \"" << cfg.anchorDir << "\" has no numbered checkpoints - anchors DISABLED");
+		return;
+	}
+
+	std::vector<size_t> keep = DecimateSpaced(found,
+		(size_t)RS_MAX(1, cfg.anchorMaxServed));
+
+	for (size_t k : keep) {
+		std::filesystem::path adir = dir / std::to_string(found[k]);
+		// Pre-check: Model::Load throws (RG_ERR_CLOSE) on a missing/odd file, and an
+		// anchor is an OPTIONAL input - a bad one must never take down the run.
+		bool haveAll = true;
+		for (const char* name : SCRATCH_MODELS) {
+			if (!scratch[name]) continue;
+			if (!std::filesystem::exists(scratch[name]->GetSavePath(adir))) haveAll = false;
+		}
+		if (!haveAll) {
+			RG_LOG("League anchors: skipping " << found[k] << " (missing model files)");
+			continue;
+		}
+		Member a;
+		bool ok = true;
+		for (const char* name : SCRATCH_MODELS) {
+			if (!scratch[name]) continue;
+			Model* tmp = scratch[name]->MakeClone(); // carries allowInputExpand
+			try {
+				// loadOptim=false: anchors are frozen opponents. Model::Load performs the
+				// pre-wire 512->517 zero-pad migration itself, so anchors from before the
+				// Ladder deploy serve correctly at the current width.
+				tmp->Load(adir, false, false);
+				a.params.push_back(
+					nn::utils::parameters_to_vector(tmp->parameters()).detach().cpu().clone());
+			} catch (std::exception& e) {
+				RG_LOG("League anchors: skipping " << found[k] << " (" << e.what() << ")");
+				ok = false;
+			}
+			delete tmp;
+			if (!ok) break;
+		}
+		if (!ok) continue;
+		a.fitness = 0; a.cell = -1; a.exploiter = false; a.matches = 0; a.lineage = -1;
+		anchors.push_back(std::move(a));
+		anchorTs.push_back(found[k]);
+	}
+	RG_LOG("League anchors: serving " << anchors.size() << " of " << found.size()
+		<< " archived (log-spaced; " << (anchors.empty() ? 0LL : anchorTs.front())
+		<< " .. " << (anchors.empty() ? 0LL : anchorTs.back())
+		<< "), anchorFrac " << cfg.anchorFrac);
+}
+
+int LeagueArchive::SampleAnchor() const {
+	if (anchors.empty()) return -1;
+	if (anchors.size() == 1) return 0;
+	// Recency-spaced with a floor: newest anchor weight 1, oldest anchorRecencyFloor,
+	// linear in rank. Never zero - ancient styles stay reachable (tail robustness), but
+	// recent anchors dominate so most anchor games are real contests rather than free wins.
+	const double floorW = RS_MAX(0.01f, cfg.anchorRecencyFloor);
+	const double n1 = (double)(anchors.size() - 1);
+	double sum = 0;
+	std::vector<double> w(anchors.size());
+	for (size_t i = 0; i < anchors.size(); i++) {
+		w[i] = floorW + (1.0 - floorW) * ((double)i / n1);
+		sum += w[i];
+	}
+	double r = ((double)Math::RandInt(0, 100000) / 100000.0) * sum, acc = 0;
+	for (size_t i = 0; i < anchors.size(); i++) { acc += w[i]; if (r <= acc) return (int)i; }
+	return (int)anchors.size() - 1;
 }
 
 LeagueArchive::~LeagueArchive() {
@@ -285,7 +402,25 @@ int LeagueArchive::SampleOpponent() const {
 	return (int)members.size() - 1;
 }
 
-ModelSet* LeagueArchive::LoadPFSPOpponentModels() {
+ModelSet* LeagueArchive::LoadPFSPOpponentModels(bool allowAnchors) {
+	// Anchor draw (LEAGUE_ANCHORS.md): a conditional inside the existing
+	// descendOpponentFrac serve, so this is a REALLOCATION of the opponent budget, not
+	// extra arena cost. cfg.anchorFrac is expressed as a share of ALL iterations, so
+	// convert to the conditional P(anchor | league serve). Anchors come from their own
+	// vector, so they cannot consume the elite/exploiter budget.
+	if (allowAnchors && !anchors.empty() && cfg.anchorFrac > 0) {
+		float pAnchor = cfg.descendOpponentFrac > 1e-6f
+			? cfg.anchorFrac / cfg.descendOpponentFrac : 0.f;
+		pAnchor = RS_CLAMP(pAnchor, 0.f, 1.f);
+		if ((float)Math::RandInt(0, 100000) / 100000.0f < pAnchor) {
+			int ai = SampleAnchor();
+			if (ai >= 0) {
+				LoadInto(oppServe, anchors[ai].params);
+				anchorServes++;
+				return &oppServe;
+			}
+		}
+	}
 	if (members.empty()) return nullptr;
 	int idx = SampleOpponent();
 	if (idx < 0) return nullptr;
@@ -469,6 +604,14 @@ void LeagueArchive::LogMetrics(Report& report) const {
 	}
 	report["League/Exploiter Count"] = (float)exploiters;
 	report["League/Lineage Count"] = (float)lineages.size();
+	// Anchors are deliberately EXCLUDED from the cell/diversity stats above (they are not
+	// MAP-Elites members); report them separately so the panels stay interpretable.
+	report["League/Anchor Count"] = (float)anchors.size();
+	report["League/Anchor Serves"] = (float)anchorServes;
+	if (!anchorTs.empty()) {
+		report["League/Anchor Span Steps"] = (float)(anchorTs.back() - anchorTs.front());
+		report["League/Anchor Oldest Ts"] = (float)anchorTs.front();
+	}
 	if (!members.empty()) report["League/Mean Fitness"] = meanFit / members.size();
 	if (exploiters > 0) report["League/Best Exploiter Fitness"] = bestExploiterFit;
 

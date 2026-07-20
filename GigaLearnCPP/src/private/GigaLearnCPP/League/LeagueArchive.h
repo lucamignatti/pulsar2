@@ -45,6 +45,16 @@ namespace GGL {
 		int nextLineage = 0;                   // monotonic era counter for re-seeds
 		int refreshCursor = 0;                 // round-robin over members for staleness refresh
 
+		// Permanent spaced ANCHOR opponents (LEAGUE_ANCHORS.md). A SEPARATE vector on
+		// purpose: every collapse mechanism (Cull, RefreshStalest, TryInsert, the MAP-Elites
+		// cell map, DedupCells) walks `members` only, so anchors are structurally exempt
+		// from re-scoring and culling rather than relying on scattered if-checks. They are
+		// also excluded from the diversity/cell metrics, and NOT persisted into the league
+		// dir - they are re-loaded from their checkpoint dirs at every boot.
+		std::vector<Member> anchors;           // fitness/cell/bd unused; params only
+		std::vector<long long> anchorTs;       // timestep of each anchor, ascending
+		long anchorServes = 0;                 // telemetry: anchor opponent serves this process
+
 		// Quantile-adaptive binning state (cfg.quantileBins): a rolling window of every BD ever
 		// measured, and the per-axis ascending bin edges derived from its quantiles. binEdges empty
 		// (or flag off) = the original uniform [0,1] binning.
@@ -66,7 +76,10 @@ namespace GGL {
 		// Load a PFSP-sampled member's weights into the internal opponent ModelSet and return it for
 		// the training collection loop to use as this iteration's opponent; nullptr if the archive is
 		// empty. This is what finally gives DESCEND arenas exposure to non-self styles.
-		ModelSet* LoadPFSPOpponentModels();
+		// allowAnchors=false disables the anchor slice only (evolved members still serve) - the
+		// caller passes !steerRatingTripped so the rating latch kills the anchor intervention
+		// exactly the way it kills steering/Ladder/RND (LEAGUE_ANCHORS.md guard).
+		ModelSet* LoadPFSPOpponentModels(bool allowAnchors = true);
 
 		void ToJSON(nlohmann::json& j) const;
 		void FromJSON(const nlohmann::json& j);
@@ -78,6 +91,10 @@ namespace GGL {
 		std::vector<torch::Tensor> SnapshotMain() const;              // current main policy weights
 		void LoadInto(ModelSet& set, const std::vector<torch::Tensor>& params);
 		long CellIndex(const std::vector<float>& bd) const;
+
+		// Anchor support (all no-ops when cfg.anchorFrac <= 0).
+		void LoadAnchors();                    // scan anchorDir, decimate, load flat vectors
+		int SampleAnchor() const;              // recency-spaced draw with a floor; -1 if none
 
 		// Play a fixed window of match env with `memberParams` (team A) vs the main agent (team B);
 		// return quality = (A goals - B goals) and fill `outBD`.
