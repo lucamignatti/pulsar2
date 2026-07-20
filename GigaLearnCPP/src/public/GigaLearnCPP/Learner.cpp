@@ -16,6 +16,7 @@
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
+#include <private/GigaLearnCPP/NextoOpponent.h>
 #include <private/GigaLearnCPP/PSD/PSDController.h>
 #include <private/GigaLearnCPP/League/LeagueArchive.h>
 
@@ -375,6 +376,11 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		renderSender = NULL;
 	}
 
+	// External fixed opponent (Nexto): fail LOUD at boot if the model is missing -
+	// a mid-run lazy failure would silently turn serve iterations into self-play
+	if (config.externalOpponent.enabled && !config.renderMode)
+		nexto = std::make_shared<NextoOpponent>(config.externalOpponent.modelPath, device);
+
 	if (config.skillTracker.enabled || config.trainAgainstOldVersions)
 		config.savePolicyVersions = true;
 
@@ -498,6 +504,13 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["ladder_imp_touches"] = (int64_t)ladderImpTouches;
 	}
 
+	// Nexto yardstick: cumulative series must survive restarts to stay longitudinal
+	if (nexto) {
+		j["nexto_goals_for"] = (int64_t)nextoGoalsFor;
+		j["nexto_goals_against"] = (int64_t)nextoGoalsAgainst;
+		j["nexto_serve_iters"] = (int64_t)nextoServeIters;
+	}
+
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
@@ -577,6 +590,11 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	}
 	if (j.contains("ladder_imp_touches"))
 		ladderImpTouches = (int64_t)j["ladder_imp_touches"];
+	if (j.contains("nexto_goals_for")) {
+		nextoGoalsFor = (int64_t)j["nexto_goals_for"];
+		nextoGoalsAgainst = (int64_t)j["nexto_goals_against"];
+		nextoServeIters = (int64_t)j.value("nexto_serve_iters", (int64_t)0);
+	}
 
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
@@ -3314,28 +3332,46 @@ void GGL::Learner::Start() {
 			// below are shared by all three sources. The sources are mutually exclusive and the choice
 			// is made once per iteration.
 			ModelSet* oppModels = nullptr;
+			// External fixed opponent (Nexto): mutually exclusive with the sources
+			// below, highest-priority roll. Rows are excluded from training via the
+			// same old-player split; inference routes through the adapter instead of
+			// InferActions (Nexto reads GameStates, not our obs).
+			bool oppExternal = false;
 			std::vector<bool> oldVersionPlayerMask;
 			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
 			torch::Tensor tNewPlayerIndices, tOldPlayerIndices;
+			Team oppTeam = Team::BLUE;
 
 			for (int i = 0; i < numPlayers; i++)
 				newPlayerIndices.push_back(i);
 
 			if (!render) {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
+				if (nexto && !steerRatingTripped
+					&& RocketSim::Math::RandFloat() < config.externalOpponent.serveFrac) {
+					// steerRatingTripped: same latch that kills steering/RND/drive/anchors
+					// covers this data-distribution intervention too
+					oppExternal = true;
+					nexto->BeginServe(numPlayers);
+					nextoServeIters++;
+				} else if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
 					&& RocketSim::Math::RandFloat() < config.trainAgainstOldChance) {
 					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
 					oppModels = &versionMgr->versions[oldVersionIdx].models;
 				} else if (league && RocketSim::Math::RandFloat() < config.league.descendOpponentFrac) {
 					// PFSP-sampled league member -> the exposure to non-self styles the league is for
 					// (returns null while the archive is still empty, falling back to self-play).
-					oppModels = league->LoadPFSPOpponentModels();
+					// steerRatingTripped gates the ANCHOR slice only (evolved members keep serving):
+					// anchors are the new intervention, so they answer to the same latch that kills
+					// steering / the Ladder drive / RND. Same write-in-barrier, read-on-collect
+					// discipline as ppo->steerVec.
+					oppModels = league->LoadPFSPOpponentModels(!steerRatingTripped);
 				}
 			}
 
-			if (oppModels) {
-				Team oppTeam = Team(RocketSim::Math::RandInt(0, 2));
+			const bool oppServed = oppModels || oppExternal;
+			if (oppServed) {
+				oppTeam = Team(RocketSim::Math::RandInt(0, 2));
 
 				newPlayerIndices.clear();
 				oldVersionPlayerMask.resize(numPlayers);
@@ -3357,7 +3393,7 @@ void GGL::Learner::Start() {
 				tOldPlayerIndices = torch::tensor(oldPlayerIndices);
 			}
 
-			int numRealPlayers = oppModels ? newPlayerIndices.size() : envSet->state.numPlayers;
+			int numRealPlayers = oppServed ? newPlayerIndices.size() : envSet->state.numPlayers;
 
 			// Opponent style draw (roadmap phase 1): with opponentStyleChance, this
 			// iteration's opponent additionally plays a validated style direction at an
@@ -3391,6 +3427,7 @@ void GGL::Learner::Start() {
 			// mid-collect.
 			torch::Tensor tSteerMask = {}, tSteerModes = {};
 			if (steerOn && steerLoaded) {
+				// (guards below use oppServed: the split applies to ALL opponent sources)
 				auto steerRows = std::vector<uint8_t>(numPlayers);
 				auto steerModes = std::vector<int64_t>(numPlayers);
 				for (int i = 0; i < numPlayers; i++) {
@@ -3399,7 +3436,7 @@ void GGL::Learner::Start() {
 				}
 				tSteerMask = torch::tensor(steerRows).to(torch::kBool);
 				tSteerModes = torch::tensor(steerModes);
-				if (oppModels) {
+				if (oppServed) {
 					tSteerMask = tSteerMask.index_select(0, tNewPlayerIndices);
 					tSteerModes = tSteerModes.index_select(0, tNewPlayerIndices);
 				}
@@ -3420,7 +3457,7 @@ void GGL::Learner::Start() {
 				// so a pre-filled buffer collects ZERO steps (Collection SPS -> 0, no progress). The
 				// discarded tails are minor, slightly-off-policy truncated data PPO doesn't want; the
 				// collection loop still gathers a full tsPerItr of fresh on-policy experience.
-				if (oppModels) {
+				if (oppServed) {
 					for (int oldPlayerIdx : oldPlayerIndices)
 						trajectories[oldPlayerIdx].Clear();
 				}
@@ -3527,23 +3564,35 @@ void GGL::Learner::Start() {
 
 						Timer inferTimer = {};
 
-						if (oppModels) {
+						if (oppServed) {
 							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
 							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes,
 								{}, 0, &ppo->ladderCollect);
-							ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels,
-								{}, {}, oppStyleVec, oppStyleCoef); // opponents: zero wire (their columns trained against their own era's ladder; zeros = the neutral input)
+							if (oppExternal) {
+								// Nexto reads GameStates directly (its own obs builder), and
+								// returns OUR action-table indices via the checked map. The
+								// terminals vector still holds the PREVIOUS step's flags -
+								// exactly the fresh-episode signal its prev-action memory needs.
+								std::vector<int> extActions(numPlayers, 0);
+								nexto->Act(envSet->state.gameStates, oldVersionPlayerMask,
+									envSet->state.terminals, extActions);
+								auto tExt = torch::tensor(extActions);
+								tOldActions = tExt.index_select(0, tOldPlayerIndices);
+							} else {
+								torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+								torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+								ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels,
+									{}, {}, oppStyleVec, oppStyleCoef); // opponents: zero wire (their columns trained against their own era's ladder; zeros = the neutral input)
+							}
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
 							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
-							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu());
+							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu().to(tNewActions.dtype()));
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
@@ -3614,6 +3663,17 @@ void GGL::Learner::Start() {
 								for (auto& player : envSet->state.gameStates[arenaIdx].players)
 									if (player.ballTouchedStep)
 										ladderImpTouches++;
+
+						// Nexto yardstick: cumulative goals for/against the external opponent
+						// (RS_TEAM_FROM_Y = the CONCEDING team; conceder == Nexto -> we scored)
+						if (oppExternal)
+							for (auto& gs : envSet->state.gameStates)
+								if (gs.goalScored) {
+									if (RS_TEAM_FROM_Y(gs.ball.pos.y) == oppTeam)
+										nextoGoalsFor++;
+									else
+										nextoGoalsAgainst++;
+								}
 
 						// Deliberate-practice DRILL snapshot capture (Stage 3): every snapshotEveryK
 						// steps, record enough of each arena's physics state to restore play from
@@ -4759,6 +4819,14 @@ void GGL::Learner::Start() {
 						report["RND/Time"] = rndTimer.Elapsed();
 					}
 
+					// Nexto yardstick panels: cumulative counters (persisted in stats), the
+					// fixed external benchmark immune to version-pool inflation
+					if (nexto) {
+						report["Nexto/Goals For"] = (float)(int64_t)nextoGoalsFor;
+						report["Nexto/Goals Against"] = (float)(int64_t)nextoGoalsAgainst;
+						report["Nexto/Serve Iters"] = (float)(int64_t)nextoServeIters;
+					}
+
 					// ===== OPTIMISTIC-CRITIC LADDER (LADDER.md; full build 2026-07-18) =====
 					// Stage 1: expectile sensor (detached twin, GAE targets) -> gap_KD.
 					// Rung 3: quasimetric map (own optimizer, QRL local/spread + dual
@@ -5394,9 +5462,18 @@ void GGL::Learner::Start() {
 						"Ladder/Wire Col Grad",
 						"Ladder/Retention Viol",
 						"",
+						"Nexto/Goals For",
+						"Nexto/Goals Against",
+						"Nexto/Serve Iters",
+						"",
 						"League/Member Count",
 						"League/Cell Count",
 						"League/Lineage Count",
+						// Anchor opponents (LEAGUE_ANCHORS.md): Anchor Serves rising is the
+						// only proof the reallocated 0.05 slice is actually being played;
+						// Anchor Count 0 means the anchor dir is missing/empty (feature inert).
+						"League/Anchor Count",
+						"League/Anchor Serves",
 						"League/Quantile Bins Live",
 						"League/BD Samples",
 						"",

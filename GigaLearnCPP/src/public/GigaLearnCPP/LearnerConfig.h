@@ -318,6 +318,20 @@ namespace GGL {
 		int impossibleArenas = 0;
 	};
 
+	// External fixed opponent (Nexto; NextoOpponent.h has the full rationale):
+	// on serveFrac of collection iterations, the non-self team across the whole
+	// fleet is played by a frozen external TorchScript bot instead of self/pool/
+	// league. Forces contact with its style (aerial play, the point) and gives a
+	// FIXED yardstick (Nexto/Goals For/Against) immune to pool inflation. Rows
+	// are excluded from training exactly like old-version opponents; eval paths
+	// never see it (Rating semantics unchanged). Latch-covered like every other
+	// data-distribution intervention.
+	struct ExternalOpponentConfig {
+		bool enabled = false;
+		std::string modelPath = {};  // TorchScript module (Nexto's nexto-model.pt)
+		float serveFrac = 0.15f;     // per-iteration serve probability
+	};
+
 	struct RndOptimismConfig {
 		bool enabled = false;
 		float weight = 0.1f;      // injected advantage-std fraction per 1z of novelty
@@ -433,6 +447,9 @@ namespace GGL {
 
 		// Introspective frontier drive, Stage-1 sensor; additive and default-OFF
 		GapSensorConfig gapSensor = {};
+
+		// External fixed opponent (Nexto); additive and default-OFF
+		ExternalOpponentConfig externalOpponent = {};
 
 		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
 		// unchanged unless psd.enabled / league.enabled are set.

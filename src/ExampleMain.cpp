@@ -556,6 +556,9 @@ int main(int argc, char* argv[]) {
 		cfg.gapSensor.driveWarmupIters = 2;
 		cfg.gapSensor.mapWarmupIters = 2;
 		cfg.gapSensor.bankMinFill = 4;
+		// NOTE: league anchor overrides do NOT belong here - this block runs BEFORE the
+		// cfg.league.* assignments below, which would clobber them. See the GGL_SMOKE
+		// re-application right after the league anchor config.
 		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential, ladder warmups collapsed (offline sandbox smoke)");
 	}
 
@@ -804,6 +807,37 @@ int main(int argc, char* argv[]) {
 	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often
 	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
 
+	// PERMANENT SPACED ANCHORS (2026-07-19, analysis/probes/LEAGUE_ANCHORS.md).
+	// Measured: the evolved archive is COLLAPSED - League/Member Count 3 and Cell Count 1
+	// of 216 in 92% of report blocks. Mechanism (code-verified): fitness is re-scored
+	// against the improving main every refresh, so every fixed style ratchets below
+	// competenceFloor and gets culled, while ReseedFromMain only adds near-clones. So the
+	// 0.35 "diverse opponent" budget was really 3 copies of the recent self. Independently
+	// measured consequence: real match-play progress is only ~+4 Elo/B (+31 Elo over 8.6B
+	// steps vs the 18.88B self) while pool Rating claimed +187 - a self-similar pool both
+	// starves training and inflates the yardstick.
+	// Anchors are full checkpoints archived outside the rotation by tools/archive_anchor.sh,
+	// held in their OWN vector so they are structurally exempt from re-scoring and culling
+	// (that exemption IS the fix; scoring them re-arms the same ratchet). Pre-wire (512)
+	// anchors migrate via Model::Load's zero-pad on the way in.
+	// 0.05 of ALL iterations = ~1/7 of the existing 0.35 league serve: a REALLOCATION, not
+	// extra arena cost. Guarded by the rating latch; revert = set this to 0 (byte-identical).
+	// Success criterion is the anchor battery's real-Elo slope (analysis/probes/
+	// anchor_battery.py), NOT Rating - see LEAGUE_ANCHORS.md pre-registration.
+	cfg.league.anchorFrac = 0.05f;
+	cfg.league.anchorMaxServed = 24;        // serving cap; disk archive keeps everything
+	cfg.league.anchorRecencyFloor = 0.15f;  // oldest anchor's sampling weight vs the newest
+	// GGL_SMOKE re-application (MUST live after the assignments above - the smoke block
+	// higher up runs first and would be clobbered). At the production 0.05 an anchor
+	// serves ~1 iteration in 20, so a short smoke would report Anchor Serves 0 and prove
+	// nothing; forcing anchorFrac == descendOpponentFrac makes P(anchor | league serve) = 1
+	// so load + migrate + serve is exercised deterministically. Never set on the trainer.
+	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0") {
+		cfg.league.anchorFrac = cfg.league.descendOpponentFrac;
+		RG_LOG("GGL_SMOKE: league anchorFrac forced to descendOpponentFrac ("
+			<< cfg.league.descendOpponentFrac << ") - every league serve draws an anchor");
+	}
+
 	// ---------------------------------------------------------------------------------------------
 	// Steered-practice collection ("optimism surgery"), ENABLED - carried over from the 3.1
 	// lineage, where v2 (possession-outcome derivation + rho-band gate) ran with healthy guards.
@@ -1044,6 +1078,29 @@ int main(int argc, char* argv[]) {
 		// precision rule. Revisit upward only with a measured SPS budget.
 		cfg.gapSensor.bankCapacity = 256;
 		g_NumImpossibleArenas = cfg.gapSensor.impossibleArenas;
+
+		// EXTERNAL OPPONENT: NEXTO (2026-07-20, user-directed "play better bots
+		// to force the aerials"). On serveFrac of iterations the whole fleet's
+		// non-self team is Nexto (frozen public SSL-level RLGym bot, tick_skip 8
+		// like this run; adapter + full rationale in NextoOpponent.h). Two jobs:
+		// (1) exposure - contesting an opponent that lives in the air puts the
+		// high-ball states our self-play never produces into the buffer; (2) the
+		// Nexto/Goals For/Against panels are a FIXED external yardstick immune to
+		// the pool inflation measured in H2_TRUNCATION.md. Rows excluded from
+		// training like all opponent sources; eval paths untouched (Rating
+		// semantics unchanged); latch-covered. Expect to LOSE heavily at first -
+		// the goal-diff SLOPE is the signal, not the level. Revert = false.
+		cfg.externalOpponent.enabled = true;
+		cfg.externalOpponent.modelPath =
+			"/home/luca/Projects/pulsar2-3.0/rlbot-run/nexto/nexto-model.pt";
+		cfg.externalOpponent.serveFrac = 0.15f;
+		// GGL_SMOKE: serve on most iterations so a short smoke exercises the
+		// adapter (obs port + action map + goal telemetry) deterministically.
+		// Lives HERE, after the production assignment - the smoke block up top
+		// runs first and would be clobbered (same trap as the league-anchor
+		// smoke override). Never set on the trainer.
+		if (const char* s2 = std::getenv("GGL_SMOKE"); s2 && s2[0] && std::string(s2) != "0")
+			cfg.externalOpponent.serveFrac = 0.75f;
 	} else {
 		// VIZ FIX (2026-07-18, same evening as ladder deploy): render mode was
 		// skipped by the whole block above, so it never set wireEnabled - the

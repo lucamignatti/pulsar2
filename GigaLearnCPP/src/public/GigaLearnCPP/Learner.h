@@ -117,6 +117,13 @@ namespace GGL {
 		// Stage-1 gap sensor plus the quasimetric map, banks and calibration
 		std::shared_ptr<struct GapState> gapSensor;
 
+		// External fixed opponent (config.externalOpponent; opaque - torch types
+		// stay out of this header). Frozen weights: collection-side only, nothing
+		// to snapshot or checkpoint. Cumulative goal counters = the fixed external
+		// yardstick (persisted so the series survives restarts).
+		std::shared_ptr<class NextoOpponent> nexto;
+		std::atomic<int64_t> nextoGoalsFor = 0, nextoGoalsAgainst = 0, nextoServeIters = 0;
+
 		// Impossible-control drill family (gapSensor.impossibleArenas): the LAST N
 		// arenas of the contiguous leading 1v1 block, computed at Start() by scanning
 		// the EnvSet (ExampleMain places ImpossibleInterceptState on the same rule).
