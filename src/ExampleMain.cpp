@@ -55,8 +55,18 @@ static constexpr int MAX_PLAYERS_PER_TEAM = 3;
 // polluted pool coincided with the gate duty-cycling around zero all PHASE B (wandb).
 // Team arenas get their own correctly-team-labeled Steer/PossWin TeamMatch panel
 // instead: measurement first, team-mode steering only as its own later experiment.
-static constexpr float PHASE_B_FRAC_2V2 = 0.20f;
-static constexpr float PHASE_B_FRAC_3V3 = 0.15f;
+// EVEN MODE SPLIT (2026-07-19, user-directed): 0.20/0.15 -> 1/3 each. The old
+// split left 3v3 at 15% of arenas (~30% of rows; rows scale with players), and
+// Rating/3v3 sat flat in the 250-400 band since 15.3B while 1v1 climbed - the
+// exposure-starvation read. Equal ARENAS deliberately over-weights team play in
+// DATA terms: row share becomes ~17% 1v1 / 33% 2v2 / 50% 3v3 (1v1 keeps ~680
+// rows/step - maintenance-level, and its rating is pool-inflated ~6x anyway per
+// H2_TRUNCATION.md). Watch: Rating/2v2 + /3v3 slopes (the point), Rating/1v1
+// for maintenance (guard bands 200/150 absorb a plateau; a hard 1v1 slide =
+// revert the fractions), SPS + GPU memory (numPlayers 3068 -> ~4094, bigger
+// inference batches).
+static constexpr float PHASE_B_FRAC_2V2 = 0.3333f;
+static constexpr float PHASE_B_FRAC_3V3 = 0.3333f;
 
 // AUTOMATIC PHASE-B TRIGGER ("once 1v1 performs decently", made mechanical): when
 // Rating/1v1 posts PHASE_B_TRIGGER_STREAK consecutive skill-tracker evals at or above
