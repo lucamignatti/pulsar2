@@ -157,7 +157,27 @@ namespace GGL {
 
 		float pfspTemp = 1.0f;            // PFSP matchmaking temperature
 		float descendOpponentFrac = 0.25f;// probability a training iteration faces a league opponent
-		int refAnchors = 3;               // (reserved) frozen reference opponents for BD measurement
+
+		// === Permanent spaced ANCHOR opponents (analysis/probes/LEAGUE_ANCHORS.md) ===
+		// Measured problem (2026-07-19): the evolved archive collapses to ~3 members / 1
+		// occupied cell because fitness (= member goals - main goals) is RE-SCORED against
+		// the improving main, so every fixed style ratchets below competenceFloor and is
+		// culled; ReseedFromMain only ever adds near-clones. Result: the "diverse" opponent
+		// pool is 3 copies of the recent self, and real match-play progress is ~+4 Elo/B.
+		//
+		// Anchors are full checkpoints archived OUTSIDE the rotation by
+		// tools/archive_anchor.sh. They live in their own vector, so they are structurally
+		// exempt from Cull/RefreshStalest/TryInsert/MAP-Elites: they are NEVER re-scored and
+		// NEVER culled. That exemption is the entire design - a build that keeps scoring
+		// them re-collapses in days via the same ratchet.
+		float anchorFrac = 0.0f;          // share of ALL training iterations facing an anchor
+		                                  // (served as a conditional draw inside the
+		                                  //  descendOpponentFrac serve; 0 = feature OFF)
+		int anchorMaxServed = 24;         // cap on the SERVING set (spaced-decimation keeps a
+		                                  //  log-spaced span, not a recent window); disk keeps all
+		float anchorRecencyFloor = 0.15f; // sampling weight of the OLDEST anchor relative to the
+		                                  //  newest (linear in rank); never 0 - tail robustness
+		std::string anchorDir = "";       // default: "<checkpointFolder>_anchors"
 		int matchesPerMember = 20;        // (reserved) eval matches before fitness/BD is trusted
 		int maxMembers = 256;
 		int evolveEveryIters = 16;        // cadence of the league evolution step
