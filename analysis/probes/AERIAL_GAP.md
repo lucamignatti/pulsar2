@@ -151,3 +151,24 @@ Rating vs the drawdown monitor as always. If boost recovers but conversion
 does not, the residual gap is takeoff SKILL -> AirDrill altitude-anneal v2
 (its 5 pre-registration requirements are recorded in ExampleMain), NOT a
 touch-streak PBRS (corner-jugglable, rejected 2026-07-19).
+
+## 45.4B census (2026-07-21): "stopped improving?" -> NO, acquisition ongoing
+
+User asked whether a fresh train was warranted (Pulsar "seems to have stopped").
+Census at 45.4B vs 29.3B baseline, plus policy entropy ~0.66 (healthy/plastic):
+
+- GROUND TAKEOFF aerial touches 0.7% -> 14% (20x); carz500 0% -> 6.3%. The
+  jump->boost-climb transition (0/300 for the ENTIRE 4.0 lineage + all of 5.0
+  until now) formed in the ~4B-step window the AirPlayState seeding + boost-as-
+  energy fix landed. Unambiguous new-skill acquisition.
+- proto-dribble 291 -> 587 /100k (2x); drill completion 62% (held); wavedash/
+  flip-cancel ~flat (-10%, noise).
+- TRANSFER LAG: match-play opportunity conversion flat-to-down (1v1 0.095->0.073,
+  2v2 0.077->0.055); boost@opp only partly recovered (1v1 18->21, 2v2 20->17).
+  Skill exists in drills, not yet CHOSEN in live opportunities.
+
+VERDICT: not maturation (entropy healthy, takeoff skill just cracked) - an
+integration lag at 4B steps. Cold start would discard the policy exactly as the
+prerequisite skill formed. Watch: match conversion following drill skill upward,
+boost@opp -> ~40. Only a weeks-long conversion flatline WITH drill skill high
+would signal an integration problem (targeted fix, still not a fresh train).
