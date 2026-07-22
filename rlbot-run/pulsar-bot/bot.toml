@@ -1,0 +1,13 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "Pulsar2"
+run_command = "run.sh"
+run_command_linux = "./run.sh"
+agent_id = "pulsar2/gigalearn"
+hivemind = false
+
+[details]
+developer = "Luca"
+description = "GigaLearn C++ PPO bot (pulsar2 5.0v3), via the official RLBot v5 C++ interface."
+language = "C++"
+tags = ["ml", "ppo"]

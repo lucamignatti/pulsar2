@@ -1,0 +1,29 @@
+#:schema https://rlbot.org/schemas/match.json
+# Bot-vs-bot: Pulsar2 (our GigaLearn bot) vs Nexto (RLGym community bot). No human -
+# you spectate. Same NoLaunch/anti-cheat safety: YOU launch RL, pick "Play without
+# Easy Anti-Cheat". Nexto supports teamplay, so ./play.sh match_vs_nexto 2|3 works too.
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 0
+
+# Nexto lives locally in this project (rlbot-run/nexto); its bot.toml's run_command
+# points at the sibling project's venv, which has its deps (torch/numpy/rlgym_compat).
+[[cars]]
+config_file = "nexto/bot.toml"
+team = 1

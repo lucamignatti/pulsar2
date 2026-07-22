@@ -15,8 +15,7 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-file(GLOB_RECURSE FILES_SRC "src/*.cpp" "src/*.h" "src/*.hpp")
-add_executable(GigaLearnBot ${FILES_SRC})
+add_executable(GigaLearnBot src/ExampleMain.cpp)
 
 # Set C++ version to 20
 set_target_properties(GigaLearnBot PROPERTIES LINKER_LANGUAGE CXX)
@@ -31,9 +30,17 @@ set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}")
 add_subdirectory(GigaLearnCPP)
 target_link_libraries(GigaLearnBot GigaLearnCPP)
 
-# Include RLBot
-add_subdirectory(RLBotCPP)
-target_link_libraries(GigaLearnBot RLBotCPP)
+# Official RLBot v5 C++ interface (defines the RLBotCPP target). Its CMake uses
+# FetchContent to pull matching flatbuffers + RLBot/flatbuffers-schema versions,
+# so building GigaLearnRLBot needs network access on a fresh build dir.
+add_subdirectory(cpp-interface)
+
+# Standalone RLBot v5 client binary: loads a trained checkpoint via InferUnit and
+# plays live matches (RLBotSim or real Rocket League). Deliberately NOT linked into
+# GigaLearnBot - the trainer and the play-against-the-bot client are separate concerns.
+add_executable(GigaLearnRLBot src/RLBotClient.cpp src/RLBotMain.cpp)
+set_target_properties(GigaLearnRLBot PROPERTIES CXX_STANDARD 20)
+target_link_libraries(GigaLearnRLBot GigaLearnCPP RLBotCPP)
 
 # Offline unit tests (GigaLearnTests). OFF by default so the training box's
 # `cmake --build build` stays byte-identical; enable with -DGGL_BUILD_TESTS=ON.

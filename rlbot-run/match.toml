@@ -1,0 +1,17 @@
+#:schema https://rlbot.org/schemas/match.json
+# 1v1 headless validation: Pulsar2 (our GigaLearn bot) vs a built-in Psyonix bot.
+# Paths are relative to this file. RLBotSim stands in for real Rocket League.
+[rlbot]
+launcher = "NoLaunch"       # don't launch Rocket League; RLBotSim is the "game"
+auto_start_agents = true    # the server launches each car's run_command
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 0
+
+[[cars]]
+type = "psyonix"
+team = 1

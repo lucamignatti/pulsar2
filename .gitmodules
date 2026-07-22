@@ -1,10 +1,10 @@
 [submodule "pybind11"]
 	path = GigaLearnCPP/pybind11
 	url = https://github.com/pybind/pybind11
-[submodule "RLBotCPP"]
-	path = RLBotCPP
-	url = https://github.com/kipje13/RLBotCPP
 [submodule "tools/viz/RocketSimVisWeb"]
 	path = tools/viz/RocketSimVisWeb
 	url = https://github.com/lucamignatti/RocketSimVisWeb.git
 	branch = pulsar-patches
+[submodule "cpp-interface"]
+	path = cpp-interface
+	url = https://github.com/RLBot/cpp-interface.git

@@ -1,0 +1,30 @@
+#:schema https://rlbot.org/schemas/match.json
+# Bot-vs-bot: Pulsar2 (our GigaLearn bot) vs Element (VirxEC's RL bot). No human -
+# you spectate in the Rocket League window. Same NoLaunch/anti-cheat safety as the
+# human match: YOU launch RL and pick "Play without Easy Anti-Cheat".
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 0
+
+# Element lives in the sibling checkout with its own Python venv (numpy/torch/
+# rlgym_compat + rlbot 2.0.0b52); its bot.toml's run_command already points at that
+# venv and it runs from its own src/ dir, so we reference it by absolute path.
+[[cars]]
+config_file = "/home/luca/Projects/pulsar2/rlbot-run/Elementv5/src/bot.toml"
+team = 1

@@ -1,0 +1,13 @@
+# Local match-running harness scratch: commit the scripts/configs only, never the
+# heavy/generated/vendored runtime artifacts below.
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Binaries / vendored builds / weights / checkpoints (large, not source)
+RLBotServer
+RLBotSim/
+collision_meshes
+nexto/nexto-model.pt
+pulsar-bot/checkpoint/

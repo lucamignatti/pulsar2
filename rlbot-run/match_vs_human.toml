@@ -1,0 +1,33 @@
+#:schema https://rlbot.org/schemas/match.json
+# 1v1: you (human, via Steam-launched Rocket League) vs Pulsar2 (our GigaLearn bot).
+[rlbot]
+# NoLaunch: RLBotServer must NOT launch Rocket League. YOU launch it from Steam and
+# pick "Play without Easy Anti-Cheat" - so the EAC choice is always in your hands and
+# the server can never auto-pick the anti-cheat binary. RL connects back via the
+# "-rlbot" Steam launch option (opens the RLBot API + disables all online play).
+launcher = "NoLaunch"
+auto_start_agents = true    # once RL connects, the server starts pulsar-bot's run_command
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+# Force a clean, straight-into-the-match start. Without these, RL loaded a Playtest
+# lobby with a team-select menu (a 1v0), and picking a team dropped RL out of the
+# RLBot-controlled match -> server tore down. These mirror RLBot's own working
+# human-vs-bot / run_forever examples.
+existing_match_behavior = "Restart"   # always (re)start a fresh match, don't reuse RL's current state
+instant_start = true                  # skip the kickoff-countdown/menu, spawn straight in
+enable_state_setting = true           # examples enable this for human matches
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+type = "Human"
+team = 0
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 1
