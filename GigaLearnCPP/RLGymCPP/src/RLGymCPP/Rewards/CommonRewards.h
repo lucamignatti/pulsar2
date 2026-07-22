@@ -709,4 +709,148 @@ namespace RLGC {
 			return (prevTouchTeam == (int)RS_OPPOSITE_TEAM(player.team)) ? 1.0f : 0.0f;
 		}
 	};
+
+	// CONSECUTIVE AIR TOUCHES (2026-07-21, user-directed): rewards CHAINING several
+	// airborne ball touches without landing in between - sustained aerial control
+	// (aerial dribbling / juggling), the skill AerialTouchReward's single-strike
+	// event cannot express. Built as an exact-telescoping PBRS so it is UNFARMABLE
+	// BY CONSTRUCTION (the user's requirement), not by tuning: Phi is a saturating
+	// function of a per-player consecutive-air-touch STREAK, r = gamma*Phi(s') -
+	// Phi(s). Extending a chain raises Phi (positive, LOCAL credit for the extra
+	// touch); the moment the player lands, the streak resets to 0 and the whole
+	// chain is refunded (gamma*Phi(0) - Phi(n) = -Phi(n)), so a tap-land-tap grind
+	// nets ~0 - the discounted sum over ANY trajectory telescopes to -Phi(start).
+	// gamma MUST equal the learner's gaeGamma (stack rule) or it stops telescoping
+	// against GAE. Wrap in ZeroSumReward: a linear map of a per-player potential is
+	// still a telescoping potential, so this keeps the whole-stack zero-sum
+	// invariant while staying exact PBRS. NEVER gate (positive-part gating breaks
+	// telescoping).
+	//
+	// Phi(streak) = 1 - exp(-max(0, streak-1)/TAU): streak 0 AND 1 both score 0, so
+	// a lone airborne touch pays nothing here (that is AerialTouchReward's job) and
+	// credit begins on the 2nd consecutive air touch, saturating toward 1 so an
+	// endless juggle cannot pay unboundedly (marginal credit shrinks each touch).
+	// The streak counts this player's airborne (isOnGround==false) ballTouchedStep
+	// touches and resets to 0 whenever the player is on the ground OR a wall (any
+	// isOnGround - "consecutive AIR touches" ends the instant you are supported).
+	// A demo/respawn is a teleport, not the player's action: the streak resets and
+	// the step is not charged (mirrors the other potentials' demo guard - a
+	// negligible, standard telescoping leak). Per-arena instance -> no cross-arena
+	// state.
+	class ConsecutiveAirTouchReward : public Reward {
+	public:
+		constexpr static float TAU = 2.0f; // touches past the first to reach ~63% saturation
+		float gamma;
+		ConsecutiveAirTouchReward(float gamma = 0.99f) : gamma(gamma) {}
+
+		std::vector<int> streak; // per player.index
+
+		static float Phi(int streak) {
+			int chained = streak - 1; // 0 and 1 -> no chain yet
+			if (chained <= 0)
+				return 0.f;
+			return 1.f - expf(-(float)chained / TAU);
+		}
+
+		virtual void Reset(const GameState& initialState) override {
+			streak.assign(initialState.players.size(), 0);
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if ((size_t)player.index >= streak.size())
+				streak.resize(player.index + 1, 0);
+			int& s = streak[player.index];
+			int prevStreak = s;
+
+			// Demo/respawn teleport is not the player's action: drop the chain, don't charge it
+			if (player.isDemoed || (player.prev && player.prev->isDemoed)) {
+				s = 0;
+				return 0;
+			}
+
+			if (player.isOnGround) {
+				s = 0; // supported (ground OR wall): the airborne chain ends
+			} else if (player.ballTouchedStep) {
+				s = prevStreak + 1; // another airborne touch extends the chain
+			}
+			// else: airborne, no touch -> streak unchanged (Phi bleeds by (gamma-1)*Phi)
+
+			return gamma * Phi(s) - Phi(prevStreak);
+		}
+	};
+
+	// WALL-JUMP-TO-BALL (2026-07-21, user-directed): rewards going for the ball in
+	// the air after launching off a wall - the wall-read aerial (drive up a wall,
+	// leave it, strike the ball). Built as an exact-telescoping PBRS so it is
+	// UNFARMABLE BY CONSTRUCTION (the user's requirement): while the player is
+	// airborne AND has left a wall since it was last supported, Phi = exp(-|ball -
+	// car| / LIU_DIST_SCALE); otherwise Phi = 0. r = gamma*Phi(s') - Phi(s). Closing
+	// on the ball after a wall launch pays +dPhi immediately; landing clears the
+	// latch and refunds the approach in full (Phi -> 0 is charged as -Phi at the
+	// landing step), so climb-and-retreat cycles telescope to ~0 - the discounted
+	// sum over ANY trajectory is -Phi(start). Leaving a wall AWAY from the ball pays
+	// ~0 (dist large -> Phi ~ 0), so it rewards wall exits TOWARD the ball only.
+	// gamma MUST equal the learner's gaeGamma. Wrap in ZeroSumReward (a linear map
+	// of a per-player potential stays a telescoping potential -> keeps the stack
+	// zero-sum). NEVER gate.
+	//
+	// "Launched off a wall" = a per-player latch set the step the player becomes
+	// airborne having been ON A WALL the previous step, held through the WHOLE
+	// aerial (so the full wall-to-ball flight is shaped, not just the launch tick),
+	// and cleared on any ground/wall contact or demo. It is intentionally NOT
+	// cleared on the ball touch: clearing mid-air would drop Phi without charging
+	// the refund and reopen a farm. A wall = world contact whose normal is closer
+	// to horizontal than the engine's own ground/wall split (|normal.z| < 1/sqrt(2),
+	// the autoflip NORM_Z_THRESH): flat ground (normal.z~1) and ceiling (normal.z~-1)
+	// are excluded, side/back/corner walls (normal.z~0) included. Being a plain state
+	// latch, Phi stays a function of (augmented) state, so telescoping holds.
+	// Per-arena instance -> no cross-arena state.
+	class WallJumpToBallReward : public Reward {
+	public:
+		constexpr static float LIU_DIST_SCALE = 1410;            // matches the other proximity potentials
+		constexpr static float WALL_NORMAL_Z_MAX = 0.7071068f;   // 1/sqrt(2) = engine ground/wall split
+		float gamma;
+		WallJumpToBallReward(float gamma = 0.99f) : gamma(gamma) {}
+
+		std::vector<char> launched; // per player.index (char = bool latch)
+
+		static bool OnWall(const Player& p) {
+			return p.isOnGround && p.worldContact.hasContact
+				&& fabsf(p.worldContact.contactNormal.z) < WALL_NORMAL_Z_MAX;
+		}
+
+		virtual void Reset(const GameState& initialState) override {
+			launched.assign(initialState.players.size(), 0);
+		}
+
+		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
+			if ((size_t)player.index >= launched.size())
+				launched.resize(player.index + 1, 0);
+			char& latch = launched[player.index];
+			bool prevLatch = latch != 0;
+
+			// Need both previous states to diff a potential; a demo/respawn teleport is
+			// not the player's action. In any of these cases, drop the latch and skip.
+			if (!state.prev || !player.prev || player.isDemoed || player.prev->isDemoed) {
+				latch = 0;
+				return 0;
+			}
+
+			bool curLatch;
+			if (player.isOnGround)
+				curLatch = false;             // supported (ground OR wall): no active launch
+			else if (OnWall(*player.prev))
+				curLatch = true;              // just left a wall into the air
+			else
+				curLatch = prevLatch;         // persist through the aerial
+			latch = curLatch ? 1 : 0;
+
+			float phiPrev = prevLatch
+				? expf(-(state.prev->ball.pos - player.prev->pos).Length() / LIU_DIST_SCALE) : 0.f;
+			float phiCur = curLatch
+				? expf(-(state.ball.pos - player.pos).Length() / LIU_DIST_SCALE) : 0.f;
+
+			return gamma * phiCur - phiPrev;
+		}
+	};
 }

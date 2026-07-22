@@ -194,6 +194,33 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
 		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 40.f },
 
+		// CONSECUTIVE AIR TOUCHES (2026-07-21, user-directed: "reward consecutive air
+		// touches", made unfarmable "by making them pbrs"). Exact-telescoping PBRS on a
+		// per-player air-touch streak (Phi = 1-exp(-max(0,streak-1)/2)): credit begins on
+		// the 2nd airborne touch of a chain and is refunded in full on landing, so it
+		// shapes sustained aerial CONTROL (juggling) without being farmable - the
+		// discounted sum telescopes to -Phi(start) over any path. Zero-sum wrapped (a
+		// linear map of a per-player potential stays a telescoping potential -> keeps the
+		// whole-stack zero-sum invariant); gamma threaded from TRAIN_GAMMA; NEVER gated.
+		// SCAFFOLD weight 30: in the aerial-emergence family (AirIntercept/FlipReset 40),
+		// deliberately BELOW them and far below the single-touch primary (AerialTouch 120)
+		// - it is a bonus stacked on already-rewarded individual aerial touches, not the
+		// finish. Being exact PBRS the weight is a pure credit-density knob (unfarmable at
+		// any value). Anneal once mechanic_census shows a stable air-touch-chain rate.
+		{ new ZeroSumReward(new ConsecutiveAirTouchReward(gamma), TEAM_SPIRIT), 30.f },
+
+		// WALL-JUMP-TO-BALL (2026-07-21, user-directed: "reward for hitting the ball after
+		// jumping off the wall", unfarmable "by making them pbrs"). Exact-telescoping PBRS:
+		// while airborne after leaving a wall, Phi = exp(-|ball-car|/1410); closing on the
+		// ball post-launch pays +dPhi, landing refunds it in full, so it shapes the
+		// wall-read aerial (drive the wall, jump off, strike the ball) without being
+		// farmable. Wall exits AWAY from the ball pay ~0. Zero-sum wrapped, gamma threaded,
+		// NEVER gated. SCAFFOLD weight 30: matches ConsecutiveAirTouch and sits in the
+		// aerial-scaffold band; its potential is nonzero only in the narrow post-wall-launch
+		// airborne subset, so its average stack share is small even so. Anneal with the rest
+		// of the aerial family once wall-play establishes.
+		{ new ZeroSumReward(new WallJumpToBallReward(gamma), TEAM_SPIRIT), 30.f },
+
 		// FLIP RESET (2026-07-20, user-directed): a gradient for the reset event,
 		// paired with AirPlayState's FLIP_RESET_READY seeding (reward + exposure -
 		// a zero-rate mechanic needs both). Gated hard (genuine airborne wheel
