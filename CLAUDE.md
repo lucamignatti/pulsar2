@@ -4,15 +4,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Pulsar: a Rocket League 1v1 bot trained by PPO self-play. The trainer is C++
-(libtorch + a vendored RocketSim physics sim); on top of it sits a research
-program testing whether the bot can be made to *explore its capability frontier*
-("optimism") — inspired by Anthropic's global-workspace paper — using linear
-probes, a learned self-model of reachability, and collection-time activation
-steering. This is not just a codebase; it is a running experiment with a history
-of measured successes and instructive collapses. **Read the design rationale
-sections below before changing training semantics — most of the non-obvious
-constraints here were paid for in Elo.**
+Pulsar: a Rocket League self-play bot trained by PPO. Core play is 1v1; the
+current run ("5.0v3") also opens 2v2/3v3 team-play phases (PHASE B). The trainer
+is C++ (libtorch + a vendored RocketSim physics sim); on top of it sits a
+research program testing whether the bot can be made to *explore its capability
+frontier* ("optimism") — inspired by Anthropic's global-workspace paper — using
+linear probes, a learned self-model of reachability, RND novelty pressure, and —
+currently — an **Optimistic-Critic Ladder** that turns the bot's own
+knowing-doing gap into training signal (it superseded the earlier
+activation-steering mechanism, which is parked but still in the code). This is
+not just a codebase; it is a running experiment with a history of measured
+successes and instructive collapses. **Read the design rationale sections below
+before changing training semantics — most of the non-obvious constraints here
+were paid for in Elo.**
+
+> **Run identity note.** Much of the file below was written for the older "3.1"
+> 1v1 run. Where it still describes hard-won *rationale* (recovery doctrine,
+> measurement-before-machinery, critic-aliasing post-mortems, methodological
+> traps) it remains authoritative. Where it states *current facts* (engine
+> version, tickSkip, obs/net dims, reward weights, checkpoint dirs) the truth is
+> now the 5.0v3 run: RocketSim **v3** (Rust FFI), **tickSkip 8 / actionDelay 0**
+> (15 Hz), **230-dim padded obs**, **517-wide policy head**, `checkpoints_5.0v3`.
+> Sections are updated inline; `analysis/probes/PULSAR5.md` (cold-start design)
+> and `analysis/probes/LADDER.md` (Ladder deploy record) are the canonical
+> current-run docs.
 
 The operating doctrine, learned from run 9uz761ua (a proposer/drill mechanism
 enabled without evidence decelerated the best run 10x): **measurement before
@@ -23,8 +38,9 @@ One lever at a time.
 ## Operations
 
 The trainer usually runs LIVE on the only GPU (RTX 5080, 16GB). Treat the
-training process, `build/checkpoints_3.1/`, and the GPU as off-limits for
-experiments; all analysis is offline CPU.
+training process, `build/checkpoints_5.0v3/`, and the GPU as off-limits for
+experiments; all analysis is offline CPU. (`trainerctl` reads
+`checkpoints_5.0v3` by default — `TRAINERCTL_CKPT_DIR` overrides.)
 
 ```bash
 tools/trainerctl status|start|stop|restart   # trainer lifecycle (wraps run_trainer.sh)
@@ -69,7 +85,7 @@ Key operational facts:
   25M so the rotation window spans ~20 minutes instead of ~50 seconds.
 - **RECOVERY DOCTRINE (user-set, binding): NO recovery machinery.** If a
   checkpoint is corrupt/damaged, restore a KNOWN-GOOD FULL checkpoint (golden
-  archive or `checkpoints_3.1_branch_backup/`), however old; if none exists,
+  archive or `checkpoints_5.0v3_branch_backup/`), however old; if none exists,
   start a fresh run. NEVER hand-assemble hybrid checkpoints (healthy policy +
   borrowed critic/optims): it was tried once and 550M steps of training against
   the mismatched value baseline made the policy WORSE than its restore point
@@ -92,65 +108,105 @@ Key operational facts:
   Desktop graphics (viz viewer, browser) can hold 6GB+; two OOM crashes happened
   under that squeeze. `miniBatchSize` is the burst-peak lever (mathematically
   identical via gradient accumulation); currently 50k for this reason.
-- Render/viz: `GGL_RENDER=1` (optionally `GGL_DEVICE=cpu`) runs a single-arena
-  live viewer that hot-swaps newer checkpoints. Render mode disables steering.
+- Render/viz: `GGL_RENDER=1` (optionally `GGL_DEVICE=cpu`, `GGL_RENDER_TEAM_SIZE`)
+  runs a single-arena live viewer that hot-swaps newer checkpoints. Render mode
+  feeds zero steering / zero Ladder-wire values and never runs a learn pass, but
+  it MUST still build the model with the Ladder architecture flags
+  (`gapSensor.wireEnabled`) or it loads a 512-wide policy head against 517-wide
+  checkpoints — the exact bug fixed in `ba4f33a`.
 - Python analysis env: `analysis/probes/requirements.txt` (torch-cpu, sklearn,
-  matplotlib, pip `RocketSim==2.2.1`; the vendored engine is 2.1.1 — close
-  enough that the policy plays competently, verified by kickoff behavior).
+  matplotlib, pip `RocketSim==2.2.1`). The vendored training engine is now
+  RocketSim **v3** (Rust); the offline harness was migrated to 5.0 dynamics
+  (tickSkip 8, actionDelay 0, DT auto-derived) so rollout parity holds — the
+  policy plays competently, verified by kickoff behavior.
 
 ## System architecture
 
 Four layers, bottom-up:
 
-1. **RocketSim** (`GigaLearnCPP/RLGymCPP/RocketSim/`, vendored v2.1.1) — the
-   physics engine. 120Hz ticks, deterministic. Needs `collision_meshes/`
-   (present in `build/`).
+1. **RocketSim** — the physics engine. 120Hz ticks, deterministic. Needs
+   `collision_meshes/` (present in `build/`). The 5.0 run switched to **v3**
+   (`RocketSimV3/`, commit `b1e1e9a`): a vendored Rust `rocketsim_ffi` staticlib
+   (plain-scalar C ABI) behind a `compat/` facade that reproduces the v2 C++
+   class surface (`Arena`, `Car`, `Step()`, `ballHitInfo`, bump/demo callbacks
+   synthesized from FFI events). The swap is a physics-backend change *behind the
+   facade* — it touched exactly one `RLGymCPP` file (`Framework.h`, an `#ifdef`
+   include switch); no gym-consumer code changed.
 2. **RLGymCPP** (`GigaLearnCPP/RLGymCPP/src/`) — gym layer. `EnvSet` steps 1024
    arenas on a shared thread pool with pluggable ObsBuilders / ActionParsers /
-   Rewards / TerminalConditions / StateSetters. The split-step protocol
-   implements action delay: `StepFirstHalf` runs `actionDelay` (3) ticks with
-   the OLD controls, then new actions are set and `StepSecondHalf` runs the
-   remaining tick — so with tickSkip 4 the bot decides at 30Hz with 3 ticks of
-   actuation latency, and the obs built after the step carries `prevAction` =
-   the action just set.
+   Rewards / TerminalConditions / StateSetters. The split-step protocol still
+   exists: `StepFirstHalf` runs `actionDelay` ticks with the OLD controls, then
+   new actions are set and `StepSecondHalf` runs `tickSkip - actionDelay`. **5.0
+   set actionDelay 0 and tickSkip 8** (was 3/4), so `StepFirstHalf` is a
+   confirmed no-op (`Arena::Step(0)` returns immediately) — the chosen action
+   now governs the whole 8-tick window from tick 1 (zero actuation latency),
+   traded for a coarser **15 Hz** decision rate (was 30 Hz + 3-tick lag). The
+   two-phase scaffold is kept generic for any future non-zero delay. The obs
+   built after the step still carries `prevAction` = the action just set.
 3. **GigaLearnCPP** (`GigaLearnCPP/src/`) — the learner. `Learner` orchestrates
    collection/processing/PPO; `PPOLearner` owns the models; aux modules:
-   Reachability (InfoNCE self-model), PSD (Basin-Racing outer loop), League
-   (QD MAP-Elites archive), PolicyVersionManager (Elo skill tracker),
-   Proposer/DrillBank (present, disabled — the 9uz761ua regression machinery).
+   Reachability (InfoNCE self-model), **the Optimistic-Critic Ladder**
+   (`GapState` — expectile sensor + quasimetric map + goal/concede banks +
+   advantage drive + policy-head wire; see its own section below), PSD
+   (Basin-Racing outer loop), League (QD MAP-Elites archive), PolicyVersionManager
+   (Elo skill tracker), Proposer/DrillBank (present, disabled — the 9uz761ua
+   regression machinery).
 4. **`src/ExampleMain.cpp`** — THE configuration. Everything (rewards, arenas,
    net sizes, all feature flags) is code here, heavily commented with the
    rationale and history of each value. Config changes = edit + rebuild +
    restart. Read this file first; it is the run's lab notebook.
 
-### Networks (1v1, current run "3.1")
+### Networks (current run "5.0v3")
 
 ```
-obs(109, RAW - standardizeObs=false)            AdvancedObs, team-canonical frame
+obs(230, RAW - standardizeObs=false)            AdvancedObsPadded(3), team-canonical frame
   └─ shared trunk: 2×[Linear512, LayerNorm, LeakyReLU]      "the trunk", h1/h2 taps
        ├─ policy head: 3×[512,LN,LReLU] → 90 logits          DefaultAction table, masked softmax
+       │     INPUT widened 512→517: +5 Ladder "wire" columns [V_real,V_exp,gap_KD,V_metric,gap_PK]
        ├─ critic head:  3×[512,LN,LReLU] → 1                 GAE value
-       └─ reach_phi(trunk ⊕ onehot(action)=602 → 128)        InfoNCE state-action embedding
-            vs reach_psi_car(goal6→128)   "can I reach the ball"  (car-local ball pos+vel /2300)
-            vs reach_psi_ball(goal6→128)  "can the ball reach the net" (canonical ball pos+vel)
-goal_critic: independent net, raw obs → 1                    γ=0.9997 (~77s), β=0.25 std-matched
+       ├─ reach_phi(trunk ⊕ onehot(action) → embed)          InfoNCE state-action embedding, φ/ψ hidden 256
+       │     vs reach_psi_car   "can I reach the ball"  (car-local ball pos+vel /2300)
+       │     vs reach_psi_ball  "can the ball reach the net" (canonical ball pos+vel)
+       │     vs carStateHead    "can I reach this car pose" (canonical car pos+vel), DETACHED
+       └─ gapSensor / Optimistic-Critic Ladder (see its own section) — expectile V_exp twin,
+             quasimetric map (own optimizer), goal/concede banks, V_metric, gap_KD+gap_PK drive
+goal_critic: independent net, raw obs → 1                    γ=0.9994 (~77s at 15Hz), std-matched
                                                              advantage blend; long-horizon credit
 ```
+`TRAIN_GAMMA = gaeGamma = 0.9969` (~15s half-life at 15 Hz), re-derived for
+tickSkip 8; `goalCritic.gamma = 0.9994` (~77s). If you change tickSkip, re-derive
+both: `half-life_s = ln2 / (-ln γ) / (120/tickSkip)`.
 
-- **AdvancedObs is team-canonical**: x,y are negated for ORANGE so both players
-  see themselves attacking +y. Every spatial label/analysis MUST canonicalize
-  per-row or silently die (probes read R²≈−0.5 on x/y when this is missed — the
-  x/y-vs-time asymmetry is the diagnostic).
-- Obs layout: ball 9 | prevAction 8 | 34 boost pads (canonical order, timer-
-  blended) | self 29 | opp 29. Pads reverse-order under inversion.
-- `DefaultAction`: 24 ground + 66 air = 90 actions; masks by ground/air state,
-  boost, flip availability.
+- **carStateHead** (added 2026-07-14) is a THIRD reachability goal-head beyond
+  psi_car/psi_ball, over canonical car pos+vel. It is trained fully **detached**
+  (`carStateCouple=0`) after an incident where undetached co-training crashed
+  Rating ~125 points — the same "probes never reshape the trunk" law the Ladder
+  formalizes (Law 2/4).
+- **Policy head is 517-wide, not 512** — the extra 5 columns are the Ladder's
+  self-conditioning "wire". Zero-init at migration, so pre-wire checkpoints are
+  behaviorally identical until trained; **one-way migration** — checkpoints saved
+  after go 517-wide and will not load on a 512-wide model. Every model-build call
+  site (train, league, render, boot) must independently carry the width flag or
+  crash/silently-mismatch (two bugs paid for this: `dccba19`, `ba4f33a`).
+- **AdvancedObsPadded is team-canonical AND fixed-width**: x,y are negated for
+  ORANGE so both players see themselves attacking +y (every spatial
+  label/analysis MUST canonicalize per-row or silently die — probes read
+  R²≈−0.5 on x/y when missed, the x/y-vs-time asymmetry is the diagnostic). Width
+  is padded to `MAX_PLAYERS_PER_TEAM=3` (230-dim: ball + prevAction + boost pads +
+  self + up to 3 teammates + up to 3 opponents, zero-padded slots + presence
+  flags), so one obs serves 1v1/2v2/3v3. Ball@0/self offsets stay
+  AdvancedObs-compatible — NOT weight-compatible with 3.1's 109-dim checkpoints.
+  Exact layout: `RLGymCPP/.../ObsBuilders/AdvancedObsPadded.h`.
+- `DefaultAction`: 24 ground + 66 air = 90 actions (unchanged); masks by
+  ground/air state, boost, flip availability.
 - **Checkpoints** (`.lt`, C++ `torch::save`): load directly in Python with
   `torch.jit.load(path, map_location="cpu")`; params named `<seqIdx>.weight`;
   2-D=Linear, 1-D=LayerNorm, index gaps=activations. No forward method — rebuild
   eagerly (see `analysis/probes/load_checkpoint.py`).
 - Reachability trains by HER: positives are FUTURE ACHIEVED states within a
-  window (car head 20 steps ≈0.67s, ball head 90 steps = 3s), InfoNCE on
+  step-count window (car head vs ball head; verify current window lengths in
+  code — note a step is now 15 Hz / ~0.067s under tickSkip 8, so any
+  step→seconds conversion doubled vs the old 30 Hz numbers), InfoNCE on
   in-batch negatives; rho(s→g) = mean over K uniform VALID actions of
   cos(φ,ψ)/τ — uniform, not policy-sampled: capability ("can we"), not policy
   ("would we"). Calibration (measured): monotone in real achievement, ~5x
@@ -183,33 +239,153 @@ struct and lambdas. Key invariants:
   `Steer/*`, `Reach/*`, `GoalCritic/*` panels) goes to wandb via the embedded
   Python metric sender.
 
-### Reward stack (FRONTIER-9, ExampleMain)
+### Reward stack (`BuildRewards()`, ExampleMain)
 
 Whole-stack invariant: every component is exactly zero-sum or antisymmetric →
 the stack sums to 0 across players, so PSD/league fitness is pure competitive
-margin. Rules encoded in comments there: PBRS potentials MUST use the learner's
-`gaeGamma` (or telescoping breaks); never gate a potential; `ZeroSum(PBRS)` is
-still exact PBRS; ShotReward is deliberately absent (its shot-attribution is
+margin. Rules encoded in comments there: PBRS potentials MUST use `TRAIN_GAMMA`
+(== `gaeGamma`, or telescoping breaks); never gate a potential; `ZeroSum(PBRS)`
+is still exact PBRS; ShotReward is deliberately absent (its shot-attribution is
 phantom-farmable — source-verified exploit in GameEventTracker).
+
+Current live weights (HEAD): BallToGoalPotential **75** (already antisymmetric —
+no ZeroSum wrapper, that would double it), TouchAccel **10**, Demo **37.5**,
+BallProximityPotential **4** (team-closest, far-field linear term added in 5.0),
+GuardedPickupBoost **6**, AerialTouch **120**, AirInterceptPotential **40**,
+OpposedSave **25**, CarEnergyPotential **15** (tempo credit), TimeCost **0.01**
+(not PBRS, not zero-sum-wrapped; ~3% of a goal per 30s episode), Goal **150**
+(the objective, exactly ±150). All the ZeroSum-wrapped terms carry `TEAM_SPIRIT`.
+
+- **AerialTouch 120 / AirIntercept 40 are SCAFFOLD weights** for 5.0's formative
+  aerial window (25→50→120 and 10→20→40 over REBALANCE-1 and the cold start),
+  flagged to anneal back toward 50/20 once aerial-touch share establishes. Don't
+  read them as steady-state values.
+- **`TEAM_SPIRIT` = 0.3 (PHASE A / 1v1-dominant) → 0.6 (PHASE B onward)**, set
+  from the `PHASE_B` marker file in `main()`. It's an algebraic no-op in 1v1
+  (teamMean == own); it only shapes 2v2/3v3 credit.
+- **`NoTouchCondition(20)`** (raised 10→20s in 5.0) so dead-play trajectories
+  survive long enough to recover and TimeCost's idle penalty accumulates into
+  real signal. Viz/render drops NoTouch entirely (goal-only terminals) so the
+  viewer shows unbounded real games.
+- **RND / EMERGENCE novelty** (`rndOptimism`, w=**0.1** from step 0 in 5.0 —
+  vs 4.0's end-of-life 0.3) is applied as an advantage-space injection, NOT a
+  reward term: mean-zero, std-matched, rating-latch-covered, self-annealing as
+  the RND predictor learns. It rides alongside the Ladder drive.
 
 ### Outer loops
 
-- **Skill tracker**: Elo (`Rating/1v1`) from eval matches vs
-  `checkpoints_3.1/policy_versions/` (32 versions × 25M steps ≈ last 800M steps
-  only). **Pool myopia caveat**: the pool cannot measure improvement against
+- **Skill tracker** (`PolicyVersionManager`): Elo (`Rating/1v1`) from eval
+  matches vs `checkpoints_5.0v3/policy_versions/` (a ring of versions ~25M steps
+  apart). **Pool myopia caveat**: the pool cannot measure improvement against
   styles older than its window, and a style shift can read as an Elo dip while
   head-to-head vs recent selves improves (measured: nontransitivity is real
-  here). Rating noise band is ±30–50; any guard thresholds must sit outside it.
+  here). Mature Rating noise band is ±30–50 — but **this run is young and
+  steeply climbing, so Rating legitimately swings ±80 around the trend**. The
+  two auto-steering-kill latches were loosened for that (`ratingPeakTrip`
+  110→200, `ratingDrawdownTrip` 75→150) after 3 false trips on pure volatility;
+  commit messages flag this as temporary — walk both back down toward 110/75 as
+  the Elo trajectory flattens into the mature band.
 - **QD League**: MAP-Elites archive over behavior descriptors (quantile-adaptive
   bins), PFSP-sampled opponents on `descendOpponentFrac` of iterations (0.35 —
-  raised from 0.25 after measuring exploitability by archived styles).
-- **PSD (Basin-Racing)**: ES-style probe rounds gated by `warmupUntilPlateau` —
-  designed to engage exactly when Rating stalls. Probe rounds repurpose arenas
-  and step them out from under in-flight episodes.
-- Eval paths (skill tracker, league, PSD, render) are all UNSTEERED — verified;
-  Rating always measures the raw policy.
+  raised from 0.25 after measuring exploitability by archived styles). Members
+  are stored as flat param vectors; **the 512→517 policy-head change made stored
+  vectors stale-shaped**, crashing crossover arithmetic in `EvolveStep`. Fixed
+  (`dccba19`) by migrating (zero-padding the first Linear's input columns) at
+  `FromJSON` load time, not just `LoadInto` — any archive saved pre-517
+  self-heals on next checkpoint load. Watch this pattern on any future net-width
+  change.
+- **PSD (Basin-Racing)**: pure-ES probe rounds gated by `warmupUntilPlateau` —
+  fire when the phase is plateaued (Rating gain < threshold) AND the iteration
+  budget is met; designed to engage exactly when Rating stalls. Probe rounds
+  repurpose arenas and step them out from under in-flight episodes (trajectories
+  are explicitly cleared in the barrier when a probe fires).
+- Eval paths (skill tracker, league, PSD, render) are all UNSTEERED and feed
+  ZERO Ladder-wire values — verified; Rating always measures the raw policy,
+  symmetric across the pool.
 
-## The steering system ("optimism surgery") — mechanism and rationale
+## The Optimistic-Critic Ladder — CURRENT optimism mechanism (live)
+
+This is the mechanism now actuating the "explore your frontier" program; it
+**superseded activation steering** (next section, parked). Live on 5.0v3 since
+~18.88B steps (built across `fc34dd3` → `36f1e01` → `15eabda`). Canonical record:
+`analysis/probes/LADDER.md`. Implementation: `GapState` in Learner.cpp; wire in
+PPOLearner; config `GapSensorConfig` / `cfg.gapSensor.*` in ExampleMain.cpp.
+
+**Why it exists**: steering nudged *behavior* toward feasible plays via an
+activation push. The Ladder instead gives the network a measurable, *trainable*
+self-model of its own optimism deficit, turns closing that deficit into an
+advantage-shaping signal, AND lets the policy directly perceive the deficit as
+input — a representation+credit lever, not just a behavioral one. Same
+knowing-doing-gap target, moved from activations to advantages and observations.
+
+Two stacked "gaps", combined into one closing drive:
+
+1. **`gap_KD` (rung 2, the sensor)** — `gapSensor->exp` is an expectile-τ=0.8
+   twin of the critic, trained on the SAME extrinsic GAE targets but reading the
+   trunk through `.detach()` (pure probe — can't reshape what it measures).
+   `gap_KD = relu(V_exp − V_real)`: "the optimistic estimate exceeds the honest
+   one." This alone was Stage 1/2a.
+2. **`gap_PK` (rung 3, the geometry)** — a learned **quasimetric map**:
+   `E: obs→256→256→64`, `f: 64→128→32`, distance `d(x,y)=Σ relu(f(E(x))−f(E(y)))`
+   (asymmetric, triangle-respecting), trained QRL-style each iteration (`L_local`
+   on consecutive same-agent pairs, `L_spread` on random pairs, dual-ascent λ)
+   with its **own Adam + own clip group** (Law 1) and **never touching the
+   trunk** (Law 2). **Goal/concede banks** (256-per-side ring buffers, live;
+   spec default 1024) hold raw obs from the final ~1s (~15 rows) before each
+   scored/conceded goal — landmark states. **`V_metric` = a·γ^d_goal +
+   a2·γ^d_concede + b**, fit each iteration by fp64 OLS against the critic's own
+   extrinsic targets (EMA'd, clamped), gated until banks≥32 AND mapUpdates≥50.
+   `gap_PK = relu(V_metric − V_exp)`: what the geometry claims *above* the sensor.
+
+**The drive**: `Φ = −(gap_KD + gap_PK)`, injected as an **undiscounted closing
+delta** into raw advantages — it pays for *shrinking* the gap, not for having one
+(the loitering fix). Masked at terminals AND truncations AND impossible rows;
+centered OVER UNMASKED ROWS ONLY then re-masked (Law 8b); std-matched at
+`driveBeta=0.05` (≈5% of extrinsic-advantage scale — the knob analogous to
+steering's old α, but on advantages); ±3σ clamped; covered by the same rating
+latch. There is no advantage normalization in this codebase, so the inject-before-
+handoff ordering is exact.
+
+**The 5-wire (why the policy head is 517)**: the five scalars
+`[V_real, V_exp, gap_KD, V_metric, gap_PK]`, tanh-squashed, appended as extra
+input columns to the **policy head only** (trunk/critic untouched). The policy
+literally sees its own critic-vs-optimist disagreement when choosing actions.
+Zero-init migration; the Muon policy optimizer is reset once at migration
+(logged transient). **Collection** fuses the wire from the pipelined snapshot
+generation (exp/mapE/mapF cloned, bank embeddings + calibration frozen per
+generation at the barrier); **Learn** re-derives it per-minibatch from CURRENT
+heads but the COLLECTION generation's bank embeddings/calibration (spec 2.5), and
+**hard-refuses to run if that hand-off wasn't armed** (no silent zero-fallback).
+Eval/opponent/render/boot feed explicit zeros.
+
+**The impossible-control family (standing falsification test)**:
+`ImpossibleInterceptState` on the last 8 arenas of the 1v1 block spawns
+certified-unreachable ballistic intercepts (required speed > 1.6× the hard cap).
+Rows are masked from injection; a cumulative **`Ladder/Imp Touches` counter must
+stay 0 for the life of the run** (one touch voids the certificate), and
+`Ladder/Imp GapPK Spawn` must fall BELOW `Ladder/Fear GapPK` as the map's doom
+geometry converges — if it never crosses, the system is manufacturing
+self-serving optimism.
+
+**Design laws (institutionalized by prior incidents, enforced in code)**: (1)
+separate gradient economies — the map/sensor get their own optimizer+clip so
+their losses can't crush the policy gradient; (2) map never touches the trunk;
+(4) probes are detached; (6) wire and drive ship together; (7) off ==
+bit-identical (`mapEnabled=false` degrades to gap_KD-only, `driveBeta=0` kills
+drive+wire); (8b) center over unmasked rows only. **Rollback**: the 517 head
+reverts only via backup — `checkpoints_5.0v3_branch_backup/18875158586` (pre-wire,
+512-head) + golden archive.
+
+## The steering system ("optimism surgery") — PARKED (superseded by the Ladder)
+
+**Status**: activation steering is numerically inert on HEAD — `steering.alpha =
+0`, `opponentStyleChance = 0` (set per the Stage-2 protocol, `36f1e01`).
+`steering.enabled` stays true only so fear-drill/census/miner telemetry keep
+running; `SetSteering` executes but adds no `α·σ·v` anywhere. The Ladder above
+replaced it (actuating both would double-dose the same axis). Reverting is a
+one-line flip back to α=0.5. **The mechanism and its hard-won lessons below are
+retained as history** — the critic-aliasing post-mortems in particular still
+govern any future episode-boundary change.
 
 **Problem (measured, not assumed)**: knowing-doing gap. Linear probes showed the
 trunk computes ball-landing information; behavioral lookahead showed the bot
@@ -258,9 +434,10 @@ PPOLearner (`SetSteering`, `InferActions` rho gate):
      steering OFF for the process, no auto-re-enable. 75 sits outside the
      ±30–50 noise band and inside the −130 collapse signature. This is the ONLY
      guard that can see update-damage; behavioral gates cannot.
-   - Ritual: branch-point checkpoint backup (`build/checkpoints_3.1_branch_backup/`)
+   - Ritual: branch-point checkpoint backup (`build/checkpoints_5.0v3_branch_backup/`)
      before every enablement; quarantine (move, never delete) on revert
-     (`build/checkpoints_3.1_quarantine/` holds the two collapse periods).
+     (`build/<ckptdir>_quarantine_<ts>/`; the 3.1-era quarantine held the two
+     collapse periods).
 
 **Why the specific dose (α=0.5σ) — the clipping ratchet**: for actions steering
 makes much likelier than the base policy, the learn-pass ratio r = π/π_steered
@@ -322,8 +499,11 @@ episode-grouped CV, controls) — plus `knowing_doing.py` (the gap analysis),
 `calibrate_rho.py`, `steer_test.py` (offline steering validation),
 `derive_steering.py`, `compare_checkpoints.py` (mirror style panels +
 head-to-head cross-play with side swap), `kd_curve.py` (gap closure across
-policy_versions). The five `*.md` reports there are the experimental record;
-`STEERED_PRACTICE.md` is the canonical history/status of the steering system.
+policy_versions). The many `*.md` reports there are the experimental record.
+Current-run canonical: `PULSAR5.md` (5.0 cold-start design) and `LADDER.md`
+(Optimistic-Critic Ladder deploy record). `STEERED_PRACTICE.md` is the canonical
+history of the parked steering system; `STEERING_ROADMAP.md` is a stale
+4.0-lineage planning doc, superseded — do not treat it as current.
 
 Methodological traps already paid for (do not rediscover):
 - Team-canonical labels (see above). World-frame spatial targets ruin probes.
@@ -353,7 +533,19 @@ seeded a genuinely stronger style (beat its branch point 42–24) plus a ratchet
 overcommit bleed; v2 re-aimed derivation+gate at possession outcomes, α→0.5,
 league 0.35; a real plateau was then measured (dead-even vs self −800M steps),
 and the contact-reachability gate retune re-engaged the channel — after which
-improvement resumed. The knowing-doing gap has since become knowledge-COUPLED
-(graded by read quality), which means representation-side pressure (an aux
-landing-prediction head — "Phase 1" of the workspace program) is the next
-measurement-backed lever when the current mechanisms saturate.
+improvement resumed. The knowing-doing gap became knowledge-COUPLED (graded by
+read quality). The **4.0 lineage** then extended the program to team play
+(230-dim padded obs, 2v2/3v3 PHASE B, energy/tempo PBRS, RND novelty) and reached
+a plastic-but-matured equilibrium (Elo ~1793, 0% dormant units) whose opponent
+pool priced out learning-phase play — it had passed its formative high-entropy
+window before aerial/mechanic pressure existed. So **5.0 was a user-directed cold
+start** (`PULSAR5.md`): the same recipe placed into the formative window, on the
+RocketSim **v3** engine, at **tickSkip 8 / actionDelay 0** (15 Hz — chosen
+because a wavedash plateau at 11% convicted learnability, not a control ceiling,
+as the binding constraint), with scaffolded aerial rewards and RND from birth.
+On that run the optimism program itself moved off activations: the
+**Optimistic-Critic Ladder** (expectile sensor → quasimetric map → combined
+gap-closing advantage drive + policy-head self-conditioning wire) went live at
+18.88B steps and is the current lever. Representation-side pressure (an aux
+landing-prediction head — "Phase 1" of the workspace program) remains the next
+measurement-backed option when the current mechanisms saturate.
