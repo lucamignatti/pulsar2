@@ -577,7 +577,13 @@ int main(int argc, char* argv[]) {
 	// again (same accumulated math, 4 passes). Side effect kept in mind: the reachability InfoNCE
 	// subsample (512/minibatch) now runs 4x per epoch instead of 2x - mildly more aux training,
 	// same as the accepted 200k->100k change. Revert to 100k if the graphics pressure goes away.
-	cfg.ppo.miniBatchSize = 50'000;
+	// 2026-07-22 (6M cold start): the 512->1152 width bump ~2.25x'd the per-row saved activations
+	// across the trunk + all three dense heads, so the learn-pass autograd peak scales the same.
+	// Cut 50k -> 20k to hold that peak roughly constant (gradient accumulation => mathematically
+	// identical update, 10 passes instead of 4). Raise back toward 25-30k only if the card shows
+	// headroom in practice (no desktop-graphics contention). The reachability InfoNCE subsample
+	// (512/minibatch) now runs 10x/epoch - same benign side effect as the earlier 200k->50k cuts.
+	cfg.ppo.miniBatchSize = 20'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
@@ -664,19 +670,27 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.goalCritic.gamma = 0.9994f;   // ~77s half-life at 15Hz (5.0 tickSkip 8; re-derived)
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
-	cfg.ppo.goalCritic.model.layerSizes = { 512, 512, 512 };
+	cfg.ppo.goalCritic.model.layerSizes = { 1152, 1152, 1152 }; // scaled 512->1152 with the policy (6M cold start, 2026-07-22)
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
 
-	// 512-wide (was 256): ~4x params. The saturation probe read the 256 net at 49-74% spectral
-	// utilization (not saturated), but the head's effective rank was grinding down all run and this
-	// is a FRESH run where underused capacity is nearly free while missing capacity compounds over
-	// an unattended week. Inference is latency-bound on the 5080 at these sizes, so the SPS cost is
-	// modest (~10-25%), not proportional to the param increase.
-	cfg.ppo.sharedHead.layerSizes = { 512, 512 };
-	cfg.ppo.policy.layerSizes = { 512, 512, 512 };
-	cfg.ppo.critic.layerSizes = { 512, 512, 512 };
+	// 1152-wide (was 512, orig 256): trunk + policy + critic + goal-critic all widened together
+	// (user-directed 2026-07-22 cold start). Trunk(2x1152) + policy(3x1152) = ~5.70M params - the
+	// "6M trunk+policy" target. Critic and goal-critic scaled to match so the value baseline keeps
+	// pace with the policy (an undersized critic bottlenecks PPO advantages). 1152 = 9x128, so the
+	// GEMMs stay tensor-core aligned. Reachability phi/psi stay 256-wide (InfoNCE contrastive
+	// embeddings, spec-tuned - a different objective, not a policy/value head) and the Ladder
+	// sensor/map keep their spec-fixed geometry; only their INPUT column count tracks the wider
+	// trunk. History kept: the prior 256->512 bump was licensed by a saturation probe (49-74%
+	// spectral utilization at 256, effective rank grinding down all run) - the same "underused
+	// capacity is nearly free, missing capacity compounds" logic scales to 1152. Inference is
+	// latency-bound on the 5080, so SPS cost is sub-proportional to the ~4.5x dense-FLOP increase,
+	// but expect a real slowdown vs 512 - measure it from the log. See the miniBatchSize note above:
+	// the ~2.25x wider activations forced a proportional minibatch cut to hold the learn-pass peak.
+	cfg.ppo.sharedHead.layerSizes = { 1152, 1152 };
+	cfg.ppo.policy.layerSizes = { 1152, 1152, 1152 };
+	cfg.ppo.critic.layerSizes = { 1152, 1152, 1152 };
 	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
 	cfg.ppo.reachability.lr = 3e-4f;
@@ -723,10 +737,12 @@ int main(int argc, char* argv[]) {
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).
-	cfg.checkpointFolder = "checkpoints_5.0v3"; // v3-ENGINE COLD START 2026-07-17: the engine swap invalidates
-	                                            // v2-physics checkpoints, so the v2 5.0 lineage stays archived in
-	                                            // checkpoints_5.0 and this run starts fresh (PULSAR5.md design unchanged)
-	cfg.metricsRunName = "4.0-team";
+	cfg.checkpointFolder = "checkpoints_6M"; // 6M-NET COLD START 2026-07-22: the 512->1152 width change
+	                                         // makes the 5.0v3 checkpoints shape-incompatible, so this run
+	                                         // starts fresh in a new folder (checkpoints_5.0v3 stays archived
+	                                         // and untouched; a fresh folder also guarantees PHASE A / empty
+	                                         // version pool / no PHASE_B marker, i.e. a true cold start)
+	cfg.metricsRunName = "6M-1152";
 
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
 	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
