@@ -22,6 +22,8 @@ namespace GGL {
 			// only the GOAL critic excludes them, and only under stage-2 resolution
 			// termination (their goal channel is structurally absent there)
 			practiceMask,
+			// HEADROOM: one-iteration-frozen V-dagger TD targets (undefined unless vdagEnabled)
+			vdagTargets,
 			advantages;
 
 		auto begin() { return &states; }

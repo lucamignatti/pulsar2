@@ -1060,6 +1060,23 @@ int main(int argc, char* argv[]) {
 		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
 		// Steer/Frontier Pool sizes, and the next offline decline census.
 		cfg.steering.frontierFearMining = true;
+		// POTENTIAL FRONTIER (FRONTIER.md, 2026-07-23): boot toggle, NO rebuild - set
+		// GGL_FRONTIER_POTENTIAL=1 and restart to drive the drill frontier by the single
+		// quasimetric axis d_goal (Phase 0 = telemetry only, actuates nothing; leaves
+		// fear-mining intact). Checkpoint-compatible with the live lineage (reuses the
+		// trained GapState map + banks; new state is RUNNING_STATS scalars, init-if-
+		// absent). Revert = unset the env and restart. Requires gapSensor.mapEnabled.
+		// HEADROOM composition critic (2026-07-24): ON BY DEFAULT (twin V-dagger trunk
+		// heads + seek drive; PPOLearnerConfig::vdagEnabled). FRESH RUNS ONLY — trunk-
+		// coupled aux must co-adapt from step 0 (the carstate incident is the mid-run
+		// counterexample). Revert = vdagEnabled false + rebuild.
+		if (cfg.ppo.vdagEnabled)
+			RG_LOG("HEADROOM: composition critic ON by default (twin V-dagger trunk heads, seek beta "
+				<< cfg.ppo.vdagSeekBeta << ") - Headroom/* panels");
+		if (const char* s = std::getenv("GGL_FRONTIER_POTENTIAL"); s && s[0] && std::string(s) != "0") {
+			cfg.steering.frontierPotential = true;
+			RG_LOG("GGL_FRONTIER_POTENTIAL: Potential Frontier ON (Phase 0 telemetry - Frontier/* panels; see FRONTIER.md)");
+		}
 		// AirDrill altitude annealing: REVERTED 2026-07-15 ~2.5h after deploy (see
 		// AERIAL_GAP.md incident record). The v1 controller's feedback metric
 		// (match-play aerial conversion) moves on a DAYS timescale while the ratchet

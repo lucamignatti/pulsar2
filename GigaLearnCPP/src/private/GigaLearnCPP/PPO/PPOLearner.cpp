@@ -31,6 +31,16 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		models.Add(new Model("goal_critic", gcConfig, device));
 	}
 
+	// HEADROOM composition critic: twin V-dagger heads reading the SHARED TRUNK
+	// (same input width as the main critic head; gradients flow into the trunk —
+	// fresh-run co-adaptation). Mirror the critic head's architecture/optimizer.
+	if (config.vdagEnabled) {
+		RG_ASSERT(models["critic"]); // V-dagger heads mirror the critic head config
+		ModelConfig vc = models["critic"]->config;
+		models.Add(new Model("vdag1", vc, device));
+		models.Add(new Model("vdag2", vc, device));
+	}
+
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
@@ -426,6 +436,16 @@ torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
 	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
 }
 
+torch::Tensor GGL::PPOLearner::InferVdagMin(torch::Tensor obs) {
+	RG_NO_GRAD;
+	obs = obs.to(device, true);
+	if (models["shared_head"])
+		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+	auto a = models["vdag1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
+	auto b = models["vdag2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
+	return torch::minimum(a, b);
+}
+
 torch::Tensor GGL::PPOLearner::InferGoalCritic(torch::Tensor obs) {
 	// Independent net: raw obs in, NO shared trunk (by design — zero gradient interference)
 	return models["goal_critic"]->Forward(obs, config.useHalfPrecision).flatten();
@@ -478,6 +498,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgReachCarStateAcc,
 		avgReachCarStateLoss,
 		avgReachLoss,
+		avgVdagLoss,
 		avgWireColGrad;
 
 	// Save parameters first
@@ -616,6 +637,25 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					avgGoalCriticLoss += goalCriticLoss.detach().cpu().item<float>();
 				}
 
+				// HEADROOM twin V-dagger: expectile regression vs one-iteration-frozen TD
+				// targets (precomputed at learn-prep, riding the buffer). Gradients FLOW
+				// into the shared trunk (fresh-run co-adaptation; see PPOLearnerConfig).
+				torch::Tensor vdagLoss;
+				if (batch.vdagTargets.defined() && models["vdag1"] && models["vdag2"]) {
+					auto yv = batch.vdagTargets.slice(0, start, stop).to(device, true, true).flatten();
+					torch::Tensor trunkV = models["shared_head"]
+						? models["shared_head"]->Forward(obs, false) : obs;
+					for (Model* vh : { models["vdag1"], models["vdag2"] }) {
+						auto pred = vh->Forward(trunkV, false).flatten().to(torch::kFloat32);
+						auto u = yv - pred;
+						auto w = torch::where(u > 0,
+							torch::full_like(u, config.vdagTau), torch::full_like(u, 1.f - config.vdagTau));
+						auto l = (w * u * u).mean() * batchSizeRatio;
+						vdagLoss = vdagLoss.defined() ? vdagLoss + l : l;
+					}
+					avgVdagLoss += vdagLoss.detach().cpu().item<float>();
+				}
+
 				// Reachability aux losses (InfoNCE on a subsample; gradient flows into the shared head)
 				torch::Tensor reachLoss, carStateLoss;
 				if (reach && batch.carHerGoals.defined()) {
@@ -723,6 +763,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					totalLoss = totalLoss.defined() ? totalLoss + reachLoss : reachLoss;
 				if (carStateLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + carStateLoss : carStateLoss;
+				if (vdagLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + vdagLoss : vdagLoss;
 
 				if (totalLoss.defined())
 					totalLoss.backward();
@@ -799,6 +841,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (avgReachCarStateLoss.count > 0)
 			report["Reach/Car State Loss"] = avgReachCarStateLoss.Get();
 		report["Reach/Aux Loss"] = avgReachLoss.Get();
+	if (models["vdag1"])
+		report["Headroom/Vdag Loss"] = avgVdagLoss.Get();
 	}
 
 	// Assemble and return report

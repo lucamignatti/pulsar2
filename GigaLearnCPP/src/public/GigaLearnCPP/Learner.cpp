@@ -2513,6 +2513,84 @@ void GGL::Learner::Start() {
 				}
 			}
 
+			// 6b) POTENTIAL FRONTIER - Phase 0 (FRONTIER.md): SENSOR ONLY. Score every
+			// mined candidate on the single quasimetric axis d_goal (min distance to the
+			// goal bank via the already-shipped GapState map) and log its distribution +
+			// sanity correlations (vs ball height, vs the incumbent Dz). Changes NO
+			// banking or selection - pure telemetry behind cfgS.frontierPotential.
+			// off = identical. Runs after the map block, so bankGEmb/dClamp are fresh.
+			if (cfgS.frontierPotential) {
+				const auto& gcfg = config.gapSensor;
+				bool mapReady = gcfg.enabled && gcfg.mapEnabled && gapSensor
+					&& gapSensor->bankGEmb.defined()
+					&& gapSensor->mapUpdates >= gcfg.mapWarmupIters
+					&& (int)gapSensor->bankGFill >= gcfg.bankMinFill;
+				std::vector<int64_t> allRows;
+				if (mapReady)
+					for (int md = 0; md < STEER_MODES; md++)
+						for (int64_t r : frontierRows[md])
+							allRows.push_back(r);
+				const int64_t Nc = (int64_t)allRows.size();
+				if (mapReady && Nc >= 32) {
+					RG_NO_GRAD;
+					std::vector<float> buf((size_t)Nc * obsSize);
+					for (int64_t i = 0; i < Nc; i++)
+						memcpy(&buf[(size_t)i * obsSize], &states[allRows[i] * (int64_t)obsSize],
+							obsSize * sizeof(float));
+					auto tCand = torch::from_blob(buf.data(), { Nc, (int64_t)obsSize }, torch::kFloat32)
+						.to(ppo->device, true);
+					float dClamp = gcfg.dClampMult * gapSensor->dClampEma;
+					auto eCand = gapSensor->Embed(tCand);
+					auto dGt = PPOLearner::MinBankDist(eCand, gapSensor->bankGEmb, dClamp)
+						.to(torch::kCPU).contiguous();
+					const float* dgp = dGt.data_ptr<float>();
+					std::vector<float> dgoal(dgp, dgp + Nc), ballZ((size_t)Nc), dzv((size_t)Nc);
+					for (int64_t i = 0; i < Nc; i++) {
+						ballZ[i] = fnObs(allRows[i], BALL_POS + 2) * POS_SCALE;
+						dzv[i] = fnDz(allRows[i]);
+					}
+					std::vector<float> srt = dgoal;
+					std::sort(srt.begin(), srt.end());
+					auto pct = [&](float q) {
+						return srt[RS_MIN((size_t)(q * (float)(Nc - 1)), (size_t)(Nc - 1))];
+					};
+					double mean = 0;
+					for (float v : dgoal) mean += v;
+					mean /= (double)Nc;
+					double var = 0;
+					for (float v : dgoal) { double d = (double)v - mean; var += d * d; }
+					var /= (double)Nc;
+					// Spearman rho (rank-based; ties broken by index - a sanity proxy)
+					auto fnSpear = [Nc](const std::vector<float>& a, const std::vector<float>& b) -> float {
+						auto rankOf = [Nc](const std::vector<float>& v) {
+							std::vector<size_t> idx((size_t)Nc);
+							for (int64_t i = 0; i < Nc; i++) idx[i] = (size_t)i;
+							std::sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return v[x] < v[y]; });
+							std::vector<double> r((size_t)Nc);
+							for (int64_t i = 0; i < Nc; i++) r[idx[i]] = (double)i;
+							return r;
+						};
+						auto ra = rankOf(a), rb = rankOf(b);
+						double m = (double)(Nc - 1) / 2.0, num = 0, da = 0, db = 0;
+						for (int64_t i = 0; i < Nc; i++) {
+							double xa = ra[i] - m, xb = rb[i] - m;
+							num += xa * xb; da += xa * xa; db += xb * xb;
+						}
+						return (da < 1e-9 || db < 1e-9) ? 0.f : (float)(num / std::sqrt(da * db));
+					};
+					report["Frontier/Dgoal P10"] = pct(0.1f);
+					report["Frontier/Dgoal P50"] = pct(0.5f);
+					report["Frontier/Dgoal P90"] = pct(0.9f);
+					report["Frontier/Dgoal Std"] = (float)std::sqrt(var);
+					report["Frontier/Dgoal vs BallZ Spearman"] = fnSpear(dgoal, ballZ);
+					report["Frontier/Dgoal Dz Spearman"] = fnSpear(dgoal, dzv);
+					report["Frontier/Candidates"] = (float)Nc;
+					report["Frontier/Map Ready"] = 1.f;
+				} else {
+					report["Frontier/Map Ready"] = 0.f;
+				}
+			}
+
 			// 7) In-trainer census (C++-only; the offline python census is a manual
 			// research tool, never automation): decline mix, scared tail, and the frozen
 			// fear-panel valuation - the longitudinal readout of whether the fear-mined
@@ -4627,7 +4705,7 @@ void GGL::Learner::Start() {
 
 					Timer gaeTimer = {};
 					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns;
+					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -4636,6 +4714,56 @@ void GGL::Learner::Start() {
 					);
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
+
+					// ===== HEADROOM (composition critic; PPOLearnerConfig::vdagEnabled) =====
+					// TD targets in the critic's own units WITHOUT touching GAE internals:
+					// scaled_r_i = A_i - g*lam*(1-d_i)*A_{i+1} - g*(1-d_i)*V_{i+1} + V_i (GAE
+					// identity, pre-injection A). y_i = scaled_r_i + g*(1-d_i)*Vdag(s_{i+1}),
+					// one-iteration-frozen heads = the implicit target net. Nonzero terminal
+					// codes (incl. truncations) zero the bootstrap, so simple i+1 indexing is
+					// boundary-safe. SEEK injection: Phi = +H, std-matched, clamped, latch-
+					// covered (the closure sign is the measured avoidance pathology).
+					if (config.ppo.vdagEnabled && (int64_t)combinedTraj.Length() > 1) {
+						RG_NO_GRAD;
+						int64_t nR = (int64_t)combinedTraj.Length();
+						float g = config.ppo.gaeGamma, lmb = config.ppo.gaeLambda;
+						auto advF = tAdvantages.to(torch::kFloat32).flatten();
+						auto vpF = tValPreds.to(torch::kFloat32).flatten();
+						auto termF = tTerminals.to(torch::kFloat32).flatten();
+						auto cont = (termF == 0).to(torch::kFloat32);
+						auto z1 = torch::zeros({ 1 }, advF.options());
+						auto advN = torch::cat({ advF.slice(0, 1, nR), z1 });
+						auto vpN = torch::cat({ vpF.slice(0, 1, nR), z1 });
+						auto scaledR = advF - g * lmb * cont * advN - g * cont * vpN + vpF;
+						// V-dagger on all rows (chunked trunk+head forwards)
+						auto vdag = torch::empty({ nR }, torch::kFloat32);
+						constexpr int64_t VCH = 32768;
+						for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+							int64_t i1 = RS_MIN(i0 + VCH, nR);
+							vdag.slice(0, i0, i1).copy_(
+								ppo->InferVdagMin(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
+						}
+						auto vdagN = torch::cat({ vdag.slice(0, 1, nR), z1 });
+						float vScale = tTargetVals.abs().to(torch::kFloat32).quantile(0.99).item<float>();
+						tVdagTargets = (scaledR + g * cont * vdagN)
+							.clamp(-2.f * RS_MAX(vScale, 1.f), 2.f * RS_MAX(vScale, 1.f));
+						// H field + seek injection
+						auto tH = torch::relu(vdag - vpF);
+						auto tHN = torch::cat({ tH.slice(0, 1, nR), z1 });
+						auto aInt = g * cont * tHN - tH;
+						aInt = aInt - aInt.mean();
+						float sExt = advF.std().item<float>();
+						float sInt = RS_MAX(0.05f * sExt, aInt.std().item<float>());
+						auto inj = ((config.ppo.vdagSeekBeta * sExt / sInt) * aInt)
+							.clamp(-3.f * sExt, 3.f * sExt);
+						if (!steerRatingTripped)
+							tAdvantages = tAdvantages + inj.view_as(tAdvantages);
+						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
+						report["Headroom/H Mean"] = tH.mean().item<float>();
+						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
+						report["Headroom/Inj Abs Mean"] = inj.abs().mean().item<float>();
+						report["Headroom/Latched"] = steerRatingTripped ? 1.f : 0.f;
+					}
 
 					if (returnStat) {
 						report["GAE/Returns STD"] = returnStat->GetSTD();
@@ -5241,6 +5369,8 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (tVdagTargets.defined())
+						experience.data.vdagTargets = tVdagTargets;
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 

@@ -149,6 +149,22 @@ namespace GGL {
 		// unavailable. false = original mining everywhere.
 		bool frontierFearMining = false;
 
+		// POTENTIAL FRONTIER (FRONTIER.md, 2026-07-23): drive the drill pool by ONE axis
+		// - the quasimetric potential d_goal (distance to the nearest goal-bank success,
+		// via the already-shipped GapState map) - instead of feasible-decline + Dz. Phase
+		// 0 = SENSOR ONLY: score every mined candidate on d_goal and log its distribution
+		// + sanity correlations (vs ball height, vs Dz), change NO banking. Requires
+		// gapSensor.mapEnabled (the map + banks the axis reads). Toggle at boot via
+		// GGL_FRONTIER_POTENTIAL (no rebuild). OFF = incumbent (identical behaviour). See
+		// FRONTIER.md for Phase 1 actuation (d_goal-quantile selection + theta controller)
+		// and the pre-registered success criteria / guards.
+		bool frontierPotential = false;
+		float frontierThetaW = 0.15f;         // Phase 1: quantile band width [theta, theta+w]
+		float frontierRetainFrac = 0.30f;     // Phase 1: pool fraction drawn from below theta (retention)
+		float frontierThetaStep = 0.02f;      // Phase 1: theta advance per mastered check
+		float frontierAdvHi = 0.55f;          // Phase 1: drilled-row resolution rate to advance theta
+		int frontierThetaAdjustEvery = 25;    // Phase 1: iterations between theta adjust checks
+
 		// AERIAL ALTITUDE ANNEALING (AERIAL_GAP.md, 2026-07-15): when set, the learner
 		// drives the shared AirDrill difficulty D (0 = classic airborne spawn, 1 =
 		// grounded takeoff) with a metric-gated hill-climb: every

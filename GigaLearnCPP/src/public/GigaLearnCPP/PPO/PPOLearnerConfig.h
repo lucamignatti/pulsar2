@@ -288,6 +288,21 @@ namespace GGL {
 		ProposerConfig proposer;
 		GoalCriticConfig goalCritic;
 
+		// HEADROOM — the composition critic (2026-07-24; validated offline in
+		// rltest/OVERNIGHT_LOG.md: iso-compute ~2x air-touch vs vanilla PPO, SPS 0.99).
+		// Twin V-dagger heads on the SHARED TRUNK (gradients flow — fresh-run
+		// co-adaptation, the reachability-aux precedent; do NOT enable mid-run on a
+		// mature trunk: that is the measured carstate-incident shape). Expectile-TD
+		// (vdagTau) on one-iteration-frozen TD targets over executed transitions,
+		// min-in-target twins (anti-ratchet). H = relu(min(V1,V2) - V_real) =
+		// realizable headroom; actuation = SEEK potential Phi=+H (PBRS; the closure
+		// sign measurably teaches avoidance), own std-matched beta, boundary-masked,
+		// rating-latch covered. ON BY DEFAULT (user directive 2026-07-24, fresh-run
+		// deploys). Revert = set false here and rebuild.
+		bool vdagEnabled = true;
+		float vdagTau = 0.75f;
+		float vdagSeekBeta = 0.15f;
+
 		PPOLearnerConfig() {
 			policy = {};
 			policy.layerSizes = { 256, 256, 256 };

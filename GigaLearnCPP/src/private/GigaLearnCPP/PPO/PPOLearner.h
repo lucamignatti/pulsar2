@@ -134,6 +134,9 @@ namespace GGL {
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);
+		// HEADROOM composition critic: min of the twin V-dagger heads (shared trunk).
+		// No-grad; used at learn-prep for one-iteration-frozen TD targets + the H field.
+		torch::Tensor InferVdagMin(torch::Tensor obs);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
