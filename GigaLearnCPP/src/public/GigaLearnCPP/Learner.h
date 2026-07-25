@@ -65,15 +65,12 @@ namespace GGL {
 		int numPracticeArenas = 0;
 		int numSteeredArenas = 0;
 
-		// Rating drawdown guard state (persisted in the checkpoint stats): the latch is the
-		// ONLY guard that can see update-damage, and the ops wrapper auto-restarts on crashes -
-		// process-local latch state would silently re-arm a damaged policy's mechanisms.
-		// Config lives in LearnerConfig::ratingGuard (NOT steering - moved 2026-07-25).
+		// Rating WATCH state (persisted in the checkpoint stats so the reference survives the
+		// wrapper's crash-restarts). Measurement only - there is no latch any more; see
+		// fnRatingWatch in Learner.cpp for why it was removed. Config: LearnerConfig::ratingWatch.
 		float ratingGuardEMA = NAN;
-		bool ratingGuardTripped = false;
-		// High-water mark for the peak-drawdown latch (ratingGuard.peakTrip): the slow EMA lags
-		// a fresh climb, so a slide off a new peak is invisible to it (2026-07-14). Also
-		// persisted - a crash-restart must not forget the peak it was sliding from.
+		// Decaying high-water mark: the slow EMA lags a fresh climb, so a slide off a new peak is
+		// invisible to it (2026-07-14). Both drawdowns are published as RatingWatch/* panels.
 		float ratingGuardPeak = NAN;
 
 		// Churn-telemetry archive of the live steering directions (STEERING_ROADMAP

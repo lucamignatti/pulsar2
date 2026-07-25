@@ -460,7 +460,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["rating_guard_ema"] = ratingGuardEMA;
 	if (!std::isnan(ratingGuardPeak))
 		j["rating_guard_peak"] = ratingGuardPeak;
-	j["rating_guard_tripped"] = ratingGuardTripped;
 
 	// Churn-telemetry vector archive, per mode (save-only; see Learner.h steerVecSave).
 	// 1v1 keeps the legacy un-suffixed keys.
@@ -565,18 +564,6 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 		ratingGuardPeak = (float)j["rating_guard_peak"];
 	else if (j.contains("steer_rating_peak"))
 		ratingGuardPeak = (float)j["steer_rating_peak"];
-
-	const char* trippedKey = j.contains("rating_guard_tripped") ? "rating_guard_tripped"
-		: (j.contains("steer_rating_tripped") ? "steer_rating_tripped" : nullptr);
-	if (trippedKey) {
-		ratingGuardTripped = (bool)j[trippedKey];
-		if (ratingGuardTripped)
-			RG_LOG("NOTE: the rating guard was TRIPPED in this checkpoint - steering, opponent "
-				"styles, frontier drills, Nexto serve, league anchors, HEADROOM seek, RND "
-				"injection and the Ladder drive stay latched OFF (a human decides; clear "
-				<< trippedKey << " in the checkpoint's running-stats JSON or restore an "
-				"untripped checkpoint to re-enable)");
-	}
 
 	if (j.contains("fear_panel_obs")) {
 		fearPanelObs = j["fear_panel_obs"].get<std::vector<float>>();
@@ -1373,7 +1360,7 @@ void GGL::Learner::Start() {
 		std::array<bool, STEER_MODES> steerGateActive;         // alpha drops to 0 when the causal gate trips
 		steerGateActive.fill(true);
 		bool steerPendingApply = false;
-		// Rating drawdown guard state (ratingGuardEMA / ratingGuardTripped) lives on the
+		// Rating watch state (ratingGuardEMA / ratingGuardPeak) lives on the
 		// Learner and is persisted in the checkpoint stats - a crash-restart must not
 		// silently un-latch steering (the wrapper restarts automatically and unattended)
 
@@ -2238,7 +2225,7 @@ void GGL::Learner::Start() {
 			// Rating latch coverage: under the latch the Fill stops, so within maxAgeIters
 			// every pool goes stale and FrontierDrillState falls back to the normal reset
 			// mix on its own - "latched OFF" silences the whole intervention, not just alpha.
-			if (cfgS.frontierPool && !ratingGuardTripped) {
+			if (cfgS.frontierPool) {
 				auto& fpool = cfgS.frontierPool;
 				const bool padded = obsSize == 230, plain = obsSize == 109;
 				static bool warnedLayout = false;
@@ -3075,16 +3062,23 @@ void GGL::Learner::Start() {
 			}
 		};
 
-		// Rating drawdown guard: called wherever the skill tracker may have just written
-		// the training mode's rating into the report. A drop of more than ratingDrawdownTrip
-		// below the slow EMA latches steering OFF for the rest of the process - no
-		// auto-re-enable, a human decides (both live collapses tonight were visible on this
-		// signal within minutes while every behavioral gate stayed green).
-		auto fnRatingGuard = [&](Report& report) {
-			// NOT gated on steerOn (2026-07-25): this latch covers six live mechanisms that
-			// have nothing to do with steering, so tying it to steering.enabled meant the
-			// documented "revert steering" move silently disarmed all of them.
-			if (!config.ratingGuard.enabled || !report.Has(ratingKey))
+		// RATING WATCH - measurement only. Tracks the training mode's rating against a slow EMA
+		// and a decaying high-water mark, and publishes both drawdowns as panels.
+		//
+		// 2026-07-25 (user-directed): the LATCH IS GONE. This used to flip a process-lifetime
+		// boolean that disabled steering, opponent styles, frontier drills, Nexto serve, league
+		// anchors, HEADROOM seek, RND injection and the Ladder drive at once, with no
+		// auto-re-enable. In practice it false-tripped repeatedly on a young run's volatility
+		// (thresholds had already been walked 110 -> 200 and 75 -> 150 after three such trips,
+		// and it fired again on a spike-and-settle where the rating was still +213 ABOVE its own
+		// EMA), and each trip silently took six unrelated live mechanisms dark. An actuator that
+		// mostly misfires and hides its blast radius is worse than none.
+		//
+		// The SIGNAL is kept, because it is still the only thing that sees update damage that
+		// behavioral gates cannot. It is now the operator's to read, not the trainer's to act on:
+		// watch RatingWatch/Drawdown From EMA and /From Peak.
+		auto fnRatingWatch = [&](Report& report) {
+			if (!report.Has(ratingKey))
 				return;
 			float rating = (float)report[ratingKey];
 			if (std::isnan(ratingGuardEMA)) {
@@ -3093,31 +3087,14 @@ void GGL::Learner::Start() {
 				return;
 			}
 			if (std::isnan(ratingGuardPeak))
-				ratingGuardPeak = rating; // resumed from a pre-peak-latch checkpoint
-			if (!ratingGuardTripped && rating < ratingGuardEMA - config.ratingGuard.drawdownTrip) {
-				ratingGuardTripped = true;
-				steerPendingApply = true; // push alpha=0 at the next barrier
-				RG_LOG("RATING GUARD TRIPPED: " << ratingKey << " " << rating
-					<< " vs EMA " << ratingGuardEMA << " (drawdown > "
-					<< config.ratingGuard.drawdownTrip << ") - LATCHED OFF: steering, opponent "
-					"styles, frontier drills, Nexto serve, league anchors, HEADROOM seek, "
-					"RND injection and the Ladder drive. No auto-re-enable.");
-			}
-			// Peak latch: the slow EMA lags a fresh climb, so a slide off a new peak sits
-			// in its blind spot (2026-07-14: 1462 -> 1336 with the EMA guard silent the
-			// whole way down). The decaying high-water mark sees exactly that shape.
-			if (!ratingGuardTripped && rating < ratingGuardPeak - config.ratingGuard.peakTrip) {
-				ratingGuardTripped = true;
-				steerPendingApply = true;
-				RG_LOG("RATING GUARD TRIPPED (peak drawdown): " << ratingKey << " "
-					<< rating << " vs recent peak " << ratingGuardPeak << " (drawdown > "
-					<< config.ratingGuard.peakTrip << ") - LATCHED OFF: steering, opponent "
-					"styles, frontier drills, Nexto serve, league anchors, HEADROOM seek, "
-					"RND injection and the Ladder drive. No auto-re-enable.");
-			}
-			ratingGuardEMA = config.ratingGuard.emaDecay * ratingGuardEMA
-				+ (1.f - config.ratingGuard.emaDecay) * rating;
-			ratingGuardPeak = RS_MAX(rating, ratingGuardPeak - config.ratingGuard.peakDecay);
+				ratingGuardPeak = rating; // resumed from a checkpoint saved before peak tracking
+			// Positive = how far below the reference the rating currently sits.
+			report["RatingWatch/Drawdown From EMA"] = ratingGuardEMA - rating;
+			report["RatingWatch/Drawdown From Peak"] = ratingGuardPeak - rating;
+			ratingGuardEMA = config.ratingWatch.emaDecay * ratingGuardEMA
+				+ (1.f - config.ratingWatch.emaDecay) * rating;
+			// The high-water mark decays so a stale old spike cannot dominate the panel forever
+			ratingGuardPeak = RS_MAX(rating, ratingGuardPeak - config.ratingWatch.peakDecay);
 		};
 
 		// Applies the META system's active cluster: its direction on all modes (dosed by
@@ -3134,7 +3111,7 @@ void GGL::Learner::Start() {
 					continue;
 				vecs[md] = act.dirEMA;
 				sigmas[md] = metaSigma[md];
-				alphas[md] = (!act.benched && !ratingGuardTripped) ? config.steering.alpha : 0.f;
+				alphas[md] = !act.benched ? config.steering.alpha : 0.f;
 				any = true;
 			}
 			if (!any)
@@ -3218,7 +3195,7 @@ void GGL::Learner::Start() {
 					continue;
 				vecs[md] = v;
 				sigmas[md] = steerSigmaEMA[md];
-				alphas[md] = (steerGateActive[md] && !ratingGuardTripped) ? config.steering.alpha : 0.f;
+				alphas[md] = steerGateActive[md] ? config.steering.alpha : 0.f;
 				any = true;
 			}
 			if (!any) {
@@ -3273,9 +3250,8 @@ void GGL::Learner::Start() {
 
 			if (!render) {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				if (nexto && !ratingGuardTripped
+				if (nexto
 					&& RocketSim::Math::RandFloat() < config.externalOpponent.serveFrac) {
-					// ratingGuardTripped: same latch that kills steering/RND/drive/anchors
 					// covers this data-distribution intervention too
 					oppExternal = true;
 					nexto->BeginServe(numPlayers);
@@ -3287,11 +3263,10 @@ void GGL::Learner::Start() {
 				} else if (league && RocketSim::Math::RandFloat() < config.league.descendOpponentFrac) {
 					// PFSP-sampled league member -> the exposure to non-self styles the league is for
 					// (returns null while the archive is still empty, falling back to self-play).
-					// ratingGuardTripped gates the ANCHOR slice only (evolved members keep serving):
 					// anchors are the new intervention, so they answer to the same latch that kills
 					// steering / the Ladder drive / RND. Same write-in-barrier, read-on-collect
 					// discipline as ppo->steerVec.
-					oppModels = league->LoadPFSPOpponentModels(!ratingGuardTripped);
+					oppModels = league->LoadPFSPOpponentModels(true);
 				}
 			}
 
@@ -3328,12 +3303,11 @@ void GGL::Learner::Start() {
 			float oppStyleCoef = 0;
 			if (oppModels) {
 				oppIters++;
-				// ratingGuardTripped: written only in the barrier zone (fnRatingGuard), read
 				// here on the collect thread - same discipline as ppo->steerVec. Latched OFF
 				// means the WHOLE steering intervention, styles included. A style whose live
 				// source vector hasn't been derived yet (first iterations after boot) simply
 				// doesn't fire - no file, no stale fallback.
-				if (oppStylesOn && !ratingGuardTripped
+				if (oppStylesOn
 					&& RocketSim::Math::RandFloat() < config.steering.opponentStyleChance) {
 					auto& st = OPP_STYLES[RocketSim::Math::RandInt(0, 3)];
 					torch::Tensor v = st.challengeSrc ? oppStyleChallengeVec : oppStyleCommitVec;
@@ -3800,7 +3774,7 @@ void GGL::Learner::Start() {
 				prevVersionTimesteps = totalTimesteps;
 				if (report.Has(ratingKey))
 					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-				fnRatingGuard(report); // may latch ALL guarded mechanisms off; alpha applied below
+				fnRatingWatch(report); // measurement only - publishes RatingWatch/* panels
 				if (league)
 					league->OnIteration(report, totalIterations);
 				if (psd) {
@@ -4604,13 +4578,11 @@ void GGL::Learner::Start() {
 						float sInt = RS_MAX(0.05f * sExt, aInt.std().item<float>());
 						auto inj = ((config.ppo.vdagSeekBeta * sExt / sInt) * aInt)
 							.clamp(-3.f * sExt, 3.f * sExt);
-						if (!ratingGuardTripped)
-							tAdvantages = tAdvantages + inj.view_as(tAdvantages);
+						tAdvantages = tAdvantages + inj.view_as(tAdvantages);
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
 						report["Headroom/H Mean"] = tH.mean().item<float>();
 						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
 						report["Headroom/Inj Abs Mean"] = inj.abs().mean().item<float>();
-						report["Headroom/Latched"] = ratingGuardTripped ? 1.f : 0.f;
 					}
 
 					if (returnStat) {
@@ -4745,7 +4717,7 @@ void GGL::Learner::Start() {
 						}
 
 						float novStd = tNov.std().item<float>();
-						if (novStd > 1e-9f && rnd->updates >= rc.warmupIters && !ratingGuardTripped) {
+						if (novStd > 1e-9f && rnd->updates >= rc.warmupIters) {
 							auto tZ = ((tNov - tNov.mean()) / novStd).clamp(-rc.clampZ, rc.clampZ);
 							float advStd = tAdvantages.std().item<float>();
 							auto injected = (rc.weight * advStd) * tZ;
@@ -5072,7 +5044,7 @@ void GGL::Learner::Start() {
 						// ===== COMBINED DRIVE: Phi = -(gap_KD + gap_PK) into the advantages =====
 						// (Stage 2a extended per LADDER.md; latch-covered, warmup train-only)
 						if (gapSensor->exp && gc.driveBeta > 0
-							&& gapSensor->updates >= gc.driveWarmupIters && !ratingGuardTripped) {
+							&& gapSensor->updates >= gc.driveWarmupIters) {
 							RG_NO_GRAD;
 							auto tVR = tValPreds.to(torch::kFloat32).flatten();
 							torch::Tensor tVExpAll = torch::empty({ nAll });
@@ -5249,18 +5221,17 @@ void GGL::Learner::Start() {
 							// incumbent's possession gate
 							bool alphaOn;
 							if (metaOn && appliedMetaHead >= 0) {
-								alphaOn = steerLoaded && !ratingGuardTripped
+								alphaOn = steerLoaded
 									&& !metaSlots[appliedMetaHead][appliedMetaCluster].benched
 									&& metaSigma[md] != 0;
 							} else {
-								alphaOn = steerLoaded && steerGateActive[md] && !ratingGuardTripped
+								alphaOn = steerLoaded && steerGateActive[md]
 									&& (steerVecEMA[md].defined() || (md > 0 && steerVecEMA[0].defined()));
 							}
 							std::string key = md == 0 ? "Steer/Alpha" : "Steer/Alpha " + fnModeName(md);
 							report[key] = alphaOn ? config.steering.alpha : 0.f;
 						}
 						report["Steer/RhoGate In-Band Frac"] = ppo->lastRhoGateFrac;
-						report["Steer/Rating Guard Tripped"] = (float)ratingGuardTripped;
 						if (!std::isnan(ratingGuardEMA))
 							report["Steer/Rating EMA"] = ratingGuardEMA;
 						if (!std::isnan(ratingGuardPeak))
@@ -5331,7 +5302,7 @@ void GGL::Learner::Start() {
 						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 					if (report.Has(ratingKey))
 						lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-					fnRatingGuard(report); // may latch ALL guarded mechanisms off before the next apply
+					fnRatingWatch(report); // measurement only - publishes RatingWatch/* panels
 
 					// QD league: evolve/evaluate members between iterations (additive, off by default).
 					if (league)
@@ -5431,7 +5402,12 @@ void GGL::Learner::Start() {
 						"Headroom/Vdag Loss",
 						"Headroom/H Mean",
 						"Headroom/Inj Abs Mean",
-						"Headroom/Latched",
+						"",
+						// The update-damage signal. Nothing acts on these any more (the latch was
+						// removed 2026-07-25) - they are here so a drawdown is visible to the
+						// operator on the console, not just in wandb.
+						"RatingWatch/Drawdown From EMA",
+						"RatingWatch/Drawdown From Peak",
 						"",
 						"Gap/Loss",
 						"Gap/Mean",

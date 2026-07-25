@@ -991,7 +991,7 @@ int main(int argc, char* argv[]) {
 	//     the LearnerConfig default; 75 sits outside the +-30-50 noise band), ratio/KL logs,
 	//     branch backup + quarantine ritual.
 	//   - Watch: Steer/* panels (Alpha, Engagement Steered/Control/Match, Gate Delta EMA,
-	//     RhoGate In-Band Frac, Rating Guard Tripped), aerial/contest metrics, Rating slope.
+	//     RhoGate In-Band Frac), aerial/contest metrics, Rating slope, RatingWatch/* drawdowns.
 	// Post-mortems + stage-2 escalation path: analysis/probes/STEERED_PRACTICE.md.
 	// STAGE-1 v2 (2026-07-12, after ~200M treated steps of v1): v1's guidance metric ("landing
 	// attendance") aged out - pool-Elo drifted down while the style beat its predecessor 42-24
@@ -1001,18 +1001,11 @@ int main(int argc, char* argv[]) {
 	// possession-win rate steered-vs-control. Unfakeable by empty flight; doesn't age with
 	// style. League old-style exposure raised below to patch the measured exploitability.
 	cfg.steering.enabled = true;
-	// YOUNG-RUN GUARD BAND (2026-07-17): the default peak-drawdown trip (110) was
-	// tuned for the mature 4.0 noise band (+-30-50); a formative-phase run
-	// legitimately oscillates +-80 around a steep climb and tripped the latch three
-	// times on pure volatility (2x post-flip on 5.0, 1x at 2.7B on 5.0v3 - trend
-	// rising, no pathology each time). 200 stays outside young-run noise while
-	// still catching a real collapse. TIGHTEN back toward 110 at maturity.
-	// NOTE (2026-07-25): these moved off cfg.steering - the guard is no longer a steering
-	// feature. It covers six live mechanisms and now runs regardless of steering.enabled.
-	cfg.ratingGuard.peakTrip = 200.0f;
-	// ...and the EMA variant likewise (75 -> 150; it tripped on the same +-80
-	// young-run wobble at 14B). Both tighten together at maturity.
-	cfg.ratingGuard.drawdownTrip = 150.0f;
+	// The rating LATCH was removed 2026-07-25 (user-directed). It used to disable six live
+	// mechanisms at once on a drawdown and never re-enable them; on this young, steeply-climbing
+	// run it false-tripped repeatedly (thresholds had already been loosened 110 -> 200 and
+	// 75 -> 150) and its last trip fired on a spike-and-settle with the rating still +213 above
+	// its own EMA. The drawdown is now telemetry only: watch RatingWatch/* in wandb.
 	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
 	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
 	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
@@ -1202,7 +1195,7 @@ int main(int argc, char* argv[]) {
 		// staged V1-V4 gates are WAIVED per the user's authorization; retained here:
 		// the V0 invariants (masked rows pay zero - audited; truncation codes are
 		// nonzero terminals and episodes only enter the buffer whole), the latch
-		// coverage (drive obeys ratingGuardTripped), branch backup, and the revert
+		// coverage, branch backup, and the revert
 		// paths: mapEnabled=false kills gap_PK (drive degrades to the proven
 		// gap_KD-only form), driveBeta=0 kills the drive+wire together (Law 6), and
 		// the WIRE architecture itself reverts only via the branch backup - the

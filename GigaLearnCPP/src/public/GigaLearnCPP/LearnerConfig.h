@@ -16,6 +16,20 @@ namespace GGL {
 		GPU_MPS
 	};
 
+	// RATING WATCH - measurement only. Publishes how far the training mode's rating sits below
+	// a slow EMA and below a decaying high-water mark (RatingWatch/* panels).
+	//
+	// This was a LATCH until 2026-07-25 (user-directed removal). It disabled steering, opponent
+	// styles, frontier drills, Nexto serve, league anchors, HEADROOM seek, RND injection and the
+	// Ladder drive together, for the rest of the process, with no auto-re-enable - and it
+	// false-tripped often enough on young-run volatility (thresholds already walked 110 -> 200
+	// and 75 -> 150 after three trips) that its misfires cost more than its catches. Nothing
+	// automatic watches for update damage now; that is the operator's job.
+	struct RatingWatchConfig {
+		float emaDecay = 0.995f;  // slow EMA (~140 rating-bearing iters half-life)
+		float peakDecay = 0.5f;   // high-water mark decays this much per rating eval
+	};
+
 	// Steered-practice collection ("optimism surgery"). During COLLECTION ONLY, current-policy
 	// rows belonging to the steered practice arenas get alpha*sigma*v added to the shared-trunk
 	// output feeding the POLICY head, where v is a behavior-derived "commitment" direction.
@@ -51,39 +65,6 @@ namespace GGL {
 	// Including them makes V the honest practice/match mixture for aliased states - a much
 	// smaller, split bias. Practice rows stay excluded from the GOAL critic (its channel is
 	// structurally absent in truncated episodes) and from the goal-advantage blend.
-	// RATING GUARD - the ONLY actuator in the system that can see UPDATE damage (behavioral
-	// gates cannot). If the training mode's rating falls more than drawdownTrip below its slow
-	// EMA, or more than peakTrip below a slowly-decaying high-water mark, it LATCHES for the
-	// rest of the process - loud log, no auto-re-enable, a human decides.
-	//
-	// It gates NINE consumers, six of them live and unrelated to steering: frontier drills,
-	// Nexto serve, league anchors, HEADROOM seek injection, RND injection, and the Ladder drive.
-	//
-	// 2026-07-25: MOVED OUT OF CollectSteeringConfig. It used to live there and early-return on
-	// !steerOn, so `steering.enabled = false` - the documented "revert steering" move - silently
-	// disarmed all six live mechanisms with no log line. The guard is not a steering feature; it
-	// is the run's safety latch, and it must survive the removal of the subsystem it was born in.
-	struct RatingGuardConfig {
-		bool enabled = true;
-
-		// Calibration note (learned live): the rating wiggles +-30..50 in MATURE training, so
-		// the trip must sit outside that band. The collapse signature this guards against was
-		// -130 in ~10 minutes; 75 catches that within a few evals and never fires on noise.
-		float drawdownTrip = 75.0f;
-		float emaDecay = 0.995f;  // slow EMA (~140 rating-bearing iters half-life)
-
-		// Second latch on the same signal: drawdown from a slowly-decaying HIGH-WATER MARK.
-		// The slow EMA has a blind spot the 2026-07-14 incident sat in exactly: after a fast
-		// climb the EMA lags far below the peak, so a slide off that fresh peak (1462 -> 1336,
-		// ~125) never reaches 75-below-EMA until long after the damage. The peak latch sees it
-		// directly. 110 sits above the high-water mark of pure noise (max of a +-40 band reads
-		// ~+60 over the mean; trough ~-40 -> ~100 spread) and inside the incident's 125; the
-		// decay releases stale peaks so a genuine long plateau after an old spike can't trip
-		// it forever.
-		float peakTrip = 110.0f;
-		float peakDecay = 0.5f;   // high-water mark decays this much per rating eval
-	};
-
 	struct CollectSteeringConfig {
 		bool enabled = false;
 		float alpha = 1.0f;             // strength, in units of sigma (trunk projection std, live-estimated)
@@ -252,7 +233,7 @@ namespace GGL {
 
 		// NOTE: the rating guard used to live here (ratingGuardEnabled / ratingDrawdownTrip /
 		// ratingEmaDecay / ratingPeakTrip / ratingPeakDecay). It moved to the top-level
-		// RatingGuardConfig on 2026-07-25 - see that struct for why.
+		// RatingWatchConfig on 2026-07-25, and the LATCH itself was removed - see that struct.
 
 		// Live derivation
 		float emaDecay = 0.9f;          // per-iteration EMA on the direction and sigma
@@ -471,8 +452,8 @@ namespace GGL {
 
 		SkillTrackerConfig skillTracker = {};
 
-		// The run's update-damage latch. Independent of every mechanism it guards - see struct.
-		RatingGuardConfig ratingGuard = {};
+		// Rating drawdown telemetry. No actuation - see struct.
+		RatingWatchConfig ratingWatch = {};
 
 		// Steered-practice collection; additive and default-OFF (see struct comment above)
 		CollectSteeringConfig steering = {};
