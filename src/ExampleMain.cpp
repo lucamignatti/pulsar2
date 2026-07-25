@@ -777,13 +777,18 @@ int main(int argc, char* argv[]) {
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).
-	cfg.checkpointFolder = "checkpoints_resid"; // RESIDUAL/ASYMMETRIC COLD START 2026-07-24: residual blocks
-	                                         // + policy 1152->768 + value heads 5x1280 all change tensor
-	                                         // shapes, so checkpoints_6M cannot be resumed (the loader would
-	                                         // abort on the trunk's first Linear). Fresh folder = archived
-	                                         // predecessors stay untouched and this is a true cold start
-	                                         // (PHASE A / empty version pool / no PHASE_B marker).
-	cfg.metricsRunName = "resid-768p-1280v";
+	// COLD START 2026-07-25 ("5.1"). The net is UNCHANGED from checkpoints_resid except for the
+	// policy head's input width: conforming to COMPOSITION_CRITIC.md removed the 5-column Ladder
+	// wire, so the head is 1152 (plain trunk width) where the resid lineage's checkpoints are
+	// 1157. That alone forces a fresh lineage - resuming would abort on the policy head's first
+	// Linear. Riding the same restart: the QD league removal, training against archived past
+	// selves, and the permanent reference set.
+	// A FRESH FOLDER is what makes this safe rather than merely loud: checkpoints_resid stays
+	// fully intact (7.0 GB, 8 checkpoints, ~950M steps) instead of having every checkpoint in it
+	// renamed corrupt_* by the loader's fallback, and PHASE A / an empty version pool / no
+	// PHASE_B marker all follow by construction (the marker lives in the checkpoint folder).
+	cfg.checkpointFolder = "checkpoints_5.1";
+	cfg.metricsRunName = "5.1-noleague";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
