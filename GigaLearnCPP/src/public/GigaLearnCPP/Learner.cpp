@@ -323,10 +323,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	// the steering config. LoadStats reads BOTH, so a checkpoint written by either version
 	// restores correctly - important because this is the latch, and losing a tripped state
 	// silently re-arms six live mechanisms on a policy that already failed.
-	if (!std::isnan(ratingGuardEMA))
-		j["rating_guard_ema"] = ratingGuardEMA;
-	if (!std::isnan(ratingGuardPeak))
-		j["rating_guard_peak"] = ratingGuardPeak;
 
 	// Churn-telemetry vector archive, per mode (save-only; see Learner.h steerVecSave).
 	// 1v1 keeps the legacy un-suffixed keys.
@@ -383,17 +379,6 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (j.contains("reach_agree_ema"))
 		reachAgreeEMA = RS_MAX(0.f, (float)j["reach_agree_ema"]);
 
-	// Read the current keys, falling back to the pre-2026-07-25 steer_rating_* names so a
-	// checkpoint from before the guard was re-homed still restores its latch.
-	if (j.contains("rating_guard_ema"))
-		ratingGuardEMA = (float)j["rating_guard_ema"];
-	else if (j.contains("steer_rating_ema"))
-		ratingGuardEMA = (float)j["steer_rating_ema"];
-
-	if (j.contains("rating_guard_peak"))
-		ratingGuardPeak = (float)j["rating_guard_peak"];
-	else if (j.contains("steer_rating_peak"))
-		ratingGuardPeak = (float)j["steer_rating_peak"];
 
 	if (j.contains("fear_panel_obs")) {
 		fearPanelObs = j["fear_panel_obs"].get<std::vector<float>>();
@@ -1037,7 +1022,6 @@ void GGL::Learner::Start() {
 		std::array<float, STEER_MODES> steerGateDeltaEMA = {}; // steered-minus-control team-possession, EMA
 		std::array<int, STEER_MODES> steerGateIters = {};      // iterations that contributed gate data
 		bool steerPendingApply = false;
-		// Rating watch state (ratingGuardEMA / ratingGuardPeak) lives on the
 		// Learner and is persisted in the checkpoint stats - a crash-restart must not
 		// silently un-latch steering (the wrapper restarts automatically and unattended)
 
@@ -1301,30 +1285,6 @@ void GGL::Learner::Start() {
 		auto fnCloneSeq = [](const torch::nn::Sequential& src) {
 			return torch::nn::Sequential(
 				std::dynamic_pointer_cast<torch::nn::SequentialImpl>(src->clone()));
-		};
-		// RATING WATCH - measurement only. Tracks the training mode's rating against a slow EMA
-		// and a decaying high-water mark and publishes both drawdowns. There is no latch: it was
-		// removed 2026-07-25 after repeatedly false-tripping and taking six live mechanisms dark.
-		// This is the only signal that sees update damage when behavioral gates read green, so it
-		// is kept as the operator's instrument. See RatingWatchConfig.
-		auto fnRatingWatch = [&](Report& report) {
-			if (!report.Has(ratingKey))
-				return;
-			float rating = (float)report[ratingKey];
-			if (std::isnan(ratingGuardEMA)) {
-				ratingGuardEMA = rating;
-				ratingGuardPeak = rating;
-				return;
-			}
-			if (std::isnan(ratingGuardPeak))
-				ratingGuardPeak = rating; // resumed from a checkpoint saved before peak tracking
-			// Positive = how far below the reference the rating currently sits.
-			report["RatingWatch/Drawdown From EMA"] = ratingGuardEMA - rating;
-			report["RatingWatch/Drawdown From Peak"] = ratingGuardPeak - rating;
-			ratingGuardEMA = config.ratingWatch.emaDecay * ratingGuardEMA
-				+ (1.f - config.ratingWatch.emaDecay) * rating;
-			// The high-water mark decays so a stale old spike cannot dominate the panel forever
-			ratingGuardPeak = RS_MAX(rating, ratingGuardPeak - config.ratingWatch.peakDecay);
 		};
 
 		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
@@ -1787,7 +1747,6 @@ void GGL::Learner::Start() {
 				prevVersionTimesteps = totalTimesteps;
 				if (report.Has(ratingKey))
 					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-				fnRatingWatch(report); // measurement only - publishes RatingWatch/* panels
 				if (league)
 					league->OnIteration(report, totalIterations);
 				// Freeze the current policy for the worker, then collect the next iteration
@@ -2417,7 +2376,6 @@ void GGL::Learner::Start() {
 						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 					if (report.Has(ratingKey))
 						lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-					fnRatingWatch(report); // measurement only - publishes RatingWatch/* panels
 
 					// QD league: evolve/evaluate members between iterations (additive, off by default).
 					if (league)
@@ -2505,11 +2463,13 @@ void GGL::Learner::Start() {
 						"Headroom/H Mean",
 						"Headroom/Inj Abs Mean",
 						"",
-						// The update-damage signal. Nothing acts on these any more (the latch was
-						// removed 2026-07-25) - they are here so a drawdown is visible to the
-						// operator on the console, not just in wandb.
-						"RatingWatch/Drawdown From EMA",
-						"RatingWatch/Drawdown From Peak",
+						// The skill-tracker Elo. This had NEVER been on the console - it was
+						// published to wandb only, which is why it looked like it was missing.
+						// Display skips keys the report does not carry, so listing all three
+						// modes is safe in any fleet layout.
+						"Rating/1v1",
+						"Rating/2v2",
+						"Rating/3v3",
 						"",
 						"Plasticity/Trunk EffRank",
 						"Plasticity/Policy EffRank",
