@@ -2098,6 +2098,13 @@ void GGL::Learner::Start() {
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
 
+					// Raw GAE advantage magnitude, captured BEFORE any injector touches it.
+					// GAE/Avg Advantage used to be read after the HEADROOM injection and before
+					// the goal-critic one, so the panel named for raw GAE was a hybrid of one
+					// injector and not the other. Both are now reported and the difference IS
+					// the composite injection budget.
+					float rawAdvAbsMean = tAdvantages.abs().mean().item<float>();
+
 					// ===== HEADROOM (composition critic; PPOLearnerConfig::vdagEnabled) =====
 					// TD targets in the critic's own units WITHOUT touching GAE internals:
 					// scaled_r_i = A_i - g*lam*(1-d_i)*A_{i+1} - g*(1-d_i)*V_{i+1} + V_i (GAE
@@ -2156,7 +2163,7 @@ void GGL::Learner::Start() {
 						}
 					}
 					report["GAE/Avg Return"] = tReturns.abs().mean().item<float>();
-					report["GAE/Avg Advantage"] = tAdvantages.abs().mean().item<float>();
+					report["GAE/Avg Advantage"] = rawAdvAbsMean; // pre-injection (see above)
 					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
 
 					// --- Secondary goal-only critic: its own GAE pass at the long-horizon gamma, then
@@ -2206,6 +2213,15 @@ void GGL::Learner::Start() {
 							report["GoalCritic/Blend BetaEff"] = betaEff;
 							report["GoalCritic/Injected Abs Mean"] = injected.abs().mean().item<float>();
 						}
+					}
+					// AFTER every injector. GAE/Injected Frac is the composite injection budget -
+					// the single number that was missing while four injectors chained with no
+					// knob owning the total. 0 = pure extrinsic advantage.
+					{
+						float postAdvAbsMean = tAdvantages.abs().mean().item<float>();
+						report["GAE/Avg Advantage Post-Inj"] = postAdvAbsMean;
+						if (rawAdvAbsMean > 1e-8f)
+							report["GAE/Injected Frac"] = (postAdvAbsMean - rawAdvAbsMean) / rawAdvAbsMean;
 					}
 
 					// Stage 2 (deliberate-practice shaping): added AFTER GAE has already derived
@@ -2418,8 +2434,6 @@ void GGL::Learner::Start() {
 					{
 						"Average Step Reward",
 						"Policy Entropy",
-						"KL Div Loss",
-						"First Accuracy",
 						"",
 						"Reach/Beta",
 						"Reach/Gate Mult Mean",
@@ -2429,20 +2443,9 @@ void GGL::Learner::Start() {
 						"Reach/Ball Accuracy",
 						"Reach/Touch Pred Agreement",
 						"",
-						"Proposer/Loss",
-						"Proposer/Rho Goal Mean",
-						"Proposer/Weight Fraction",
-						"Proposer/Shaping BetaEff",
-						"Proposer/Drill Bank Size",
-						"Proposer/Drills Added",
-						"Proposer/Practice Step Fraction",
-						"Proposer/Car Loss",
-						"Proposer/Car Goal Drift",
-						"Proposer/Car Shaping BetaEff",
 						"",
 						"Policy Update Magnitude",
 						"Critic Update Magnitude",
-						"Shared Head Update Magnitude",
 						"",
 						"GoalCritic/Loss",
 						"GoalCritic/Value-Outcome Corr",
@@ -2478,20 +2481,6 @@ void GGL::Learner::Start() {
 						"Gap/Loss",
 						"Gap/Mean",
 						"Gap/Fear Panel",
-						"Gap/Drive Inj Abs Mean",
-						"Ladder/Map Local Loss",
-						"Ladder/Lambda",
-						"Ladder/Bank Goal Fill",
-						"Ladder/Bank Concede Fill",
-						"Ladder/Calib A",
-						"Ladder/Calib A2",
-						"Ladder/GapPK Mean",
-						"Ladder/Fear GapPK",
-						"Ladder/Imp GapPK Spawn",
-						"Ladder/Imp Touches",
-						"Ladder/Wire Active",
-						"Ladder/Wire Col Grad",
-						"Ladder/Retention Viol",
 						"",
 						"Nexto/Goals For",
 						"Nexto/Goals Against",
