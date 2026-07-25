@@ -83,7 +83,6 @@ namespace GGL {
 
 	struct CollectSteeringConfig {
 		bool enabled = false;
-		float alpha = 1.0f;             // strength, in units of sigma (trunk projection std, live-estimated)
 		float practiceArenaFrac = 0.2f; // fraction of EACH MODE's arenas that are practice (steered + control)
 		float controlFracOfPractice = 0.15f; // fraction of practice arenas kept unsteered as gate controls
 
@@ -131,12 +130,6 @@ namespace GGL {
 		// as the possession gate). Rating latch stays the global backstop.
 		// meta=false = the pinned incumbent (commitment steering) - the baseline the
 		// meta system must beat on Elo slope over a matched window (pre-registered).
-		bool meta = false;
-		int metaClusters = 6;            // emergent regions per head
-		int metaBankSize = 512;          // achieved-goal bank per head per iteration
-		int metaMaxRows = 4000;          // mined state rows per iteration
-		int metaGoalsPerRow = 3;         // sampled cross-episode goals per row
-		int metaDwellIters = 10;         // scheduler dwell per cluster
 		// The steering slot is TIME-MULTIPLEXED between the proven incumbent commitment
 		// direction (the default actuator) and meta cluster probes (2026-07-14 incident:
 		// v1 handed meta the slot permanently - the proven driver stopped applying and
@@ -145,15 +138,9 @@ namespace GGL {
 		// benched included - that re-probe is the unbench path); other dwells go to the
 		// cluster with the best warmed-up effect EMA if it clears metaPromoteMin, else to
 		// the incumbent. A cluster therefore EARNS actuation from its own measurements.
-		int metaProbeEvery = 3;
-		float metaPromoteMin = 0.05f;    // effect EMA a warmed cluster must clear to own exploit dwells
 		// Effect-EMA iterations before bench/promote decisions. Counted only while the
 		// cluster is actually applied: at 150 (the incumbent gate's number, measured
 		// every iteration) benching was mathematically inert under 10-iter dwells
-		int metaWarmupIters = 30;
-		float metaEffectTrip = -0.3f;    // bench below this normalized effect EMA
-		float metaEffectReenable = -0.1f;// unbench above this (duty-cycle re-probe)
-		float metaCentroidEma = 0.7f;    // cluster-slot stability across iterations
 
 		// Frontier reset pool (roadmap phase 3): when set, the learner banks each
 		// iteration's feasible-but-declined MATCH readings (reconstructed from obs) into
@@ -187,12 +174,6 @@ namespace GGL {
 		// GGL_FRONTIER_POTENTIAL (no rebuild). OFF = incumbent (identical behaviour). See
 		// FRONTIER.md for Phase 1 actuation (d_goal-quantile selection + theta controller)
 		// and the pre-registered success criteria / guards.
-		bool frontierPotential = false;
-		float frontierThetaW = 0.15f;         // Phase 1: quantile band width [theta, theta+w]
-		float frontierRetainFrac = 0.30f;     // Phase 1: pool fraction drawn from below theta (retention)
-		float frontierThetaStep = 0.02f;      // Phase 1: theta advance per mastered check
-		float frontierAdvHi = 0.55f;          // Phase 1: drilled-row resolution rate to advance theta
-		int frontierThetaAdjustEvery = 25;    // Phase 1: iterations between theta adjust checks
 
 		// AERIAL ALTITUDE ANNEALING (AERIAL_GAP.md, 2026-07-15): when set, the learner
 		// drives the shared AirDrill difficulty D (0 = classic airborne spawn, 1 =
@@ -238,22 +219,17 @@ namespace GGL {
 		// offline calibration put the intermediate band at ~40-60% actual conversion).
 		// Points the optimism at hard-but-plausible plays toward the net.
 		bool rhoGateEnabled = true;
-		float rhoGateLo = 0.2f, rhoGateHi = 0.8f;
-		int rhoGateActionSamples = 8;   // K uniform valid actions per row for the rho read
 		// Gate by CONTACT reachability (car head, "can I reach the ball" - races) instead of
 		// scoring reachability (ball head, "can the ball reach the net" - shots). Added after
 		// the v2 possession gate kept reading scoring-gated steering as race-LOSING: we told
 		// it to commit where the shot was uncertain, then graded it on winning the ball.
-		bool rhoGateOnContact = true;
 
 		// NOTE: the rating guard used to live here (ratingGuardEnabled / ratingDrawdownTrip /
 		// ratingEmaDecay / ratingPeakTrip / ratingPeakDecay). It moved to the top-level
 		// RatingWatchConfig on 2026-07-25, and the LATCH itself was removed - see that struct.
 
 		// Live derivation
-		float emaDecay = 0.9f;          // per-iteration EMA on the direction and sigma
 		int maxReadingsPerIter = 4000;  // airborne readings labeled per iteration (landing sims are ~free)
-		int minPairsPerUpdate = 100;    // skip the EMA update when matched pairs are scarcer than this
 
 		// Causal auto-gate (units: absolute engagement fraction, e.g. 0.01 = 1pp).
 		// Purpose in stage 1: detect a SIGN-INVERTED direction (steering actively suppressing
@@ -262,9 +238,6 @@ namespace GGL {
 		// tripped, alpha=0 makes steered==control, the delta EMA decays toward 0 and crosses
 		// gateReenableAbove -> steering resumes -> re-trips only if genuinely harmful: the
 		// thresholds below produce a natural duty-cycled probe with no extra machinery.
-		int gateWarmupIters = 150;        // iterations with data before the gate may act
-		float gateDisableBelow = -0.03f;  // ~3 sigma of the delta EMA: real inversion only
-		float gateReenableAbove = -0.01f; // decay path back to probing
 	};
 
 	// External fixed opponent (Nexto; NextoOpponent.h has the full rationale):

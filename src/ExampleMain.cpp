@@ -933,7 +933,6 @@ int main(int argc, char* argv[]) {
 	// STAGE-2 PROTOCOL ACTIVE (2026-07-18): the gap drive replaces commitment
 	// steering - actuation OFF (alpha 0, styles 0 below), machinery/telemetry/drills
 	// stay up. Restore alpha 0.5 only if the drive is reverted.
-	cfg.steering.alpha = 0.0f;
 	// ESCALATE-1 (2026-07-16): 0.18 -> 0.30 - the fear-drill dose was ~6% of team
 	// resets and 10B steps moved neither Fear Panel zV nor Census NONE; this lineage
 	// is end-of-life (cold start decided), so it gets one full-dose final experiment.
@@ -973,7 +972,6 @@ int main(int argc, char* argv[]) {
 	// next one-lever experiment, judged on Elo slope vs this baseline with the peak
 	// latch armed. (The meta machinery, banks and panels are all still built and the
 	// probe/promote scheduler smoke-passed - this flag is the only thing holding it.)
-	cfg.steering.meta = false;
 	// Phase 1 (steered league opponents): style directions the opponent side occasionally
 	// plays - hesitant/overcommit (commitment direction at offline-validated negative /
 	// mild positive dose) and shadow (live challenge-vs-shadow contrast). Synthesized
@@ -1043,7 +1041,6 @@ int main(int argc, char* argv[]) {
 			RG_LOG("HEADROOM: composition critic ON by default (twin V-dagger trunk heads, seek beta "
 				<< cfg.ppo.vdagSeekBeta << ") - Headroom/* panels");
 		if (const char* s = std::getenv("GGL_FRONTIER_POTENTIAL"); s && s[0] && std::string(s) != "0") {
-			cfg.steering.frontierPotential = true;
 			RG_LOG("GGL_FRONTIER_POTENTIAL: Potential Frontier ON (Phase 0 telemetry - Frontier/* panels; see FRONTIER.md)");
 		}
 		// AirDrill altitude annealing: REVERTED 2026-07-15 ~2.5h after deploy (see

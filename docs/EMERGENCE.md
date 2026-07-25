@@ -1,5 +1,10 @@
 # EMERGENCE — fix the learning system, let skills emerge (the root-cause program)
 
+> **SUPERSEDED 2026-07-25.** The machinery described here was REMOVED from the trainer in the
+> composition-critic conformance pass. Kept for provenance and for the lessons it carries — not
+> as a description of the current system. What runs now: `research/reports/COMPOSITION_CRITIC.md`
+> (the spec) and `docs/ENABLED_INVENTORY.md` (the live inventory).
+
 **Pre-registered 2026-07-15/16, authorized by the user** ("skills should emerge
 naturally from a simple reward... fix the root cause... apply in the live
 trainer, give it time, rollback to golden if needed"). Rollback anchor:
