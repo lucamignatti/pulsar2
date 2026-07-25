@@ -4,7 +4,7 @@
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
-#include "PSDConfig.h"
+#include "LeagueConfig.h"
 
 #include <memory>
 
@@ -468,8 +468,7 @@ namespace GGL {
 		ExternalOpponentConfig externalOpponent = {};
 
 		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
-		// unchanged unless psd.enabled / league.enabled are set.
-		PSDConfig psd = {};
+		// unchanged unless league.enabled is set.
 		LeagueConfig league = {};
 	};
 }

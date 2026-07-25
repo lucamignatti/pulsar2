@@ -833,80 +833,13 @@ int main(int argc, char* argv[]) {
 		}
 		RG_LOG("Render mode: " << g_RenderTeamSize << "v" << g_RenderTeamSize << " arena");
 	}
-
-	// ---------------------------------------------------------------------------------------------
-	// Basin-Racing (PSD) + QD league. Both ADDITIVE and OFF by default: with these two flags false
-	// the trainer is byte-for-byte the proven 2.6 baseline. Enable to layer the outer loop on top.
-	//
-	// PSD alternates ordinary DESCEND (== the baseline above) with EGGROLL PROBE rounds: K antithetic
-	// low-rank perturbations of the policy each get a short factor-only finetune, are scored on
-	// held-out arenas, and the fitness-weighted sum of the ORIGINAL directions is folded into the
-	// base weights. warmupUntilPlateau keeps pure DESCEND until Rating/1v1 stalls, so the K-cost is
-	// only paid where PPO alone plateaus (resuming the live 2.6 checkpoint trips this immediately).
-	// FULL RUN: Basin-Racing + QD league both ON.
-	// warmupUntilPlateau keeps pure DESCEND (== the 2.6 baseline) until Rating/1v1 stalls, so the
-	// K-cost is only paid at a plateau: resuming a competent 2.6 checkpoint trips it quickly; a
-	// from-scratch start descends normally until its first plateau (~GExploit iters). K=16 -> 32
-	// antithetic probes; numGames 1024 splits cleanly (24 probe + 8 eval arenas per slot).
-	// DISABLED 2026-07-13 by pre-registered measurement (see the evalWindowSteps note below
-	// for the full trial design): with 12x eval data per slot, the ES slot-ranking
-	// reliability read 0.20 and 0.23 across two probe rounds - the fitness signal is
-	// structurally unresolvable (episode-level variance in zero-sum 1v1 swamps
-	// perturbation-scale effects at any affordable budget), so every fold is a noise kick.
-	// A live-bracketed fold (reliability 0.57, norm 17.3) measurably degraded behavior
-	// (engagement -7.6pp ~3sigma). Disabling also disarms the plasticity interventions,
-	// which were past their 25k-iteration warmup. The theory of ES stands; its
-	// precondition - a cheap reliable fitness - does not exist in this domain.
-	cfg.psd.enabled = false;
-	cfg.psd.warmupUntilPlateau = true;
-	// Pure-ES probe (EGGROLL-faithful; arXiv 2511.16652). The 32-slot Baldwinian probe measured
-	// fitness reliability ~0 for 20 rounds -> the ranking was noise, so folds were a random walk.
-	// The paper's own sweeps show ES needs LARGE populations; K=256 -> S=512 antithetic slots puts N
-	// inside their proven envelope. numGames 1024 -> ~2 eval arenas/slot; the round budget goes to a
-	// long level-fitness window instead of a per-slot finetune that couldn't discriminate anyway.
-	cfg.psd.pureES = true;
-	cfg.psd.K = 256;                      // S = 512 slots (was 16 -> S=32, 16x below the paper's floor)
-	cfg.psd.rank = 4;
-	cfg.psd.sigma = 0.02f;                // adaptive: widens on low reliability, tightens if most slots hurt
-	// 200 -> 2400 (2026-07-13): fold direction-SNR scales with sqrt(total eval steps), and at
-	// 200 steps/slot the slot ranking's measured reliability sat at 0.13-0.65 (mostly ~0.55 -
-	// half the fold was noise) while norm-15..20 folds landed anyway; a bracketed fold at
-	// reliability 0.57 measurably degraded behavior (engagement -7.6pp, ~3 sigma). 12x the
-	// eval window costs ~30-60s of wall per round (slots parallelize across all arenas) and
-	// should lift reliability toward 0.8+. PRE-REGISTERED VERDICT: if reliability still reads
-	// ~0.5 after 2-3 rounds at this budget, the noise is structural (non-stationary base /
-	// antithetic pairing under drift) and PSD gets disabled per the measurement doctrine.
-	cfg.psd.evalWindowSteps = 2400;
-	cfg.psd.GExploit = 2500;
-	// Validation-gated fold: A/B the base policy's held-out return before vs after each fold and revert
-	// if it regressed, so no noise-fold ever lands unchecked (aggregate-level Baldwinian validation).
-	cfg.psd.valGateEnabled = true;
-	// 20 -> 200: the fold-approval A/B gets the same medicine - a 20-step window green-lit a
-	// fold with fracHurt 0.58 and another at ranking reliability 0.13.
-	cfg.psd.valWindowSteps = 200;
-
-	// Plasticity interventions — the canaries now ACT (handoff §3.6/§4.2), not just log. Every knob
-	// is gated to be a no-op under healthy training and fires only on real plasticity loss:
-	//   (1) ReDo recycles dead policy units when >=10% collapse.
-	//   (2) EffRank collapse response shrink-and-perturbs the head when its effective rank drops
-	//       below 70% of its running peak.
-	//   (3) Critic gets a gentle 10%-toward-init partial reset every 5 probe rounds (it loses value
-	//       plasticity first and tolerates resets).
-	//   (4) Distill reset (deepest) reinits + behavior-distills the policy, but only when the head
-	//       rank has collapsed below 60% of peak AND >=8 rounds since the last distill.
-	//   (5) Competence freeze is wired but dormant: set freezeRatingThresh to the Rating/1v1 at which
-	//       you want the trunk locked in (the default never fires).
-	cfg.psd.redoEnabled = true;
-	cfg.psd.effRankResponseEnabled = true;
-	cfg.psd.criticResetPeriod = 5;
-	cfg.psd.criticPartialResetFrac = 0.10f;
-	cfg.psd.distillPeriod = 8;
-	cfg.psd.distillTrigger = 0.6f;
-	cfg.psd.freezeEnabled = true;
-	// FRESH run: interventions LOG from step 0 but only ACT after 25k iterations, so the naturally
-	// steep early effective-rank drop of a cold net doesn't trip distill/perturb with nobody watching.
-	cfg.psd.interventionWarmupIters = 25000;
-	// cfg.psd.freezeRatingThresh = <Rating/1v1 to freeze the trunk at>;  // leave unset = never freeze
+	// PSD (Basin-Racing) was REMOVED 2026-07-25. It had been disabled by a pre-registered
+	// verdict since 2026-07-13 and had drifted architecturally incompatible with the live net
+	// (Ladder wire columns, the arena pool, the critic family). Its two genuinely useful
+	// signals - effective rank and dead-unit fraction - were PROMOTED to unconditional
+	// telemetry instead of deleted (Plasticity/* panels): the residual cold start was
+	// justified by effective-rank decay, so the project needs to keep measuring it.
+	// History: git log -- GigaLearnCPP/src/private/GigaLearnCPP/PSD
 
 	// QD league: a MAP-Elites archive of behaviorally-diverse opponents so the main doesn't converge
 	// to one playstyle and gets exposure to others. Now actually WIRED into training: descendOpponentFrac

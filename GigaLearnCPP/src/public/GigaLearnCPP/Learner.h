@@ -24,7 +24,6 @@ namespace GGL {
 
 		class PPOLearner* ppo;
 		class PolicyVersionManager* versionMgr;
-		class PSDController* psd = nullptr;   // Basin-Racing outer loop; null unless config.psd.enabled
 		class LeagueArchive* league = nullptr; // QD league; null unless config.league.enabled
 
 		RLGC::EnvCreateFn envCreateFn;

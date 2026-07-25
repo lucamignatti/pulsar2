@@ -5,6 +5,7 @@
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <RLGymCPP/CommonValues.h>
+#include "../Util/Plasticity.h"
 
 using namespace torch;
 
@@ -880,6 +881,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["SB3 Clip Fraction"] = avgClip.Get();
 		report["Policy Update Magnitude"] = policyUpdateMagnitude;
 		report["Critic Update Magnitude"] = criticUpdateMagnitude;
+
+		// PLASTICITY (promoted from the retired PSD subsystem, 2026-07-25). Weights-only, no data
+		// batch, so it is cheap enough to run every iteration. Effective-rank decay is the
+		// measurement that justified the residual architecture (45a59d5); keeping it means the
+		// project can still check whether that change did what it was chosen to do.
+		{
+			auto lins = Plasticity::LinearLayers(models["policy"]);
+			if (!lins.empty())
+				report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);
+			report["Plasticity/Policy Dead Units"] = Plasticity::DeadUnitFraction(models["policy"]);
+			if (models["shared_head"]) {
+				auto tl = Plasticity::LinearLayers(models["shared_head"]);
+				if (!tl.empty())
+					report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
+			}
+		}
 	}
 
 	if (ladderWired) {

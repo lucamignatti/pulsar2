@@ -17,7 +17,7 @@
 #include <private/GigaLearnCPP/PPO/GAE.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
 #include <private/GigaLearnCPP/NextoOpponent.h>
-#include <private/GigaLearnCPP/PSD/PSDController.h>
+#include <private/GigaLearnCPP/Util/Plasticity.h>
 #include <private/GigaLearnCPP/League/LeagueArchive.h>
 
 #include "Util/KeyPressDetector.h"
@@ -333,10 +333,10 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 			// (steering derivation's obs decoding, PSD/league/skill-tracker eval rollouts,
 			// and Save() racing the worker's stat updates under pipelining) reads RAW obs
 			// and would silently measure garbage - fail loudly instead of training on it.
-			if (config.steering.enabled || config.psd.enabled || config.league.enabled
+			if (config.steering.enabled || config.league.enabled
 				|| config.skillTracker.enabled || config.pipelinedCollection)
 				RG_ERR_CLOSE("Learner::Learner(): standardizeObs is only supported by the plain "
-					"sequential PPO path - steering/PSD/league/skillTracker/pipelinedCollection "
+					"sequential PPO path - steering/league/skillTracker/pipelinedCollection "
 					"all feed raw obs to the models and would break silently");
 			this->obsStat = new BatchedWelfordStat(obsSize);
 		} else {
@@ -397,10 +397,6 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	// Basin-Racing (PSD) + QD league — additive, created only when enabled. Built BEFORE Load()
 	// so LoadStats can restore their persistent state from the checkpoint.
-	if (config.psd.enabled && !config.renderMode) {
-		psd = new PSDController(config.psd, device);
-		psd->Init(envSet, ppo, (int)envSet->arenas.size(), config.checkpointFolder);
-	}
 	if (config.league.enabled && !config.renderMode) {
 		league = new LeagueArchive(config.league, ppo, envSet, device, config.checkpointFolder);
 	}
@@ -517,8 +513,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
-	if (psd)
-		psd->ToJSON(j);
 	if (league)
 		league->ToJSON(j);
 
@@ -601,8 +595,6 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
 
-	if (psd)
-		psd->FromJSON(j);
 	if (league)
 		league->FromJSON(j);
 }
@@ -3789,15 +3781,6 @@ void GGL::Learner::Start() {
 				fnRatingWatch(report); // measurement only - publishes RatingWatch/* panels
 				if (league)
 					league->OnIteration(report, totalIterations);
-				if (psd) {
-					float rating = report.Has(ratingKey) ? (float)report[ratingKey] : NAN;
-					bool probed = psd->OnDescendIteration(report, rating, totalIterations);
-					if (probed) {
-						// Probe rounds stepped the arenas out from under the in-flight episodes
-						for (auto& traj : trajectories)
-							traj.Clear();
-					}
-				}
 				// Freeze the current policy for the worker, then collect the next iteration
 				// concurrently with this iteration's processing + Learn.
 				fnApplySteering(); // barrier zone: the worker is joined, no reader in flight
@@ -5320,19 +5303,6 @@ void GGL::Learner::Start() {
 					if (league)
 						league->OnIteration(report, totalIterations);
 
-					// Basin-Racing (PSD): may run a full probe round in-line. If it does, the arenas
-					// were stepped out from under the in-flight trajectories, so clear them — the next
-					// iteration starts fresh episodes (a probe boundary is like a checkpoint boundary).
-					if (psd) {
-						float rating = report.Has(ratingKey) ? (float)report[ratingKey] : NAN;
-						bool probed = psd->OnDescendIteration(report, rating, totalIterations);
-						if (probed) {
-							// Clear the persistent per-player trajectories so post-probe collection
-							// starts fresh episodes (combinedTraj is rebuilt from these each iteration).
-							for (auto& traj : trajectories)
-								traj.Clear();
-						}
-					}
 				}
 
 				// User per-iteration hook (curriculum triggers etc.): sees the finished
@@ -5421,6 +5391,10 @@ void GGL::Learner::Start() {
 						"RatingWatch/Drawdown From EMA",
 						"RatingWatch/Drawdown From Peak",
 						"",
+						"Plasticity/Trunk EffRank",
+						"Plasticity/Policy EffRank",
+						"Plasticity/Policy Dead Units",
+						"",
 						"Gap/Loss",
 						"Gap/Mean",
 						"Gap/Fear Panel",
@@ -5482,7 +5456,6 @@ void GGL::Learner::Start() {
 }
 
 GGL::Learner::~Learner() {
-	delete psd;
 	delete league;
 	delete ppo;
 	delete versionMgr;

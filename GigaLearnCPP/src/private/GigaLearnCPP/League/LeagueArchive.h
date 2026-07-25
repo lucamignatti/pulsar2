@@ -1,7 +1,7 @@
 #pragma once
 #include "../FrameworkTorch.h"
 #include "../Util/Models.h"
-#include <GigaLearnCPP/PSDConfig.h>
+#include <GigaLearnCPP/LeagueConfig.h>
 #include <GigaLearnCPP/Util/Report.h>
 
 #include <RLGymCPP/EnvSet/EnvSet.h>
