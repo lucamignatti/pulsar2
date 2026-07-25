@@ -5594,6 +5594,17 @@ void GGL::Learner::Start() {
 						"GoalCritic/Blend BetaEff",
 						"GoalCritic/Injected Abs Mean",
 						"",
+						// HEADROOM had NO console presence, despite the boot banner promising
+						// "Headroom/* panels" and the seek term injecting ~0.15 sigma into
+						// advantages - which is how 16.1M frozen params went unnoticed for the
+						// life of the run. Update Magnitude is the load-bearing one: 0 means the
+						// twins are not training and the injection is a random projection.
+						"Headroom/Vdag Update Magnitude",
+						"Headroom/Vdag Loss",
+						"Headroom/H Mean",
+						"Headroom/Inj Abs Mean",
+						"Headroom/Latched",
+						"",
 						"Gap/Loss",
 						"Gap/Mean",
 						"Gap/Fear Panel",

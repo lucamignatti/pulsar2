@@ -230,6 +230,18 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// finish. Anneal once mechanic_census shows a stable flip-reset rate.
 		{ new ZeroSumReward(new FlipResetReward(), TEAM_SPIRIT), 40.f },
 
+		// IN AIR (2026-07-25, user-directed): a small flat reward for simply being
+		// airborne (AirReward = !isOnGround), reintroduced from the pre-FRONTIER-9
+		// lineage (was dropped, not measured against this stack). NOT PBRS - it is a
+		// raw per-step state reward, so unlike the rest of the aerial family it does
+		// not telescope to zero; ZeroSum-wrapped so a lone player can't farm it
+		// unopposed (payout is relative air-time vs the opponent, mutual hovering
+		// cancels) - the same bound TeamPressure/GuardedPickupBoost rely on. Small
+		// weight (15, << AerialTouch 120 / AirIntercept 75) deliberately: this is
+		// exposure pressure to get off the ground more often, not a skill reward -
+		// watch for pure-hover/flight-farming if raised.
+		{ new ZeroSumReward(new AirReward(), TEAM_SPIRIT), 15.f },
+
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
 		// - phantom-farmable). UNGATED - the gate's attack-oriented level is lowest exactly in the

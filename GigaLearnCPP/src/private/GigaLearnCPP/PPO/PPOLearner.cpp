@@ -504,6 +504,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
 	auto criticBefore = models["critic"]->CopyParams();
+	// V-dagger: the direct "are these weights actually moving?" signal. Frozen at lr=0 this
+	// read exactly 0 for the life of the run, which nothing would have revealed.
+	auto vdagBefore = models["vdag1"] ? models["vdag1"]->CopyParams() : torch::Tensor();
 
 	bool trainPolicy = config.policyLR != 0;
 	bool trainCritic = config.criticLR != 0;
@@ -805,6 +808,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			if (models["goal_critic"])
 				nn::utils::clip_grad_norm_(models["goal_critic"]->parameters(), 0.5f);
 
+			// V-dagger twins clip at the same 0.5 as every other head. They were absent from
+			// this list, which was harmless only because their LR was 0 - the moment the LR is
+			// wired (same commit) 16.1M params would otherwise be the only unclipped block in
+			// the model, on an expectile loss whose targets are the widest-scale ones here.
+			for (const char* n : { "vdag1", "vdag2" })
+				if (models[n])
+					nn::utils::clip_grad_norm_(models[n]->parameters(), 0.5f);
+
 			if (reach) {
 				nn::utils::clip_grad_norm_(reach->phi->parameters(), 0.5f);
 				nn::utils::clip_grad_norm_(reach->psiCar->parameters(), 0.5f);
@@ -823,6 +834,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
+	float vdagUpdateMagnitude = vdagBefore.defined()
+		? (vdagBefore - models["vdag1"]->CopyParams()).norm().item<float>() : 0.f;
 
 	if (reach) {
 		float carAcc = avgReachCarAcc.Get();
@@ -841,8 +854,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (avgReachCarStateLoss.count > 0)
 			report["Reach/Car State Loss"] = avgReachCarStateLoss.Get();
 		report["Reach/Aux Loss"] = avgReachLoss.Get();
-	if (models["vdag1"])
+	if (models["vdag1"]) {
 		report["Headroom/Vdag Loss"] = avgVdagLoss.Get();
+		// Must be > 0. It was exactly 0 for the whole run until the LR was wired (2026-07-25);
+		// if it reads 0 again, HEADROOM is inert and its 0.15-sigma injection is noise.
+		report["Headroom/Vdag Update Magnitude"] = vdagUpdateMagnitude;
+	}
 	}
 
 	// Assemble and return report
@@ -953,6 +970,18 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 
 	if (models["goal_critic"])
 		models["goal_critic"]->SetOptimLR(config.goalCritic.lr);
+
+	// HEADROOM V-dagger twins. These were MISSING here from the day they were added
+	// (9856813), and Model's ctor builds every optimizer at lr=0 (Util/Models.cpp) - under
+	// Muon, which they inherit from the critic config, lr=0 is an exact no-op. So 16.1M
+	// params (42% of the net) sat frozen at random init while H = relu(min(V1,V2) - V_real)
+	// was still injected into advantages at vdagSeekBeta and still backpropagated into the
+	// shared trunk. Found by the 2026-07-25 audit. Wiring this turns HEADROOM on for the
+	// FIRST time - treat a regression here as a new deployment, not a fix gone wrong.
+	// They mirror the critic's architecture and target scale, so they take criticLR.
+	for (const char* n : { "vdag1", "vdag2" })
+		if (models[n])
+			models[n]->SetOptimLR(criticLR);
 
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }
