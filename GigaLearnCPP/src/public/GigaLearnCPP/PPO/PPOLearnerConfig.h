@@ -71,8 +71,9 @@ namespace GGL {
 		// shared trunk and Rating slid ~125 across ALL modes in ~500 iterations with
 		// every behavioral guard green (this path had none). Values in (0,1] gradient-
 		// scale the coupling (value-preserving: loss magnitude unchanged, trunk/phi
-		// gradient scaled). Raising it is a one-lever experiment with the rating
-		// latches watching - never ship it coupled while the head is fresh.
+		// gradient scaled). Raising it is a one-lever experiment that NOW HAS NO
+		// automatic guard behind it (the rating latches were removed 2026-07-25) -
+		// never ship it coupled while the head is fresh, and watch Rating by hand.
 		float carStateCouple = 0.0f;
 		// The ball head only trains on episodes where the ball exceeded this speed;
 		// a dead never-touched episode would just reteach the stationary-ball manifold
@@ -213,8 +214,10 @@ namespace GGL {
 		// (vdagTau) on one-iteration-frozen TD targets over executed transitions,
 		// min-in-target twins (anti-ratchet). H = relu(min(V1,V2) - V_real) =
 		// realizable headroom; actuation = SEEK potential Phi=+H (PBRS; the closure
-		// sign measurably teaches avoidance), own std-matched beta, boundary-masked,
-		// rating-latch covered. ON BY DEFAULT (user directive 2026-07-24, fresh-run
+		// sign measurably teaches avoidance), own std-matched beta, boundary-masked.
+		// NOT guarded: the rating latch was removed 2026-07-25, so the only automatic
+		// check left is the boot sanity probe, which sees crashes and not update
+		// damage - watch Headroom/* by hand. ON BY DEFAULT (user directive 2026-07-24, fresh-run
 		// deploys). Revert = set false here and rebuild.
 		bool vdagEnabled = true;
 		float vdagTau = 0.75f;

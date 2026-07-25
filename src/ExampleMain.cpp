@@ -818,10 +818,12 @@ int main(int argc, char* argv[]) {
 	// starves training and inflates the yardstick.
 	// Anchors are full checkpoints archived outside the rotation by tools/archive_anchor.sh,
 	// held in their OWN vector so they are structurally exempt from re-scoring and culling
-	// (that exemption IS the fix; scoring them re-arms the same ratchet). Pre-wire (512)
-	// anchors migrate via Model::Load's zero-pad on the way in.
+	// (that exemption IS the fix; scoring them re-arms the same ratchet). NOTE: the zero-pad
+	// migration that used to widen pre-wire anchors on load went with the wire (2026-07-25),
+	// so archived anchors must match the current net width.
 	// 0.05 of ALL iterations = ~1/7 of the existing 0.35 league serve: a REALLOCATION, not
-	// extra arena cost. Guarded by the rating latch; revert = set this to 0 (byte-identical).
+	// extra arena cost. NO automatic guard covers this any more - the rating latch was removed
+	// 2026-07-25; revert is manual = set this to 0 (byte-identical).
 	// Success criterion is the anchor battery's real-Elo slope (research/tools/
 	// anchor_battery.py), NOT Rating - see LEAGUE_ANCHORS.md pre-registration.
 	cfg.league.anchorFrac = 0.05f;
@@ -890,7 +892,8 @@ int main(int argc, char* argv[]) {
 		// Nexto/Goals For/Against panels are a FIXED external yardstick immune to
 		// the pool inflation measured in H2_TRUNCATION.md. Rows excluded from
 		// training like all opponent sources; eval paths untouched (Rating
-		// semantics unchanged); latch-covered. Expect to LOSE heavily at first -
+		// semantics unchanged). No automatic guard (the latch was removed
+		// 2026-07-25) - watch the Nexto panels. Expect to LOSE heavily at first -
 		// the goal-diff SLOPE is the signal, not the level. Revert = false.
 		cfg.externalOpponent.enabled = true;
 		cfg.externalOpponent.modelPath =

@@ -17,8 +17,9 @@ your phone/laptop ──(WireGuard/tailnet)──▶ this box
 
 | Piece | What it is |
 |---|---|
-| `tools/trainerctl` | CLI for everything: status/start/stop/restart/logs/update/build/viz/doctor. Use over SSH. |
+| `tools/trainerctl` | CLI for everything: status/start/stop/restart/logs/metrics/update/build/viz/doctor. Use over SSH. |
 | `tools/remote/dashboard.py` | Web dashboard (stdlib-only, systemd user service `pulsar-dashboard`). |
+| `tools/remote/trainer_report.py` | Parser for the trainer's per-iteration report block and the wrapper's crash lines. Shared by the dashboard and `trainerctl metrics`, so both read one source. |
 | `tools/viz/RocketSimVisWeb/` | Submodule → [lucamignatti/RocketSimVisWeb](https://github.com/lucamignatti/RocketSimVisWeb) `pulsar-patches` (fork of chrisrca's three.js visualizer, patched for headless/localhost/remote use). Fresh clones: `git submodule update --init tools/viz/RocketSimVisWeb`. |
 | `tools/remote/setup_remote.sh` | One-time interactive setup (tailscale, HTTPS serve, units, linger, PIN). |
 
@@ -47,7 +48,24 @@ paths run identical logic.
 ## Using it from the road
 
 **Dashboard** (`https://<box>.ts.net`): trainer state, log freshness, steps /
-checkpoint age, GPU util/VRAM/temp, disk, git sync state. Buttons:
+checkpoint age, GPU util/VRAM/temp, disk, git sync state — plus, from the
+trainer's own per-iteration report block:
+
+- a headline strip (**running / steps / steps-per-second / iteration**),
+- a **Learning** card (avg step reward, policy entropy, Rating, update
+  magnitudes) — enough to tell whether the run is *learning*, not just alive,
+- **launches / last crash**, scanned out of the wrapper's restart lines: a run
+  that is quietly crash-looping looks identical to a healthy one otherwise,
+- **Full telemetry**, every row of the block grouped by subsystem. Nothing here
+  is a hardcoded metric list — it follows whatever the C++ `Report` emits, so it
+  cannot drift out of date the way a fixed list would.
+
+The **Checkpoints** card names the directory it is reading. That used to be a
+second hardcoded default that silently drifted a whole run behind the CLI's;
+it now comes from `trainerctl ckpt-dir`, and it is on screen so a future
+divergence is visible rather than silent.
+
+Buttons:
 
 - **Start / Stop / Restart** — wraps `run_trainer.sh`; checkpoints auto-resume,
   wandb run continues (run ID is stored in checkpoint json).
@@ -78,9 +96,13 @@ check wandb an hour later.
 ```
 ssh luca@<box>.ts.net
 cd ~/Projects/pulsar2-3.0
-tools/trainerctl status | logs 500 | follow | update | viz start | doctor ...
+tools/trainerctl status | logs 500 | metrics | follow | update | viz start | doctor ...
 claude          # Claude Code is installed on the box for real surgery
 ```
+
+`trainerctl metrics` prints the same report block the dashboard's Learning card
+and Full-telemetry section render — one parser, so SSH and web cannot disagree
+about what the trainer said.
 
 ## When things go wrong
 
@@ -89,7 +111,7 @@ claude          # Claude Code is installed on the box for real surgery
 | Dashboard unreachable | `ssh` in → `systemctl --user restart pulsar-dashboard` → `journalctl --user -u pulsar-dashboard -n 50` |
 | SSH also dead | Tailscale admin console (login.tailscale.com) shows if the box is offline: power/network outage → phone a friend / smart plug. Everything auto-resumes on boot (see below). |
 | Box rebooted | Linger auto-starts the dashboard. Trainer does NOT auto-start (deliberate — a crash-looping run shouldn't fight you): press **Start**; it resumes from the last checkpoint. |
-| Trainer crash-looping | `run_trainer.sh` gives up after 5 fast crashes. Log panel shows why. If a bad commit did it: revert/fix on laptop, push, **Update**. |
+| Trainer crash-looping | The **launches / last crash** rows on the Trainer card are the tell. `run_trainer.sh` NEVER gives up: after 5 fast crashes it backs off 15 min and retries forever (a corrupt-checkpoint loop once stranded an unattended run overnight, so "give up" was removed). Log panel shows why. If a bad commit did it: revert/fix on laptop, push, **Update**. |
 | Update says "not fast-forward-able" / "dirty" | Someone (you) left local state on the box. SSH in and resolve by hand — deliberately not automated. |
 | Wrong-PIN lockout | Wait 15 min, or `ssh` in and `rm ~/.local/state/pulsar-remote/lockout.json`. |
 | Forgot PIN | `ssh` in → `tools/trainerctl set-pin`. |

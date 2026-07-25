@@ -30,11 +30,12 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import trainer_report
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAINERCTL = REPO_ROOT / "tools" / "trainerctl"
 LOG_DIR = Path(os.environ.get("RUN_TRAINER_LOG_DIR", REPO_ROOT / "run_logs"))
 BUILD_DIR = Path(os.environ.get("TRAINERCTL_BUILD_DIR", REPO_ROOT / "build"))
-CKPT_DIR = Path(os.environ.get("TRAINERCTL_CKPT_DIR", BUILD_DIR / "checkpoints_5.0v3"))
 
 CONF_DIR = Path.home() / ".config" / "pulsar-remote"
 STATE_DIR = Path.home() / ".local" / "state" / "pulsar-remote"
@@ -51,7 +52,7 @@ BIND = ("127.0.0.1", int(os.environ.get("DASHBOARD_PORT", "8500")))
 # /api/golden 404'd from a stale service and the card hung). Bump BOTH this constant
 # and EXPECT_DASH_VERSION in dashboard.html whenever the API surface changes; the page
 # shows a "restart the dashboard" banner on mismatch.
-DASH_VERSION = "2026-07-14.2"
+DASH_VERSION = "2026-07-25.1"
 
 MAX_PIN_FAILURES = 5
 LOCKOUT_WINDOW_SECS = 15 * 60
@@ -71,8 +72,6 @@ ACTIONS = {
     "viz_mode_1v1":  ([str(TRAINERCTL), "viz", "mode", "1v1"], "Viz mode 1v1"),
     "viz_mode_2v2":  ([str(TRAINERCTL), "viz", "mode", "2v2"], "Viz mode 2v2"),
     "viz_mode_3v3":  ([str(TRAINERCTL), "viz", "mode", "3v3"], "Viz mode 3v3"),
-    "clear_latch":   ([str(TRAINERCTL), "clear-latch"],
-                      "Un-trip the steering rating latch (stop+edit+start)"),
     "check_updates": (["git", "-C", str(REPO_ROOT), "fetch", "origin", "--prune"],
                       "Fetch origin (no merge)"),
     "dashboard_restart": (["systemctl", "--user", "restart", "pulsar-dashboard.service"],
@@ -85,11 +84,30 @@ ACTIONS = {
 # enumerated set the trainer itself maintains, never free-form user input.
 GOLDEN_RE = re.compile(r"best_r\d+_\d+")
 
+# The checkpoint directory is TRAINERCTL'S to decide, never ours. This used to be a
+# second hardcoded default here, and it silently drifted a full run behind: trainerctl
+# moved to checkpoints_resid while the dashboard still read checkpoints_5.0v3, so the
+# Progress card reported 54.5B steps from a frozen lineage while the live run was at
+# 417M, and the golden list offered entries that `trainerctl restore-golden` could not
+# find. Ask the CLI, cache briefly, and SHOW the answer on the page so a future
+# divergence is visible instead of silent.
+_CKPT_CACHE = {"path": None, "at": 0.0}
+_CKPT_TTL = 30.0
+
+
+def ckpt_dir():
+    now = time.time()
+    if _CKPT_CACHE["path"] is None or now - _CKPT_CACHE["at"] > _CKPT_TTL:
+        rc, out = run([str(TRAINERCTL), "ckpt-dir"])
+        path = Path(out) if rc == 0 and out else BUILD_DIR / "checkpoints"
+        _CKPT_CACHE.update(path=path, at=now)
+    return _CKPT_CACHE["path"]
+
 
 def golden_entries():
     entries = []
     try:
-        for p in CKPT_DIR.iterdir():
+        for p in ckpt_dir().iterdir():
             if p.is_dir() and GOLDEN_RE.fullmatch(p.name):
                 rating, _, ts = p.name[len("best_r"):].partition("_")
                 entries.append({
@@ -301,16 +319,37 @@ def log_status():
     return st
 
 
+# Wrapper crash/restart lines accumulate across the life of one log file, so the
+# scan is incremental (see trainer_report.RestartTracker) — logs reach hundreds of
+# MB and a 15 s poll cannot re-read them.
+RESTARTS = trainer_report.RestartTracker()
+
+
+def metrics_status():
+    """The trainer's newest report block, plus how many times the wrapper has had
+    to relaunch it. Everything the console prints, without streaming the log —
+    the point being that you can tell whether the run is LEARNING, not just
+    whether the process is alive."""
+    try:
+        path = str((LOG_DIR / "latest.log").resolve())
+    except Exception:
+        return {"report": None, "restarts": None}
+    return {"report": trainer_report.latest_report(path),
+            "restarts": RESTARTS.update(path)}
+
+
 def checkpoint_status():
-    st = {"steps": None, "mtime": None, "age_secs": None, "count": 0}
+    ckpts = ckpt_dir()
+    st = {"steps": None, "mtime": None, "age_secs": None, "count": 0,
+          "dir": ckpts.name}
     try:
         nums = sorted(
-            int(p.name) for p in CKPT_DIR.iterdir()
+            int(p.name) for p in ckpts.iterdir()
             if p.is_dir() and p.name.isdigit()
         )
         st["count"] = len(nums)
         if nums:
-            newest = CKPT_DIR / str(nums[-1])
+            newest = ckpts / str(nums[-1])
             mtime = newest.stat().st_mtime
             st["steps"] = nums[-1]
             st["mtime"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
@@ -376,6 +415,7 @@ def full_status():
         "host": os.uname().nodename,
         "trainer": trainer_status(),
         "log": log_status(),
+        "metrics": metrics_status(),
         "checkpoint": checkpoint_status(),
         "git": git_status(),
         "gpu": gpu_status(),
