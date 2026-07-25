@@ -89,7 +89,7 @@ namespace GGL {
 		// coef * vec added to the trunk output of EVERY row of this call, ungated (style is
 		// a whole-game disposition, not a frontier read). Callers pass it only on the
 		// old-version/league-opponent inference call, never on the trained policy's.
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor styleVec = {}, float styleCoef = 0);
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);

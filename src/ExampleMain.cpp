@@ -8,7 +8,6 @@
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
 #include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
-#include <RLGymCPP/TerminalConditions/AttemptResolutionCondition.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObsPadded.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
@@ -16,7 +15,6 @@
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include <RLGymCPP/StateSetters/AirPlayState.h>
-#include <RLGymCPP/StateSetters/FrontierDrillState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
@@ -297,18 +295,6 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 // two sites agree by construction). 0 = feature off = every arena is a normal match arena.
 static int g_NumPracticeArenas = 0;
 
-// Frontier reset pool (STEERING_ROADMAP phase 3): the Learner banks feasible-but-declined
-// readings; FrontierDrillState resets PRACTICE arenas into perturbed copies. Created in
-// main() when steering is on (never in render mode). The practice-slice arithmetic in
-// IsPracticeArena (below the team-split globals) MUST match the Learner's per-mode
-// steerBlocks computation (leading practiceArenaFrac of each mode's contiguous arena
-// block, >= 2 or none).
-static std::shared_ptr<RLGC::FrontierPool> g_FrontierPool;
-static float g_PracticeArenaFrac = 0.f;
-// AirDrill altitude annealing (AERIAL_GAP.md): shared difficulty knob, written by
-// the Learner's controller, read by every AirDrillState at reset. NULL (render
-// mode) = the classic fixed airborne spawn.
-static std::shared_ptr<RLGC::AirDrillCurriculum> g_AirDrillCurriculum;
 
 // Team-mode arena split (set in main(): zero in PHASE A, the PHASE_B_FRAC_* fractions once
 // the phase marker exists). Team arenas occupy the END of the index range — see the
@@ -330,20 +316,6 @@ static int g_SkillArenas3v3 = 0;
 static bool g_PhaseB = false;
 static int g_PhaseBStreak = 0;
 
-// Per-mode practice-slice membership - MUST mirror Learner.cpp's steerBlocks arithmetic
-// (per-mode contiguous blocks, leading practiceArenaFrac slice, none when < 2)
-static bool IsPracticeArena(int index) {
-	int n2 = g_NumArenas2v2, n3 = g_NumArenas3v3, n1 = g_NumGames - n2 - n3;
-	int starts[3] = { 0, n1, n1 + n2 }, counts[3] = { n1, n2, n3 };
-	for (int md = 0; md < 3; md++) {
-		int numPractice = RS_CLAMP((int)(counts[md] * g_PracticeArenaFrac), 0, counts[md]);
-		if (numPractice < 2)
-			continue;
-		if (index >= starts[md] && index < starts[md] + numPractice)
-			return true;
-	}
-	return false;
-}
 
 // Render mode only (GGL_RENDER_TEAM_SIZE, set in main()): the viewer's single arena plays
 // this team size regardless of the curriculum split. 0 = not in render mode. The padded obs
@@ -378,12 +350,6 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 		new GoalScoreCondition()
 	};
 
-	// Practice arenas (steered-practice collection): episodes additionally end - as a TRUE
-	// terminal, no value bootstrap - the moment an airborne-ball attempt resolves, so a whiff's
-	// counterattack never enters the return. Match arenas keep full consequences.
-	if (practiceArena)
-		terminalConditions.push_back(new AttemptResolutionCondition());
-
 	auto arena = Arena::Create(GameMode::SOCCAR);
 	for (int i = 0; i < playersPerTeam; i++) {
 		arena->AddCar(Team::BLUE);
@@ -406,10 +372,8 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	// that curriculum stopped one stage early - at 30.3B the bot completes from mid-air
 	// (44%, touches above goal height) but from the GROUND converts 0/300 (jumps 98%,
 	// reaches z>500 only 9%): the jump->boost-climb transition was never in the training
-	// distribution. g_AirDrillCurriculum lets the Learner anneal the spawn from airborne
 	// (D=0) toward grounded takeoff (D=1), gated on the live aerial-conversion EMA.
 	AirDrillState* airDrill = new AirDrillState();
-	airDrill->curriculum = g_AirDrillCurriculum; // NULL in render mode = classic spawn
 	result.stateSetter = new CombinedState({
 		// Ground touch bootstrap - the proven anti-freeze state
 		{ new BallNearCarState(600, 900), 0.30f },
@@ -458,14 +422,6 @@ EnvCreateResult EnvCreateFunc(int index) {
 	else if (g_NumGames > 0 && index >= g_NumGames - g_NumArenas3v3 - g_NumArenas2v2)
 		playersPerTeam = 2;
 	EnvCreateResult result = MakeEnv(playersPerTeam, index < g_NumPracticeArenas);
-	// Phase 3: practice arenas draw a share of their resets from the frontier pool
-	// (perturbed copies of feasible-but-declined readings; offline-validated dose:
-	// useFrac 0.35, pos/vel noise 250). Falls back to the normal mix while the pool
-	// is empty or stale, so cold boots and quiet iterations behave exactly as before.
-	if (g_FrontierPool && IsPracticeArena(index))
-		// ESCALATE-1: useFrac 0.35 -> 0.60 (with practiceArenaFrac 0.30, fear drills
-		// now ~18% of team resets vs the ~6% that measurably did nothing)
-		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.60f, 250, 250);
 	return result;
 }
 
@@ -881,188 +837,31 @@ int main(int argc, char* argv[]) {
 		RG_LOG("GGL_SMOKE: league anchorFrac forced to descendOpponentFrac ("
 			<< cfg.league.descendOpponentFrac << ") - every league serve draws an anchor");
 	}
+	// ===== STEERING: REMOVED WHOLESALE 2026-07-25 =====
+	// The activation-steering research programme is finished. Its actuation went inert when the
+	// optimism work superseded it, and the remainder - possession-outcome labeling, the frontier
+	// reset pool, FrontierDrillState, the practice/control arena split, the census and the
+	// learning-progress miner - is removed here because it CONTRADICTS the constraint set of
+	// research/reports/COMPOSITION_CRITIC.md, which the trainer now implements:
+	//   C1 (homogeneity)      all environment instances identical; no dedicated drill/reset
+	//                         instances. The practice/control split violated this.
+	//   C2 (no env design)    no banked reset states, no success-state memories that define the
+	//                         objective retrospectively. FrontierPool was exactly that, and the
+	//                         paper's section 4.1 criticises the design by name.
+	// Keeping it would mean any future deployment measured "architecture PLUS an environment-side
+	// drill curriculum" - confounding the paper's central claim. Section 6.1 already reports the
+	// spawn curriculum separately as a skyline that violates C2, for the same reason.
+	//
+	// The reset mix below is NOT a curriculum: it is fixed, identical in every arena, and does
+	// not adapt. That is what C1 asks for.
+	//
+	// The lessons survive in research/reports/ (STEERING.md, STEERED_PRACTICE.md, FEAR_MINE.md,
+	// KNOWING_DOING.md) and the code is one `git log -- <path>` away from tag
+	// pre-strip-20260725. Two of them still bind and are cited from this file: the CLIPPING
+	// RATCHET (a push large enough to move the IS ratio outside the clip window makes PPO keep
+	// positive-advantage gradients and discard negative ones) and CRITIC ALIASING at episode
+	// boundaries (AttemptResolutionCondition, two Elo collapses - removed with the rest).
 
-	// ---------------------------------------------------------------------------------------------
-	// Steered-practice collection ("optimism surgery"), ENABLED - carried over from the 3.1
-	// lineage, where v2 (possession-outcome derivation + rho-band gate) ran with healthy guards.
-	// The commitment direction is derived LIVE each iteration from the collected buffer itself
-	// (ball-landing sims + went/declined trunk contrast, match-arena rows only, EMA-smoothed), and
-	// a slice of practice arenas runs unsteered as controls so a causal auto-gate can drop alpha
-	// to 0 the moment steering stops out-engaging the controls. No sidecar, nothing to babysit.
-	// Protocol, measured effects, and REVERT path (flag off + resume the branch-point backup in
-	// build/checkpoints_3.1_branch_backup/): research/reports/STEERED_PRACTICE.md.
-	//   Watch: Steer/* panels (Engagement Steered vs Control, Gate Active, Dir Drift, Pairs);
-	//   Player/Aerial Touch Ratio + contest metrics (must rise within ~a day or the mechanism
-	//   isn't engaging); GAE ratio/KL (same off-policyness class as pipelinedCollection);
-	//   Rating/1v1 slope vs the pre-switch trend as the revert trigger.
-	// STAGE-1 steered collection ("optimism surgery", terminationless), ENABLED.
-	// History: the first deployment (resolution-terminated practice episodes) tanked Elo twice
-	// - both failures from the TERMINATION half (phantom -V(s_end) penalty; shared critic
-	// cannot price aliased truncations). Stage 1 keeps episodes 100% NORMAL: the whiff tax
-	// stays, reality filters the attempts, and the only change is WHERE experience comes from.
-	//   - ~15% of arenas collect with the live-derived commitment direction (+1 sigma) added
-	//     to the policy head's trunk input, RHO-BAND GATED: only in states the ball head rates
-	//     as hard-but-plausible for scoring (per-batch quantile band). A few more arenas are
-	//     unsteered controls for the causal engagement gate.
-	//   - Guards, all automatic: engagement gate (steered must out-engage controls), rating
-	//     drawdown guard (Rating/1v1 falling >75 below its slow EMA LATCHES steering off -
-	//     the LearnerConfig default; 75 sits outside the +-30-50 noise band), ratio/KL logs,
-	//     branch backup + quarantine ritual.
-	//   - Watch: Steer/* panels (Alpha, Engagement Steered/Control/Match, Gate Delta EMA,
-	//     RhoGate In-Band Frac), aerial/contest metrics, Rating slope, RatingWatch/* drawdowns.
-	// Post-mortems + stage-2 escalation path: research/reports/STEERED_PRACTICE.md.
-	// STAGE-1 v2 (2026-07-12, after ~200M treated steps of v1): v1's guidance metric ("landing
-	// attendance") aged out - pool-Elo drifted down while the style beat its predecessor 42-24
-	// and lost to older selves 12-19. v2 re-aims the SAME machinery at a possession-outcome
-	// definition: the direction contrasts "went and WON the race to the ball" vs "declined and
-	// nobody got it" (first-touch events within the landing window), and the gate measures
-	// possession-win rate steered-vs-control. Unfakeable by empty flight; doesn't age with
-	// style. League old-style exposure raised below to patch the measured exploitability.
-	cfg.steering.enabled = true;
-	// The rating LATCH was removed 2026-07-25 (user-directed). It used to disable six live
-	// mechanisms at once on a drawdown and never re-enable them; on this young, steeply-climbing
-	// run it false-tripped repeatedly (thresholds had already been loosened 110 -> 200 and
-	// 75 -> 150) and its last trip fired on a spike-and-settle with the rating still +213 above
-	// its own EMA. The drawdown is now telemetry only: watch RatingWatch/* in wandb.
-	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
-	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
-	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
-	// punished failures are discarded. That one-way ratchet is how overcommit-then-concede
-	// compounded into an Elo bleed despite real head-to-head gains. A smaller push keeps the
-	// induced ratios mostly inside the clip window so both outcome signs teach.
-	// STAGE-2 PROTOCOL ACTIVE (2026-07-18): the gap drive replaces commitment
-	// steering - actuation OFF (alpha 0, styles 0 below), machinery/telemetry/drills
-	// stay up. Restore alpha 0.5 only if the drive is reverted.
-	// ESCALATE-1 (2026-07-16): 0.18 -> 0.30 - the fear-drill dose was ~6% of team
-	// resets and 10B steps moved neither Fear Panel zV nor Census NONE; this lineage
-	// is end-of-life (cold start decided), so it gets one full-dose final experiment.
-	cfg.steering.practiceArenaFrac = 0.30f;      // of EACH mode's arenas (leading slice per block)
-	cfg.steering.resolutionTermination = false;  // STAGE 1: normal episodes, no exceptions
-	// PER-MODE steering (2026-07-14): 2v2/3v3 arenas get their own steered/control slices,
-	// gates, and sigmas; a team mode applies the 1v1 direction (offline-validated transfer,
-	// teamWon +3.4pp @ +0.5 in 2v2) until its own WON-vs-NONE pool is rich enough to derive
-	// one. The commitment frontier is much larger in team modes (collective declines:
-	// 74%/88%/92% of feasible balls for 1v1/2v2/3v3). Revert = false (team arenas revert
-	// to measurement-only panels).
-	cfg.steering.steerTeamModes = true;
-	// META frontier steering (2026-07-14, prior-free phase 4): goals from the agent's own
-	// achieved bank, frontier by its own self-model, emergent clusters in its own psi
-	// geometry, model-free attainment outcomes, per-cluster causal gates + a dwell
-	// scheduler. Offline: ball-head calibration monotone (car head self-disables for
-	// arbitrary goals), and at least one emergent cluster shows a monotone causal
-	// attainment uplift (deep-own-half high ball: -1.002 -> -0.901 across alpha 0..1)
-	// with clean canaries - plus cluster heterogeneity, the scheduler's raison d'etre.
-	// INCIDENT (2026-07-14): v1 of this handed meta the steering slot PERMANENTLY - the
-	// proven incumbent commitment direction (fresh off driving Rating 1380 -> 1462)
-	// stopped actuating, rotating unproven cluster directions took its place, and
-	// benching could never engage (150-iter warmup / 10-iter dwells). Contributed to a
-	// ~125 all-mode Elo slide together with the carstate aux-loss churn (see above).
-	// The slot is now TIME-MULTIPLEXED (LearnerConfig.h metaProbeEvery/metaPromoteMin):
-	// the incumbent is the default actuator, meta probes one cluster every 3rd dwell,
-	// and a cluster only owns exploit dwells after its measured effect EMA clears the
-	// promotion bar - actuation is earned, never granted. Measurement attribution
-	// follows the slot owner (the incumbent gate no longer grades meta-steered buffers
-	// and vice versa). meta=false remains the pinned fallback AND the pre-registered
-	// baseline: meta must beat it on Elo slope over a matched window or it reverts.
-	// Watch: Meta/Owns Slot, Meta/* panels, Steer/Rating Peak.
-	// RE-ENABLE SEQUENCE (2026-07-14, post-incident): steering returns in its PROVEN
-	// configuration first - pinned commitment, meta OFF. This is the exact config that
-	// drove 1380 -> 1462, it re-establishes value with clean attribution, and it IS the
-	// pre-registered baseline the meta system must beat. Flipping meta back on is the
-	// next one-lever experiment, judged on Elo slope vs this baseline with the peak
-	// latch armed. (The meta machinery, banks and panels are all still built and the
-	// probe/promote scheduler smoke-passed - this flag is the only thing holding it.)
-	// Phase 1 (steered league opponents): style directions the opponent side occasionally
-	// plays - hesitant/overcommit (commitment direction at offline-validated negative /
-	// mild positive dose) and shadow (live challenge-vs-shadow contrast). Synthesized
-	// LIVE in the trainer from the same per-iteration derivations that drive collection
-	// steering (2026-07-15, replacing the frozen steering_styles.json: pinned vectors rot
-	// within ~75M steps, so a checkpoint-stale file was diversity in name only; exploiter
-	// styles FAILED their offline bar and remain absent). Set chance 0 to turn off.
-	cfg.steering.opponentStyleChance = 0.0f; // Stage-2 protocol (was 0.25)
-	// AttemptResolutionCondition is a STAGE-2 semantic; only attach it when termination is on
-	// (and only ever together with a dedicated practice-value baseline - see post-mortems).
-	if (cfg.steering.enabled && cfg.steering.resolutionTermination && !cfg.renderMode)
-		g_NumPracticeArenas = (int)(cfg.numGames * cfg.steering.practiceArenaFrac);
-
-	// Team-mode arena split, decided by the lineage-scoped phase marker (see the
-	// PHASE_B_RATING_TRIGGER comment). Must be set before the Learner is built -
-	// EnvCreateFunc reads these.
-	g_PhaseB = std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
-	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
-	g_NumGames = cfg.numGames;
-	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
-	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
-	RG_LOG("Team curriculum: PHASE " << (g_PhaseB ? "B" : "A") << " - "
-		<< (cfg.numGames - g_NumArenas2v2 - g_NumArenas3v3) << " 1v1 / "
-		<< g_NumArenas2v2 << " 2v2 / " << g_NumArenas3v3 << " 3v3 arenas");
-
-	// Skill tracker eval mix: same fractions over its own small fleet, team arenas trailing,
-	// at least one arena per team mode in PHASE B (16 arenas -> 11 1v1 / 3 2v2 / 2 3v3).
-	// This is what puts Rating/2v2 / Rating/3v3 on wandb once the phase flips; with few
-	// arenas per team mode those Elos move slower per eval than Rating/1v1 - expect them to
-	// take some evals to leave their initial value.
-	g_SkillNumArenas = cfg.skillTracker.numArenas;
-	g_SkillArenas2v2 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_2V2)) : 0;
-	g_SkillArenas3v3 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_3V3)) : 0;
-	cfg.skillTracker.envCreateFn = SkillEnvCreateFunc;
-	if (cfg.skillTracker.enabled)
-		RG_LOG("Skill tracker eval fleet: "
-			<< (g_SkillNumArenas - g_SkillArenas2v2 - g_SkillArenas3v3) << " 1v1 / "
-			<< g_SkillArenas2v2 << " 2v2 / " << g_SkillArenas3v3 << " 3v3 arenas");
-
-	// Phase 3 (frontier resets): the pool is shared between the Learner (writer, learn-prep)
-	// and the practice arenas' FrontierDrillState (readers, env threads). Never in render
-	// mode - the viewer's single arena would otherwise land in the 1v1 practice slice and
-	// draw drill resets. Must exist before the Learner is built (EnvCreateFunc reads it).
-	if (cfg.steering.enabled && !cfg.renderMode) {
-		g_FrontierPool = std::make_shared<RLGC::FrontierPool>();
-		cfg.steering.frontierPool = g_FrontierPool;
-		g_PracticeArenaFrac = cfg.steering.practiceArenaFrac;
-		// FEAR_MINE (2026-07-15): team-mode pools bank the highest critic/goal-critic
-		// disagreement declines by the best-placed teammate ("states it thinks could be
-		// good but is too scared to commit to" - the dataset-quality lever). Conviction
-		// and offline drill validation (all four pre-registered bars passed):
-		// research/reports/CREDIT_PROBE.md + FEAR_MINE.md. useFrac/noise/dose untouched;
-		// obeys the rating latch + pool staleness like all frontier mining.
-		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
-		// Steer/Frontier Pool sizes, and the next offline decline census.
-		cfg.steering.frontierFearMining = true;
-		// POTENTIAL FRONTIER (FRONTIER.md, 2026-07-23): boot toggle, NO rebuild - set
-		// GGL_FRONTIER_POTENTIAL=1 and restart to drive the drill frontier by the single
-		// quasimetric axis d_goal (Phase 0 = telemetry only, actuates nothing; leaves
-		// fear-mining intact). Checkpoint-compatible with the live lineage (reuses the
-		// trained GapState map + banks; new state is RUNNING_STATS scalars, init-if-
-		// HEADROOM composition critic (2026-07-24): ON BY DEFAULT (twin V-dagger trunk
-		// heads + seek drive; PPOLearnerConfig::vdagEnabled). FRESH RUNS ONLY — trunk-
-		// coupled aux must co-adapt from step 0 (the carstate incident is the mid-run
-		// counterexample). Revert = vdagEnabled false + rebuild.
-		if (cfg.ppo.vdagEnabled)
-			RG_LOG("HEADROOM: composition critic ON by default (twin V-dagger trunk heads, seek beta "
-				<< cfg.ppo.vdagSeekBeta << ") - Headroom/* panels");
-		if (const char* s = std::getenv("GGL_FRONTIER_POTENTIAL"); s && s[0] && std::string(s) != "0") {
-			RG_LOG("GGL_FRONTIER_POTENTIAL: Potential Frontier ON (Phase 0 telemetry - Frontier/* panels; see FRONTIER.md)");
-		}
-		// AirDrill altitude annealing: REVERTED 2026-07-15 ~2.5h after deploy (see
-		// AERIAL_GAP.md incident record). The v1 controller's feedback metric
-		// (match-play aerial conversion) moves on a DAYS timescale while the ratchet
-		// adjusted every 50 iterations - with no effective feedback it annealed
-		// D 0 -> 0.9 in ~3h, turning ~20% of ALL resets (INCLUDING the skill-tracker
-		// eval fleet, which was wrongly sharing the curriculum) into grounded-takeoff
-		// states the bot converts at 0%. Rating slid 1657 -> 1546 in lockstep.
-		// A v2 needs, before any re-enable (own pre-registration): (1) drill-outcome
-		// attribution as the feedback signal (not match conversion), (2) a
-		// non-refreshing baseline floor, (3) eval-fleet exclusion, (4) rating-latch
-		// coverage, (5) a schema tag so stale persisted D is discarded on load.
-		// g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
-		// cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
-		// EMERGENCE RC2 Stage O (2026-07-16, research/reports/EMERGENCE.md): the
-		// learning-progress miner, OBSERVER ONLY - characterization panels (Miner/*)
-		// must show it rediscovering the hand-found state families unprompted before
-		// any actuation is registered. Watch: Miner/PreLanding Frac vs Base (bar:
-		// >=3x), Miner/Dz Mean (bar: > +0.5 on banked declines), Miner/GroundedHighBall.
-		cfg.steering.emergenceMiner = true;
-	}
 	// ===== OPTIMISM: the composition critic (research/reports/COMPOSITION_CRITIC.md) =====
 	// The live stack is exactly the paper's: V_real (the critic) -> V_exp (return-level
 	// expectile, measurement) -> twin composition critics V-dagger, actuated by ONE potential

@@ -1,6 +1,5 @@
 #pragma once
 #include <RLGymCPP/BasicTypes/Lists.h>
-#include <RLGymCPP/StateSetters/FrontierDrillState.h>
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
@@ -54,190 +53,11 @@ namespace GGL {
 	//
 	// Arena layout: [0, numSteered) steered practice | [numSteered, numPractice) control
 	// practice | rest match. Pair ALL practice arenas (steered + control) with
-	// AttemptResolutionCondition (ExampleMain wiring): practice episodes end at attempt
-	// resolution with a NORMAL terminal (true terminal, NO value bootstrap - bootstrapping
-	// V(s_end) would re-inject the counterattack tax through the critic).
-	//
-	// CRITIC SEMANTICS (learned the hard way): the MAIN critic trains on practice rows too.
-	// Excluding them leaves V(s) at full match value while practice returns are truncated, so
-	// GAE charges ~ -V(s_end) as a phantom penalty across every practice episode and the
-	// policy unlearns ball engagement (live Elo freefall on first deployment, 2026-07-12).
-	// Including them makes V the honest practice/match mixture for aliased states - a much
-	// smaller, split bias. Practice rows stay excluded from the GOAL critic (its channel is
-	// structurally absent in truncated episodes) and from the goal-advantage blend.
-	// V_exp - the return-level expectile twin of the value critic. Ladder rung 2 in
-	// COMPOSITION_CRITIC.md Â§8 ("what I sometimes do"): trained on the SAME extrinsic GAE
-	// targets as the critic, read through a DETACHED trunk so it measures without reshaping.
-	//
-	// MEASUREMENT ONLY as of 2026-07-25. Nothing actuates from it. The paper's mechanism is a
-	// single seek term on the COMPOSITION critic (PPOLearnerConfig::vdagSeekBeta); the closure
-	// drive that used to run off this head, together with the quasimetric map, the goal/concede
-	// banks, V_metric, gap_PK and the 5-column policy wire, were removed in the conformance
-	// pass. History: git log -- docs/LADDER.md
 	struct GapSensorConfig {
 		bool enabled = false;
 		float tau = 0.8f;        // expectile: "returns when it goes well"
 		float lr = 1e-4f;
 		int trainRows = 98304;
-	};
-
-	struct CollectSteeringConfig {
-		bool enabled = false;
-		float practiceArenaFrac = 0.2f; // fraction of EACH MODE's arenas that are practice (steered + control)
-		float controlFracOfPractice = 0.15f; // fraction of practice arenas kept unsteered as gate controls
-
-		// PER-MODE steering (4.0 team play): every team size present in the fleet gets its
-		// own direction, sigma, causal gate, and steered/control arena slices (leading
-		// arenas of each mode's contiguous block). The commitment frontier is mode-specific
-		// (offline census: collective declines on feasible balls are 74%/88%/92% for
-		// 1v1/2v2/3v3), but a mode derives its OWN direction only once its WON-vs-NONE
-		// pool clears minPairsPerUpdate - until then it applies the 1v1 direction dosed by
-		// its own sigma (offline-validated transfer: teamWon +3.4pp @ +0.5 in 2v2, while
-		// thin weak-team-derived directions were causally dead). false = team arenas are
-		// measurement-only (Steer/PossWin panels, no treatment).
-		bool steerTeamModes = true;
-
-		// OPPONENT-side style steering (roadmap phase 1/2): on opponent iterations
-		// (old-version or league member), with this chance the opponent additionally plays
-		// a STYLE - a trunk direction applied to every opponent row, ungated, at an alpha
-		// sampled from the style's dose window. Diversifies the training distribution the
-		// way descendOpponentFrac does, but along behavioral axes instead of history.
-		// Styles are synthesized LIVE each iteration from the same derivations that drive
-		// collection steering - hesitant/overcommit from the commitment direction (negative
-		// / mild positive dose), shadow from a live challenge-vs-shadow contrast. NO file:
-		// the frozen steering_styles.json era ended 2026-07-15 - pinned vectors rot
-		// (measured +7pp -> -11pp within ~75M steps), so a stale file is diversity in name
-		// only. The dose windows keep their offline-validated values (STEERING_PHASE0_40)
-		// and are in units of the LIVE projection sigma, so they self-calibrate as the
-		// trunk drifts. Chance 0 = feature off. Styles obey the rating latch.
-		float opponentStyleChance = 0.25f;
-
-		// ===== META frontier steering (roadmap phase 4, prior-free) =====
-		// HARD REQUIREMENT: no human priors. Everything the meta system steers toward is
-		// agent-derived: goals sampled from the agent's OWN achieved-state bank (both
-		// self-model goal spaces); the frontier = (state, goal) pairs its OWN self-model
-		// rates coin-flip (rho band); structure = emergent k-means clusters in its OWN
-		// psi-embedding geometry (no cluster is ever named); outcome = CONTINUOUS
-		// ATTAINMENT (model-free: how close future achieved states got to the goal within
-		// the head's own HER horizon), compared only via within-population quantiles.
-		// A head drives steering ONLY while its own calibration curve is monotone
-		// (median attain below < in < above band) - the system disables its own
-		// unreliable senses (offline: the ball head passes, the car head fails for
-		// arbitrary goals and self-disables while keeping its contact-gate role).
-		// The scheduler dwells on the cluster with the best causal effect (normalized
-		// steered-vs-control attain shift), explores stale clusters periodically, and
-		// benches clusters whose effect goes negative (duty-cycle probing, same shape
-		// as the possession gate). Rating latch stays the global backstop.
-		// meta=false = the pinned incumbent (commitment steering) - the baseline the
-		// meta system must beat on Elo slope over a matched window (pre-registered).
-		// The steering slot is TIME-MULTIPLEXED between the proven incumbent commitment
-		// direction (the default actuator) and meta cluster probes (2026-07-14 incident:
-		// v1 handed meta the slot permanently - the proven driver stopped applying and
-		// rotating unproven directions took over; Rating slid ~125 across all modes).
-		// Every metaProbeEvery-th dwell probes a cluster (unmeasured first, then stalest,
-		// benched included - that re-probe is the unbench path); other dwells go to the
-		// cluster with the best warmed-up effect EMA if it clears metaPromoteMin, else to
-		// the incumbent. A cluster therefore EARNS actuation from its own measurements.
-		// Effect-EMA iterations before bench/promote decisions. Counted only while the
-		// cluster is actually applied: at 150 (the incumbent gate's number, measured
-		// every iteration) benching was mathematically inert under 10-iter dwells
-
-		// Frontier reset pool (roadmap phase 3): when set, the learner banks each
-		// iteration's feasible-but-declined MATCH readings (reconstructed from obs) into
-		// this pool, and the user's EnvCreateFunc wraps the PRACTICE arenas' setter in a
-		// FrontierDrillState drawing from it - practice reps start AT the frontier
-		// instead of paying the approach. The pool object is shared between the Learner
-		// (writer, learn-prep) and the setters (readers, env threads); it locks
-		// internally. NULL = feature off. Revert = stop wrapping the setter (config).
-		std::shared_ptr<RLGC::FrontierPool> frontierPool;
-		int frontierPoolPerMode = 256; // banked entries per mode per iteration
-		// FEAR_MINE (2026-07-15): TEAM-mode pools bank the highest critic/goal-critic
-		// DISAGREEMENT declines instead of a uniform stride - Dz = z(goalCritic) - z(critic)
-		// ranks "states the long-horizon evaluator likes but the baselining critic is
-		// scared of", restricted to readings where the decliner was the BEST-PLACED
-		// teammate (an obs-local check; a better-placed teammate's ball is their decline,
-		// not ours). Conviction: CREDIT_PROBE (the critic prices declining ABOVE pursuing
-		// at matched best-placed frontier states while the long-horizon goal critic
-		// disagrees, 2.9 sigma). Offline drill validation: FEAR_MINE.md, all four bars
-		// passed (100% playable, coin-flip races 50/50, resolution matched, selector
-		// median Dz +2.0 vs -0.3 for the old criterion). Validated in 2v2; 3v3 rides the
-		// identical mechanism (watch Steer/Frontier Dz). 1v1 pools keep the original
-		// criterion. Falls back to the uniform stride whenever value tensors are
-		// unavailable. false = original mining everywhere.
-		bool frontierFearMining = false;
-
-		// POTENTIAL FRONTIER (FRONTIER.md, 2026-07-23): drive the drill pool by ONE axis
-		// - the quasimetric potential d_goal (distance to the nearest goal-bank success,
-		// via the already-shipped GapState map) - instead of feasible-decline + Dz. Phase
-		// 0 = SENSOR ONLY: score every mined candidate on d_goal and log its distribution
-		// + sanity correlations (vs ball height, vs Dz), change NO banking. Requires
-		// GGL_FRONTIER_POTENTIAL (no rebuild). OFF = incumbent (identical behaviour). See
-		// FRONTIER.md for Phase 1 actuation (d_goal-quantile selection + theta controller)
-		// and the pre-registered success criteria / guards.
-
-		// AERIAL ALTITUDE ANNEALING (AERIAL_GAP.md, 2026-07-15): when set, the learner
-		// drives the shared AirDrill difficulty D (0 = classic airborne spawn, 1 =
-		// grounded takeoff) with a metric-gated hill-climb: every
-		// airDrillAdjustEvery iterations, D rises by airDrillStep if the aerial-
-		// conversion EMA (high feasible readings converted by an above-goal-height
-		// touch; style-proof) has not degraded more than airDrillBackoffFrac relative
-		// to the last adjustment's reference, else D falls by one step (automatic
-		// backoff). Conviction: takeoff probe at 30.3B - jump 98%, car z>500 9%,
-		// aerial touch 0/300 from the ground; the drill never taught the climb.
-		// D starts at 0 (deploy = behavioral no-op that ramps only while healthy) and
-		// persists in RUNNING_STATS. The controller lives in the learn-prep census
-		// (steering must be enabled; if steering is ever disabled D freezes - safe).
-		// NULL curriculum = feature off, classic fixed drill.
-		std::shared_ptr<RLGC::AirDrillCurriculum> airDrillCurriculum;
-		int airDrillAdjustEvery = 50;
-		float airDrillStep = 0.05f;
-		float airDrillBackoffFrac = 0.20f;
-		float airDrillConvEmaDecay = 0.97f;
-
-		// EMERGENCE RC2 Stage O (EMERGENCE.md, 2026-07-16): learning-progress miner,
-		// OBSERVER ONLY. Mines top-|z-scored GAE-advantage| rows (both signs, spaced)
-		// each iteration - the general "surprise" statistic, no skill or outcome ever
-		// named - and reports characterization panels (Miner/*) testing the
-		// pre-registered rediscovery bars: the miner must find the hand-discovered
-		// state families (pre-landing, fear-tail, aerial-attempt) UNPROMPTED before
-		// it is ever allowed to feed resets. A rolling 64-row obs sample lands in
-		// RUNNING_STATS for offline inspection. Actuates nothing in this stage.
-		bool emergenceMiner = false;
-		int emergenceMinerTopK = 256;
-		int emergenceMinerSpacing = 128;   // min row distance between picks (episode-dedupe proxy)
-
-		// STAGE-1 vs STAGE-2 (see the failure history above): stage 1 runs NORMAL episodes in
-		// steered arenas - no AttemptResolutionCondition (user wiring must match this flag), no
-		// goal-critic masking, no blend guard; the whiff tax stays and reality does the
-		// filtering. Only flip to true (stage 2) together with a dedicated practice-value
-		// baseline; the shared critic provably cannot price mid-play truncations.
-		bool resolutionTermination = false;
-
-		// Rho-band gate: steer a row only when the ball head rates its state's scoring-
-		// reachability inside the middle band of the current inference batch's rho
-		// distribution (per-batch quantiles - self-calibrating, no absolute thresholds;
-		// offline calibration put the intermediate band at ~40-60% actual conversion).
-		// Points the optimism at hard-but-plausible plays toward the net.
-		bool rhoGateEnabled = true;
-		// Gate by CONTACT reachability (car head, "can I reach the ball" - races) instead of
-		// scoring reachability (ball head, "can the ball reach the net" - shots). Added after
-		// the v2 possession gate kept reading scoring-gated steering as race-LOSING: we told
-		// it to commit where the shot was uncertain, then graded it on winning the ball.
-
-		// NOTE: the rating guard used to live here (ratingGuardEnabled / ratingDrawdownTrip /
-		// ratingEmaDecay / ratingPeakTrip / ratingPeakDecay). It moved to the top-level
-		// RatingWatchConfig on 2026-07-25, and the LATCH itself was removed - see that struct.
-
-		// Live derivation
-		int maxReadingsPerIter = 4000;  // airborne readings labeled per iteration (landing sims are ~free)
-
-		// Causal auto-gate (units: absolute engagement fraction, e.g. 0.01 = 1pp).
-		// Purpose in stage 1: detect a SIGN-INVERTED direction (steering actively suppressing
-		// engagement), NOT "not helping yet" - per-iteration delta se is ~1pp at these arena
-		// counts, so a 0.0 threshold trips on noise within minutes (observed live). While
-		// tripped, alpha=0 makes steered==control, the delta EMA decays toward 0 and crosses
-		// gateReenableAbove -> steering resumes -> re-trips only if genuinely harmful: the
-		// thresholds below produce a natural duty-cycled probe with no extra machinery.
 	};
 
 	// External fixed opponent (Nexto; NextoOpponent.h has the full rationale):
@@ -358,8 +178,6 @@ namespace GGL {
 		// Rating drawdown telemetry. No actuation - see struct.
 		RatingWatchConfig ratingWatch = {};
 
-		// Steered-practice collection; additive and default-OFF (see struct comment above)
-		CollectSteeringConfig steering = {};
 
 
 
