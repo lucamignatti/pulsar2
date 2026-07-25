@@ -66,11 +66,6 @@ namespace GGL {
 		// Applied ONLY where InferActions gets a row mask + row modes - the learn pass, value
 		// preds, and old-version inference never pass them.
 		static constexpr int STEER_MODES = 3;
-		std::array<torch::Tensor, STEER_MODES> steerVecs; // unit, on this->device (undefined = mode off)
-		std::array<float, STEER_MODES> steerSigmas = {}, steerAlphas = {};
-		void SetSteering(const std::array<torch::Tensor, STEER_MODES>& vecsCpu,
-			const std::array<float, STEER_MODES>& sigmas,
-			const std::array<float, STEER_MODES>& alphas);
 
 		// Rho-band gate on the steering delta (LearnerConfig::CollectSteeringConfig): steer a
 		// row only when its contact-reachability sits in the middle band of the current
@@ -79,18 +74,12 @@ namespace GGL {
 		// mode). Set by the Learner at startup; reads phi/psi from the SAME ModelSet as the
 		// policy (the pipelined worker's snapshot includes them, so no concurrent read of
 		// live weights).
-		bool steerRhoGate = false;
-		bool steerRhoContact = true; // gate on the car head's contact reachability (races)
-		float steerRhoLo = 0.2f, steerRhoHi = 0.8f;
-		int steerRhoK = 8;
 		float lastRhoGateFrac = 0; // metric: fraction of eligible rows steered last call
 
 		// META gate-goal override: when defined, the rho band scores reachability toward
 		// THIS goal (the active emergent cluster's representative, an achieved state from
 		// the agent's own bank) on the given head, replacing the fixed contact/scoring
 		// default. Set in the barrier zone only (the worker reads it unsynchronized).
-		torch::Tensor steerGoalOverride; // [6], goal-space normalized, on `device`
-		int steerGoalOverrideHead = 0;   // 0 = car-local ball, 1 = canonical ball, 2 = canonical car state
 		void SetSteerGoal(torch::Tensor goal6Cpu, int head); // undefined tensor = clear
 
 		// If models is null, this->models will be used. steerRowMask (optional, [n] bool, any
@@ -100,7 +89,7 @@ namespace GGL {
 		// coef * vec added to the trunk output of EVERY row of this call, ungated (style is
 		// a whole-game disposition, not a frontier read). Callers pass it only on the
 		// old-version/league-opponent inference call, never on the trained policy's.
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor steerRowMask = {}, torch::Tensor steerRowModes = {}, torch::Tensor styleVec = {}, float styleCoef = 0);
+		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL, torch::Tensor styleVec = {}, float styleCoef = 0);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
 		torch::Tensor InferGoalCritic(torch::Tensor obs);
@@ -110,7 +99,7 @@ namespace GGL {
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
-		// before the policy head. Requires a shared head. Collection-only - see SetSteering.
+		// before the policy head. Requires a shared head. Collection-only (opponent styles).
 		static torch::Tensor InferPolicyProbsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,

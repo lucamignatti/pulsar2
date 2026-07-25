@@ -1,0 +1,18 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cb02aa8..705eb77 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -164,8 +164,11 @@ add_custom_target(rlbot-generated
+ 
+ add_subdirectory(library)
+ 
+-add_subdirectory(examples/ATBA)
+-add_subdirectory(examples/ExampleBot)
++# EXCLUDE_FROM_ALL (local, 2026-07-25): upstream sample bots. Kept buildable on demand
++# (cmake --build <dir> --target ATBA) but off the default build - they cost 3 LTO links
++# on every rebuild of a tree that only ever needs GigaLearnBot.
++add_subdirectory(examples/ATBA EXCLUDE_FROM_ALL)
++add_subdirectory(examples/ExampleBot EXCLUDE_FROM_ALL)
+ 
+ if(RLBOT_CPP_BUILD_BENCHMARK)
+ 	add_subdirectory(benchmark)

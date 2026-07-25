@@ -1060,25 +1060,18 @@ void GGL::Learner::Start() {
 				blk.numSteered = blk.numPractice - numControl;
 				for (int a = blk.first; a < blk.first + blk.numPractice; a++)
 					arenaSteerRole[a] = (a < blk.first + blk.numSteered) ? 1 : 2;
-				RG_LOG("Steered-practice collection [" << fnModeName(md) << "]: "
-					<< blk.numSteered << " steered + " << numControl << " control of "
-					<< blk.count << " arenas");
+				RG_LOG("Practice arenas [" << fnModeName(md) << "]: "
+					<< blk.numPractice << " of " << blk.count
+					<< " (FrontierDrillState resets; roles feed the frontier pool)");
 			}
 			// Legacy aggregate members (kept for the stage-2 wiring/logs)
 			numSteeredArenas = steerBlocks[0].numSteered;
 			numPracticeArenas = steerBlocks[0].numPractice;
-			RG_LOG("Steering: alpha " << config.steering.alpha
-				<< (config.steering.resolutionTermination ? ", RESOLUTION-TERMINATED" : ", normal episodes (stage 1)")
-				<< (config.steering.rhoGateEnabled ? ", rho-band gated (per-mode bands)" : "")
-				<< (config.steering.steerTeamModes ? ", team modes steered" : ", team modes measurement-only")
-				<< " (directions derived live per iteration; first iteration runs unsteered)");
+			// Actuation was removed 2026-07-25; what survives under config.steering is the
+			// possession-outcome labeling that fills FrontierPool + the census/miner telemetry.
+			RG_LOG("Frontier derivation: possession labeling + census ON, NO steering actuation"
+				<< (config.steering.resolutionTermination ? " [RESOLUTION-TERMINATED]" : ""));
 
-			// Rho-band gate parameters live on the PPOLearner (it applies them at inference)
-			ppo->steerRhoGate = config.steering.rhoGateEnabled && config.ppo.reachability.enabled;
-			ppo->steerRhoContact = config.steering.rhoGateOnContact;
-			ppo->steerRhoLo = config.steering.rhoGateLo;
-			ppo->steerRhoHi = config.steering.rhoGateHi;
-			ppo->steerRhoK = RS_MAX(1, config.steering.rhoGateActionSamples);
 		}
 
 
@@ -1093,7 +1086,7 @@ void GGL::Learner::Start() {
 		// has clean canaries at +0.5..+1) and are in units of the LIVE projection sigma,
 		// so they self-calibrate as the trunk drifts. The vectors the draw reads are
 		// barrier-swapped copies (same discipline as ppo->steerVec): written only in
-		// fnApplySteering with the collect worker joined.
+		// the collect worker joined.
 		struct OppStyle { const char* name; bool challengeSrc; float aLo, aHi; };
 		static constexpr OppStyle OPP_STYLES[3] = {
 			{ "hesitant",   false, -2.0f, -1.0f },
@@ -1111,7 +1104,6 @@ void GGL::Learner::Start() {
 
 		// Live per-mode steering state (derived in fnSteerUpdate during learn-prep, applied
 		// in the barrier zone where no collect worker is in flight). CPU tensors.
-		std::array<torch::Tensor, STEER_MODES> steerVecEMA;
 		std::array<float, STEER_MODES> steerSigmaEMA = {};
 		// Challenge-vs-shadow contrast for the live "shadow" opponent style (1v1 match
 		// rows; same EMA discipline as the commitment direction)
@@ -1119,8 +1111,6 @@ void GGL::Learner::Start() {
 		float challengeSigmaEMA = 0;
 		std::array<float, STEER_MODES> steerGateDeltaEMA = {}; // steered-minus-control team-possession, EMA
 		std::array<int, STEER_MODES> steerGateIters = {};      // iterations that contributed gate data
-		std::array<bool, STEER_MODES> steerGateActive;         // alpha drops to 0 when the causal gate trips
-		steerGateActive.fill(true);
 		bool steerPendingApply = false;
 		// Rating watch state (ratingGuardEMA / ratingGuardPeak) lives on the
 		// Learner and is persisted in the checkpoint stats - a crash-restart must not
@@ -1395,6 +1385,31 @@ void GGL::Learner::Start() {
 			return torch::nn::Sequential(
 				std::dynamic_pointer_cast<torch::nn::SequentialImpl>(src->clone()));
 		};
+		// RATING WATCH - measurement only. Tracks the training mode's rating against a slow EMA
+		// and a decaying high-water mark and publishes both drawdowns. There is no latch: it was
+		// removed 2026-07-25 after repeatedly false-tripping and taking six live mechanisms dark.
+		// This is the only signal that sees update damage when behavioral gates read green, so it
+		// is kept as the operator's instrument. See RatingWatchConfig.
+		auto fnRatingWatch = [&](Report& report) {
+			if (!report.Has(ratingKey))
+				return;
+			float rating = (float)report[ratingKey];
+			if (std::isnan(ratingGuardEMA)) {
+				ratingGuardEMA = rating;
+				ratingGuardPeak = rating;
+				return;
+			}
+			if (std::isnan(ratingGuardPeak))
+				ratingGuardPeak = rating; // resumed from a checkpoint saved before peak tracking
+			// Positive = how far below the reference the rating currently sits.
+			report["RatingWatch/Drawdown From EMA"] = ratingGuardEMA - rating;
+			report["RatingWatch/Drawdown From Peak"] = ratingGuardPeak - rating;
+			ratingGuardEMA = config.ratingWatch.emaDecay * ratingGuardEMA
+				+ (1.f - config.ratingWatch.emaDecay) * rating;
+			// The high-water mark decays so a stale old spike cannot dominate the panel forever
+			ratingGuardPeak = RS_MAX(rating, ratingGuardPeak - config.ratingWatch.peakDecay);
+		};
+
 		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
 		Report collectReport;         // worker-owned between barriers; merged into the iteration report
 		int collectSteps = 0;
@@ -1410,7 +1425,6 @@ void GGL::Learner::Start() {
 		//   1. label airborne-ball readings via ball-only landing sims + within-episode lookahead
 		//   2. engagement per arena group -> causal auto-gate (steered vs control practice)
 		//   3. matched went/declined difference of trunk means from MATCH rows only -> EMA
-		// The updated direction is applied in the barrier zone (fnApplySteering), never while a
 		// collect worker is in flight. Rows of one player's episode are CONTIGUOUS in
 		// combinedTraj (episodes are appended whole at finalize), so lookahead is row + k.
 		auto fnSteerUpdate = [&](Report& report, const torch::Tensor& tValPredsIn, const torch::Tensor& tGoalValPredsIn, const torch::Tensor& tAdvIn, const torch::Tensor& tLogProbIn) {
@@ -1640,242 +1654,14 @@ void GGL::Learner::Start() {
 						report[fnModeKey((std::string("Steer/PossWin ") + roleNames[g]).c_str(), md)] =
 							(float)possTeamWon[md][g] / feas[md][g];
 
-			// 4) Causal auto-gates, one per mode: that mode's steered arenas must WIN THE BALL
-			// (team possession) on feasible aerial situations at least as often as its controls
-			// (identical arenas, only steering differs)
-			for (int md = 0; md < STEER_MODES; md++) {
-				if (steerBlocks[md].numSteered == 0)
-					continue;
-				// Accrue only from buffers the INCUMBENT steered: during meta-owned dwells
-				// the steered arenas carry a cluster direction, and grading the incumbent's
-				// possession gate on someone else's behavior would trip/clear it spuriously
-				if (steerLoaded && measuredMetaHead < 0 && feas[md][1] >= 50 && feas[md][2] >= 50) {
-					float delta = (float)possTeamWon[md][1] / feas[md][1]
-						- (float)possTeamWon[md][2] / feas[md][2];
-					steerGateDeltaEMA[md] = (steerGateIters[md] == 0)
-						? delta : 0.9f * steerGateDeltaEMA[md] + 0.1f * delta;
-					steerGateIters[md]++;
-					report[fnModeKey("Steer/Gate Delta EMA", md)] = steerGateDeltaEMA[md];
-					if (steerGateIters[md] >= cfgS.gateWarmupIters) {
-						if (steerGateActive[md] && steerGateDeltaEMA[md] < cfgS.gateDisableBelow) {
-							steerGateActive[md] = false;
-							steerPendingApply = true;
-							RG_LOG("Steering causal gate [" << fnModeName(md) << "] TRIPPED "
-								"(team-possession delta EMA " << steerGateDeltaEMA[md]
-								<< ") - alpha -> 0, derivation continues");
-						} else if (!steerGateActive[md] && steerGateDeltaEMA[md] > cfgS.gateReenableAbove) {
-							steerGateActive[md] = true;
-							steerPendingApply = true;
-							RG_LOG("Steering causal gate [" << fnModeName(md) << "] RE-ENGAGED "
-								"(team-possession delta EMA " << steerGateDeltaEMA[md] << ")");
-						}
-					}
-				}
-				report[fnModeKey("Steer/Gate Active", md)] = (float)steerGateActive[md];
-			}
-
-			// 5) Matched difference of trunk means -> per-mode EMA direction + sigma.
-			// A mode whose pool is too thin keeps its own EMA untouched; fnApplySteering
-			// falls back to the 1v1 direction for it (validated offline: the 1v1 direction
-			// TRANSFERS to 2v2 - teamWon +3.4pp at +0.5 with sign-correct air/touch shifts -
-			// while directions derived from thin weak-team pools were causally dead).
-			auto fnGatherTrunk = [&](const std::vector<int64_t>& rows) {
-				FList buf;
-				buf.reserve(rows.size() * obsSize);
-				for (int64_t r : rows)
-					for (int c = 0; c < obsSize; c++)
-						buf.push_back(states[r * (int64_t)obsSize + c]);
-				torch::Tensor obs = torch::tensor(buf).reshape({ (int64_t)rows.size(), obsSize }).to(ppo->device);
-				return ppo->models["shared_head"]->Forward(obs, false).cpu();
-			};
-			for (int md = 0; md < STEER_MODES; md++) {
-				if (steerBlocks[md].count == 0 || (md > 0 && !cfgS.steerTeamModes))
-					continue;
-				auto& pool = pools[md];
-				std::vector<int64_t> selWent, selDecl;
-				if ((int)pool.size() >= 2 * cfgS.minPairsPerUpdate) {
-					// quantile bin edges over the pool (5 distance bins x 3 flight-time bins)
-					auto fnEdges = [&](auto getter, int bins) {
-						FList vals;
-						for (auto& p : pool)
-							vals.push_back(getter(p));
-						std::sort(vals.begin(), vals.end());
-						FList edges;
-						for (int b = 1; b < bins; b++)
-							edges.push_back(vals[vals.size() * b / bins]);
-						return edges;
-					};
-					FList dEdges = fnEdges([](const Labeled& p) { return p.dNow; }, 5);
-					FList tEdges = fnEdges([](const Labeled& p) { return p.tLand; }, 3);
-					auto fnBin = [&](const Labeled& p) {
-						int db = 0, tb = 0;
-						while (db < (int)dEdges.size() && p.dNow > dEdges[db]) db++;
-						while (tb < (int)tEdges.size() && p.tLand > tEdges[tb]) tb++;
-						return db * 8 + tb;
-					};
-					std::map<int, std::pair<std::vector<int64_t>, std::vector<int64_t>>> byBin;
-					for (auto& p : pool)
-						(p.won ? byBin[fnBin(p)].first : byBin[fnBin(p)].second).push_back(p.row);
-					std::mt19937 shuffleRng((unsigned)(totalIterations + md * 7919));
-					for (auto& kv : byBin) {
-						auto& w = kv.second.first;
-						auto& d = kv.second.second;
-						std::shuffle(w.begin(), w.end(), shuffleRng);
-						std::shuffle(d.begin(), d.end(), shuffleRng);
-						size_t m = RS_MIN(w.size(), d.size());
-						selWent.insert(selWent.end(), w.begin(), w.begin() + m);
-						selDecl.insert(selDecl.end(), d.begin(), d.begin() + m);
-					}
-				}
-
-				if ((int)selWent.size() >= cfgS.minPairsPerUpdate) {
-					torch::Tensor vNew = (fnGatherTrunk(selWent).mean(0) - fnGatherTrunk(selDecl).mean(0));
-					vNew = vNew / vNew.norm().clamp_min(1e-8f);
-					if (steerVecEMA[md].defined()) {
-						report[fnModeKey("Steer/Dir Drift", md)] =
-							1.f - torch::dot(steerVecEMA[md], vNew).item<float>();
-						steerVecEMA[md] = cfgS.emaDecay * steerVecEMA[md] + (1.f - cfgS.emaDecay) * vNew;
-						steerVecEMA[md] = steerVecEMA[md] / steerVecEMA[md].norm().clamp_min(1e-8f);
-					} else {
-						steerVecEMA[md] = vNew;
-					}
-					report[fnModeKey("Steer/Pairs", md)] = (float)selWent.size();
-				}
-				report[fnModeKey("Steer/Dir Source Own", md)] = (float)steerVecEMA[md].defined();
-
-				// sigma of THIS mode's match-row projections onto the vector this mode will
-				// APPLY (its own EMA, or the 1v1 fallback) - so the dose alpha*sigma is
-				// calibrated to the mode's own trunk distribution either way
-				torch::Tensor applied = steerVecEMA[md].defined() ? steerVecEMA[md] : steerVecEMA[0];
-				if (applied.defined()) {
-					std::vector<int64_t> sampleRows;
-					int64_t sampleStride = RS_MAX((int64_t)1, n / 4096);
-					for (int64_t r = 0; r < n; r += sampleStride)
-						if (groups[r] == 0 && rowModes[r] == md)
-							sampleRows.push_back(r);
-					if (sampleRows.size() >= 64) {
-						float sigNew = fnGatherTrunk(sampleRows).matmul(applied).std().item<float>();
-						steerSigmaEMA[md] = (steerSigmaEMA[md] == 0) ? sigNew
-							: cfgS.emaDecay * steerSigmaEMA[md] + (1.f - cfgS.emaDecay) * sigNew;
-						steerPendingApply = true;
-					}
-					report[fnModeKey("Steer/Sigma", md)] = steerSigmaEMA[md];
-				}
-			}
-
-			// 5b) LIVE "shadow" style ingredient: the challenge-vs-shadow contrast, ported
-			// from the offline label (style_contrasts.label_challenge, causally validated
-			// in STEERING_PHASE0_40: negative dose cut challenge rate 44%->24% with clean
-			// canaries). Readings = 1v1 MATCH rows under OPPONENT possession (their touch
-			// within the last 2s, none of ours since, current gap >= 600uu); challenge =
-			// within 1.5s the player got within 600uu of the ball or closed half the gap;
-			// shadow = stayed farther AND goal-side (canonical self y < ball y). Matched
-			// on (distance x canonical-ball-y) quantile bins, EMA'd like the commitment
-			// direction. hesitant/overcommit need nothing here - they reuse steerVecEMA[0].
-			if (oppStylesOn) {
-				constexpr float POSSESSION_S = 2.0f, LOOKAHEAD_S = 1.5f, CHALLENGE_DIST = 600.f;
-				const int lookRows = (int)roundf(LOOKAHEAD_S * stepsPerSec);
-				const int possRows = (int)roundf(POSSESSION_S * stepsPerSec);
-				struct ChRow { int64_t row; bool challenge; float dNow, ballY; };
-				std::vector<ChRow> chPool;
-				{
-					int64_t epStart = 0;
-					for (int64_t epEnd = 0; epEnd < n; epEnd++) {
-						if (!combinedTraj.terminals[epEnd])
-							continue;
-						int64_t lastOpp = -1, lastOurs = -1;
-						for (int64_t r = epStart; r + lookRows <= epEnd; r++) {
-							if (combinedTraj.oppTouched[r]) lastOpp = r;
-							if (combinedTraj.touched[r] || combinedTraj.teamTouched[r]) lastOurs = r;
-							if (groups[r] != 0 || rowModes[r] != 0)
-								continue; // 1v1 match rows only (thin/weak team pools, E2)
-							if (lastOpp < 0 || r - lastOpp > possRows || lastOurs > lastOpp)
-								continue; // not under opponent possession
-							float bx = fnObs(r, BALL_POS) * POS_SCALE, by = fnObs(r, BALL_POS + 1) * POS_SCALE;
-							float sx = fnObs(r, SELF_POS) * POS_SCALE, sy = fnObs(r, SELF_POS + 1) * POS_SCALE;
-							float dNow = sqrtf((sx - bx) * (sx - bx) + (sy - by) * (sy - by));
-							if (dNow < CHALLENGE_DIST)
-								continue; // already engaged: neither label
-							bool challenge = false;
-							for (int64_t rr = r + 1; rr <= r + lookRows; rr++) {
-								float bx2 = fnObs(rr, BALL_POS) * POS_SCALE, by2 = fnObs(rr, BALL_POS + 1) * POS_SCALE;
-								float sx2 = fnObs(rr, SELF_POS) * POS_SCALE, sy2 = fnObs(rr, SELF_POS + 1) * POS_SCALE;
-								float d2 = sqrtf((sx2 - bx2) * (sx2 - bx2) + (sy2 - by2) * (sy2 - by2));
-								if (d2 < CHALLENGE_DIST || d2 < 0.5f * dNow) { challenge = true; break; }
-							}
-							if (!challenge && sy >= by)
-								continue; // neither challenging nor goal-side shadowing
-							chPool.push_back({ r, challenge, dNow, by });
-						}
-						epStart = epEnd + 1;
-					}
-				}
-				// Stride to the reading budget (trunk gathers below are the real cost)
-				if ((int)chPool.size() > cfgS.maxReadingsPerIter) {
-					size_t stride = chPool.size() / (size_t)cfgS.maxReadingsPerIter + 1;
-					std::vector<ChRow> strided;
-					for (size_t i = 0; i < chPool.size(); i += stride)
-						strided.push_back(chPool[i]);
-					chPool = std::move(strided);
-				}
-				if (!chPool.empty())
-					report["Steer/Challenge Rate"] = (float)std::count_if(chPool.begin(),
-						chPool.end(), [](const ChRow& c) { return c.challenge; }) / chPool.size();
-
-				// Matched (distance x ball-y) selection, same recipe as the commitment pools
-				std::vector<int64_t> selCh, selSh;
-				if ((int)chPool.size() >= 2 * cfgS.minPairsPerUpdate) {
-					auto fnEdges = [&](auto getter, int bins) {
-						FList vals;
-						for (auto& c : chPool)
-							vals.push_back(getter(c));
-						std::sort(vals.begin(), vals.end());
-						FList edges;
-						for (int b = 1; b < bins; b++)
-							edges.push_back(vals[vals.size() * b / bins]);
-						return edges;
-					};
-					FList dEdges = fnEdges([](const ChRow& c) { return c.dNow; }, 5);
-					FList yEdges = fnEdges([](const ChRow& c) { return c.ballY; }, 3);
-					std::map<int, std::pair<std::vector<int64_t>, std::vector<int64_t>>> byBin;
-					for (auto& c : chPool) {
-						int db = 0, yb = 0;
-						while (db < (int)dEdges.size() && c.dNow > dEdges[db]) db++;
-						while (yb < (int)yEdges.size() && c.ballY > yEdges[yb]) yb++;
-						(c.challenge ? byBin[db * 8 + yb].first : byBin[db * 8 + yb].second).push_back(c.row);
-					}
-					std::mt19937 shuffleRng((unsigned)(totalIterations * 31 + 17));
-					for (auto& kv : byBin) {
-						auto& a = kv.second.first;
-						auto& b = kv.second.second;
-						std::shuffle(a.begin(), a.end(), shuffleRng);
-						std::shuffle(b.begin(), b.end(), shuffleRng);
-						size_t m = RS_MIN(a.size(), b.size());
-						selCh.insert(selCh.end(), a.begin(), a.begin() + m);
-						selSh.insert(selSh.end(), b.begin(), b.begin() + m);
-					}
-				}
-				if ((int)selCh.size() >= cfgS.minPairsPerUpdate) {
-					torch::Tensor Hc = fnGatherTrunk(selCh), Hs = fnGatherTrunk(selSh);
-					torch::Tensor vNew = Hc.mean(0) - Hs.mean(0);
-					vNew = vNew / vNew.norm().clamp_min(1e-8f);
-					if (challengeVecEMA.defined()) {
-						report["Steer/Challenge Dir Drift"] =
-							1.f - torch::dot(challengeVecEMA, vNew).item<float>();
-						challengeVecEMA = cfgS.emaDecay * challengeVecEMA + (1.f - cfgS.emaDecay) * vNew;
-						challengeVecEMA = challengeVecEMA / challengeVecEMA.norm().clamp_min(1e-8f);
-					} else {
-						challengeVecEMA = vNew;
-					}
-					// sigma of the pool rows' projections onto the vector actually applied
-					torch::Tensor proj = torch::cat({ Hc, Hs }, 0).matmul(challengeVecEMA);
-					float sigNew = proj.std().item<float>();
-					challengeSigmaEMA = challengeSigmaEMA == 0
-						? sigNew : cfgS.emaDecay * challengeSigmaEMA + (1.f - cfgS.emaDecay) * sigNew;
-					report["Steer/Challenge Pairs"] = (float)selCh.size();
-				}
-			}
-
+			// Sections 4 and 5 (causal auto-gate; matched trunk-mean contrast -> direction +
+			// sigma EMA) were REMOVED 2026-07-25. They existed only to produce and dose the
+			// activation-steering push, which had been numerically inert at alpha = 0 since the
+			// Ladder superseded it - three GPU trunk forwards and four barrier-zone parameter
+			// copies per iteration to compute a delta that was then multiplied by zero.
+			// Sections 1-3 and 6-8 survive: they label possession outcomes and fill FrontierPool,
+			// which drives FrontierDrillState on ~30% of arena resets and is LIVE.
+			// History: git log -- docs/LADDER.md research/reports/STEERING.md
 			// 6) Frontier reset pool (roadmap phase 3): bank the collectively-declined
 			// readings as canonical-frame reset entries reconstructed from obs-visible
 			// quantities. Layout support: AdvancedObsPadded(3) (230) and plain AdvancedObs
@@ -2170,641 +1956,6 @@ void GGL::Learner::Start() {
 			}
 		};
 
-		// ===== META frontier steering (roadmap phase 4, prior-free) =====
-		// Generalizes the commitment mechanism from ONE hand-derived contrast to the
-		// agent's whole capability frontier, with NO human priors: goals are sampled from
-		// the agent's own achieved-state bank; the frontier is what its own self-model
-		// rates coin-flip; structure is emergent (k-means in its own psi geometry, no
-		// cluster ever named); outcomes are model-free continuous ATTAINMENT (how close
-		// future achieved states got to the goal within the head's own HER horizon),
-		// compared only through within-population quantiles. Offline validation
-		// (research/tools/meta_frontier_validate.py, and the archived report
-		// research/reports/archive/STEERING_META_40.md): the ball
-		// head's calibration is monotone (a real frontier detector), the car head's is
-		// not for arbitrary goals (it self-disables here while keeping its contact-gate
-		// role), and at least one emergent cluster shows a monotone causal attainment
-		// uplift under its derived direction with clean canaries - with heterogeneity
-		// across clusters, which is exactly the scheduler's reason to exist.
-		struct MetaClusterState {
-			torch::Tensor centroid;  // [repr] psi space, slot-matched + EMA'd across iters
-			torch::Tensor repGoal;   // [6] representative achieved goal (raw goal space)
-			torch::Tensor dirEMA;    // [trunk] the cluster's steering direction
-			float effectEMA = 0;     // normalized causal effect (steered-vs-control attain)
-			int effectIters = 0;
-			bool benched = false;
-			int64_t lastDwellIdx = -1;
-			int lastPairs = 0;
-		};
-		// Heads: [0]=car-local ball, [1]=canonical ball, [2]=canonical CAR state (the
-		// movement-capability space; entry-gated by its decisively-monotone offline
-		// calibration, actuation-gated live like every head)
-		std::array<std::vector<MetaClusterState>, 3> metaSlots;
-		std::array<std::array<float, 3>, 3> metaCalibEMA = {};  // median attain below/in/above
-		std::array<int, 3> metaCalibIters = {};
-		std::array<bool, 3> metaHeadValid = { false, false, false }; // monotone calibration gate
-		int metaActiveHead = -1, metaActiveCluster = -1;
-		int64_t metaDwellIdx = 0;
-		int metaDwellLeft = 0;
-		std::array<float, STEER_MODES> metaSigma = {};
-		const bool metaOn = steerOn && config.steering.meta && reachOn;
-
-		auto fnMetaUpdate = [&](Report& report) {
-			if (!metaOn)
-				return;
-			RG_NO_GRAD;
-			const auto& cfgS = config.steering;
-			const auto& states = combinedTraj.states;
-			const auto& groups = combinedTraj.steerPractice;
-			const auto& rowModes = combinedTraj.steerMode;
-			int64_t n = (int64_t)combinedTraj.Length();
-			if (n == 0 || groups.size() != (size_t)n || rowModes.size() != (size_t)n)
-				return;
-
-			auto fnObs = [&](int64_t row, int off) { return states[row * (int64_t)obsSize + off]; };
-			const bool paddedObs = obsSize == 230, plainObs = obsSize == 109;
-			if (!paddedObs && !plainObs)
-				return; // unsupported layout (loud enough via the frontier-pool warning)
-
-			// Episode ids + episode end per row (rows of one player's episode are contiguous)
-			std::vector<int32_t> epId(n);
-			std::vector<int64_t> epEnd(n);
-			{
-				int32_t cur = 0;
-				int64_t start = 0;
-				for (int64_t r = 0; r < n; r++) {
-					epId[r] = cur;
-					if (combinedTraj.terminals[r]) {
-						for (int64_t i = start; i <= r; i++)
-							epEnd[i] = r;
-						cur++;
-						start = r + 1;
-					}
-				}
-				for (int64_t i = start; i < n; i++)
-					epEnd[i] = n - 1; // trailing partial episode
-			}
-
-			// Achieved-goal vectors per row per head, from the canonical obs the policy
-			// consumed (fnAppendAchieved parity; obs coefs 1/5000 pos, 1/2300 vel)
-			const auto& rc = config.ppo.reachability;
-			auto fnAch = [&](int64_t r, int head, float* out) {
-				constexpr int SELF = 51;
-				if (head == 1) { // ball: canonical pos/vel -> reach scales
-					out[0] = fnObs(r, 0) * 5000.f / rc.posScaleX;
-					out[1] = fnObs(r, 1) * 5000.f / rc.posScaleY;
-					out[2] = fnObs(r, 2) * 5000.f / rc.posScaleZ;
-					out[3] = fnObs(r, 3) * 2300.f / rc.velScale;
-					out[4] = fnObs(r, 4) * 2300.f / rc.velScale;
-					out[5] = fnObs(r, 5) * 2300.f / rc.velScale;
-				} else if (head == 0) { // car: self-block local ball pos/vel -> carLocalScale
-					out[0] = fnObs(r, SELF + 18) * 5000.f / 2300.f;
-					out[1] = fnObs(r, SELF + 19) * 5000.f / 2300.f;
-					out[2] = fnObs(r, SELF + 20) * 5000.f / 2300.f;
-					out[3] = fnObs(r, SELF + 21);
-					out[4] = fnObs(r, SELF + 22);
-					out[5] = fnObs(r, SELF + 23);
-				} else { // carstate: self-block canonical CAR pos/vel -> reach scales
-					out[0] = fnObs(r, SELF + 0) * 5000.f / rc.posScaleX;
-					out[1] = fnObs(r, SELF + 1) * 5000.f / rc.posScaleY;
-					out[2] = fnObs(r, SELF + 2) * 5000.f / rc.posScaleZ;
-					out[3] = fnObs(r, SELF + 9) * 2300.f / rc.velScale;
-					out[4] = fnObs(r, SELF + 10) * 2300.f / rc.velScale;
-					out[5] = fnObs(r, SELF + 11) * 2300.f / rc.velScale;
-				}
-			};
-
-			auto fnGatherTrunkRows = [&](const std::vector<int64_t>& rows) {
-				FList buf;
-				buf.reserve(rows.size() * obsSize);
-				for (int64_t r : rows)
-					for (int c = 0; c < obsSize; c++)
-						buf.push_back(states[r * (int64_t)obsSize + c]);
-				torch::Tensor obs = torch::tensor(buf).reshape({ (int64_t)rows.size(), obsSize }).to(ppo->device);
-				return ppo->models["shared_head"]->Forward(obs, false);
-			};
-
-			auto fnKMeans = [&](torch::Tensor emb, int k, int iters) {
-				auto perm = torch::randperm(emb.size(0)).slice(0, 0, k);
-				torch::Tensor cent = emb.index_select(0, perm).clone();
-				torch::Tensor labels = torch::zeros({ emb.size(0) }, torch::kLong);
-				for (int it = 0; it < iters; it++) {
-					labels = emb.matmul(cent.t()).argmax(1);
-					for (int c = 0; c < k; c++) {
-						auto sel = (labels == c).nonzero().flatten();
-						if (sel.numel() > 0) {
-							auto m = emb.index_select(0, sel).mean(0);
-							cent[c] = m / m.norm().clamp_min(1e-6f);
-						}
-					}
-				}
-				return std::make_pair(cent, labels);
-			};
-
-			// ---- per head: bank -> clusters -> mined pairs -> calibration/dirs/effect
-			for (int head = 0; head < 3; head++) {
-				const char* headName = head == 0 ? "car" : (head == 1 ? "ball" : "carstate");
-				Model* psi = ppo->models[head == 0 ? "reach_psi_car"
-					: (head == 1 ? "reach_psi_ball" : "reach_psi_carstate")];
-				Model* phi = ppo->models["reach_phi"];
-				if (!psi || !phi)
-					continue;
-				int W = head == 0 ? rc.carHerMaxOffset
-					: (head == 1 ? rc.ballHerMaxOffset : rc.carStateHerMaxOffset);
-
-				// Bank: the agent's own achieved goals, from MATCH rows with a full window
-				std::vector<int64_t> bankRows;
-				{
-					int64_t tries = 0;
-					while ((int)bankRows.size() < cfgS.metaBankSize && tries++ < cfgS.metaBankSize * 8) {
-						int64_t r = (int64_t)RocketSim::Math::RandInt(0, (int)n);
-						if (groups[r] == 0 && r + W <= epEnd[r])
-							bankRows.push_back(r);
-					}
-				}
-				if ((int)bankRows.size() < cfgS.metaClusters * 8)
-					continue;
-				torch::Tensor bankGoals = torch::zeros({ (int64_t)bankRows.size(), 6 });
-				for (size_t i = 0; i < bankRows.size(); i++)
-					fnAch(bankRows[i], head, bankGoals[i].data_ptr<float>());
-				torch::Tensor bankEmb = psi->Forward(bankGoals.to(ppo->device), false).cpu();
-				bankEmb = bankEmb / bankEmb.norm(2, -1, true).clamp_min(1e-6f);
-
-				auto [cent, bankLabels] = fnKMeans(bankEmb, cfgS.metaClusters, 8);
-
-				// Slot-match new centroids to persistent slots (greedy max cosine) + EMA,
-				// so per-cluster state keeps its identity across iterations
-				auto& slots = metaSlots[head];
-				if ((int)slots.size() != cfgS.metaClusters) {
-					slots.assign(cfgS.metaClusters, MetaClusterState{});
-					for (int c = 0; c < cfgS.metaClusters; c++)
-						slots[c].centroid = cent[c].clone();
-				}
-				std::vector<int> newToSlot(cfgS.metaClusters, -1);
-				{
-					std::vector<bool> slotUsed(cfgS.metaClusters, false);
-					torch::Tensor slotCent = torch::zeros({ cfgS.metaClusters, cent.size(1) });
-					for (int c = 0; c < cfgS.metaClusters; c++)
-						slotCent[c] = slots[c].centroid;
-					torch::Tensor sim = cent.matmul(slotCent.t()); // [new, slot]
-					for (int step = 0; step < cfgS.metaClusters; step++) {
-						auto flat = sim.argmax().item<int64_t>();
-						int nc = (int)(flat / cfgS.metaClusters), sc = (int)(flat % cfgS.metaClusters);
-						newToSlot[nc] = sc;
-						sim.index_put_({ nc, torch::indexing::Slice() }, -2.f);
-						sim.index_put_({ torch::indexing::Slice(), sc }, -2.f);
-					}
-					for (int nc = 0; nc < cfgS.metaClusters; nc++) {
-						auto& s = slots[newToSlot[nc]];
-						s.centroid = cfgS.metaCentroidEma * s.centroid + (1 - cfgS.metaCentroidEma) * cent[nc];
-						s.centroid = s.centroid / s.centroid.norm().clamp_min(1e-6f);
-					}
-				}
-				// Representative goal per slot = bank goal nearest the slot centroid
-				{
-					torch::Tensor slotCent = torch::zeros({ cfgS.metaClusters, bankEmb.size(1) });
-					for (int c = 0; c < cfgS.metaClusters; c++)
-						slotCent[c] = slots[c].centroid;
-					torch::Tensor sims = bankEmb.matmul(slotCent.t()); // [bank, slot]
-					auto best = sims.argmax(0);                        // [slot]
-					for (int c = 0; c < cfgS.metaClusters; c++)
-						slots[c].repGoal = bankGoals[best[c].item<int64_t>()].clone();
-				}
-
-				// Mined pairs: strided rows (all roles - roles 1/2 feed the causal effect,
-				// role 0 feeds the direction pools), goals sampled cross-episode
-				std::vector<int64_t> mineRows;
-				int64_t stride = RS_MAX((int64_t)1, n / RS_MAX(1, cfgS.metaMaxRows));
-				for (int64_t r = 0; r < n; r += stride)
-					if (r + W <= epEnd[r])
-						mineRows.push_back(r);
-				if ((int)mineRows.size() < 64)
-					continue;
-
-				torch::Tensor trunk = fnGatherTrunkRows(mineRows); // [rows, trunk] on device
-				// K uniform valid actions per row -> phi pieces
-				torch::Tensor masksT;
-				{
-					FList mbuf;
-					mbuf.reserve(mineRows.size() * numActions);
-					for (int64_t r : mineRows)
-						for (int a = 0; a < numActions; a++)
-							mbuf.push_back((float)combinedTraj.actionMasks[r * (int64_t)numActions + a]);
-					masksT = torch::tensor(mbuf).reshape({ (int64_t)mineRows.size(), numActions })
-						.clamp_min(1e-9f).to(ppo->device);
-				}
-				int K = RS_MAX(1, cfgS.rhoGateActionSamples);
-				auto acts = torch::multinomial(masksT, K, true);
-				auto trunkRep = trunk.repeat_interleave(K, 0);
-				auto oneHot = torch::one_hot(acts.flatten(), numActions).to(torch::kFloat32);
-				torch::Tensor phiT = phi->Forward(torch::cat({ trunkRep, oneHot }, -1), false);
-				phiT = (phiT / phiT.norm(2, -1, true).clamp_min(1e-6f))
-					.view({ (int64_t)mineRows.size(), K, -1 }).cpu();
-				trunk = trunk.cpu();
-
-				// Pair assembly
-				struct MetaPair { int rowIdx; int bankIdx; float rho, attain; uint8_t bandPos, role; };
-				std::vector<MetaPair> pairs;
-				pairs.reserve(mineRows.size() * cfgS.metaGoalsPerRow);
-				for (size_t i = 0; i < mineRows.size(); i++) {
-					int64_t r = mineRows[i];
-					for (int gsel = 0; gsel < cfgS.metaGoalsPerRow; gsel++) {
-						int bi = -1;
-						for (int t = 0; t < 8; t++) {
-							int c = RocketSim::Math::RandInt(0, (int)bankRows.size());
-							if (epId[bankRows[c]] != epId[r]) { bi = c; break; }
-						}
-						if (bi < 0)
-							continue;
-						float rho = phiT[i].matmul(bankEmb[bi]).mean().item<float>();
-						pairs.push_back({ (int)i, bi, rho, 0.f, 0, groups[r] });
-					}
-				}
-				if ((int)pairs.size() < 256)
-					continue;
-
-				// Band quantiles over this head's pairs
-				{
-					std::vector<float> rhos(pairs.size());
-					for (size_t j = 0; j < pairs.size(); j++)
-						rhos[j] = pairs[j].rho;
-					std::sort(rhos.begin(), rhos.end());
-					float lo = rhos[(size_t)(rhos.size() * cfgS.rhoGateLo)];
-					float hi = rhos[(size_t)(rhos.size() * cfgS.rhoGateHi)];
-					for (auto& p : pairs)
-						p.bandPos = p.rho < lo ? 0 : (p.rho <= hi ? 1 : 2);
-				}
-
-				// Attainment (model-free): -min goal-space distance over the head's window
-				for (auto& p : pairs) {
-					int64_t r = mineRows[p.rowIdx];
-					const float* g = bankGoals[p.bankIdx].data_ptr<float>();
-					float best = 1e30f;
-					float a[6];
-					for (int64_t f = r + 1; f <= RS_MIN(epEnd[r], r + W); f++) {
-						fnAch(f, head, a);
-						float d2 = 0;
-						for (int d = 0; d < 6; d++)
-							d2 += (a[d] - g[d]) * (a[d] - g[d]);
-						best = RS_MIN(best, d2);
-					}
-					p.attain = -sqrtf(best);
-				}
-
-				// Calibration: median attain below/in/above the band; the head drives
-				// steering ONLY while this is monotone (it disables its own bad senses)
-				{
-					std::array<std::vector<float>, 3> byBand;
-					for (auto& p : pairs)
-						byBand[p.bandPos].push_back(p.attain);
-					auto fnMedian = [](std::vector<float>& v) {
-						if (v.empty()) return NAN;
-						std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-						return v[v.size() / 2];
-					};
-					for (int b = 0; b < 3; b++) {
-						float m = fnMedian(byBand[b]);
-						if (!std::isnan(m))
-							metaCalibEMA[head][b] = metaCalibIters[head] == 0 ? m
-								: 0.9f * metaCalibEMA[head][b] + 0.1f * m;
-					}
-					metaCalibIters[head]++;
-					metaHeadValid[head] = metaCalibIters[head] >= 3
-						&& metaCalibEMA[head][0] <= metaCalibEMA[head][1]
-						&& metaCalibEMA[head][1] <= metaCalibEMA[head][2];
-					report[std::string("Meta/Calib Valid ") + headName] = (float)metaHeadValid[head];
-				}
-
-				// Per-cluster: direction pools (role 0 only - practice arenas never feed
-				// their own direction) + the ACTIVE cluster's causal effect (roles 1 vs 2)
-				for (int c = 0; c < cfgS.metaClusters; c++) {
-					auto& slot = slots[c];
-					std::vector<const MetaPair*> pool;
-					std::vector<float> steered, control;
-					// pair cluster = its bank goal's slot-matched label
-					for (auto& p : pairs) {
-						int slotOfPair = newToSlot[(int)bankLabels[p.bankIdx].item<int64_t>()];
-						if (slotOfPair != c || p.bandPos != 1)
-							continue;
-						if (p.role == 0)
-							pool.push_back(&p);
-						else if (p.role == 1)
-							steered.push_back(p.attain);
-						else
-							control.push_back(p.attain);
-					}
-					slot.lastPairs = (int)pool.size();
-
-					// Direction: matched top-vs-bottom attain terciles within rho quintiles
-					if ((int)pool.size() >= 2 * cfgS.minPairsPerUpdate) {
-						std::sort(pool.begin(), pool.end(),
-							[](const MetaPair* a, const MetaPair* b) { return a->rho < b->rho; });
-						std::vector<int64_t> selTop, selBot;
-						size_t binSize = pool.size() / 5;
-						for (int b = 0; b < 5 && binSize >= 6; b++) {
-							auto first = pool.begin() + b * binSize;
-							auto last = b == 4 ? pool.end() : first + binSize;
-							std::vector<const MetaPair*> bin(first, last);
-							std::sort(bin.begin(), bin.end(),
-								[](const MetaPair* a, const MetaPair* b) { return a->attain < b->attain; });
-							size_t third = bin.size() / 3;
-							for (size_t i = 0; i < third; i++) {
-								selBot.push_back(mineRows[bin[i]->rowIdx]);
-								selTop.push_back(mineRows[bin[bin.size() - 1 - i]->rowIdx]);
-							}
-						}
-						if ((int)selTop.size() >= cfgS.minPairsPerUpdate) {
-							torch::Tensor vNew = (fnGatherTrunkRows(selTop).mean(0)
-								- fnGatherTrunkRows(selBot).mean(0)).cpu();
-							vNew = vNew / vNew.norm().clamp_min(1e-8f);
-							slot.dirEMA = slot.dirEMA.defined()
-								? cfgS.emaDecay * slot.dirEMA + (1 - cfgS.emaDecay) * vNew
-								: vNew;
-							slot.dirEMA = slot.dirEMA / slot.dirEMA.norm().clamp_min(1e-8f);
-						}
-					}
-
-					// Causal effect, attributed to the cluster that ACTUALLY STEERED this
-					// buffer (measuredMeta*, one apply behind in pipelined mode) - during
-					// incumbent-owned dwells no cluster accrues, and the steered-vs-control
-					// contrast is never charged to a cluster that wasn't applied
-					if (head == measuredMetaHead && c == measuredMetaCluster
-						&& steered.size() >= 30 && control.size() >= 30) {
-						auto fnMedIqr = [](std::vector<float>& v, float& med, float& iqr) {
-							std::sort(v.begin(), v.end());
-							med = v[v.size() / 2];
-							iqr = v[(size_t)(v.size() * 0.75)] - v[(size_t)(v.size() * 0.25)];
-						};
-						float ms, is, mc, ic;
-						fnMedIqr(steered, ms, is);
-						fnMedIqr(control, mc, ic);
-						float eff = (ms - mc) / RS_MAX(ic, 1e-3f);
-						slot.effectEMA = slot.effectIters == 0 ? eff
-							: 0.95f * slot.effectEMA + 0.05f * eff;
-						slot.effectIters++;
-						report["Meta/Effect EMA"] = slot.effectEMA;
-						report["Meta/Attain Steered"] = ms;
-						report["Meta/Attain Control"] = mc;
-						if (slot.effectIters >= cfgS.metaWarmupIters) {
-							if (!slot.benched && slot.effectEMA < cfgS.metaEffectTrip) {
-								slot.benched = true;
-								RG_LOG("Meta steering: cluster " << headName << "/" << c
-									<< " BENCHED (effect EMA " << slot.effectEMA << ")");
-							} else if (slot.benched && slot.effectEMA > cfgS.metaEffectReenable) {
-								slot.benched = false;
-								RG_LOG("Meta steering: cluster " << headName << "/" << c
-									<< " UNBENCHED (effect EMA " << slot.effectEMA << ")");
-							}
-						}
-					}
-				}
-			}
-
-			// ---- Scheduler: TIME-MULTIPLEXED slot ownership (2026-07-14 incident fix).
-			// v1 gave meta the slot permanently: the PROVEN incumbent commitment direction
-			// (which had just driven Rating 1380 -> 1462) stopped actuating and rotating
-			// unproven cluster directions took over, while benching could never engage
-			// (150-iter warmup / 10-iter dwells). Now the incumbent is the DEFAULT actuator;
-			// every metaProbeEvery-th dwell probes one cluster (unmeasured first, then
-			// stalest - benched included, that re-probe is the unbench path), and a cluster
-			// only owns exploit dwells after its measured effect EMA clears metaPromoteMin
-			// with a full warmup: actuation is EARNED from the system's own measurements.
-			if (metaDwellLeft > 0)
-				metaDwellLeft--;
-			if (metaDwellLeft == 0) {
-				metaDwellIdx++;
-				bool probe = (metaDwellIdx % RS_MAX(1, (int64_t)cfgS.metaProbeEvery)) == 0;
-				int bestH = -1, bestC = -1;
-				float bestScore = -1e30f;
-				for (int h = 0; h < 3; h++) {
-					if (!metaHeadValid[h])
-						continue;
-					for (int c = 0; c < (int)metaSlots[h].size(); c++) {
-						auto& s = metaSlots[h][c];
-						if (!s.dirEMA.defined() || s.lastPairs < cfgS.minPairsPerUpdate)
-							continue;
-						float score;
-						if (probe) {
-							score = s.effectIters == 0 ? 1e6f - c   // unmeasured: probe first
-								: -(float)s.lastDwellIdx;           // then stalest
-						} else {
-							// Exploit dwells must be earned: warmed up, unbenched, and
-							// measurably better than not steering
-							if (s.benched || s.effectIters < cfgS.metaWarmupIters
-								|| s.effectEMA < cfgS.metaPromoteMin)
-								continue;
-							score = s.effectEMA;
-						}
-						if (score > bestScore) {
-							bestScore = score;
-							bestH = h;
-							bestC = c;
-						}
-					}
-				}
-				bool wasMeta = metaOwnsActuation;
-				metaOwnsActuation = bestH >= 0;
-				if (metaOwnsActuation) {
-					if (!wasMeta || bestH != metaActiveHead || bestC != metaActiveCluster)
-						RG_LOG("Meta steering: slot -> "
-							<< (bestH == 0 ? "car" : (bestH == 1 ? "ball" : "carstate")) << "/" << bestC
-							<< (probe ? " (probe dwell)" : " (earned exploit dwell)"));
-					metaActiveHead = bestH;
-					metaActiveCluster = bestC;
-					metaSlots[bestH][bestC].lastDwellIdx = metaDwellIdx;
-				} else if (wasMeta) {
-					RG_LOG("Meta steering: slot -> incumbent commitment direction");
-				}
-				metaDwellLeft = RS_MAX(1, cfgS.metaDwellIters);
-			}
-			report["Meta/Owns Slot"] = (float)metaOwnsActuation;
-			report["Meta/Active Head"] = (float)metaActiveHead;
-			report["Meta/Active Cluster"] = (float)metaActiveCluster;
-			if (metaActiveHead >= 0 && metaActiveCluster >= 0)
-				report["Meta/Active Pairs"] = (float)metaSlots[metaActiveHead][metaActiveCluster].lastPairs;
-
-			// Per-mode sigma of match-row projections onto the ACTIVE direction
-			if (metaActiveHead >= 0 && metaActiveCluster >= 0) {
-				auto& act = metaSlots[metaActiveHead][metaActiveCluster];
-				if (act.dirEMA.defined()) {
-					for (int md = 0; md < STEER_MODES; md++) {
-						if (steerBlocks[md].count == 0)
-							continue;
-						std::vector<int64_t> sampleRows;
-						int64_t sampleStride = RS_MAX((int64_t)1, n / 4096);
-						for (int64_t r = 0; r < n; r += sampleStride)
-							if (groups[r] == 0 && rowModes[r] == md)
-								sampleRows.push_back(r);
-						if (sampleRows.size() >= 64) {
-							float sig = fnGatherTrunkRows(sampleRows).cpu()
-								.matmul(act.dirEMA).std().item<float>();
-							metaSigma[md] = metaSigma[md] == 0 ? sig
-								: cfgS.emaDecay * metaSigma[md] + (1 - cfgS.emaDecay) * sig;
-						}
-					}
-				}
-			}
-		};
-
-		// RATING WATCH - measurement only. Tracks the training mode's rating against a slow EMA
-		// and a decaying high-water mark, and publishes both drawdowns as panels.
-		//
-		// 2026-07-25 (user-directed): the LATCH IS GONE. This used to flip a process-lifetime
-		// boolean that disabled steering, opponent styles, frontier drills, Nexto serve, league
-		// anchors, HEADROOM seek, RND injection and the Ladder drive at once, with no
-		// auto-re-enable. In practice it false-tripped repeatedly on a young run's volatility
-		// (thresholds had already been walked 110 -> 200 and 75 -> 150 after three such trips,
-		// and it fired again on a spike-and-settle where the rating was still +213 ABOVE its own
-		// EMA), and each trip silently took six unrelated live mechanisms dark. An actuator that
-		// mostly misfires and hides its blast radius is worse than none.
-		//
-		// The SIGNAL is kept, because it is still the only thing that sees update damage that
-		// behavioral gates cannot. It is now the operator's to read, not the trainer's to act on:
-		// watch RatingWatch/Drawdown From EMA and /From Peak.
-		auto fnRatingWatch = [&](Report& report) {
-			if (!report.Has(ratingKey))
-				return;
-			float rating = (float)report[ratingKey];
-			if (std::isnan(ratingGuardEMA)) {
-				ratingGuardEMA = rating;
-				ratingGuardPeak = rating;
-				return;
-			}
-			if (std::isnan(ratingGuardPeak))
-				ratingGuardPeak = rating; // resumed from a checkpoint saved before peak tracking
-			// Positive = how far below the reference the rating currently sits.
-			report["RatingWatch/Drawdown From EMA"] = ratingGuardEMA - rating;
-			report["RatingWatch/Drawdown From Peak"] = ratingGuardPeak - rating;
-			ratingGuardEMA = config.ratingWatch.emaDecay * ratingGuardEMA
-				+ (1.f - config.ratingWatch.emaDecay) * rating;
-			// The high-water mark decays so a stale old spike cannot dominate the panel forever
-			ratingGuardPeak = RS_MAX(rating, ratingGuardPeak - config.ratingWatch.peakDecay);
-		};
-
-		// Applies the META system's active cluster: its direction on all modes (dosed by
-		// each mode's own sigma), its representative goal as the rho-gate target, alphas
-		// gated by benching + the rating latch. ONLY call in the barrier zone, and only
-		// while the scheduler has given meta the slot (fnApplySteering owns that call).
-		auto fnApplyMeta = [&]() {
-			auto& act = metaSlots[metaActiveHead][metaActiveCluster];
-			std::array<torch::Tensor, PPOLearner::STEER_MODES> vecs = {};
-			std::array<float, PPOLearner::STEER_MODES> sigmas = {}, alphas = {};
-			bool any = false;
-			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
-				if (steerBlocks[md].numSteered == 0 || metaSigma[md] == 0)
-					continue;
-				vecs[md] = act.dirEMA;
-				sigmas[md] = metaSigma[md];
-				alphas[md] = !act.benched ? config.steering.alpha : 0.f;
-				any = true;
-			}
-			if (!any)
-				return false;
-			ppo->SetSteering(vecs, sigmas, alphas);
-			ppo->SetSteerGoal(act.repGoal, metaActiveHead);
-			steerLoaded = true;
-
-			// Churn-telemetry archive: under meta, the archived vector is the ACTIVE
-			// cluster's direction (what collection actually steers with)
-			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
-				if (vecs[md].defined()) {
-					auto vec = vecs[md].contiguous();
-					steerVecSave[md].assign(vec.data_ptr<float>(), vec.data_ptr<float>() + vec.numel());
-					steerSigmaSave[md] = sigmas[md];
-				}
-			}
-			return true;
-		};
-
-		// Applies the latest derived direction/gate state to the PPOLearner. ONLY call when no
-		// collect worker is in flight (barrier zone / sequential mode) - the worker reads
-		// ppo->steerVec without synchronization. Under META the slot is time-multiplexed:
-		// the scheduler (fnMetaUpdate) decides the owner per dwell, this function routes the
-		// apply and keeps the measurement attribution (measured*/applied*) in step with it.
-		auto fnApplySteering = [&]() {
-			// Live opponent-style vectors: swap in the freshest EMAs while the worker is
-			// joined (it reads these without synchronization). EMA updates rebind rather
-			// than mutate tensors, so a copy the worker still holds stays valid.
-			if (oppStylesOn) {
-				oppStyleCommitVec = steerVecEMA[0];
-				oppStyleCommitSigma = steerSigmaEMA[0];
-				oppStyleChallengeVec = challengeVecEMA;
-				oppStyleChallengeSigma = challengeSigmaEMA;
-			}
-			// Resolve this barrier's owner: the scheduled meta cluster if it has a direction,
-			// else the incumbent
-			int ownerHead = -1, ownerCluster = -1;
-			if (metaOn && metaOwnsActuation && metaActiveHead >= 0 && metaActiveCluster >= 0
-				&& metaSlots[metaActiveHead][metaActiveCluster].dirEMA.defined()) {
-				ownerHead = metaActiveHead;
-				ownerCluster = metaActiveCluster;
-			}
-			bool ownerChanged = ownerHead != appliedMetaHead || ownerCluster != appliedMetaCluster;
-			// Pipelined mode processes the buffer collected under the PREVIOUS apply;
-			// sequential mode collects and processes under this one
-			measuredMetaHead = pipelineOn ? appliedMetaHead : ownerHead;
-			measuredMetaCluster = pipelineOn ? appliedMetaCluster : ownerCluster;
-			appliedMetaHead = ownerHead;
-			appliedMetaCluster = ownerCluster;
-
-			if (ownerHead >= 0) {
-				if (fnApplyMeta())
-					return;
-				// No mode had a sigma yet - fall through to the incumbent so the slot
-				// never silently keeps stale vectors
-				appliedMetaHead = appliedMetaCluster = -1;
-				if (!pipelineOn)
-					measuredMetaHead = measuredMetaCluster = -1;
-				ownerChanged = true;
-			}
-			if (metaOn && ownerChanged) {
-				// Slot handed back to the incumbent: restore the contact-gate default and
-				// force a re-apply (the meta cluster's vectors are still loaded in the
-				// PPOLearner and must not keep steering under incumbent attribution)
-				ppo->SetSteerGoal(torch::Tensor(), 0);
-				steerPendingApply = true;
-			}
-			if (!steerOn || !steerPendingApply)
-				return;
-			// Per-mode vectors: a mode without its own direction falls back to the 1v1 one
-			// (offline-validated transfer), dosed by ITS OWN sigma. Modes stay undefined
-			// (unsteered) until a vector + sigma exist for them.
-			std::array<torch::Tensor, PPOLearner::STEER_MODES> vecs = {};
-			std::array<float, PPOLearner::STEER_MODES> sigmas = {}, alphas = {};
-			bool any = false;
-			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
-				torch::Tensor v = steerVecEMA[md].defined() ? steerVecEMA[md]
-					: (md > 0 && config.steering.steerTeamModes ? steerVecEMA[0] : torch::Tensor());
-				if (!v.defined() || steerSigmaEMA[md] == 0 || steerBlocks[md].numSteered == 0)
-					continue;
-				vecs[md] = v;
-				sigmas[md] = steerSigmaEMA[md];
-				alphas[md] = steerGateActive[md] ? config.steering.alpha : 0.f;
-				any = true;
-			}
-			if (!any) {
-				if (metaOn && ownerChanged) {
-					// No incumbent direction exists yet either (early run): clear the meta
-					// vectors outright rather than letting them steer unattributed
-					ppo->SetSteering(vecs, sigmas, alphas);
-					steerLoaded = false;
-					steerPendingApply = false;
-				}
-				return;
-			}
-			ppo->SetSteering(vecs, sigmas, alphas);
-			steerLoaded = true;
-			steerPendingApply = false;
-
-			// Snapshot for the checkpoint's churn-telemetry archive (Save() runs on this
-			// thread at the same safe point, so no synchronization is needed)
-			for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
-				if (vecs[md].defined()) {
-					auto vec = vecs[md].contiguous();
-					steerVecSave[md].assign(vec.data_ptr<float>(), vec.data_ptr<float>() + vec.numel());
-					steerSigmaSave[md] = sigmas[md];
-				}
-			}
-		};
 
 		std::jthread collectThread;
 		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
@@ -3051,8 +2202,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes,
-								{}, 0);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, {}, 0);
 							if (oppExternal) {
 								// Nexto reads GameStates directly (its own obs builder), and
 								// returns OUR action-table indices via the checked map. The
@@ -3066,8 +2216,7 @@ void GGL::Learner::Start() {
 							} else {
 								torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 								torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-								ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels,
-									{}, {}, oppStyleVec, oppStyleCoef); // opponents: zero wire (their columns trained against their own era's ladder; zeros = the neutral input)
+								ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels, oppStyleVec, oppStyleCoef);
 							}
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
@@ -3076,8 +2225,7 @@ void GGL::Learner::Start() {
 						} else {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes,
-								{}, 0);
+							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr, {}, 0);
 							tActions = tActions.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
@@ -3295,7 +2443,6 @@ void GGL::Learner::Start() {
 			if (collectThread.joinable()) {
 				collectThread.join();
 			} else {
-				fnApplySteering(); // no worker in flight - safe to swap the direction
 				fnCollectIteration(); // first iteration, or sequential mode
 			}
 			int stepsCollected = collectSteps;
@@ -3320,7 +2467,6 @@ void GGL::Learner::Start() {
 					league->OnIteration(report, totalIterations);
 				// Freeze the current policy for the worker, then collect the next iteration
 				// concurrently with this iteration's processing + Learn.
-				fnApplySteering(); // barrier zone: the worker is joined, no reader in flight
 				fnSyncSnapshot();
 				collectThread = std::jthread([&]() { fnCollectIteration(); });
 			}
@@ -3919,25 +3065,6 @@ void GGL::Learner::Start() {
 						if (config.steering.resolutionTermination)
 							experience.data.practiceMask = tPractice;
 						report["Steer/Practice Row Frac"] = tPractice.mean().item<float>();
-						report["Steer/Vector Active"] = (float)steerLoaded;
-						for (int md = 0; md < PPOLearner::STEER_MODES; md++) {
-							if (steerBlocks[md].numSteered == 0)
-								continue;
-							// The applied alpha is governed by whoever OWNS the slot this
-							// dwell: the applied meta cluster's bench state, or the
-							// incumbent's possession gate
-							bool alphaOn;
-							if (metaOn && appliedMetaHead >= 0) {
-								alphaOn = steerLoaded
-									&& !metaSlots[appliedMetaHead][appliedMetaCluster].benched
-									&& metaSigma[md] != 0;
-							} else {
-								alphaOn = steerLoaded && steerGateActive[md]
-									&& (steerVecEMA[md].defined() || (md > 0 && steerVecEMA[0].defined()));
-							}
-							std::string key = md == 0 ? "Steer/Alpha" : "Steer/Alpha " + fnModeName(md);
-							report[key] = alphaOn ? config.steering.alpha : 0.f;
-						}
 						report["Steer/RhoGate In-Band Frac"] = ppo->lastRhoGateFrac;
 						if (!std::isnan(ratingGuardEMA))
 							report["Steer/Rating EMA"] = ratingGuardEMA;
@@ -3951,7 +3078,6 @@ void GGL::Learner::Start() {
 					// and feed the causal gate from the steered-vs-control practice split
 					if (steerOn)
 						fnSteerUpdate(report, tValPreds, tGoalValPreds, tAdvantages, tLogProbs);
-						fnMetaUpdate(report);
 				}
 
 				// Free CUDA cache
