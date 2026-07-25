@@ -1,5 +1,10 @@
 # FRONTIER — the Potential Frontier: one axis (quasimetric potential) for the drill curriculum
 
+> **SUPERSEDED 2026-07-25.** The machinery described here was REMOVED from the trainer in the
+> composition-critic conformance pass. Kept for provenance and for the lessons it carries — not
+> as a description of the current system. What runs now: `research/reports/COMPOSITION_CRITIC.md`
+> (the spec) and `docs/ENABLED_INVENTORY.md` (the live inventory).
+
 **Pre-registered 2026-07-23 BEFORE trainer code, per repo doctrine (measurement
 convicting the problem, pre-registered criteria, an automatic guard, a revert path,
 one lever). Directive (user): the practice/drill curriculum should be driven by a

@@ -1,5 +1,10 @@
 # The Optimistic-Critic Ladder — Pulsar integration state (2026-07-18)
 
+> **SUPERSEDED 2026-07-25.** The machinery described here was REMOVED from the trainer in the
+> composition-critic conformance pass. Kept for provenance and for the lessons it carries — not
+> as a description of the current system. What runs now: `research/reports/COMPOSITION_CRITIC.md`
+> (the spec) and `docs/ENABLED_INVENTORY.md` (the live inventory).
+
 The full spec was delivered by the user; canonical copy lives in the session
 record and this file's Implementation-state section is the working map.
 
