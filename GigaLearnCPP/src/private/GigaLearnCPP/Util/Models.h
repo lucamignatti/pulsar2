@@ -6,12 +6,7 @@
 #include <torch/nn/modules/container/sequential.h>
 
 #include <torch/optim/adam.h>
-#include <torch/optim/adamw.h>
-#include <torch/optim/adagrad.h>
-#include <torch/optim/rmsprop.h>
-#include <torch/optim/sgd.h>
 
-#include "MagSGD.h"
 #include "Muon.h"
 
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
@@ -42,14 +37,6 @@ namespace GGL {
 		switch (type) {
 		case ModelOptimType::ADAM:
 			return new torch::optim::Adam(parameters, lr);
-		case ModelOptimType::ADAMW:
-			return new torch::optim::AdamW(parameters, lr);
-		case ModelOptimType::ADAGRAD:
-			return new torch::optim::Adagrad(parameters, lr);
-		case ModelOptimType::RMSPROP:
-			return new torch::optim::RMSprop(parameters, lr);
-		case ModelOptimType::MAGSGD:
-			return new MagSGD(parameters, lr);
 		case ModelOptimType::MUON:
 			return new Muon(parameters, MuonOptions(lr).momentum(0.95).nesterov(true));
 		}
@@ -63,18 +50,6 @@ namespace GGL {
 			switch (type) {
 			case ModelOptimType::ADAM:
 				static_cast<torch::optim::AdamOptions&>(group.options()).lr(lr);
-				break;
-			case ModelOptimType::ADAMW:
-				static_cast<torch::optim::AdamWOptions&>(group.options()).lr(lr);
-				break;
-			case ModelOptimType::ADAGRAD:
-				static_cast<torch::optim::AdagradOptions&>(group.options()).lr(lr);
-				break;
-			case ModelOptimType::RMSPROP:
-				static_cast<torch::optim::RMSpropOptions&>(group.options()).lr(lr);
-				break;
-			case ModelOptimType::MAGSGD:
-				static_cast<MagSGDOptions&>(group.options()).lr(lr);
 				break;
 			case ModelOptimType::MUON:
 				static_cast<MuonOptions&>(group.options()).lr(lr);

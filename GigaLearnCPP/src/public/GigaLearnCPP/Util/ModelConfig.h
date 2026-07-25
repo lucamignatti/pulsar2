@@ -3,12 +3,14 @@
 #include "../Framework.h"
 
 namespace GGL {
+	// ADAM is the DEFAULT (first member) - the reachability heads rely on that rather than
+	// naming it, because contrastive InfoNCE embeddings train poorly under orthogonalized
+	// updates. MUON is what every dense net asks for explicitly.
+	// ADAMW / ADAGRAD / RMSPROP / MAGSGD removed 2026-07-25: zero users, and MagSGD carried a
+	// whole implementation file. Safe to renumber - optimType is never serialized, it is
+	// rebuilt from ExampleMain on every boot.
 	enum class ModelOptimType {
 		ADAM,
-		ADAMW,
-		ADAGRAD,
-		RMSPROP,
-		MAGSGD,
 		MUON
 	};
 
