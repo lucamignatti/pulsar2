@@ -15,19 +15,6 @@ namespace GGL {
 		GPU_MPS
 	};
 
-	// RATING WATCH - measurement only. Publishes how far the training mode's rating sits below
-	// a slow EMA and below a decaying high-water mark (RatingWatch/* panels).
-	//
-	// This was a LATCH until 2026-07-25 (user-directed removal). It disabled steering, opponent
-	// styles, frontier drills, Nexto serve, league anchors, HEADROOM seek, RND injection and the
-	// Ladder drive together, for the rest of the process, with no auto-re-enable - and it
-	// false-tripped often enough on young-run volatility (thresholds already walked 110 -> 200
-	// and 75 -> 150 after three trips) that its misfires cost more than its catches. Nothing
-	// automatic watches for update damage now; that is the operator's job.
-	struct RatingWatchConfig {
-		float emaDecay = 0.995f;  // slow EMA (~140 rating-bearing iters half-life)
-		float peakDecay = 0.5f;   // high-water mark decays this much per rating eval
-	};
 
 	// Steered-practice collection ("optimism surgery"). During COLLECTION ONLY, current-policy
 	// rows belonging to the steered practice arenas get alpha*sigma*v added to the shared-trunk
@@ -175,8 +162,6 @@ namespace GGL {
 
 		SkillTrackerConfig skillTracker = {};
 
-		// Rating drawdown telemetry. No actuation - see struct.
-		RatingWatchConfig ratingWatch = {};
 
 
 
