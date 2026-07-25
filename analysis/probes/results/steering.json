@@ -1,0 +1,69 @@
+{
+  "checkpoint": 3047354368,
+  "n_matched_per_class": 721,
+  "direction_auc": 0.8919207988596513,
+  "direction_effect": 8.520049095153809,
+  "alphas": {
+    "-2.0": {
+      "engagement": 0.1115485564304462,
+      "attendance_of_free": 0.09733333333333333,
+      "contested_frac": 0.015748031496062992,
+      "n_feasible_readings": 762,
+      "aerial_touch_ratio": 0.0,
+      "touch_ratio": 0.00135,
+      "in_air_ratio": 0.281425,
+      "goals_per_episode": 0.12643678160919541,
+      "kickoff_first_touch_s": 3.966666666666667,
+      "n_kickoffs_touched": 27
+    },
+    "-1.0": {
+      "engagement": 0.18252126836813612,
+      "attendance_of_free": 0.17679127725856697,
+      "contested_frac": 0.0069605568445475635,
+      "n_feasible_readings": 1293,
+      "aerial_touch_ratio": 0.0,
+      "touch_ratio": 0.002075,
+      "in_air_ratio": 0.283825,
+      "goals_per_episode": 0.136986301369863,
+      "kickoff_first_touch_s": 3.3333333333333335,
+      "n_kickoffs_touched": 19
+    },
+    "0.0": {
+      "engagement": 0.17597173144876324,
+      "attendance_of_free": 0.1569052783803326,
+      "contested_frac": 0.022614840989399292,
+      "n_feasible_readings": 1415,
+      "aerial_touch_ratio": 0.0,
+      "touch_ratio": 0.0021375,
+      "in_air_ratio": 0.2853,
+      "goals_per_episode": 0.1794871794871795,
+      "kickoff_first_touch_s": 3.1666666666666665,
+      "n_kickoffs_touched": 21
+    },
+    "1.0": {
+      "engagement": 0.19290123456790123,
+      "attendance_of_free": 0.16520351157222665,
+      "contested_frac": 0.033179012345679014,
+      "n_feasible_readings": 1296,
+      "aerial_touch_ratio": 0.0,
+      "touch_ratio": 0.0013875,
+      "in_air_ratio": 0.30015,
+      "goals_per_episode": 0.10112359550561797,
+      "kickoff_first_touch_s": 3.2333333333333334,
+      "n_kickoffs_touched": 23
+    },
+    "2.0": {
+      "engagement": 0.2623083131557708,
+      "attendance_of_free": 0.25751421608448416,
+      "contested_frac": 0.00645682001614205,
+      "n_feasible_readings": 1239,
+      "aerial_touch_ratio": 0.0,
+      "touch_ratio": 0.00115,
+      "in_air_ratio": 0.312375,
+      "goals_per_episode": 0.10869565217391304,
+      "kickoff_first_touch_s": 3.566666666666667,
+      "n_kickoffs_touched": 25
+    }
+  },
+  "runtime_s": 51.4
+}

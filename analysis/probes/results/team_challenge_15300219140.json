@@ -1,0 +1,12 @@
+{
+  "checkpoint": "15300219140",
+  "ppt": 2,
+  "arena_steps": 36000,
+  "team_steps": 72000,
+  "double_commit_rate": 0.057180555555555554,
+  "solo_commit_rate": 0.4155138888888889,
+  "double_given_any_commit": 0.12096726802609156,
+  "crowding_rate": 0.04522222222222222,
+  "touches": 1385,
+  "challenge_at_touch_rate": 0.12346570397111914
+}

@@ -1,0 +1,34 @@
+{
+ "checkpoint": 27550023244,
+ "rows": 900000,
+ "char": {
+  "median_dz_pursued": -0.19716143608093262,
+  "median_dz_declined": -0.09544992446899414,
+  "scared_tail_frac": 0.5262135922330097
+ },
+ "median_dz_current": 0.1693156212568283,
+ "median_dz_fear": 2.6998305320739746,
+ "CURRENT": {
+  "n_states": 150,
+  "n_rolls": 300,
+  "playable_frac": 1.0,
+  "resolution_rate": 0.16666666666666666,
+  "reader_first_share": 0.48,
+  "unresolved_rate": 0.8333333333333334
+ },
+ "FEAR": {
+  "n_states": 150,
+  "n_rolls": 300,
+  "playable_frac": 1.0,
+  "resolution_rate": 0.09333333333333334,
+  "reader_first_share": 0.75,
+  "unresolved_rate": 0.9066666666666666
+ },
+ "bars": {
+  "playability": true,
+  "elicitation": false,
+  "balance": false,
+  "distinctness": true
+ },
+ "PASS": false
+}

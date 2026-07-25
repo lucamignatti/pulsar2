@@ -1,0 +1,44 @@
+{
+ "checkpoint": 27550023244,
+ "rows_arm": 400000,
+ "posthoc": true,
+ "s1_pairs": 175,
+ "s2_pairs": 414,
+ "cos_bp_vs_own": 0.9064497947692871,
+ "arms": {
+  "S1": {
+   "self_won": 0.09410729991204925,
+   "teammate_won": 0.029023746701846966,
+   "lost": 0.09498680738786279,
+   "none": 0.781882145998241,
+   "team_won": 0.1231310466138962,
+   "team_won_se": 0.028507095446347826,
+   "n_feasible_readings": 2274,
+   "n_reading_episodes": 108,
+   "aerial_touch_ratio": 7.2511601856297e-05,
+   "touch_ratio": 0.00237788046087374,
+   "in_air_ratio": 0.626950312049928,
+   "goals_per_episode": 0.15286624203821655,
+   "kickoff_first_touch_s": 3.3666666666666667,
+   "inband_frac": 0.6041666865348816,
+   "teamgate_frac": NaN
+  },
+  "S2": {
+   "self_won": 0.13352769679300291,
+   "teammate_won": 0.0629737609329446,
+   "lost": 0.0641399416909621,
+   "none": 0.7393586005830903,
+   "team_won": 0.19650145772594751,
+   "team_won_se": 0.04027729735045583,
+   "n_feasible_readings": 1715,
+   "n_reading_episodes": 100,
+   "aerial_touch_ratio": 8.751400224035845e-05,
+   "touch_ratio": 0.0021378420547287567,
+   "in_air_ratio": 0.6326612257961274,
+   "goals_per_episode": 0.20454545454545456,
+   "kickoff_first_touch_s": 3.1833333333333336,
+   "inband_frac": 0.6041666865348816,
+   "teamgate_frac": 0.5
+  }
+ }
+}

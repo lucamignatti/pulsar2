@@ -1,0 +1,25 @@
+{
+ "checkpoint": 34875184646,
+ "rows": 600000,
+ "families": {
+  "pre_landing": {
+   "base": 0.3836016666666667,
+   "top_share": 0.33566666666666667,
+   "enrichment": 0.8750396461607309
+  },
+  "grounded_high_ball": {
+   "base": 0.0024983333333333333,
+   "top_share": 0.0069166666666666664,
+   "enrichment": 2.7685123415610406
+  },
+  "proto_dribble": {
+   "base": 0.00025333333333333333,
+   "top_share": 0.0008666666666666666,
+   "enrichment": 3.4210526315789473
+  }
+ },
+ "novelty_boost_corr": 0.23377770748436025,
+ "novelty_ballz_corr": 0.3167275436278519,
+ "n_families_pass": 2,
+ "PASS": true
+}

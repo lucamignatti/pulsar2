@@ -147,10 +147,15 @@ Four layers, bottom-up:
    collection/processing/PPO; `PPOLearner` owns the models; aux modules:
    Reachability (InfoNCE self-model), **the Optimistic-Critic Ladder**
    (`GapState` — expectile sensor + quasimetric map + goal/concede banks +
-   advantage drive + policy-head wire; see its own section below), PSD
-   (Basin-Racing outer loop), League (QD MAP-Elites archive), PolicyVersionManager
-   (Elo skill tracker), Proposer/DrillBank (present, disabled — the 9uz761ua
-   regression machinery).
+   advantage drive + policy-head wire; see its own section below), the HEADROOM
+   composition critic (twin V-dagger heads), League (QD MAP-Elites archive) and
+   PolicyVersionManager (Elo skill tracker).
+   **REMOVED 2026-07-25** (strip; restore point tag `pre-strip-20260725`): PSD
+   (Basin-Racing), Proposer/DrillBank (the 9uz761ua regression machinery), and
+   TransferLearn. All three had been disabled by pre-registered verdicts and had
+   drifted incompatible with the live net. Their post-mortems remain in
+   `analysis/probes/*.md`; the code is one `git log -- <path>` away. PSD's two
+   useful signals were PROMOTED, not deleted — see `Util/Plasticity.h`.
 4. **`src/ExampleMain.cpp`** — THE configuration. Everything (rewards, arenas,
    net sizes, all feature flags) is code here, heavily commented with the
    rationale and history of each value. Config changes = edit + rebuild +
@@ -223,7 +228,7 @@ struct and lambdas. Key invariants:
   absorbs the one-iteration staleness (stored logprobs come from the snapshot
   that acted). **Barrier zone**: the top of each iteration, worker joined — the
   ONLY place shared state (model weights read by the worker, steering vectors,
-  version manager, league, PSD) may be mutated. The shared thread pool belongs
+  version manager, league) may be mutated. The shared thread pool belongs
   to the worker during learn; never use `fnParallelFor` from learn-prep (ad-hoc
   `std::thread`s are the pattern there, e.g. the steering landing sims).
 - **Episodes are appended whole** to `combinedTraj` at finalize — one player's
@@ -242,7 +247,7 @@ struct and lambdas. Key invariants:
 ### Reward stack (`BuildRewards()`, ExampleMain)
 
 Whole-stack invariant: every component is exactly zero-sum or antisymmetric →
-the stack sums to 0 across players, so PSD/league fitness is pure competitive
+the stack sums to 0 across players, so league fitness is pure competitive
 margin. Rules encoded in comments there: PBRS potentials MUST use `TRAIN_GAMMA`
 (== `gaeGamma`, or telescoping breaks); never gate a potential; `ZeroSum(PBRS)`
 is still exact PBRS; ShotReward is deliberately absent (its shot-attribution is
@@ -251,15 +256,25 @@ phantom-farmable — source-verified exploit in GameEventTracker).
 Current live weights (HEAD): BallToGoalPotential **75** (already antisymmetric —
 no ZeroSum wrapper, that would double it), TouchAccel **10**, Demo **37.5**,
 BallProximityPotential **4** (team-closest, far-field linear term added in 5.0),
-GuardedPickupBoost **6**, AerialTouch **120**, AirInterceptPotential **40**,
-OpposedSave **25**, CarEnergyPotential **15** (tempo credit), TimeCost **0.01**
-(not PBRS, not zero-sum-wrapped; ~3% of a goal per 30s episode), Goal **150**
-(the objective, exactly ±150). All the ZeroSum-wrapped terms carry `TEAM_SPIRIT`.
+GuardedPickupBoost **6**, AerialTouch **120**, AirInterceptPotential **75**,
+ConsecutiveAirTouch **30**, WallJumpToBall **30**, FlipReset **40**, AirReward
+**0.45**, OpposedSave **25**, CarEnergyPotential **75** (tempo credit), TimeCost
+**0.01** (not PBRS, not zero-sum-wrapped; ~3% of a goal per 30s episode),
+TeamPressure **0.15**, KickoffRace **25**, Goal **150** (the objective, exactly
+±150). All the ZeroSum-wrapped terms carry `TEAM_SPIRIT`.
+(Weights re-read from ExampleMain 2026-07-25 — the previous list here had drifted:
+it understated AirIntercept 40→75 and CarEnergy 15→75 and omitted five terms.)
 
-- **AerialTouch 120 / AirIntercept 40 are SCAFFOLD weights** for 5.0's formative
-  aerial window (25→50→120 and 10→20→40 over REBALANCE-1 and the cold start),
-  flagged to anneal back toward 50/20 once aerial-touch share establishes. Don't
-  read them as steady-state values.
+- **AerialTouch 120 / AirIntercept 75 are SCAFFOLD weights** for 5.0's formative
+  aerial window, flagged to anneal back down once aerial-touch share establishes.
+  Don't read them as steady-state values. **Their stated anneal trigger does not
+  exist**: six SCAFFOLD weights totalling ~260 (vs Goal 150) name `mechanic_census`,
+  which measures none of the relevant mechanics and cannot load the live
+  checkpoints — so "anneal later" currently means "never". Either implement it or
+  delete the promise.
+- **CarEnergyPotential 75** rode uncommitted through two cold starts and is
+  recorded but UNMEASURED on this lineage; extrapolation from `REWARD_SHAPING.md`
+  puts it near 60% of per-step credit density. Re-measure before trusting it.
 - **`TEAM_SPIRIT` = 0.3 (PHASE A / 1v1-dominant) → 0.6 (PHASE B onward)**, set
   from the `PHASE_B` marker file in `main()`. It's an algebraic no-op in 1v1
   (teamMean == own); it only shapes 2v2/3v3 credit.
@@ -281,10 +296,14 @@ OpposedSave **25**, CarEnergyPotential **15** (tempo credit), TimeCost **0.01**
   head-to-head vs recent selves improves (measured: nontransitivity is real
   here). Mature Rating noise band is ±30–50 — but **this run is young and
   steeply climbing, so Rating legitimately swings ±80 around the trend**. The
-  two auto-steering-kill latches were loosened for that (`ratingPeakTrip`
-  110→200, `ratingDrawdownTrip` 75→150) after 3 false trips on pure volatility;
-  commit messages flag this as temporary — walk both back down toward 110/75 as
-  the Elo trajectory flattens into the mature band.
+  two auto-kill latches were loosened for that (110→200, 75→150) after 3 false
+  trips on pure volatility — and then **the latch was REMOVED entirely
+  (2026-07-25, user-directed)** after it fired a fourth time, on a spike-and-settle
+  where Rating was still +213 ABOVE its own EMA, taking six unrelated live
+  mechanisms dark. What remains is measurement only: `RatingWatch/Drawdown From
+  EMA` and `/From Peak`. **There is no automatic update-damage guard any more** —
+  the boot sanity probe and the impossible-arena certificate are now the only
+  automatic safety checks, and neither sees gradual update damage.
 - **QD League**: MAP-Elites archive over behavior descriptors (quantile-adaptive
   bins), PFSP-sampled opponents on `descendOpponentFrac` of iterations (0.35 —
   raised from 0.25 after measuring exploitability by archived styles). Members
@@ -294,12 +313,12 @@ OpposedSave **25**, CarEnergyPotential **15** (tempo credit), TimeCost **0.01**
   `FromJSON` load time, not just `LoadInto` — any archive saved pre-517
   self-heals on next checkpoint load. Watch this pattern on any future net-width
   change.
-- **PSD (Basin-Racing)**: pure-ES probe rounds gated by `warmupUntilPlateau` —
-  fire when the phase is plateaued (Rating gain < threshold) AND the iteration
-  budget is met; designed to engage exactly when Rating stalls. Probe rounds
-  repurpose arenas and step them out from under in-flight episodes (trajectories
-  are explicitly cleared in the barrier when a probe fires).
-- Eval paths (skill tracker, league, PSD, render) are all UNSTEERED and feed
+- **Plasticity telemetry** (`Util/Plasticity.h`, promoted out of PSD when it was
+  retired): `Plasticity/Trunk EffRank`, `/Policy EffRank`, `/Policy Dead Units`.
+  Weights-only, every iteration, no actuation. Kept because the residual
+  architecture (`45a59d5`) was justified BY effective-rank decay — deleting PSD
+  wholesale would have removed the ability to check that rationale.
+- Eval paths (skill tracker, league, render) are all UNSTEERED and feed
   ZERO Ladder-wire values — verified; Rating always measures the raw policy,
   symmetric across the pool.
 

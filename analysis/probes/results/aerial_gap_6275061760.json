@@ -1,0 +1,41 @@
+{
+ "checkpoint": 6275061760,
+ "touch_hist_1v1": {
+  "ground": 0.9673109721432632,
+  "jumpable": 0.026151222285389426,
+  "low_aerial": 0.005400795906765207,
+  "true_aerial": 0.0011370096645821489,
+  "n_touches": 3518
+ },
+ "opportunity_1v1": {
+  "n_opportunities": 3196,
+  "left_ground_frac": 0.5913642052565707,
+  "aerial_touch_frac": 0.02753441802252816,
+  "mean_boost_at_opp": 38.42152784352607
+ },
+ "touch_hist_2v2": {
+  "ground": 0.9656765676567657,
+  "jumpable": 0.015181518151815182,
+  "low_aerial": 0.014521452145214522,
+  "true_aerial": 0.0046204620462046205,
+  "n_touches": 1515
+ },
+ "opportunity_2v2": {
+  "n_opportunities": 2589,
+  "left_ground_frac": 0.432985708767864,
+  "aerial_touch_frac": 0.03901120123599845,
+  "mean_boost_at_opp": 40.154607778214356
+ },
+ "drill_completion": {
+  "n": 300,
+  "touch_frac": 0.11333333333333333,
+  "touch_z_median": 1020.7361145019531,
+  "touch_above_goalz_frac": 0.9411764705882353
+ },
+ "takeoff_probe": {
+  "n": 300,
+  "jump_1s_frac": 0.92,
+  "carz500_frac": 0.02,
+  "aerial_touch_frac": 0.0
+ }
+}
