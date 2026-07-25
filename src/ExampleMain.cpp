@@ -97,7 +97,7 @@ static constexpr const char* PHASE_B_MARKER = "PHASE_B_ENGAGED";
 // 5.0: PHASE-SCHEDULED (PULSAR5.md) - 0.3 while 1v1 dominates (individual credit
 // for skill formation, free-rider bounded), 0.6 from PHASE B (shared fate makes
 // deferring to the better-placed teammate payoff-neutral - the trust forcing;
-// steering the belief failed, TRUST_PAIR.md). Set in main() after the phase
+// steering the belief failed, research/reports/archive/TRUST_PAIR.md). Set in main() after the phase
 // marker is read, before the envs (and their reward stacks) are built.
 static float TEAM_SPIRIT = 0.3f;
 
@@ -261,7 +261,7 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// REWARD_SHAPING.md's measured table puts 75 near 60% of per-step credit density,
 		// which would make tempo the dominant shaping term - that is an extrapolation, not
 		// a measurement. OPEN: re-measure per-term credit share on the resid lineage and
-		// either justify 75 or walk it back. See analysis/probes/DEAD_CODE_AUDIT.md Q11.
+		// either justify 75 or walk it back. See research/reports/DEAD_CODE_AUDIT.md Q11.
 		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 75.f },
 
 		// ESCALATE-1 (2026-07-16, user-directed): small time cost - urgency vs the
@@ -653,7 +653,7 @@ int main(int argc, char* argv[]) {
 	// frontier for META steering. Offline (conservative frozen-phi test): calibration
 	// DECISIVELY monotone (~7x the ball head's margin; window 45 chosen by margin across
 	// {20,45,90}); per-cluster causal steerability NOT yet demonstrated offline (0/3
-	// clusters clean). Revert = false. Record: analysis/probes/carstate_head_validate.py.
+	// clusters clean). Revert = false. Record: research/tools/carstate_head_validate.py.
 	// INCIDENT (2026-07-14, same day): the first deployment let this head's InfoNCE
 	// co-train phi AND the shared trunk while the fresh head was at chance - its loss
 	// alone (~2x every other aux term combined; Reach/Aux Loss 0.5 -> 1.0+) churned the
@@ -933,7 +933,7 @@ int main(int argc, char* argv[]) {
 	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often
 	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
 
-	// PERMANENT SPACED ANCHORS (2026-07-19, analysis/probes/LEAGUE_ANCHORS.md).
+	// PERMANENT SPACED ANCHORS (2026-07-19, research/reports/LEAGUE_ANCHORS.md).
 	// Measured: the evolved archive is COLLAPSED - League/Member Count 3 and Cell Count 1
 	// of 216 in 92% of report blocks. Mechanism (code-verified): fitness is re-scored
 	// against the improving main every refresh, so every fixed style ratchets below
@@ -948,7 +948,7 @@ int main(int argc, char* argv[]) {
 	// anchors migrate via Model::Load's zero-pad on the way in.
 	// 0.05 of ALL iterations = ~1/7 of the existing 0.35 league serve: a REALLOCATION, not
 	// extra arena cost. Guarded by the rating latch; revert = set this to 0 (byte-identical).
-	// Success criterion is the anchor battery's real-Elo slope (analysis/probes/
+	// Success criterion is the anchor battery's real-Elo slope (research/tools/
 	// anchor_battery.py), NOT Rating - see LEAGUE_ANCHORS.md pre-registration.
 	cfg.league.anchorFrac = 0.05f;
 	cfg.league.anchorMaxServed = 24;        // serving cap; disk archive keeps everything
@@ -972,7 +972,7 @@ int main(int argc, char* argv[]) {
 	// a slice of practice arenas runs unsteered as controls so a causal auto-gate can drop alpha
 	// to 0 the moment steering stops out-engaging the controls. No sidecar, nothing to babysit.
 	// Protocol, measured effects, and REVERT path (flag off + resume the branch-point backup in
-	// build/checkpoints_3.1_branch_backup/): analysis/probes/STEERED_PRACTICE.md.
+	// build/checkpoints_3.1_branch_backup/): research/reports/STEERED_PRACTICE.md.
 	//   Watch: Steer/* panels (Engagement Steered vs Control, Gate Active, Dir Drift, Pairs);
 	//   Player/Aerial Touch Ratio + contest metrics (must rise within ~a day or the mechanism
 	//   isn't engaging); GAE ratio/KL (same off-policyness class as pipelinedCollection);
@@ -992,7 +992,7 @@ int main(int argc, char* argv[]) {
 	//     branch backup + quarantine ritual.
 	//   - Watch: Steer/* panels (Alpha, Engagement Steered/Control/Match, Gate Delta EMA,
 	//     RhoGate In-Band Frac), aerial/contest metrics, Rating slope, RatingWatch/* drawdowns.
-	// Post-mortems + stage-2 escalation path: analysis/probes/STEERED_PRACTICE.md.
+	// Post-mortems + stage-2 escalation path: research/reports/STEERED_PRACTICE.md.
 	// STAGE-1 v2 (2026-07-12, after ~200M treated steps of v1): v1's guidance metric ("landing
 	// attendance") aged out - pool-Elo drifted down while the style beat its predecessor 42-24
 	// and lost to older selves 12-19. v2 re-aims the SAME machinery at a possession-outcome
@@ -1107,7 +1107,7 @@ int main(int argc, char* argv[]) {
 		// disagreement declines by the best-placed teammate ("states it thinks could be
 		// good but is too scared to commit to" - the dataset-quality lever). Conviction
 		// and offline drill validation (all four pre-registered bars passed):
-		// analysis/probes/CREDIT_PROBE.md + FEAR_MINE.md. useFrac/noise/dose untouched;
+		// research/reports/CREDIT_PROBE.md + FEAR_MINE.md. useFrac/noise/dose untouched;
 		// obeys the rating latch + pool staleness like all frontier mining.
 		// Watch: Steer/Frontier Dz 2v2/3v3 (banked-pool mean disagreement, expect ~+2),
 		// Steer/Frontier Pool sizes, and the next offline decline census.
@@ -1142,7 +1142,7 @@ int main(int argc, char* argv[]) {
 		// coverage, (5) a schema tag so stale persisted D is discarded on load.
 		// g_AirDrillCurriculum = std::make_shared<RLGC::AirDrillCurriculum>();
 		// cfg.steering.airDrillCurriculum = g_AirDrillCurriculum;
-		// EMERGENCE RC2 Stage O (2026-07-16, analysis/probes/EMERGENCE.md): the
+		// EMERGENCE RC2 Stage O (2026-07-16, research/reports/EMERGENCE.md): the
 		// learning-progress miner, OBSERVER ONLY - characterization panels (Miner/*)
 		// must show it rediscovering the hand-found state families unprompted before
 		// any actuation is registered. Watch: Miner/PreLanding Frac vs Base (bar:

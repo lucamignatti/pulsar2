@@ -158,7 +158,7 @@ namespace GGL {
 		float pfspTemp = 1.0f;            // PFSP matchmaking temperature
 		float descendOpponentFrac = 0.25f;// probability a training iteration faces a league opponent
 
-		// === Permanent spaced ANCHOR opponents (analysis/probes/LEAGUE_ANCHORS.md) ===
+		// === Permanent spaced ANCHOR opponents (research/reports/LEAGUE_ANCHORS.md) ===
 		// Measured problem (2026-07-19): the evolved archive collapses to ~3 members / 1
 		// occupied cell because fitness (= member goals - main goals) is RE-SCORED against
 		// the improving main, so every fixed style ratchets below competenceFloor and is

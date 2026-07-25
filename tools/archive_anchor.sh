@@ -6,7 +6,7 @@
 # goes. When we tried to locate when 1v1 progress slowed, every checkpoint
 # between 18.88B and 27.5B was gone: only two branch backups survived. Anchors
 # fix that permanently, and double as the fixed opponents for the honest
-# match-play Elo battery (analysis/probes/anchor_battery.py) - the pool Rating
+# match-play Elo battery (research/tools/anchor_battery.py) - the pool Rating
 # overstates real progress ~6x, so a FIXED yardstick is the only trustworthy one.
 #
 # Never deletes anything. Copies are atomic (<ts>.tmp then rename). Safe to run

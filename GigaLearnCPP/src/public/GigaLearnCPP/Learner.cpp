@@ -1791,7 +1791,7 @@ void GGL::Learner::Start() {
 
 			// Obs layout (AdvancedObs, 1v1), team-canonical frame - the field is symmetric under
 			// the canonical flip, so landing sims run directly in it. Constants mirror the
-			// validated offline pipeline (analysis/probes/steer_test.py).
+			// validated offline pipeline (research/tools/steer_test.py).
 			constexpr int BALL_POS = 0, BALL_VEL = 3, BALL_ANGVEL = 6, SELF_POS = 51;
 			constexpr float POS_SCALE = 5000, VEL_SCALE = 2300, ANGVEL_SCALE = 3;
 			constexpr float ARM_Z = 300, LANDING_Z = 111.25f;
@@ -2491,7 +2491,7 @@ void GGL::Learner::Start() {
 			}
 
 			// 8) EMERGENCE RC2 Stage O - learning-progress miner, OBSERVER ONLY
-			// (analysis/probes/EMERGENCE.md). Picks top-|z-scored advantage| rows,
+			// (research/reports/EMERGENCE.md). Picks top-|z-scored advantage| rows,
 			// both signs, spaced emergenceMinerSpacing apart (episodes are row-
 			// contiguous, so spacing is an episode-dedupe proxy). Panels test the
 			// pre-registered rediscovery bars against the same-iteration base rates;
@@ -2596,7 +2596,8 @@ void GGL::Learner::Start() {
 		// cluster ever named); outcomes are model-free continuous ATTAINMENT (how close
 		// future achieved states got to the goal within the head's own HER horizon),
 		// compared only through within-population quantiles. Offline validation
-		// (analysis/probes/meta_frontier_validate.py, STEERING_META_40.md): the ball
+		// (research/tools/meta_frontier_validate.py, and the archived report
+		// research/reports/archive/STEERING_META_40.md): the ball
 		// head's calibration is monotone (a real frontier detector), the car head's is
 		// not for arbitrary goals (it self-disables here while keeping its contact-gate
 		// role), and at least one emergent cluster shows a monotone causal attainment
@@ -3565,15 +3566,26 @@ void GGL::Learner::Start() {
 										ladderImpTouches++;
 
 						// Nexto yardstick: cumulative goals for/against the external opponent
-						// (RS_TEAM_FROM_Y = the CONCEDING team; conceder == Nexto -> we scored)
-						if (oppExternal)
-							for (auto& gs : envSet->state.gameStates)
+						// (RS_TEAM_FROM_Y = the CONCEDING team; conceder == Nexto -> we scored).
+						// SKIP the impossible-control arenas: they spawn certified-unreachable
+						// ballistic intercepts, so whatever the ball does there is a property of
+						// the falsification fixture, not of play against Nexto. This series is the
+						// only pool-inflation-proof yardstick in the run and must not be diluted
+						// by arenas that exist to be unwinnable.
+						if (oppExternal) {
+							int nArenas = (int)envSet->state.gameStates.size();
+							for (int arenaIdx = 0; arenaIdx < nArenas; arenaIdx++) {
+								if (ladderImpOn && arenaIdx >= ladderImpStart && arenaIdx < ladderImpEnd)
+									continue;
+								auto& gs = envSet->state.gameStates[arenaIdx];
 								if (gs.goalScored) {
 									if (RS_TEAM_FROM_Y(gs.ball.pos.y) == oppTeam)
 										nextoGoalsFor++;
 									else
 										nextoGoalsAgainst++;
 								}
+							}
+						}
 
 						// Deliberate-practice DRILL snapshot capture (Stage 3): every snapshotEveryK
 						// steps, record enough of each arena's physics state to restore play from

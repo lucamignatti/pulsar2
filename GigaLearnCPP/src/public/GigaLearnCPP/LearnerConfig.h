@@ -252,7 +252,7 @@ namespace GGL {
 		float gateReenableAbove = -0.01f; // decay path back to probing
 	};
 
-	// EMERGENCE RC1 (2026-07-16, analysis/probes/EMERGENCE.md): frontier optimism via
+	// EMERGENCE RC1 (2026-07-16, research/reports/EMERGENCE.md): frontier optimism via
 	// RND novelty. The RND predictor is a trained SELF-MODEL of familiarity over
 	// (trunk output, action); its prediction error DEFINES the acquisition frontier,
 	// and a small mean-zero, std-matched adjustment prices optimism onto the
@@ -292,7 +292,7 @@ namespace GGL {
 		float driveBeta = 0.0f;
 		int driveWarmupIters = 50;
 
-		// ===== OPTIMISTIC-CRITIC LADDER (analysis/probes/LADDER.md; upstream-validated
+		// ===== OPTIMISTIC-CRITIC LADDER (research/reports/LADDER.md; upstream-validated
 		// spec, user-authorized full build 2026-07-18). Third rung: a quasimetric map
 		// over raw obs (d(x,y) = sum_j relu(f(E(x))_j - f(E(y))_j): triangle inequality
 		// + asymmetry by construction, units ~ policy steps) with goal/concede obs

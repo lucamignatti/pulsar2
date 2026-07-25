@@ -25,6 +25,12 @@ LeagueArchive::LeagueArchive(const LeagueConfig& cfg, PPOLearner* ppo, RLGC::Env
 	mc.numArenas = 16;
 	matchEnv = new RLGC::EnvSet(mc);
 	for (int i = 0; i < (int)matchEnv->arenas.size(); i++) {
+		// Fitness here is goalScored ONLY - nothing reads these rewards. Inherited from
+		// trainEnv->config, the full 16-term stack was being evaluated for every player on every
+		// step of every evolve match (~58k discarded player-steps per evolve) IN THE BARRIER
+		// ZONE, where the collection worker is joined and the cost is pure wall clock.
+		// Mirrors PolicyVersionManager.cpp:31, which already clears its skill-tracker envs.
+		matchEnv->rewards[i].clear();
 		matchEnv->stateSetters[i] = { new RLGC::FuzzedKickoffState() };
 		matchEnv->terminalConditions[i] = { new RLGC::GoalScoreCondition() };
 	}

@@ -63,9 +63,6 @@ libtorch
 # remote tooling
 tools/viz/.venv/
 run_logs/
-# scratch analyses stay untracked, but the probe suite ships (data/ excluded below)
-analysis/*
-!analysis/probes/
 build-viz/
 
 # local build trees and run artifacts
@@ -73,10 +70,12 @@ build-steer/
 build-viz/
 run_logs/
 
-# probe analysis: datasets and checkpoint caches are large and regenerable
-analysis/probes/data/
+# research/ (offline analysis): the toolkit, reports and results JSON all ship.
+# Only the regenerable bulk is excluded - datasets, checkpoint caches, the venv.
+research/data/
+research/.venv/
+research/wandb/
 __pycache__/
-analysis/probes/wandb/
 
 # Serena MCP tool cache
 .serena/

@@ -16,7 +16,7 @@ namespace RLGC {
 	// termination: the critic SEES episode starts at resets and learns the drill value
 	// profile - no GAE surgery.
 	//
-	// Offline validation (analysis/probes/frontier_validate.py): reconstruction is 100%
+	// Offline validation (research/tools/frontier_validate.py): reconstruction is 100%
 	// playable, and 250uu / 250uu/s Gaussian perturbation yields balanced coin-flip
 	// first-touch races. Entries are staleness-bounded: a pool older than ~2 iterations
 	// re-imports the stale-direction problem in state space (roadmap phase-3 guard).

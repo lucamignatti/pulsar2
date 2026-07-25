@@ -25,8 +25,8 @@ were paid for in Elo.**
 > version, tickSkip, obs/net dims, reward weights, checkpoint dirs) the truth is
 > now the 5.0v3 run: RocketSim **v3** (Rust FFI), **tickSkip 8 / actionDelay 0**
 > (15 Hz), **230-dim padded obs**, **517-wide policy head**, `checkpoints_5.0v3`.
-> Sections are updated inline; `analysis/probes/PULSAR5.md` (cold-start design)
-> and `analysis/probes/LADDER.md` (Ladder deploy record) are the canonical
+> Sections are updated inline; `research/reports/PULSAR5.md` (cold-start design)
+> and `research/reports/LADDER.md` (Ladder deploy record) are the canonical
 > current-run docs.
 
 The operating doctrine, learned from run 9uz761ua (a proposer/drill mechanism
@@ -77,7 +77,7 @@ Key operational facts:
   behaviorally destroyed policy** (1/10 kickoff touches, 89% aimless air time).
   No structural check can catch these. Detection: the in-run rating guard trips
   (it did), and offline a 2-minute kickoff test
-  (`analysis/probes` — healthy ≈ 10/10 touches, median ~3.4s) is definitive.
+  (`research/tools` — healthy ≈ 10/10 touches, median ~3.4s) is definitive.
   Automatic defenses (same day): the boot sanity probe (3 kickoff episodes on a
   throwaway arena, >= 2 must have touches, only for checkpoints claiming rating
   >= 400), a golden archive keeping the top-3 rated checkpoints outside rotation
@@ -114,7 +114,7 @@ Key operational facts:
   it MUST still build the model with the Ladder architecture flags
   (`gapSensor.wireEnabled`) or it loads a 512-wide policy head against 517-wide
   checkpoints — the exact bug fixed in `ba4f33a`.
-- Python analysis env: `analysis/probes/requirements.txt` (torch-cpu, sklearn,
+- Python analysis env: `research/tools/requirements.txt` (torch-cpu, sklearn,
   matplotlib, pip `RocketSim==2.2.1`). The vendored training engine is now
   RocketSim **v3** (Rust); the offline harness was migrated to 5.0 dynamics
   (tickSkip 8, actionDelay 0, DT auto-derived) so rollout parity holds — the
@@ -202,7 +202,7 @@ both: `half-life_s = ln2 / (-ln γ) / (120/tickSkip)`.
 - **Checkpoints** (`.lt`, C++ `torch::save`): load directly in Python with
   `torch.jit.load(path, map_location="cpu")`; params named `<seqIdx>.weight`;
   2-D=Linear, 1-D=LayerNorm, index gaps=activations. No forward method — rebuild
-  eagerly (see `analysis/probes/load_checkpoint.py`).
+  eagerly (see `research/tools/load_checkpoint.py`).
 - Reachability trains by HER: positives are FUTURE ACHIEVED states within a
   step-count window (car head vs ball head; verify current window lengths in
   code — note a step is now 15 Hz / ~0.067s under tickSkip 8, so any
@@ -229,7 +229,7 @@ struct and lambdas. Key invariants:
 - **Episodes are appended whole** to `combinedTraj` at finalize — one player's
   episode is row-contiguous. In-trainer analyses (steering derivation) rely on
   `row+k` = same player k steps later. (Offline datasets from
-  `analysis/probes/collect_dataset.py` interleave 2 players per step instead —
+  `research/tools/collect_dataset.py` interleave 2 players per step instead —
   different indexing; this mismatch has caused bugs, check which layout you're in.)
 - **GAE terminal semantics** (GAE.cpp): `NORMAL` = true terminal, no bootstrap;
   `TRUNCATED` = bootstrap from a stored next-state value. THE central hard-won
@@ -308,7 +308,7 @@ OpposedSave **25**, CarEnergyPotential **15** (tempo credit), TimeCost **0.01**
 This is the mechanism now actuating the "explore your frontier" program; it
 **superseded activation steering** (next section, parked). Live on 5.0v3 since
 ~18.88B steps (built across `fc34dd3` → `36f1e01` → `15eabda`). Canonical record:
-`analysis/probes/LADDER.md`. Implementation: `GapState` in Learner.cpp; wire in
+`research/reports/LADDER.md`. Implementation: `GapState` in Learner.cpp; wire in
 PPOLearner; config `GapSensorConfig` / `cfg.gapSensor.*` in ExampleMain.cpp.
 
 **Why it exists**: steering nudged *behavior* toward feasible plays via an
@@ -461,7 +461,7 @@ arrives": +10pp air time, −10pp engagement, measured); training on all rows
 only re-splits the bias (critic learns the blend). A sound retry requires a
 dedicated practice-value head keyed on the ROW TAG (not the obs), or
 reset-based practice episodes (the AirDrillState pattern, where the critic sees
-the boundary coming). Full post-mortems: `analysis/probes/STEERED_PRACTICE.md`.
+the boundary coming). Full post-mortems: `research/reports/STEERED_PRACTICE.md`.
 
 **Open questions and their planned fixes** (in priority order):
 1. *Inference-time steering*: the trained policy beat its own unsteered self
@@ -479,7 +479,7 @@ the boundary coming). Full post-mortems: `analysis/probes/STEERED_PRACTICE.md`.
 3. The steering direction is not checkpointed (re-derives within 1 iteration of
    any restart — first iteration always runs unsteered; by design, but relevant
    to 1).
-4. `analysis/probes/derive_steering.py` still uses the v1 landing-attendance
+4. `research/tools/derive_steering.py` still uses the v1 landing-attendance
    metric — offline analysis only now; the in-trainer v2 possession derivation
    is authoritative.
 5. Metric aging is a live risk pattern: the v1 "landing attendance" definition
@@ -488,22 +488,44 @@ the boundary coming). Full post-mortems: `analysis/probes/STEERED_PRACTICE.md`.
    style ("winning the ball first" is good at every level) — but audit any
    behavioral metric against head-to-head results periodically.
 
-## analysis/probes — the measurement toolkit
+## research/ — the measurement program
 
-Pipeline scripts (see its README.md for env + invocation; all offline CPU,
-copy-first checkpoint access, deterministic seeds):
-`load_checkpoint.py` (jit-load + eager rebuild + `PulsarPolicy` with h1/h2/phi
-taps) → `collect_dataset.py` (self-play with exact obs/action/step parity) →
-`label_landing.py` (ball-only touchdown sims) → `train_probes.py` (ridge probes,
-episode-grouped CV, controls) — plus `knowing_doing.py` (the gap analysis),
-`calibrate_rho.py`, `steer_test.py` (offline steering validation),
-`derive_steering.py`, `compare_checkpoints.py` (mirror style panels +
-head-to-head cross-play with side swap), `kd_curve.py` (gap closure across
-policy_versions). The many `*.md` reports there are the experimental record.
-Current-run canonical: `PULSAR5.md` (5.0 cold-start design) and `LADDER.md`
-(Optimistic-Critic Ladder deploy record). `STEERED_PRACTICE.md` is the canonical
-history of the parked steering system; `STEERING_ROADMAP.md` is a stale
-4.0-lineage planning doc, superseded — do not treat it as current.
+Everything offline lives under `research/` (it was `analysis/probes/` until
+2026-07-25; the old name was a fossil of the Phase 0 linear-probe study it grew
+out of). Four parts, each with its own README:
+
+- **`research/reports/`** — the experimental record, one `.md` per study, most
+  opening with a pre-registration block dated before the run. Its `README.md` is
+  the status index (CANONICAL / RESULT / HISTORICAL / SUPERSEDED) and is the
+  right entry point. Current-run canonical: `PULSAR5.md` (cold-start design),
+  `LADDER.md` (Ladder deploy record), `FRONTIER.md`, `REWARD_SHAPING.md`,
+  `DEAD_CODE_AUDIT.md`, `LEAGUE_ANCHORS.md`. `STEERED_PRACTICE.md` is the
+  canonical history of the parked steering system and its episode-boundary rule
+  still binds. **`reports/archive/`** holds nine superseded 4.0-lineage steering
+  studies (including `STEERING_ROADMAP.md`) — provenance only, never a
+  justification for a new change.
+- **`research/tools/`** — the Python toolkit. Pipeline: `load_checkpoint.py`
+  (jit-load + eager rebuild + `PulsarPolicy` with h1/h2/phi taps) →
+  `collect_dataset.py` (self-play at exact obs/action/step parity) →
+  `label_landing.py` (ball-only touchdown sims) → `train_probes.py` (ridge
+  probes, episode-grouped CV, controls). Plus `anchor_battery.py` /
+  `match_play_eval.py` (real match-play Elo vs fixed anchors — use these, not
+  `Rating/1v1`), `compare_checkpoints.py`, `knowing_doing.py`, `kd_curve.py`,
+  `calibrate_rho.py`, `steer_test.py` / `steer_team.py` (rollout harnesses that
+  the steering-era drivers still import).
+- **`research/results/`** — JSON output keyed by checkpoint timestep.
+- **`research/data/`, `research/.venv/`** — untracked, large, regenerable.
+
+**Two live traps** (both written up in `reports/DEAD_CODE_AUDIT.md` §5/§15,
+neither fixed): `load_checkpoint.py`'s default checkpoint root does not list
+`checkpoints_resid`, so it silently falls through to the frozen
+`checkpoints_5.0v3` — pass `PULSAR_CKPT_ROOT` explicitly; and it asserts a
+512-wide 2-layer non-residual trunk, which the residual run does not match. A
+naive shape fix would replay the h2-truncation bug class.
+
+Offline behavioral numbers dated before 2026-07-19 used pre-activation `h2`
+(`reports/H2_TRUNCATION.md`); affected reports carry a banner. In-trainer
+telemetry is unaffected — that bug was in the toolkit, not the C++.
 
 Methodological traps already paid for (do not rediscover):
 - Team-canonical labels (see above). World-frame spatial targets ruin probes.

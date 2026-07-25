@@ -51,7 +51,7 @@ namespace GGL {
 		// how") - the movement-capability frontier for the META steering system. The
 		// head + HER machinery predate this (car-proposer era); this flag trains it
 		// INDEPENDENT of the proposer. Offline (conservative frozen-phi test,
-		// analysis/probes/carstate_head_validate.py): its calibration curve is monotone
+		// research/tools/carstate_head_validate.py): its calibration curve is monotone
 		// with ~7x the ball head's margin at every candidate window - the sharpest
 		// frontier detector of the three heads. The window below was chosen BY
 		// calibration margin across {20,45,90}, not by hand - AT tickSkip 4; that
