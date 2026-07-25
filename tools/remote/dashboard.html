@@ -12,25 +12,40 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 15px/1.45 -apple-system, system-ui, sans-serif; padding: 12px; }
-  h1 { font-size: 18px; margin: 4px 0 12px; }
-  h1 .host { color: var(--dim); font-weight: normal; }
+         font: 15px/1.45 -apple-system, system-ui, sans-serif; padding: 12px 12px 40px; }
+  h1 { font-size: 18px; margin: 4px 0 10px; }
+  h1 .host { color: var(--dim); font-weight: normal; font-size: 14px; }
+
+  /* Headline strip: the three things you actually open the page to see. */
+  .strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .stat { flex: 1 1 130px; background: var(--card); border: 1px solid var(--border);
+          border-radius: 10px; padding: 9px 12px; }
+  .stat .lbl { color: var(--dim); font-size: 11px; text-transform: uppercase;
+               letter-spacing: .06em; }
+  .stat .big { font-family: var(--mono); font-size: 19px; margin-top: 2px; }
+
   .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--border);
-          border-radius: 10px; padding: 12px 14px; }
+          border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+  .grid .card { margin-top: 0; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
              color: var(--dim); margin: 0 0 8px; }
   .kv { display: flex; justify-content: space-between; gap: 10px; margin: 3px 0;
         font-size: 14px; }
   .kv .k { color: var(--dim); flex-shrink: 0; }
+  .kv .k.sub { padding-left: 12px; opacity: .8; }
   .kv .v { text-align: right; overflow-wrap: anywhere; font-family: var(--mono); font-size: 13px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
          margin-right: 6px; vertical-align: baseline; }
   .on  { background: var(--green); } .off { background: var(--red); }
   .warn { color: var(--yellow); } .bad { color: var(--red); } .good { color: var(--green); }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+
+  .actions { margin: 12px 0; }
+  .actrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .actrow > .grouplbl { color: var(--dim); font-size: 11px; text-transform: uppercase;
+                        letter-spacing: .06em; width: 62px; flex-shrink: 0; }
   button { background: #21262d; color: var(--fg); border: 1px solid var(--border);
-           border-radius: 8px; padding: 10px 14px; font-size: 14px; cursor: pointer; }
+           border-radius: 8px; padding: 9px 13px; font-size: 14px; cursor: pointer; }
   button:active { background: #30363d; }
   button.danger { border-color: #6e2c2f; color: #ff7b72; }
   button.primary { border-color: #1f6feb; color: var(--blue); }
@@ -40,12 +55,16 @@
         white-space: pre-wrap; word-break: break-all; max-height: 45vh; overflow-y: auto; }
   #jobcard { display: none; }
   a { color: var(--blue); text-decoration: none; }
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+         flex-wrap: wrap; }
   .muted { color: var(--dim); font-size: 12px; }
+  input[type=text] { background: #010409; color: var(--fg); border: 1px solid var(--border);
+                     border-radius: 8px; padding: 7px 10px; font-size: 13px;
+                     font-family: var(--mono); min-width: 0; flex: 1 1 120px; }
   #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
            background: #21262d; border: 1px solid var(--border); padding: 10px 16px;
            border-radius: 10px; display: none; max-width: 90vw; z-index: 10; }
-  details { margin-top: 12px; }
+  details { margin-top: 10px; }
   summary { color: var(--dim); cursor: pointer; font-size: 13px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
          overflow: hidden; }
@@ -53,30 +72,51 @@
                 background: transparent; }
   .seg button + button { border-left: 1px solid var(--border); }
   .seg button.active { background: #1f6feb33; color: var(--blue); }
+  .tgroup { margin: 10px 0 0; }
+  .tgroup > h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+                 color: var(--blue); margin: 10px 0 4px; }
 </style>
 </head>
 <body>
 <h1>pulsar trainer <span class="host" id="host"></span></h1>
 
-<div class="card" id="verwarn" style="display:none; border-color:#6e5518; margin-bottom:10px">
+<div class="card" id="verwarn" style="display:none; border-color:#6e5518; margin:0 0 10px">
   <span class="warn">⚠ The dashboard service is running older code than this page
   (updated files on disk, old process in memory). API buttons may fail until it reloads —
   press <b>↻ Dashboard</b>, then reload this page.</span>
 </div>
 
+<div class="strip">
+  <div class="stat"><div class="lbl">trainer</div><div class="big" id="s-state">…</div></div>
+  <div class="stat"><div class="lbl">steps</div><div class="big" id="s-steps">–</div></div>
+  <div class="stat"><div class="lbl">steps/sec</div><div class="big" id="s-sps">–</div></div>
+  <div class="stat"><div class="lbl">iteration</div><div class="big" id="s-iter">–</div></div>
+</div>
+
 <div class="grid">
   <div class="card">
     <h2>Trainer</h2>
-    <div class="kv"><span class="k">state</span><span class="v" id="t-state">…</span></div>
     <div class="kv"><span class="k">since</span><span class="v" id="t-since">–</span></div>
     <div class="kv"><span class="k">log written</span><span class="v" id="t-logage">–</span></div>
+    <div class="kv"><span class="k">launches</span><span class="v" id="t-launches">–</span></div>
+    <div class="kv"><span class="k">last crash</span><span class="v" id="t-crash">–</span></div>
     <div class="kv"><span class="k">last line</span><span class="v" id="t-lastline" style="font-size:11px">–</span></div>
   </div>
   <div class="card">
-    <h2>Progress</h2>
-    <div class="kv"><span class="k">steps</span><span class="v" id="c-steps">–</span></div>
-    <div class="kv"><span class="k">checkpoint age</span><span class="v" id="c-age">–</span></div>
-    <div class="kv"><span class="k">checkpoints</span><span class="v" id="c-count">–</span></div>
+    <h2>Learning</h2>
+    <div class="kv"><span class="k">avg step reward</span><span class="v" id="m-reward">–</span></div>
+    <div class="kv"><span class="k">policy entropy</span><span class="v" id="m-entropy">–</span></div>
+    <div class="kv"><span class="k">rating 1v1</span><span class="v" id="m-rating">–</span></div>
+    <div class="kv"><span class="k">policy update</span><span class="v" id="m-pupd">–</span></div>
+    <div class="kv"><span class="k">critic update</span><span class="v" id="m-cupd">–</span></div>
+    <div class="kv"><span class="k">report age</span><span class="v" id="m-age">–</span></div>
+  </div>
+  <div class="card">
+    <h2>Checkpoints</h2>
+    <div class="kv"><span class="k">directory</span><span class="v" id="c-dir">–</span></div>
+    <div class="kv"><span class="k">newest</span><span class="v" id="c-steps">–</span></div>
+    <div class="kv"><span class="k">saved</span><span class="v" id="c-age">–</span></div>
+    <div class="kv"><span class="k">in rotation</span><span class="v" id="c-count">–</span></div>
     <div class="kv"><span class="k">metrics</span><span class="v" id="c-wandb">–</span></div>
   </div>
   <div class="card">
@@ -103,18 +143,31 @@
 </div>
 
 <div class="actions">
-  <button data-action="start"  class="primary">▶ Start</button>
-  <button data-action="stop"   class="danger">■ Stop</button>
-  <button data-action="restart" class="danger">↻ Restart</button>
-  <button data-action="check_updates">Check updates</button>
-  <button data-action="update" class="primary">⬆ Update (pull+build+restart)</button>
-  <button data-action="build">Build only</button>
-  <button data-action="clear_latch" class="danger">⚡ Clear steering latch</button>
-  <button data-action="viz_start">Viz on</button>
-  <button data-action="viz_stop">Viz off</button>
-  <button data-action="dashboard_restart">↻ Dashboard</button>
-  <a id="vizlink" href="#" target="_blank"><button type="button" class="primary">👁 Visualizer ↗</button></a>
+  <div class="actrow">
+    <span class="grouplbl">Run</span>
+    <button data-action="start"  class="primary">▶ Start</button>
+    <button data-action="stop"   class="danger">■ Stop</button>
+    <button data-action="restart" class="danger">↻ Restart</button>
+  </div>
+  <div class="actrow">
+    <span class="grouplbl">Code</span>
+    <button data-action="check_updates">Check updates</button>
+    <button data-action="update" class="primary">⬆ Update (pull+build+restart)</button>
+    <button data-action="build">Build only</button>
+  </div>
+  <div class="actrow">
+    <span class="grouplbl">Viz</span>
+    <button data-action="viz_start">Viz on</button>
+    <button data-action="viz_stop">Viz off</button>
+    <a id="vizlink" href="#" target="_blank"><button type="button" class="primary">👁 Open ↗</button></a>
+    <button data-action="dashboard_restart">↻ Dashboard</button>
+  </div>
 </div>
+
+<details id="telemetry">
+  <summary>Full telemetry — every row the trainer prints this iteration</summary>
+  <div class="card" id="telebody" style="margin-top:8px">(open to load)</div>
+</details>
 
 <div class="card">
   <div class="row">
@@ -133,7 +186,11 @@
 <div class="card">
   <div class="row">
     <h2>Live log</h2>
-    <span><button id="logbtn">▶ stream</button></span>
+    <span class="row" style="gap:6px">
+      <input type="text" id="logfilter" placeholder="filter (substring)" autocapitalize="off"
+             autocorrect="off" spellcheck="false">
+      <button id="logbtn">▶ stream</button>
+    </span>
   </div>
   <pre id="logout">(press stream)</pre>
 </div>
@@ -150,7 +207,7 @@
 let PIN = null;
 // Must match DASH_VERSION in dashboard.py (see the comment there): the page comes from
 // disk, the service from memory - after a git pull they can diverge until ↻ Dashboard.
-const EXPECT_DASH_VERSION = "2026-07-14.2";
+const EXPECT_DASH_VERSION = "2026-07-25.1";
 
 const $ = id => document.getElementById(id);
 function toast(msg, ms = 3500) {
@@ -165,16 +222,26 @@ function ago(secs) {
 }
 function fmtSteps(n) {
   if (n == null) return "–";
-  return n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  return (n / 1e3).toFixed(0) + "K";
 }
+function num(metrics, key, digits) {
+  if (!metrics || !(key in metrics)) return null;
+  const v = metrics[key];
+  return digits == null ? v : v.toFixed(digits);
+}
+
+let LAST_REPORT = null;
 
 async function refresh() {
   try {
     const s = await (await fetch("/api/status")).json();
     $("verwarn").style.display = s.dash_version === EXPECT_DASH_VERSION ? "none" : "block";
     $("host").textContent = "@ " + s.host;
+
     const tr = s.trainer;
-    $("t-state").innerHTML = tr.running
+    $("s-state").innerHTML = tr.running
       ? '<span class="dot on"></span>running'
       : '<span class="dot off"></span>stopped';
     $("t-since").textContent = tr.since || (tr.pid ? "pid " + tr.pid : "–");
@@ -182,11 +249,45 @@ async function refresh() {
     $("t-logage").textContent = ago(la);
     $("t-logage").className = "v " + (la == null ? "" : la > 600 ? "bad" : la > 120 ? "warn" : "good");
     $("t-lastline").textContent = s.log.last_line || "–";
+
+    // --- report block ---------------------------------------------------
+    const met = s.metrics || {};
+    const rep = met.report;
+    LAST_REPORT = rep;
+    const n = rep ? rep.numbers : null;
+    $("s-steps").textContent = fmtSteps(n ? n["Total Timesteps"] : s.checkpoint.steps);
+    $("s-sps").textContent = n && n["Overall Steps/Second"]
+      ? Math.round(n["Overall Steps/Second"]).toLocaleString() : "–";
+    $("s-iter").textContent = n && n["Total Iterations"]
+      ? n["Total Iterations"].toLocaleString() : "–";
+    $("m-reward").textContent = num(n, "Average Step Reward", 4) ?? "–";
+    $("m-entropy").textContent = num(n, "Policy Entropy", 4) ?? "–";
+    $("m-rating").textContent = num(n, "Rating/1v1", 0) ?? "(not published)";
+    $("m-pupd").textContent = num(n, "Policy Update Magnitude", 4) ?? "–";
+    $("m-cupd").textContent = num(n, "Critic Update Magnitude", 4) ?? "–";
+    $("m-age").textContent = rep ? ago(rep.age_secs) : "no report block yet";
+    if ($("telemetry").open) renderTelemetry();
+
+    // --- wrapper restarts -------------------------------------------------
+    const rs = met.restarts;
+    if (rs) {
+      $("t-launches").textContent = rs.launches
+        + (rs.planned_restarts ? ` (${rs.planned_restarts} planned)` : "");
+      const last = rs.crashes && rs.crashes.length ? rs.crashes[rs.crashes.length - 1] : null;
+      $("t-crash").textContent = last ? `${last.what} @ ${last.time}` : "none";
+      $("t-crash").className = "v " + (last ? "warn" : "good");
+      if (rs.backoff)
+        $("t-crash").className = "v bad";
+    }
+
+    // --- checkpoints ------------------------------------------------------
+    $("c-dir").textContent = s.checkpoint.dir || "?";
     $("c-steps").textContent = fmtSteps(s.checkpoint.steps);
     $("c-age").textContent = ago(s.checkpoint.age_secs);
     $("c-count").textContent = s.checkpoint.count;
     $("c-wandb").innerHTML = s.wandb_url
       ? `<a href="${s.wandb_url}" target="_blank">wandb ↗</a>` : "wandb";
+
     if (s.gpu) {
       $("g-util").textContent = s.gpu.util;
       $("g-mem").textContent = s.gpu.mem_used + " / " + s.gpu.mem_total;
@@ -194,7 +295,11 @@ async function refresh() {
     }
     $("g-disk").textContent = s.disk.free_gb + " / " + s.disk.total_gb + " GB";
     $("git-branch").textContent = s.git.branch + (s.git.dirty ? " (dirty!)" : "");
-    $("git-head").textContent = s.git.head;
+    // "<sha> <subject>" — a long subject wraps to four lines and shoves the card
+    // around, and the sha is the part you actually compare against origin.
+    $("git-head").textContent = s.git.head.length > 46
+      ? s.git.head.slice(0, 45) + "…" : s.git.head;
+    $("git-head").title = s.git.head;
     const behind = s.git.behind, aheadN = s.git.ahead;
     let sync = [];
     if (behind) sync.push(`<span class="warn">${behind} behind</span>`);
@@ -218,12 +323,59 @@ async function refresh() {
   }
 }
 
+// The trainer's report keys are whatever the C++ Report emits; group them by the
+// "Group/Key" convention and render everything. Nothing here is hardcoded, so a
+// report change shows up on the page without touching this file.
+function renderTelemetry() {
+  const box = $("telebody");
+  if (!LAST_REPORT) { box.textContent = "(no report block in the log yet)"; return; }
+  // A "Prefix/" is only a group if at least two keys share it. Without this,
+  // "Collection Steps/Second" and "Overall Steps/Second" each invent a one-row
+  // section — they are throughput scalars that happen to contain a slash, not a
+  // subsystem. Counting first keeps the rule schema-free.
+  const prefixCount = new Map();
+  for (const r of LAST_REPORT.rows) {
+    const slash = r.k.indexOf("/");
+    if (slash > 0) {
+      const p = r.k.slice(0, slash);
+      prefixCount.set(p, (prefixCount.get(p) || 0) + 1);
+    }
+  }
+  const groups = new Map();
+  for (const r of LAST_REPORT.rows) {
+    const slash = r.k.indexOf("/");
+    const prefix = slash > 0 ? r.k.slice(0, slash) : null;
+    const grouped = prefix && prefixCount.get(prefix) > 1;
+    const g = grouped ? prefix : "General";
+    const label = grouped ? r.k.slice(slash + 1) : r.k;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push({ label, v: r.v, sub: r.sub });
+  }
+  box.textContent = "";
+  for (const [g, rows] of groups) {
+    const sec = document.createElement("div");
+    sec.className = "tgroup";
+    const h = document.createElement("h3");
+    h.textContent = g;
+    sec.appendChild(h);
+    for (const r of rows) {
+      const kv = document.createElement("div");
+      kv.className = "kv";
+      const k = document.createElement("span");
+      k.className = "k" + (r.sub ? " sub" : "");
+      k.textContent = r.label;
+      const v = document.createElement("span");
+      v.className = "v";
+      v.textContent = r.v;
+      kv.appendChild(k); kv.appendChild(v);
+      sec.appendChild(kv);
+    }
+    box.appendChild(sec);
+  }
+}
+$("telemetry").addEventListener("toggle", () => { if ($("telemetry").open) renderTelemetry(); });
+
 async function act(action, extra) {
-  if (action === "clear_latch"
-      && !confirm("Clear the steering rating latch?\n\n" +
-        "This stops the trainer, sets steer_rating_tripped=false in the newest " +
-        "checkpoint, and restarts. Steering (plus opponent styles and frontier " +
-        "drills) re-enables and the rating guards re-arm.")) return;
   if (["stop", "restart", "update", "dashboard_restart"].includes(action)
       && !confirm(action.replace("_", " ") + " — sure?")) return;
   if (!PIN) {
@@ -312,20 +464,37 @@ function followJob(id, action) {
   jobES.onerror = () => { $("jobstate").textContent = "stream lost"; };
 }
 
-let logES = null;
+// The log is a firehose on a phone. Keep the raw lines so the filter can be changed
+// without losing history, and only autoscroll when the user is already at the bottom.
+let logES = null, logLines = [];
+function logMatches(line) {
+  const f = $("logfilter").value.trim().toLowerCase();
+  return !f || line.toLowerCase().includes(f);
+}
+function renderLog() {
+  const out = $("logout");
+  out.textContent = logLines.filter(logMatches).join("\n") + "\n";
+  out.scrollTop = out.scrollHeight;
+}
+$("logfilter").oninput = renderLog;
 $("logbtn").onclick = () => {
   if (logES) {
     logES.close(); logES = null;
     $("logbtn").textContent = "▶ stream";
     return;
   }
-  const out = $("logout"); out.textContent = "";
+  logLines = [];
+  $("logout").textContent = "";
   logES = new EventSource("/api/logs/stream");
   logES.onmessage = ev => {
-    out.textContent += ev.data + "\n";
-    if (out.textContent.length > 400000)
-      out.textContent = out.textContent.slice(-300000);
-    out.scrollTop = out.scrollHeight;
+    logLines.push(ev.data);
+    if (logLines.length > 4000) logLines.splice(0, logLines.length - 3000);
+    const out = $("logout");
+    const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+    if (logMatches(ev.data)) {
+      out.textContent += ev.data + "\n";
+      if (atBottom) out.scrollTop = out.scrollHeight;
+    }
   };
   logES.onerror = () => toast("log stream lost; tap stream to reconnect");
   $("logbtn").textContent = "■ pause";
@@ -339,7 +508,9 @@ async function loadAudit() {
     ).reverse().join("\n") || "(none)";
   } catch (e) {}
 }
-document.querySelector("details").addEventListener("toggle", loadAudit);
+document.querySelectorAll("details").forEach(d => {
+  if (d.querySelector("#audit")) d.addEventListener("toggle", loadAudit);
+});
 
 document.querySelectorAll("button[data-action]").forEach(b =>
   b.onclick = () => act(b.dataset.action));

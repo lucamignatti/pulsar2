@@ -3,9 +3,9 @@
   "configurations": [
     {
       "name": "pulsar-dashboard",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["tools/remote/dashboard.py"],
-      "port": 8500
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["DASHBOARD_PORT=8599", "python3", "tools/remote/dashboard.py"],
+      "port": 8599
     }
   ]
 }
