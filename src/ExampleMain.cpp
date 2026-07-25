@@ -244,7 +244,14 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// sequence a few hours behind RC1). REBALANCE-1: 6 -> 15 (pace unmoved at
 		// weight 6 over 4B steps - emergence_check.json; farm-proof by telescoping,
 		// so the weight is a pure credit-density knob).
-		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 15.f },
+		// 15 -> 75 (user-directed): a further 5x on the same knob. UNMEASURED ON THIS
+		// LINEAGE - it rode uncommitted through the 6M and residual cold starts and was
+		// only recorded 2026-07-25 during the dead-code audit. Static extrapolation from
+		// REWARD_SHAPING.md's measured table puts 75 near 60% of per-step credit density,
+		// which would make tempo the dominant shaping term - that is an extrapolation, not
+		// a measurement. OPEN: re-measure per-term credit share on the resid lineage and
+		// either justify 75 or walk it back. See analysis/probes/DEAD_CODE_AUDIT.md Q11.
+		{ new ZeroSumReward(new CarEnergyPotentialReward(gamma), TEAM_SPIRIT), 75.f },
 
 		// ESCALATE-1 (2026-07-16, user-directed): small time cost - urgency vs the
 		// measured stall/hover pathology. 0.01 -> ~4.5 per 30s episode (15Hz steps
