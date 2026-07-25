@@ -244,3 +244,41 @@ On a served iteration the opponent half's in-flight partial episodes are `Clear(
 **5.8 — The end-to-end wall-clock cost of serving.** The evolve barrier is solid (residue-1 median 9.007 s vs 5.247 s baseline, n≈105 each). The serving cost is not: median collection time gives +3–7% at a 32% share, while an SPS-based read gives ~11%, and the discrepancy is that `Collected Timesteps` counts in-flight rows that never enter the learn buffer (`Learner.cpp:1410`, `:2377`). **Settling it:** sum `max(0, Collection − Consumption)` by opponent class, as was done for Nexto (1,838 s of 12,291 s = 15.0%).
 
 **5.9 — Whether 434etlix follows wsd2oclp's decay curve.** Partly answered in the last hour: the peak came at 141 members / 139 cells around 0.62B and the iteration-2000 rebin took 25 members in one step. wsd2oclp peaked at 128 / 0.563G, halved by 1.20G and quartered by 1.79G. The next two rebin events (iterations 3000 and 4000) will tell us whether this is the same curve — free to observe, no intervention needed.
+---
+
+## VERDICT — 2026-07-25: strip it
+
+**Decision (user):** remove the league entirely. Train against a few archived past selves plus
+Nexto; fix Rating in the same pass; no ablation. Deploy on the cold start the composition-critic
+conformance pass already requires — the 700M-step lineage this recon was measured on is superseded.
+
+The reasoning that carried it, from the sections above: the archive **collapses on every lineage
+that learns**, and the documented cause (`competenceFloor`) turned out to be unreachable code, so
+there was no parameter to tune. What it actually served were **noisy copies of the untrained birth
+network** — 0.039–0.064 relative-L2 from `policy_versions/0` against 0.73–0.78 from the current
+main. And the asymmetry that settled it: **its cost is well measured and its value has never been
+measured once**, in any run, at any maturity. By the project's own doctrine that is not a state a
+lever gets to stay in.
+
+Two things were kept rather than deleted:
+
+- **The log-spaced decimation** (`GigaLearnCPP/src/public/GigaLearnCPP/Util/LogSpaced.h`), salvaged
+  from `LeagueArchive::DecimateSpaced`. Its rationale — that FIFO eviction recreates the very pool
+  myopia a permanent set exists to cure — is what makes `Ref/Oldest Share` a fixed yardstick.
+- **The anchor design's load-bearing idea**: a separate vector that nothing re-scores, re-rates or
+  culls, so the exemption is structural rather than a scattering of if-checks. That is now the
+  reference set. `LEAGUE_ANCHORS.md` is superseded, but this part of it was right.
+
+What replaced it: `trainAgainstOldVersions` (uniform draw from the 32-version ring, realized 0.255
+of iterations) for training diversity, and the permanent reference set for honest measurement.
+Restore point: tag `pre-league-strip-20260725`.
+
+**Findings from this recon that outlived the league** and were fixed in the same pass:
+
+- The Nexto serve dose was a **127.773 s wall-clock sawtooth**, not a probability (§3.5). The
+  opponent roll now uses a persistent `std::mt19937_64` instead of RocketSim's clock-reseeded
+  `thread_local` engine.
+- The Nexto goal counters **did not survive restarts** (§3.10) — `SaveStats` wrote them, the
+  matching `LoadStats` reads had been deleted as collateral in `4f25b1c`. Restored.
+- `Rating/1v1`'s inflation mechanism (§3.4 and the recon's §2) is now written down where it is
+  read, in `SkillTrackerConfig.h` and `ExampleMain.cpp`, rather than only in this document.

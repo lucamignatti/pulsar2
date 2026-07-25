@@ -276,28 +276,54 @@ it understated AirIntercept 40→75 and CarEnergy 15→75 and omitted five terms
   viewer shows unbounded real games.
 ### Outer loops
 
-- **Skill tracker** (`PolicyVersionManager`): Elo (`Rating/1v1`) from eval
-  matches vs `checkpoints_5.0v3/policy_versions/` (a ring of versions ~25M steps
-  apart). **Pool myopia caveat**: the pool cannot measure improvement against
-  styles older than its window, and a style shift can read as an Elo dip while
-  head-to-head vs recent selves improves (measured: nontransitivity is real
-  here). Mature Rating noise band is ±30–50 — but **this run is young and
-  steeply climbing, so Rating legitimately swings ±80 around the trend**. The
-  two auto-kill latches were loosened for that (110→200, 75→150) after 3 false
-  trips on pure volatility — and then **the latch was REMOVED entirely
-  (2026-07-25, user-directed)** after it fired a fourth time, on a spike-and-settle
-  where Rating was still +213 ABOVE its own EMA, taking six unrelated live
-  mechanisms dark. What remains is measurement only: `RatingWatch/Drawdown From
-  EMA` and `/From Peak`. **There is no automatic update-damage guard any more** —
-  the boot sanity probe and the impossible-arena certificate are now the only
-  automatic safety checks, and neither sees gradual update damage.
-- **QD League**: MAP-Elites archive over behavior descriptors (quantile-adaptive
-  bins), PFSP-sampled opponents on `descendOpponentFrac` of iterations (0.35 —
-  raised from 0.25 after measuring exploitability by archived styles). Members
-  are stored as flat param vectors, so **any net-width change makes stored vectors
-  stale-shaped** and crashes crossover arithmetic in `EvolveStep`. That happened
-  once (`dccba19`, the 512→517 wire migration). The migration path was removed with
-  the wire on 2026-07-25 — if you change net width again, the archive needs one.
+There is **one opponent archive** since 2026-07-25 (`PolicyVersionManager`), doing
+three jobs that used to be spread across three subsystems:
+
+- **The version ring** — 32 versions ~25M steps apart, a rotating ~800M window.
+  Since the league was removed this is also the **training** opponent source:
+  `trainAgainstOldVersions` is ON, drawn uniformly. **Pool myopia is an accepted
+  property, not a bug**: the ring cannot exercise or measure styles older than its
+  window, and as the run matures it becomes a narrower slice of recent history
+  (nontransitivity here is real and measured). Accepted deliberately in exchange
+  for having no archive to maintain; the reference set carries the old styles.
+- **`Rating/1v1`** — Elo from eval matches vs that same ring. **INFLATED, kept only
+  for continuity.** `AddVersion` copies the main's *current* rating into each new
+  version and every goal moves both sides, so the pool's rating tracks the agent:
+  measured ~6× overstatement (54% real win share against a predicted 75%). Training
+  against the ring makes it worse — the run now optimizes against its own measuring
+  stick. Do not read it as skill; read `Ref/Oldest Share`. Mature noise band ±30–50,
+  but a young steeply-climbing run swings ±80 around the trend.
+- **The reference set** — log-spaced past checkpoints in `policy_versions/ref_<ts>/`,
+  in their own vector, **never trained against and never re-rated**. The oldest is
+  never evicted (`Util/LogSpaced.h` drops middles, never endpoints), so
+  **`Ref/Oldest Share` is measured against a genuinely fixed opponent and cannot
+  inflate**. Cumulative goal counters like Nexto's — the SLOPE is the signal, and
+  they are persisted, so never delete the read side (see below).
+
+**Opponent cascade** (`Learner.cpp`; one opponent for the whole fleet per iteration,
+a sequential if/else-if): Nexto `serveFrac` → old version `trainAgainstOldChance` →
+self-play. Realized shares are **nested, not independent**: P(old version) =
+(1 − serveFrac) × chance. The roll uses a persistent `std::mt19937_64`, NOT
+RocketSim's `Math::RandFloat` — that is a `thread_local` engine reseeded from the
+millisecond clock on every fresh collect thread, which turned the serve rate into a
+127.773 s wall-clock sawtooth (measured 8.9% against a configured 15%, tracking
+machine speed across five runs). Do not put that call back.
+
+**The rating latch was REMOVED entirely** (2026-07-25, user-directed) after it fired
+on a spike-and-settle where Rating was still +213 ABOVE its own EMA, taking six
+unrelated live mechanisms dark. What remains is measurement only: `RatingWatch/*`.
+**There is no automatic update-damage guard any more** — the boot sanity probe is
+the only automatic safety check, and it does not see gradual update damage.
+
+- **QD League — REMOVED 2026-07-25** (restore tag `pre-league-strip-20260725`).
+  Post-mortem: `docs/LEAGUE_RECON.md`. It collapsed on every lineage that learned
+  (peak → 3 members on three separate runs); what it served were noisy copies of the
+  *untrained birth network*; and its value was never measured in any run at any
+  maturity while its cost was (~3.6% of wall clock in the evolve barrier, plus 2.7 GB
+  rewritten every save into an index-keyed store that had already desynced). Lesson
+  worth keeping: its members were flat param vectors, so **any net-width change made
+  stored vectors stale-shaped** and nothing in the load path checked — the reference
+  set stores self-contained checkpoint dirs instead, which is the pattern to keep.
 - **Plasticity telemetry** (`Util/Plasticity.h`, promoted out of PSD when it was
   retired): `Plasticity/Trunk EffRank`, `/Policy EffRank`, `/Policy Dead Units`.
   Weights-only, every iteration, no actuation. Kept because the residual

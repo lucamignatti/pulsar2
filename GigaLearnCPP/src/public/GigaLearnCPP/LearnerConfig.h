@@ -3,7 +3,6 @@
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
-#include "LeagueConfig.h"
 
 #include <memory>
 
@@ -154,6 +153,15 @@ namespace GGL {
 		int64_t tsPerVersion = 25'000'000;
 		int maxOldVersions = 32;
 
+		// Train against archived past selves drawn uniformly from the version ring. Since the
+		// QD league was removed (2026-07-25) this is the ONLY self-play opponent source, so the
+		// realized share matters: the opponent cascade is sequential, and Nexto rolls first, so
+		// P(old version) = (1 - externalOpponent.serveFrac) * trainAgainstOldChance.
+		// KNOWN PROPERTY, not a bug: the ring is a ROTATING window (maxOldVersions * tsPerVersion
+		// = ~800M steps), so as the run matures the pool becomes a narrower slice of recent
+		// history - the pool myopia CLAUDE.md documents. Accepted deliberately (user, 2026-07-25)
+		// in exchange for having no archive to maintain; the permanent reference set in
+		// SkillTrackerConfig is what carries genuinely old styles, and it is never trained against.
 		bool trainAgainstOldVersions = false;
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
@@ -168,9 +176,5 @@ namespace GGL {
 
 		// External fixed opponent (Nexto); additive and default-OFF
 		ExternalOpponentConfig externalOpponent = {};
-
-		// Basin-Racing (PSD) + QD league. Both additive and default-OFF; the baseline runs
-		// unchanged unless league.enabled is set.
-		LeagueConfig league = {};
 	};
 }

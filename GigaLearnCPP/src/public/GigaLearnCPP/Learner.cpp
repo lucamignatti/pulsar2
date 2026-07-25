@@ -18,7 +18,6 @@
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
 #include <private/GigaLearnCPP/NextoOpponent.h>
 #include <private/GigaLearnCPP/Util/Plasticity.h>
-#include <private/GigaLearnCPP/League/LeagueArchive.h>
 
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
@@ -213,14 +212,13 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 		if (config.standardizeObs) {
 			// Only the main collection loop standardizes obs. Every other inference surface
-			// (steering derivation's obs decoding, PSD/league/skill-tracker eval rollouts,
-			// and Save() racing the worker's stat updates under pipelining) reads RAW obs
-			// and would silently measure garbage - fail loudly instead of training on it.
-			if (config.league.enabled
-				|| config.skillTracker.enabled || config.pipelinedCollection)
+			// (skill-tracker and reference-battery eval rollouts, and Save() racing the
+			// worker's stat updates under pipelining) reads RAW obs and would silently
+			// measure garbage - fail loudly instead of training on it.
+			if (config.skillTracker.enabled || config.pipelinedCollection)
 				RG_ERR_CLOSE("Learner::Learner(): standardizeObs is only supported by the plain "
-					"sequential PPO path - steering/league/skillTracker/pipelinedCollection "
-					"all feed raw obs to the models and would break silently");
+					"sequential PPO path - skillTracker/pipelinedCollection feed raw obs to "
+					"the models and would break silently");
 			this->obsStat = new BatchedWelfordStat(obsSize);
 		} else {
 			this->obsStat = NULL;
@@ -266,12 +264,6 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		versionMgr = NULL;
 	}
 
-	// Basin-Racing (PSD) + QD league — additive, created only when enabled. Built BEFORE Load()
-	// so LoadStats can restore their persistent state from the checkpoint.
-	if (config.league.enabled && !config.renderMode) {
-		league = new LeagueArchive(config.league, ppo, envSet, device, config.checkpointFolder);
-	}
-
 	if (!config.checkpointFolder.empty())
 		Load();
 
@@ -280,6 +272,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 			RG_ERR_CLOSE("Cannot save/load old policy versions with no checkpoint save folder");
 		auto models = ppo->GetPolicyModels();
 		versionMgr->LoadVersions(models, totalTimesteps);
+		versionMgr->LoadReferences(models, totalTimesteps);
 	}
 
 	if (config.sendMetrics && !config.renderMode) {
@@ -345,9 +338,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 	if (versionMgr)
 		versionMgr->AddRunningStatsToJSON(j);
 
-	if (league)
-		league->ToJSON(j);
-
 	std::string jStr = j.dump(4);
 	fOut << jStr;
 }
@@ -388,8 +378,13 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	if (versionMgr)
 		versionMgr->LoadRunningStatsFromJSON(j);
 
-	if (league)
-		league->FromJSON(j);
+	// Nexto's cumulative goal counters. SaveStats has always written these ("must survive
+	// restarts"), but the matching reads were deleted as collateral inside a steering-removal
+	// hunk in 4f25b1c, so every restart silently zeroed the run's only pool-inflation-proof
+	// yardstick. Restored 2026-07-25.
+	nextoGoalsFor = j.value("nexto_goals_for", (int64_t)0);
+	nextoGoalsAgainst = j.value("nexto_goals_against", (int64_t)0);
+	nextoServeIters = j.value("nexto_serve_iters", (int64_t)0);
 }
 
 // Different than RLGym-PPO to show that they are not compatible
@@ -540,8 +535,10 @@ void GGL::Learner::Save() {
 		}
 	}
 
-	if (versionMgr)
+	if (versionMgr) {
 		versionMgr->SaveVersions();
+		versionMgr->SaveReferences();
+	}
 
 	RG_LOG(" > Done.");
 }
@@ -644,7 +641,7 @@ bool GGL::Learner::ReloadNewestCheckpointForRender(int64_t& loadedTimesteps) {
 		return false;
 
 	// Newest fully-numbered checkpoint dir. FindNumberedDirs already skips the sibling
-	// policy_versions / league / psd_rounds folders (their names aren't all-digits).
+	// policy_versions folder (its name isn't all-digits).
 	std::set<int64_t> saved = Utils::FindNumberedDirs(config.checkpointFolder);
 	if (saved.empty())
 		return false;
@@ -1246,9 +1243,9 @@ void GGL::Learner::Start() {
 		//   * logProbs are recorded from the SAME snapshot that sampled the actions, so PPO's ratio
 		//     pi_new/pi_behavior is exact; the one-update policy lag is standard async-PPO staleness
 		//     that the clip objective is built to absorb.
-		//   * Everything that steps the training EnvSet (PSD probes), submits to the global thread
-		//     pool (league/skill-eval match envs), or evaluates live weights (league, version manager)
-		//     runs in the BARRIER ZONE between join and kick — never concurrent with the worker.
+		//   * Everything that submits to the global thread pool (the skill-eval and reference
+		//     match envs) or evaluates live weights (the version manager) runs in the BARRIER
+		//     ZONE between join and kick — never concurrent with the worker.
 		// REVERT: set config.pipelinedCollection = false — the flag-off path is the exact sequential
 		// order and call pattern (inline collect, live models, original tail call sites).
 		const bool pipelineOn = config.pipelinedCollection && !render;
@@ -1295,16 +1292,32 @@ void GGL::Learner::Start() {
 
 
 		std::jthread collectThread;
+
+		// Opponent-source RNG. Deliberately NOT RocketSim's Math::RandFloat: that is a
+		// thread_local minstd_rand0 seeded RS_CUR_MS() + hash(thread_id), and fnCollectIteration
+		// runs on a FRESH std::jthread every iteration whose thread_id hash is constant under
+		// glibc stack reuse - so the serve roll was the engine's first draw after a clock reseed,
+		// making it a 127.773 s sawtooth of WALL CLOCK rather than a probability. Measured on run
+		// 434etlix: all 169 Nexto serves fell inside one contiguous 8/40 phase arc with zero
+		// serves in the other 1,575 iterations, realized rate 8.9% against a configured 15%, and
+		// the rate tracked mean iteration time across five runs (3.61 s/iter -> 3.64%, 6.62 -> 8.9%).
+		// One persistent engine, advanced once per iteration, restores a real Bernoulli. Safe
+		// without a lock: only the single live collector touches it, and the barrier joins the
+		// worker before launching the next one.
+		std::mt19937_64 oppRng(std::random_device{}());
+
 		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
 		// Defined OUTSIDE the iteration loop on purpose: it must not capture any loop-local (the
 		// compiler enforces this — loop locals aren't in scope here), because in pipelined mode it
 		// executes concurrently with the NEXT iteration's locals.
 		auto fnCollectIteration = [&]() {
-			// This iteration's opponent for the non-self team: an old policy version, a PFSP-sampled
-			// league member, or (default) the current self. `oppModels` is the opponent's network
-			// (null = mirror self-play); the player masking, trajectory exclusion, and split inference
-			// below are shared by all three sources. The sources are mutually exclusive and the choice
-			// is made once per iteration.
+			// This iteration's opponent for the non-self team: Nexto, an archived past self, or
+			// (default) the current self. `oppModels` is the opponent's network (null = mirror
+			// self-play); the player masking, trajectory exclusion, and split inference below are
+			// shared by both non-self sources. The sources are mutually exclusive and the choice is
+			// made once per iteration, so the whole arena fleet faces one opponent at a time.
+			// NOTE the cascade is SEQUENTIAL, so the realized share of the second branch is
+			// (1 - serveFrac) * trainAgainstOldChance, not trainAgainstOldChance.
 			ModelSet* oppModels = nullptr;
 			// External fixed opponent (Nexto): mutually exclusive with the sources
 			// below, highest-priority roll. Rows are excluded from training via the
@@ -1321,23 +1334,18 @@ void GGL::Learner::Start() {
 
 			if (!render) {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
-				if (nexto
-					&& RocketSim::Math::RandFloat() < config.externalOpponent.serveFrac) {
-					// covers this data-distribution intervention too
+				std::uniform_real_distribution<float> oppRoll(0.0f, 1.0f);
+				if (nexto && oppRoll(oppRng) < config.externalOpponent.serveFrac) {
 					oppExternal = true;
 					nexto->BeginServe(numPlayers);
 					nextoServeIters++;
 				} else if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
-					&& RocketSim::Math::RandFloat() < config.trainAgainstOldChance) {
-					int oldVersionIdx = RocketSim::Math::RandInt(0, versionMgr->versions.size());
-					oppModels = &versionMgr->versions[oldVersionIdx].models;
-				} else if (league && RocketSim::Math::RandFloat() < config.league.descendOpponentFrac) {
-					// PFSP-sampled league member -> the exposure to non-self styles the league is for
-					// (returns null while the archive is still empty, falling back to self-play).
-					// anchors are the new intervention, so they answer to the same latch that kills
-					// steering / the Ladder drive / RND. Same write-in-barrier, read-on-collect
-					// discipline as ppo->steerVec.
-					oppModels = league->LoadPFSPOpponentModels(true);
+					&& oppRoll(oppRng) < config.trainAgainstOldChance) {
+					// Uniform over the version ring. The REFERENCE set is a separate vector and is
+					// never drawn here - it is the measuring stick (Ref/*) and must stay
+					// uncontaminated by being trained against.
+					std::uniform_int_distribution<size_t> pick(0, versionMgr->versions.size() - 1);
+					oppModels = &versionMgr->versions[pick(oppRng)].models;
 				}
 			}
 
@@ -1747,8 +1755,6 @@ void GGL::Learner::Start() {
 				prevVersionTimesteps = totalTimesteps;
 				if (report.Has(ratingKey))
 					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-				if (league)
-					league->OnIteration(report, totalIterations);
 				// Freeze the current policy for the worker, then collect the next iteration
 				// concurrently with this iteration's processing + Learn.
 				fnSyncSnapshot();
@@ -2392,11 +2398,6 @@ void GGL::Learner::Start() {
 						versionMgr->OnIteration(ppo, report, totalTimesteps, prevTimesteps);
 					if (report.Has(ratingKey))
 						lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-
-					// QD league: evolve/evaluate members between iterations (additive, off by default).
-					if (league)
-						league->OnIteration(report, totalIterations);
-
 				}
 
 				// User per-iteration hook (curriculum triggers etc.): sees the finished
@@ -2486,16 +2487,16 @@ void GGL::Learner::Start() {
 						"Nexto/Goals Against",
 						"Nexto/Serve Iters",
 						"",
-						"League/Member Count",
-						"League/Cell Count",
-						"League/Lineage Count",
-						// Anchor opponents (LEAGUE_ANCHORS.md): Anchor Serves rising is the
-						// only proof the reallocated 0.05 slice is actually being played;
-						// Anchor Count 0 means the anchor dir is missing/empty (feature inert).
-						"League/Anchor Count",
-						"League/Anchor Serves",
-						"League/Quantile Bins Live",
-						"League/BD Samples",
+						// Permanent reference set: the non-inflating skill read. Ref/Oldest Share is
+						// the headline - the oldest reference is never evicted, so that series is
+						// measured against a genuinely fixed opponent and cannot drift the way
+						// Rating/1v1 does (which rates against a ring that moves with the agent).
+						"Ref/Count",
+						"Ref/Oldest Ts",
+						"Ref/Goals For",
+						"Ref/Goals Against",
+						"Ref/Share",
+						"Ref/Oldest Share",
 						"",
 						"Collection Steps/Second",
 						"Consumption Steps/Second",
@@ -2525,7 +2526,6 @@ void GGL::Learner::Start() {
 }
 
 GGL::Learner::~Learner() {
-	delete league;
 	delete ppo;
 	delete versionMgr;
 	delete metricSender;

@@ -24,7 +24,6 @@ namespace GGL {
 
 		class PPOLearner* ppo;
 		class PolicyVersionManager* versionMgr;
-		class LeagueArchive* league = nullptr; // QD league; null unless config.league.enabled
 
 		RLGC::EnvCreateFn envCreateFn;
 		MetricSender* metricSender;

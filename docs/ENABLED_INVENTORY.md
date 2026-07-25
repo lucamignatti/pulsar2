@@ -89,13 +89,19 @@ cited from `ExampleMain`: the **clipping ratchet**, and **critic aliasing at epi
 
 ## 5. Outer loops
 
+Rewritten 2026-07-25: the QD League was removed and its three jobs consolidated into
+`PolicyVersionManager`. See `LEAGUE_RECON.md` for why, and `CLAUDE.md`'s Outer loops
+section for the resulting shape.
+
 | Feature | Live | Notes |
 |---|---|---|
-| Skill tracker (Elo) | `enabled`, 32 versions | Versions no longer clone the vdag twins (~2 GB VRAM, the OOM cause). |
-| QD League | `enabled`, `descendOpponentFrac 0.35` | Match env clears its reward stack (~58k discarded evals/evolve removed). `LeagueConfig` has its own header. |
-| League anchors | **off** | No `checkpoints_resid_anchors` dir. |
-| Nexto opponent | `serveFrac 0.15`, CPU-only | The only pool-inflation-proof yardstick. |
+| Version ring | `enabled`, 32 versions @ 25M | Now the **training** opponent source as well as the Elo pool. Versions do not clone the vdag twins (~2 GB VRAM, the OOM cause). |
+| Train vs past selves | `trainAgainstOldChance 0.30` | Realized **0.255** — the cascade is sequential and Nexto rolls first. Total non-self exposure 0.405, deliberately equal to the pre-strip measured 0.408. |
+| `Rating/1v1` | `enabled` | **INFLATED ~6×** and kept only for continuity: new versions inherit the main's current rating and both sides move on every goal. Training against the ring makes it worse. Read `Ref/Oldest Share`. |
+| Reference set | `maxReferences 8`, battery every 64 iters | Log-spaced, never trained against, never re-rated, oldest never evicted. `Ref/Oldest Share` is the non-inflating read. Cumulative counters — the slope is the signal. |
+| Nexto opponent | `serveFrac 0.15`, CPU-only | Dose fixed 2026-07-25 (was a 127.773 s wall-clock sawtooth realizing 8.9%); counters now restore on boot. |
 | Rating watch | measurement only | `RatingWatch/Drawdown From EMA` and `/From Peak`. **No latch** — nothing acts on it. |
+| QD League | **REMOVED** | Tag `pre-league-strip-20260725`. Collapsed on every lineage that learned; served copies of the untrained birth network; value never measured. |
 
 ## 6. Reachability
 

@@ -1,5 +1,16 @@
 # League anchor opponents — IMPLEMENTED, BUILT, SMOKE-VERIFIED (2026-07-19)
 
+> **SUPERSEDED 2026-07-25 — the QD League was removed entirely.** Read
+> `LEAGUE_RECON.md` first. Two things here did not survive contact with the code:
+> its central premise, that the archive collapsed via a `competenceFloor` cull, is
+> **wrong** — that cull is unreachable (`Cull()` protects every cell elite and dedup
+> guarantees one elite per cell), so the collapse was `DedupCells` at each quantile
+> rebin instead. And the intervention was **never judged**: one baseline line in
+> `research/results/anchor_battery_history.jsonl` and no follow-up, across a 28.7B-step
+> anchor era. Its load-bearing idea — a separate vector that nothing re-scores or culls,
+> exempt structurally rather than by if-check — was right, and is now the reference set
+> in `PolicyVersionManager`. Kept for provenance; not a justification for a new change.
+
 **Status: built and staged in `build/GigaLearnBot`; takes effect at the next
 trainer restart.** Items 1 (permanent spaced archival, `tools/archive_anchor.sh`
 + `pulsar-anchor.timer`) and 2 (honest match-play battery,

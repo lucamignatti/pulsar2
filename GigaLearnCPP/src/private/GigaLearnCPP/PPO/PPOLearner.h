@@ -82,13 +82,8 @@ namespace GGL {
 		// default. Set in the barrier zone only (the worker reads it unsynchronized).
 		void SetSteerGoal(torch::Tensor goal6Cpu, int head); // undefined tensor = clear
 
-		// If models is null, this->models will be used. steerRowMask (optional, [n] bool, any
-		// device): rows eligible for steering; steerRowModes ([n] int64, REQUIRED when the
-		// mask is passed): each row's mode index (playersPerTeam-1) selecting the direction.
-		// styleVec/styleCoef (optional): OPPONENT-side style steering (league phase 1/2) -
-		// coef * vec added to the trunk output of EVERY row of this call, ungated (style is
-		// a whole-game disposition, not a frontier read). Callers pass it only on the
-		// old-version/league-opponent inference call, never on the trained policy's.
+		// If models is null, this->models will be used - which is how the opponent half of a
+		// served iteration is inferred (pass the archived version's ModelSet).
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
 		torch::Tensor InferCritic(torch::Tensor obs);
 		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.

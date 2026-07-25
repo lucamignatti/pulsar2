@@ -39,9 +39,8 @@ static constexpr int MAX_PLAYERS_PER_TEAM = 3;
 
 // PHASE B arena fractions, applied by arena index with the team arenas at the END of the
 // index range (deterministic across restarts). Keeping them at the end means: (a) the
-// steering practice arenas (the FIRST practiceArenaFrac of indices) stay 1v1, and (b) the
-// league eval EnvSet — which clones this create-func with small numArenas, so only low
-// indices — stays 1v1. The skill tracker gets its OWN create-func (SkillEnvCreateFunc)
+// eval EnvSets that clone this create-func with a small numArenas (so only low indices)
+// stay 1v1. The skill tracker gets its OWN create-func (SkillEnvCreateFunc)
 // with the same trailing-team layout scaled to its small eval fleet, so PHASE B also
 // plays 2v2/3v3 eval matches and wandb gains Rating/2v2 + Rating/3v3; its arena 0 is
 // always 1v1, keeping Rating/1v1 continuous across the phase switch (it is also the
@@ -114,9 +113,17 @@ static float TEAM_SPIRIT = 0.3f;
 // reverted", as requested.
 //
 // What is deliberately NOT here vs. the current (HEAD) config: the goal proposer, the drill bank
-// / DrillSetter, the car-proposer head, and the recent uncommitted edit that turned on the
-// self-play LEAGUE (trainAgainstOldVersions) and halved tsPerItr to 100k. None of those were in
+// / DrillSetter, the car-proposer head, and the halving of tsPerItr to 100k. None of those were in
 // the proven-good era.
+//
+// AMENDED 2026-07-25: `trainAgainstOldVersions` used to be on this list. It is now ON (see the
+// assignment further down). Stating the override explicitly because this paragraph is the run's
+// own record of what the 9uz761ua regression cost. The honest position: that flag was never
+// individually convicted - it arrived bundled in the same uncommitted edit as the proposer and
+// the drill bank, and the proposer is what the measurement blamed for the ~10x deceleration.
+// It is on now because the QD league was removed and past selves are the only remaining
+// self-play opponent source; if throughput or Elo slope regresses, this flag is the first
+// thing to put back to false.
 
 // FRONTIER-9 reward stack (workflow-designed: understand -> research -> 5 competing designs ->
 // adversarial red-team+math+integration verification -> synthesis). Replaces SURGICAL-7.
@@ -325,7 +332,7 @@ static int g_RenderTeamSize = 0;
 // Optimistic-Critic Ladder: impossible-control drill family (LADDER.md 3.2) on the
 // LAST N arenas of the 1v1 block - the SAME rule the Learner uses for row tagging
 // and the injection mask, so the two sites agree by construction. Trailing indices
-// keep the league's low-index eval clones and the leading practice slice clear.
+// keep the low-index eval clones clear.
 static int g_NumImpossibleArenas = 0;
 static bool IsImpossibleArena(int index) {
 	if (g_NumImpossibleArenas <= 0)
@@ -573,13 +580,11 @@ int main(int argc, char* argv[]) {
 		// Accelerate GEMMs from two threads) - an environment bug this box's CUDA build
 		// does not have. Diagnosed 2026-07-14 via the InferPolicyProbsFromModels probe.
 		cfg.pipelinedCollection = false;
-		// Ladder warmups collapsed so a few smoke iterations reach the FULL path
-		// (map trained, banks seeded, calibration fit, gap_PK live, wire active) -
-		// production warmups would need 50+ CPU iterations to exercise any of it
-		// NOTE: league anchor overrides do NOT belong here - this block runs BEFORE the
-		// cfg.league.* assignments below, which would clobber them. See the GGL_SMOKE
-		// re-application right after the league anchor config.
-		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential, ladder warmups collapsed (offline sandbox smoke)");
+		// NOTE: any override of a value assigned LATER in this function does not belong
+		// here - this block runs first and would be clobbered. Re-apply it next to the
+		// production assignment instead (see the Nexto serveFrac and reference-cadence
+		// smoke overrides).
+		RG_LOG("GGL_SMOKE: numGames 128, tsPerItr 25k, fp32, sequential (offline sandbox smoke)");
 	}
 
 	cfg.ppo.epochs = 2;
@@ -721,11 +726,49 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.goalCritic.model.addLayerNorm = addLayerNorm;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
-	// savePolicyVersions. This was ON in the good era. NOTE: this only EVALUATES against old
-	// versions - it does NOT train against them. The separate trainAgainstOldVersions (self-play
-	// league) is deliberately left OFF: it was not part of the proven-good config (it was a recent
-	// uncommitted addition). Flip it on later as its own experiment if desired.
+	// savePolicyVersions.
+	//
+	// Rating/1v1 IS INFLATED and is kept only for continuity. AddVersion copies the main's CURRENT
+	// rating into each new version (PolicyVersionManager.cpp:50) and every goal moves BOTH sides,
+	// so the pool's rating tracks the agent and the number is a treadmill: measured ~6x overstatement
+	// (54% real win share against a predicted 75%). Read Ref/Oldest Share instead - the reference set
+	// below is fixed, is never trained against, and therefore cannot inflate. Both series publish for
+	// this run so the two can be compared directly; retire Rating/1v1 in a later change.
 	cfg.skillTracker.enabled = true;
+
+	// Permanent reference set: the honest yardstick. Log-spaced past checkpoints kept OUTSIDE the
+	// rotating version ring, never evicted at the oldest end, never trained against.
+	cfg.skillTracker.maxReferences = 8;
+	cfg.skillTracker.referenceUpdateInterval = 64;
+
+	// Train against archived past selves. ON since 2026-07-25, when the QD league was removed:
+	// it is now the only self-play opponent source. The cascade is sequential and Nexto rolls
+	// first, so the realized share is (1 - 0.15) * 0.30 = 0.255, and total non-self exposure is
+	// 0.15 + 0.255 = 0.405 - deliberately equal to what the run measured before the strip
+	// (Nexto 0.089 + league 0.319 = 0.408). That holds "how much non-self exposure" fixed while
+	// "who the opponents are" changes, so the two are not confounded in one step. The exposure
+	// level itself was tuned once (descendOpponentFrac 0.25 -> 0.35, after measuring
+	// exploitability by archived styles) and should move only as its own experiment.
+	cfg.trainAgainstOldVersions = true;
+	cfg.trainAgainstOldChance = 0.30f;
+
+	// GGL_SMOKE re-application (MUST live here, after the production assignments above - the
+	// smoke block higher up runs first and would be clobbered). At production cadence a version
+	// is archived every 25M steps and the reference battery runs every 64 iterations, so a short
+	// smoke would report Ref/* never and prove nothing about the archive -> decimate -> save ->
+	// reload -> battery path. These values exercise all of it within ~10 CPU iterations.
+	// Never set on the trainer.
+	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0") {
+		cfg.tsPerVersion = 50'000;                        // ~2 smoke iterations per version
+		cfg.skillTracker.updateInterval = 2;
+		cfg.skillTracker.referenceUpdateInterval = 3;
+		cfg.skillTracker.simTime = 20;                    // long enough that a random-init
+		                                                  // policy actually scores, so the smoke
+		                                                  // exercises Ref/Share and its persistence
+		cfg.skillTracker.maxReferences = 4;               // small enough that decimation fires
+		RG_LOG("GGL_SMOKE: tsPerVersion 50k, reference battery every 3 iters "
+			"(exercises archive -> decimate -> save -> reload -> Ref/* panels)");
+	}
 
 	// FRESH RUN (4.0): the team-play lineage - padded 230-dim obs (AdvancedObsPadded(3)),
 	// PHASE A all-1v1 curriculum, otherwise the proven 3.1 config (512-wide, secondary
@@ -742,11 +785,25 @@ int main(int argc, char* argv[]) {
 	                                         // (PHASE A / empty version pool / no PHASE_B marker).
 	cfg.metricsRunName = "resid-768p-1280v";
 
+	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
+	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
+	// at a glance from the live lineage. Prefer WANDB_MODE=offline too; this is the backstop for
+	// when that is forgotten. Lives here, after the production assignment, per the rule above.
+	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0")
+		cfg.metricsRunName = "SMOKE-" + cfg.metricsRunName;
+
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
 	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
 	// it. 25M = a save every ~2.5 min, window ~20 min, and far less IO. Worst-case crash
 	// loss rises from ~6s to ~2.5min of training - the wrapper restart costs more anyway.
 	cfg.tsPerSave = 25'000'000;
+	// GGL_SMOKE: force a real checkpoint round-trip within a few CPU iterations, so the smoke
+	// actually exercises SaveVersions/SaveReferences and the reference_goals persistence rather
+	// than only the in-memory path. MUST live here, AFTER the production assignment above - an
+	// earlier override is silently clobbered (this exact mistake cost a smoke cycle on
+	// 2026-07-25, which is why the rule is written down in three places). Never on the trainer.
+	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0")
+		cfg.tsPerSave = 100'000;
 	// Golden archive + boot sanity probe use LearnerConfig defaults (keep 3 best-rated
 	// checkpoints outside rotation; probe loaded checkpoints rated >= 400).
 
@@ -782,63 +839,26 @@ int main(int argc, char* argv[]) {
 	// justified by effective-rank decay, so the project needs to keep measuring it.
 	// History: git log -- GigaLearnCPP/src/private/GigaLearnCPP/PSD
 
-	// QD league: a MAP-Elites archive of behaviorally-diverse opponents so the main doesn't converge
-	// to one playstyle and gets exposure to others. Now actually WIRED into training: descendOpponentFrac
-	// of iterations face a PFSP-sampled league member (was dead code before - the archive existed but
-	// never fed the training loop). Members are past selves (re-seeded each era) + their mutations;
-	// exploiterSlots members hill-climb to attack the current main's weaknesses. Fitness = member goals
-	// minus main goals over a match (the sign was inverted before, breeding the worst losers).
-	cfg.league.enabled = true;
-	cfg.league.gridAxes = { "in_air_ratio", "field_y", "boost_economy" };
-	// 6 bins/axis + QUANTILE-ADAPTIVE edges (default-on in LeagueConfig). The uniform-[0,1] 4-bin
-	// grid was measured nearly dead at 919M steps: the whole population lived in in_air [0.51,0.92],
-	// field_y [0.37,0.62], boost [0.016,0.060] -> only 3 of 64 cells occupied, boost axis never left
-	// bin 0, and 58 exploiter-unmapped wins said the grid couldn't name the styles that matter.
-	// Quantile edges (rolling window of observed BDs, refreshed each reseed era) put every bin where
-	// the population actually lives and track it as the bot improves all week.
-	cfg.league.binsPerAxis = 6;
-	cfg.league.exploiterSlots = 2;
-	// 0.25 -> 0.35 (2026-07-12): the steered style measurably beats its recent self (42-24)
-	// but loses to ARCHIVED styles (12-19 vs the 4.16B era) - nontransitive exploitability.
-	// PFSP already prefers members that beat the main, so more league iterations = targeted
-	// training against exactly the styles currently winning. Revert to 0.25 if Elo variance
-	// rises without the deficit closing.
-	cfg.league.descendOpponentFrac = 0.35f;
-	cfg.league.reseedEveryIters = 1000;     // snapshot the current main as a fresh lineage this often
-	cfg.league.competenceFloor = -25.0f;    // keep sparring partners that lose by a bit (style > winning)
+	// ===== QD LEAGUE: REMOVED WHOLESALE 2026-07-25 =====
+	// The MAP-Elites opponent archive is gone. It did not do the job it existed for, and the
+	// only thing about it that was ever measured was its cost (docs/LEAGUE_RECON.md: 63 defect
+	// claims, 59 survived adversarial verification).
+	//   * It COLLAPSED on every lineage that learned: 17o01ku8 94 members -> 3 (coverage 0.426
+	//     -> 0.005), bfl8mbw4 3 members in 93.9% of blocks, tpgyf8de 129 -> 11. Not via the
+	//     documented competenceFloor cull - that code is UNREACHABLE, because Cull() protects
+	//     every cell elite and dedup guarantees one elite per cell. The real engine was
+	//     DedupCells at each quantile rebin.
+	//   * What it actually served were noisy copies of the UNTRAINED BIRTH NETWORK. All members
+	//     were lineage 0 (both reseeds rejected: TryInsert needs strictly better fitness, and a
+	//     fresh snapshot scores ~0 against itself while 31 incumbents sat at exactly 0), measuring
+	//     0.039-0.064 relative-L2 from policy_versions/0 and 0.73-0.78 from the current main.
+	//   * Cost: ~3.6% of wall clock in the evolve barrier, a serving tax, and 2.7 GB rewritten
+	//     every save into an index-keyed store that was already desynced (141 .pt files for a
+	//     121-member archive).
+	// Replaced by: archived past selves (trainAgainstOldVersions above) + Nexto for training
+	// diversity, and the permanent reference set for honest measurement. History:
+	// git log -- GigaLearnCPP/src/private/GigaLearnCPP/League ; tag pre-league-strip-20260725
 
-	// PERMANENT SPACED ANCHORS (2026-07-19, research/reports/LEAGUE_ANCHORS.md).
-	// Measured: the evolved archive is COLLAPSED - League/Member Count 3 and Cell Count 1
-	// of 216 in 92% of report blocks. Mechanism (code-verified): fitness is re-scored
-	// against the improving main every refresh, so every fixed style ratchets below
-	// competenceFloor and gets culled, while ReseedFromMain only adds near-clones. So the
-	// 0.35 "diverse opponent" budget was really 3 copies of the recent self. Independently
-	// measured consequence: real match-play progress is only ~+4 Elo/B (+31 Elo over 8.6B
-	// steps vs the 18.88B self) while pool Rating claimed +187 - a self-similar pool both
-	// starves training and inflates the yardstick.
-	// Anchors are full checkpoints archived outside the rotation by tools/archive_anchor.sh,
-	// held in their OWN vector so they are structurally exempt from re-scoring and culling
-	// (that exemption IS the fix; scoring them re-arms the same ratchet). NOTE: the zero-pad
-	// migration that used to widen pre-wire anchors on load went with the wire (2026-07-25),
-	// so archived anchors must match the current net width.
-	// 0.05 of ALL iterations = ~1/7 of the existing 0.35 league serve: a REALLOCATION, not
-	// extra arena cost. NO automatic guard covers this any more - the rating latch was removed
-	// 2026-07-25; revert is manual = set this to 0 (byte-identical).
-	// Success criterion is the anchor battery's real-Elo slope (research/tools/
-	// anchor_battery.py), NOT Rating - see LEAGUE_ANCHORS.md pre-registration.
-	cfg.league.anchorFrac = 0.05f;
-	cfg.league.anchorMaxServed = 24;        // serving cap; disk archive keeps everything
-	cfg.league.anchorRecencyFloor = 0.15f;  // oldest anchor's sampling weight vs the newest
-	// GGL_SMOKE re-application (MUST live after the assignments above - the smoke block
-	// higher up runs first and would be clobbered). At the production 0.05 an anchor
-	// serves ~1 iteration in 20, so a short smoke would report Anchor Serves 0 and prove
-	// nothing; forcing anchorFrac == descendOpponentFrac makes P(anchor | league serve) = 1
-	// so load + migrate + serve is exercised deterministically. Never set on the trainer.
-	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0") {
-		cfg.league.anchorFrac = cfg.league.descendOpponentFrac;
-		RG_LOG("GGL_SMOKE: league anchorFrac forced to descendOpponentFrac ("
-			<< cfg.league.descendOpponentFrac << ") - every league serve draws an anchor");
-	}
 	// ===== STEERING: REMOVED WHOLESALE 2026-07-25 =====
 	// The activation-steering research programme is finished. Its actuation went inert when the
 	// optimism work superseded it, and the remainder - possession-outcome labeling, the frontier
@@ -902,8 +922,7 @@ int main(int argc, char* argv[]) {
 		// GGL_SMOKE: serve on most iterations so a short smoke exercises the
 		// adapter (obs port + action map + goal telemetry) deterministically.
 		// Lives HERE, after the production assignment - the smoke block up top
-		// runs first and would be clobbered (same trap as the league-anchor
-		// smoke override). Never set on the trainer.
+		// runs first and would be clobbered. Never set on the trainer.
 		if (const char* s2 = std::getenv("GGL_SMOKE"); s2 && s2[0] && std::string(s2) != "0")
 			cfg.externalOpponent.serveFrac = 0.75f;
 	} else {
