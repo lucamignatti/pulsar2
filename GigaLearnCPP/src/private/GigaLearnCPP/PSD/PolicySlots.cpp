@@ -67,7 +67,14 @@ torch::Tensor PolicySlots::Forward(torch::Tensor trunkOut) {
 	torch::Tensor x = trunkOut;
 	int l = 0;
 	auto& seq = policy->seq;
+	// The policy's residual blocks (Model::residualSpans) must be reproduced here, or the slot
+	// forward computes a different function than Model::Forward and every ES fitness is garbage.
+	auto& spans = policy->residualSpans;
+	std::vector<torch::Tensor> saved(spans.size());
 	for (size_t i = 0; i < seq->size(); i++) {
+		for (size_t s = 0; s < spans.size(); s++)
+			if (spans[s].first == (int)i)
+				saved[s] = x;
 		auto m = seq->ptr(i);
 		if (auto lin = std::dynamic_pointer_cast<torch::nn::LinearImpl>(m)) {
 			auto& info = layers[l];
@@ -94,6 +101,10 @@ torch::Tensor PolicySlots::Forward(torch::Tensor trunkOut) {
 		} else {
 			RG_ERR_CLOSE("PolicySlots::Forward: unexpected module type in policy net at index " << i);
 		}
+
+		for (size_t s = 0; s < spans.size(); s++)
+			if (spans[s].second == (int)i && saved[s].defined())
+				x = x + saved[s];
 	}
 	return x;
 }

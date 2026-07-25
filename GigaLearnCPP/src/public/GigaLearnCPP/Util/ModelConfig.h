@@ -27,6 +27,17 @@ namespace GGL {
 		bool addLayerNorm = true;
 		bool addOutputLayer = true;
 
+		// Residual (BroNet-style) blocks. When true, layerSizes[0] is a plain "stem" layer
+		// and every following PAIR of layers becomes a residual block:
+		//     x <- Act( x + LN(W2 Act(LN(W1 x))) )
+		// A trailing unpaired layer stays plain, so {W} and {W,W} are unchanged by this flag
+		// and {W,W,W} = stem + 1 block, {W,W,W,W,W} = stem + 2 blocks.
+		// Requires uniform layerSizes (the skip needs matching dims) - asserted in Model().
+		// The module list stays FLAT (Linear/LayerNorm/Act in order, exactly as before); the
+		// skips are applied by Model::Forward from recorded index spans, so every consumer
+		// that walks seq looking for Linears (PSD::LinearLayers, PolicySlots) still works.
+		bool addResiduals = false;
+
 		bool IsValid() const {
 			return !layerSizes.empty();
 		}

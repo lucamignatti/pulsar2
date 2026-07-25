@@ -13,12 +13,39 @@ GGL::Model::Model(
 	if (!config.IsValid())
 		RG_ERR_CLOSE("Failed to create model \"" << modelName << "\" with invalid config");
 
+	if (config.addResiduals) {
+		// The skip adds a block's input to its output, so every hidden layer must share a width.
+		for (int size : config.layerSizes)
+			if (size != config.layerSizes[0])
+				RG_ERR_CLOSE("Model \"" << modelName << "\": addResiduals requires uniform layerSizes, got "
+					<< size << " among " << config.layerSizes[0] << "-wide layers");
+	}
+
 	int lastSize = config.numInputs;
-	for (int i = 0; i < config.layerSizes.size(); i++) {
+	int blockRemaining = 0;   // hidden layers left in the currently-open residual block
+	int blockStartModule = -1;
+	const int numLayers = (int)config.layerSizes.size();
+	for (int i = 0; i < numLayers; i++) {
+
+		// Open a 2-layer residual block at layer i. Never at the stem (i=0, which changes width
+		// from numInputs), and only when layer i+1 exists to pair with - a trailing odd layer
+		// stays plain, so {W} and {W,W} are unaffected by addResiduals.
+		if (config.addResiduals && blockRemaining == 0 && i >= 1 && (i + 1) < numLayers) {
+			blockRemaining = 2;
+			blockStartModule = (int)seq->size();
+		}
+
 		seq->push_back(torch::nn::Linear(lastSize, config.layerSizes[i]));
 		if (config.addLayerNorm)
 			seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({(int64_t)config.layerSizes[i]})));
 		lastSize = config.layerSizes[i];
+
+		// Close the block on its SECOND layer, before that layer's activation is pushed:
+		// the recorded span ends at the LayerNorm, so Forward adds the skip and the trailing
+		// activation then sees the sum (ResNet-v1 ordering).
+		if (blockRemaining > 0 && --blockRemaining == 0)
+			residualSpans.push_back({ blockStartModule, (int)seq->size() - 1 });
+
 		AddActivationFunc(seq, config.activationType);
 	}
 	
@@ -34,6 +61,45 @@ GGL::Model::Model(
 	register_module("seq", seq);
 	seq->to(device);
 	optim = MakeOptimizer(config.optimType, this->parameters(), 0);
+}
+
+torch::Tensor GGL::ForwardSeqModule(const std::shared_ptr<torch::nn::Module>& mod, torch::Tensor x) {
+	if (auto lin = std::dynamic_pointer_cast<torch::nn::LinearImpl>(mod))
+		return lin->forward(x);
+	if (auto ln = std::dynamic_pointer_cast<torch::nn::LayerNormImpl>(mod))
+		return ln->forward(x);
+	if (auto act = std::dynamic_pointer_cast<torch::nn::LeakyReLUImpl>(mod))
+		return act->forward(x);
+	if (auto act = std::dynamic_pointer_cast<torch::nn::ReLUImpl>(mod))
+		return act->forward(x);
+	if (auto act = std::dynamic_pointer_cast<torch::nn::SigmoidImpl>(mod))
+		return act->forward(x);
+	if (auto act = std::dynamic_pointer_cast<torch::nn::TanhImpl>(mod))
+		return act->forward(x);
+
+	RG_ERR_CLOSE("ForwardSeqModule: unexpected module type in model seq");
+	return x;
+}
+
+// Walk a flat seq applying the recorded residual spans. Only used when residualSpans is
+// non-empty; otherwise callers take Sequential's own fused forward.
+static torch::Tensor ForwardResidual(
+	torch::nn::Sequential& seq, const std::vector<std::pair<int, int>>& spans, torch::Tensor x) {
+
+	std::vector<torch::Tensor> saved(spans.size());
+	for (int i = 0; i < (int)seq->size(); i++) {
+
+		for (int s = 0; s < (int)spans.size(); s++)
+			if (spans[s].first == i)
+				saved[s] = x;
+
+		x = GGL::ForwardSeqModule(seq->ptr(i), x);
+
+		for (int s = 0; s < (int)spans.size(); s++)
+			if (spans[s].second == i && saved[s].defined())
+				x = x + saved[s];
+	}
+	return x;
 }
 
 torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec) {
@@ -61,10 +127,14 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec) {
 		}
 		
 		auto halfInput = input.to(RG_HALFPERC_TYPE);
-		auto halfOutput = seqHalf->forward(halfInput);
+		auto halfOutput = residualSpans.empty()
+			? seqHalf->forward(halfInput)
+			: ForwardResidual(seqHalf, residualSpans, halfInput);
 		return halfOutput.to(torch::kFloat);
 	} else {
-		return seq->forward(input);
+		return residualSpans.empty()
+			? seq->forward(input)
+			: ForwardResidual(seq, residualSpans, input);
 	}
 }
 

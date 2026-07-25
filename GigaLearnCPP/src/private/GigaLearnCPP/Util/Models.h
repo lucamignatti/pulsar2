@@ -87,6 +87,10 @@ namespace GGL {
 
 	//////////////////////////
 
+	// Forward one type-erased module of a Model's flat seq. Mirrors the cast chain in
+	// PolicySlots::Forward - both walk the same module list, so both must know the same types.
+	torch::Tensor ForwardSeqModule(const std::shared_ptr<torch::nn::Module>& mod, torch::Tensor x);
+
 	class Model : public torch::nn::Module {
 	public:
 		const char* modelName;
@@ -94,6 +98,13 @@ namespace GGL {
 		torch::nn::Sequential seq, seqHalf;
 		bool _seqHalfOutdated = true;
 		ModelConfig config;
+
+		// Residual block spans over seq's module indices, as (firstModule, lastModule):
+		// the input to firstModule is added back to the output of lastModule (which is the
+		// block's final LayerNorm, so the add lands BEFORE the block's trailing activation).
+		// Empty unless config.addResiduals - and when empty, Forward takes the original
+		// straight-through seq->forward() path, so non-residual models are bit-identical.
+		std::vector<std::pair<int, int>> residualSpans;
 
 		torch::optim::Optimizer* optim;
 

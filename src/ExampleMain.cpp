@@ -670,29 +670,67 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.goalCritic.gamma = 0.9994f;   // ~77s half-life at 15Hz (5.0 tickSkip 8; re-derived)
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
-	cfg.ppo.goalCritic.model.layerSizes = { 1152, 1152, 1152 }; // scaled 512->1152 with the policy (6M cold start, 2026-07-22)
+	cfg.ppo.goalCritic.model.layerSizes = { 1280, 1280, 1280, 1280, 1280 }; // aux-head scale-up (see the block below)
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
 
-	// 1152-wide (was 512, orig 256): trunk + policy + critic + goal-critic all widened together
-	// (user-directed 2026-07-22 cold start). Trunk(2x1152) + policy(3x1152) = ~5.70M params - the
-	// "6M trunk+policy" target. Critic and goal-critic scaled to match so the value baseline keeps
-	// pace with the policy (an undersized critic bottlenecks PPO advantages). 1152 = 9x128, so the
-	// GEMMs stay tensor-core aligned. Reachability phi/psi stay 256-wide (InfoNCE contrastive
-	// embeddings, spec-tuned - a different objective, not a policy/value head) and the Ladder
-	// sensor/map keep their spec-fixed geometry; only their INPUT column count tracks the wider
-	// trunk. History kept: the prior 256->512 bump was licensed by a saturation probe (49-74%
-	// spectral utilization at 256, effective rank grinding down all run) - the same "underused
-	// capacity is nearly free, missing capacity compounds" logic scales to 1152. Inference is
-	// latency-bound on the 5080, so SPS cost is sub-proportional to the ~4.5x dense-FLOP increase,
-	// but expect a real slowdown vs 512 - measure it from the log. See the miniBatchSize note above:
-	// the ~2.25x wider activations forced a proportional minibatch cut to hold the learn-pass peak.
-	cfg.ppo.sharedHead.layerSizes = { 1152, 1152 };
-	cfg.ppo.policy.layerSizes = { 1152, 1152, 1152 };
-	cfg.ppo.critic.layerSizes = { 1152, 1152, 1152 };
-	cfg.ppo.reachability.phi.layerSizes = { 256, 256 };
-	cfg.ppo.reachability.psi.layerSizes = { 256, 256 };
+	// ASYMMETRIC RESIDUAL NETS (2026-07-24 cold start, user-directed). Three changes at once,
+	// all shape-breaking, so this needs its own checkpoint folder (see cfg.checkpointFolder):
+	//
+	//   (a) RESIDUALS everywhere (PartialModelConfig::addResiduals). layerSizes[0] is a plain
+	//       stem, every following PAIR becomes x <- Act(x + LN(W2 Act(LN(W1 x)))). {W,W} is
+	//       unchanged by the flag, {W,W,W} = stem+1 block, 5 entries = stem+2 blocks. This is
+	//       the BroNet shape (Nauman et al. 2024); the local bake-off (~/Projects/experiments/
+	//       arch/RESULTS.md, 5 seeds x 10 min) measured residual+LN nets at ~20x the SAMPLE
+	//       efficiency of a plain LN-MLP (60 vs 3 touches at matched 0.9M steps) with the
+	//       tightest seed spread of any arm. It also directly targets the effective-rank decay
+	//       noted below: a residual stream is the documented fix for on-policy plasticity loss
+	//       (arXiv 2405.19153), where widening only treats the symptom.
+	//
+	//   (b) POLICY SHRUNK 1152 -> 768 (3 entries = stem + 1 block): ~4.09M -> ~2.14M params.
+	//       SimBa (2410.09754) and BRO (2405.16158) both find actor scaling contributes ~nothing
+	//       while critic scaling pays - SimBa's own defaults are actor 128 / critic 512, a 4x
+	//       ratio, so 768/1280 here is mild. The freed SPS funds (c).
+	//
+	//   (c) VALUE HEADS WIDENED AND DEEPENED to 5x1280 (stem + 2 blocks): critic ~3.98M ->
+	//       ~8.03M, goal critic ~2.92M -> ~6.85M. Depth is only safe now because of (a) - the
+	//       bake-off's plain 16-layer stack LOST badly to a 4-layer one (142 vs 214).
+	//       *** COST WARNING: vdag1/vdag2 mirror the critic's config automatically
+	//       (PPOLearner.cpp), so every critic parameter is paid THREE times: critic-family goes
+	//       ~11.9M -> ~24.1M. Total dense params ~20M -> ~38M. ***
+	//       Widths stay 128-aligned (768=6x128, 1280=10x128) for tensor cores. The learn-pass
+	//       activation peak grows with width x depth, so watch for OOM - the 512->1152 bump
+	//       already forced a miniBatchSize cut, and this one may force another.
+	//
+	// The trunk keeps its 1152 width but gains a third layer so it gets a residual stream too
+	// ({1152,1152} would be flag-immune); it is shared perception feeding both heads, so it is
+	// deliberately NOT shrunk with the policy.
+	// History kept: the 256->512 bump was licensed by a saturation probe (49-74% spectral
+	// utilization at 256, effective rank grinding down all run); 512->1152 followed the same
+	// "underused capacity is nearly free" logic. Inference is latency-bound on the 5080, so SPS
+	// cost stays sub-proportional to dense FLOPs - but measure it from the log, and if the
+	// policy shrink costs strength, revert (b) alone by putting policy back to 1152.
+	bool addResiduals = true;
+	cfg.ppo.sharedHead.addResiduals = addResiduals;
+	cfg.ppo.policy.addResiduals = addResiduals;
+	cfg.ppo.critic.addResiduals = addResiduals;
+	cfg.ppo.goalCritic.model.addResiduals = addResiduals;
+	cfg.ppo.reachability.phi.addResiduals = addResiduals;
+	cfg.ppo.reachability.psi.addResiduals = addResiduals;
+	cfg.ppo.proposer.delta.addResiduals = addResiduals;
+
+	cfg.ppo.sharedHead.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
+	cfg.ppo.policy.layerSizes = { 768, 768, 768 };         // SHRUNK: stem + 1 block
+	cfg.ppo.critic.layerSizes = { 1280, 1280, 1280, 1280, 1280 };  // stem + 2 blocks (x3 w/ vdag twins)
+	// Reachability phi/psi and the proposer delta are CONTRASTIVE/regression heads, not value
+	// heads: the critic-scaling evidence above does not cover them, and over-parameterized
+	// InfoNCE embeddings can overfit the contrastive task. Grown only modestly (256x2 ->
+	// 384x3 = stem + 1 block); if reach accuracy or drill quality regresses, revert these two
+	// lines first - they are the least-supported part of this change.
+	cfg.ppo.reachability.phi.layerSizes = { 384, 384, 384 };
+	cfg.ppo.reachability.psi.layerSizes = { 384, 384, 384 };
+	cfg.ppo.proposer.delta.layerSizes = { 384, 384, 384 };
 	cfg.ppo.reachability.lr = 3e-4f;
 
 	// Speed knob kept from the post-good-era "speed 2" commit (2211cce): larger rho-read chunks
@@ -737,12 +775,13 @@ int main(int argc, char* argv[]) {
 	// can NEVER accidentally resume the 3.1 lineage (obs 109 -> 230; the loader would abort
 	// on the trunk's first Linear anyway, but the folder split keeps the failure impossible
 	// rather than merely loud).
-	cfg.checkpointFolder = "checkpoints_6M"; // 6M-NET COLD START 2026-07-22: the 512->1152 width change
-	                                         // makes the 5.0v3 checkpoints shape-incompatible, so this run
-	                                         // starts fresh in a new folder (checkpoints_5.0v3 stays archived
-	                                         // and untouched; a fresh folder also guarantees PHASE A / empty
-	                                         // version pool / no PHASE_B marker, i.e. a true cold start)
-	cfg.metricsRunName = "6M-1152";
+	cfg.checkpointFolder = "checkpoints_resid"; // RESIDUAL/ASYMMETRIC COLD START 2026-07-24: residual blocks
+	                                         // + policy 1152->768 + value heads 5x1280 all change tensor
+	                                         // shapes, so checkpoints_6M cannot be resumed (the loader would
+	                                         // abort on the trunk's first Linear). Fresh folder = archived
+	                                         // predecessors stay untouched and this is a true cold start
+	                                         // (PHASE A / empty version pool / no PHASE_B marker).
+	cfg.metricsRunName = "resid-768p-1280v";
 
 	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
 	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
