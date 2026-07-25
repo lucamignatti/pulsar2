@@ -45,20 +45,7 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
-			/*makeCarStateHead=*/(config.proposer.enabled && config.proposer.carEnabled)
-				|| config.reachability.carStateHead);
-	}
-
-	if (config.proposer.enabled) {
-		if (!config.reachability.enabled)
-			RG_ERR_CLOSE("PPOLearner: config.proposer.enabled requires config.reachability.enabled (the proposer reuses the reachability phi/psiBall goal space)");
-		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
-		proposer = new ProposerModule(trunkOutSize, config.proposer, device, models);
-
-		// Car proposer = a SECOND ProposerModule instance (same 6D goal space, same A^(N) weights,
-		// same unroll/train machinery) with its own delta net, proposing canonical car states.
-		if (config.proposer.carEnabled)
-			proposerCar = new ProposerModule(trunkOutSize, config.proposer, device, models, "proposer_car_delta");
+			/*makeCarStateHead=*/config.reachability.carStateHead);
 	}
 
 	SetLearningRates(config.policyLR, config.criticLR);
@@ -968,11 +955,6 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 
 		// Reachability heads are training-time-only; old policy versions don't carry them
 		if (name.rfind("reach_", 0) == 0)
-			continue;
-
-		// Same for the deliberate-practice proposer - it's training-time-only and old policy
-		// versions are loaded with allowNotExist=false, which would hard-fail on it
-		if (name.rfind("proposer", 0) == 0)
 			continue;
 
 		result.Add(model);

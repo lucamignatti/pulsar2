@@ -669,10 +669,10 @@ int main(int argc, char* argv[]) {
 	// iterations instead. The InfoNCE trunk aux (the part that helps learning) is unaffected.
 	cfg.ppo.reachability.diagEveryIters = 16;
 
-	// Explicitly OFF - the regression. ProposerConfig defaults enabled=true upstream, so this
-	// override is what actually keeps the proposer / drill bank / car-proposer / HRL machinery
-	// out of this build (no drill bank is ever constructed or attached, either).
-	cfg.ppo.proposer.enabled = false;
+	// The goal proposer / drill bank / car-proposer bundle was REMOVED 2026-07-25. It had been
+	// explicitly disabled since the 9uz761ua regression (enabling it decelerated the best run
+	// ~10x), and its config block configured a delta net that was never constructed.
+	// History: git log -- GigaLearnCPP/src/private/GigaLearnCPP/PPO/Proposer.cpp
 
 	// Wide clip (cold return-sigma is ~2-4 under this near-sparse stack; default 10 compressed the
 	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
@@ -736,19 +736,17 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.goalCritic.model.addResiduals = addResiduals;
 	cfg.ppo.reachability.phi.addResiduals = addResiduals;
 	cfg.ppo.reachability.psi.addResiduals = addResiduals;
-	cfg.ppo.proposer.delta.addResiduals = addResiduals;
 
 	cfg.ppo.sharedHead.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
 	cfg.ppo.policy.layerSizes = { 768, 768, 768 };         // SHRUNK: stem + 1 block
 	cfg.ppo.critic.layerSizes = { 1280, 1280, 1280, 1280, 1280 };  // stem + 2 blocks (x3 w/ vdag twins)
-	// Reachability phi/psi and the proposer delta are CONTRASTIVE/regression heads, not value
+	// Reachability phi/psi are CONTRASTIVE/regression heads, not value
 	// heads: the critic-scaling evidence above does not cover them, and over-parameterized
 	// InfoNCE embeddings can overfit the contrastive task. Grown only modestly (256x2 ->
 	// 384x3 = stem + 1 block); if reach accuracy or drill quality regresses, revert these two
 	// lines first - they are the least-supported part of this change.
 	cfg.ppo.reachability.phi.layerSizes = { 384, 384, 384 };
 	cfg.ppo.reachability.psi.layerSizes = { 384, 384, 384 };
-	cfg.ppo.proposer.delta.layerSizes = { 384, 384, 384 };
 	cfg.ppo.reachability.lr = 3e-4f;
 
 	// Speed knob kept from the post-good-era "speed 2" commit (2211cce): larger rho-read chunks

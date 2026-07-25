@@ -4,7 +4,6 @@
 #include "../Util/ModelConfig.h"
 
 namespace RLGC {
-	class DrillBank;
 }
 
 namespace GGL {
@@ -126,83 +125,8 @@ namespace GGL {
 			psi.activationType = ModelActivationType::LEAKY_RELU;
 		}
 	};
-
-	// Deliberate-practice goal proposer: g_t = clamp(g_{t-1} + Delta(detached_trunk_feat_t, g_{t-1})),
-	// goals living in the SAME 6D canonical-ball space as the reachability BALL head. Trained by
-	// advantage-weighted hindsight (targets = achieved ball state N steps ahead; CRR-binary weights
-	// from an N-step-advantage aspiration percentile). Requires reachability.enabled (reuses phi/psiBall).
-	//
-	// Stage 1 (enabled by default) is PASSIVE: it trains the proposer and logs calibration metrics,
-	// but never touches rewards/advantages/returns/values.
-	// Stage 2 (shapingBeta, default 0) adds a centered, advantage-only shaping term built from the
-	// SAME proposed goal on both sides of the potential difference (gamma*rho(s',g) - rho(s,g)) so
-	// goal-motion never gets charged to the policy — only its progress toward a goal that stood.
-	// Stage 3 (practiceEnabled, default off) detects reachability "drop" events (a committed mistake),
-	// banks a restorable snapshot + the goal that was in play, and periodically replays that snapshot
-	// under an amplified beta so the policy gets repeated at-bats on its own near-misses.
-	struct ProposerConfig {
-		// ---- Stage 1 (ships ENABLED; passive) ----
-		bool enabled = true;              // requires reachability.enabled (validated in PPOLearner ctor)
-		PartialModelConfig delta;         // proposer_delta net; Muon (like policy/critic, not Adam like reach)
-		float lr = 1e-4f;
-		int horizonSteps = 45;            // N ~ 3s at tickSkip 8
-		float goalClamp = 1.5f;           // box the unrolled goal is kept within, normalized units
-		float aspirationPercentile = 0.75f;  // top (1-p) of A^(N) get weight 1
-		float belowAspirationWeight = 0.05f; // CRR-binary low arm; NEVER 0 (dilution, not repulsion)
-		int trainMinibatchSize = 4096;
-		int trainEpochs = 1;
-		int64_t featureChunkSize = 4096;  // shared-head feature pass chunk size (mirrors reach.scoreChunkSize)
-		int dumpEveryNItrs = 25;          // JSONL calibration dump cadence to disk; 0 = never
-		int dumpMaxRows = 512;
-
-		// ---- Stage 2 (code-complete; DISABLED by default) ----
-		float shapingBeta = 0.0f;         // 0 => stage-2 path fully skipped (bit-identical to stage-1-only)
-
-		// ---- Car proposer head (canonical CAR-state goals, not ball-relative; DISABLED by default) ----
-		// A second proposer head proposing where the CAR should go, delivered as its own potential
-		// shaping term. Reuses the SAME A^(N) aspiration weights + trunk features as the ball head
-		// (aspiration is goal-space-agnostic); adds a psi_carstate reach head + a second delta net.
-		// Passive when carEnabled && carShapingBeta==0 (trains + logs car-space tilt, no shaping).
-		bool carEnabled = false;          // build + train the car head (requires enabled)
-		float carShapingBeta = 0.0f;      // 0 => car shaping skipped (car head stays passive)
-
-		// ---- Stage 3 (code-complete; DISABLED by default) ----
-		bool practiceEnabled = false;
-		RLGC::DrillBank* drillBank = NULL; // owned by user code (e.g. ExampleMain); required when practiceEnabled
-		int snapshotEveryK = 8;           // per-arena snapshot cadence, in collection steps
-		float phiSquashTemp = 10;         // Phi = sigmoid(rho / T) for drop detection
-		// Phi-drop detector thresholds. Phi is a squashed InfoNCE logit - uncalibrated and NON-
-		// stationary (the rho distribution drifts as the reach critic + policy improve), so absolute
-		// thresholds silently flood or starve. Default = self-calibrate each iteration from the
-		// batch's own Phi distribution over non-practice rows: "high" = the phiHighPercentile-th Phi,
-		// "drop" = that minus the phiDropPercentile-th Phi. Scale-free, tracks the drift automatically
-		// (same dimensionless-dial pattern as aspirationPercentile). Set phiCalibratePerIter=false to
-		// fall back to the fixed phiHighThresh/phiDropThresh below.
-		bool phiCalibratePerIter = true;
-		float phiHighPercentile = 0.85f;  // batch percentile that counts as a "high" (reachable) moment
-		float phiDropPercentile = 0.40f;  // low anchor; drop-magnitude bar = Phi(pHigh) - Phi(pDrop)
-		float phiHighThresh = 0.7f;       // absolute fallback: Phi was "high" if it reached at least this
-		float phiDropThresh = 0.3f;       // absolute fallback: a drop of at least this = a "mistake"
-		int phiDropWindow = 30;           // steps
-		int maxNewDrillsPerItr = 16;      // bank at most this many per iter, the LARGEST-drop candidates
-		int drillDumpEveryNItrs = 25;     // JSONL dump of the bank's contents for eyeballing; 0 = never
-		int drillDumpMaxRows = 128;
-		int practiceWindowSteps = 90;     // tagged window length after a drill reset (~6s at tickSkip 8)
-		float practiceBetaScale = 3.0f;   // shaping amplification on practice-tagged rows
-		float drillJitterPos = 100, drillJitterVel = 150;
-		float successProximity = 0.15f;   // normalized canonical ball-pos distance counted as a "recovery"
-		int drillMaxTries = 20;
-		int drillMinTriesForRetire = 5;
-		float drillRetireSuccessRate = 0.7f;
-		int maxDrillBankSize = 512;
-
-		ProposerConfig() {
-			delta = {};
-			delta.layerSizes = { 256, 256 };
-			delta.activationType = ModelActivationType::LEAKY_RELU;
-			delta.optimType = ModelOptimType::MUON;
-		}
-	};
+	// ProposerConfig (deliberate-practice proposer + drill bank) REMOVED 2026-07-25.
+	// Disabled since the 9uz761ua regression; see git log -- .../PPO/Proposer.cpp
 
 	// Secondary GOAL-ONLY critic (multi-horizon value decomposition). The dense shaped reward needs a
 	// moderate gamma or target variance swamps the critic; the true objective (goal/concede, the one
@@ -285,7 +209,6 @@ namespace GGL {
 		float guidingStrength = 0.03f;
 
 		ReachabilityConfig reachability;
-		ProposerConfig proposer;
 		GoalCriticConfig goalCritic;
 
 		// HEADROOM — the composition critic (2026-07-24; validated offline in

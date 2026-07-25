@@ -28,7 +28,6 @@
 #include <random>
 #include <thread>
 #include "Util/AvgTracker.h"
-#include <RLGymCPP/StateSetters/DrillBank.h>
 
 using namespace RLGC;
 
@@ -1012,7 +1011,7 @@ void GGL::Learner::Start() {
 			// Car proposer training pairs (canonical car state at t and t+horizonSteps), 6/row each.
 			FList proposerCarCur, proposerCarTarget;
 
-			// Deliberate-practice DRILL extras (only filled when propCfg.practiceEnabled and a
+			// Deliberate-practice DRILL extras (proposer removed 2026-07-25; fields kept in
 			// bank is configured): whether row t falls inside an active practice window, the
 			// committed goal for that window (zeros if not practicing), which bank drill it came
 			// from, and provenance (which trajectories[] slot / local step) so the learn-prep pass
@@ -1202,15 +1201,11 @@ void GGL::Learner::Start() {
 		const bool reachOn = reachCfg.enabled && !render;
 
 		// Deliberate-practice proposer collection extras (requires reach's achieved-ball buffers)
-		const auto& propCfg = config.ppo.proposer;
-		const bool proposerOn = propCfg.enabled && reachOn;
-		const bool proposerCarOn = proposerOn && propCfg.carEnabled;
 		// Car-state reachability head (META third goal space) - trains the proposer-era
 		// psiCarState machinery independent of the proposer
 		const bool reachCarStateOn = reachOn && config.ppo.reachability.carStateHead;
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
-		const bool practiceOn = proposerOn && propCfg.practiceEnabled && propCfg.drillBank != NULL;
 		const bool goalCriticOn = config.ppo.goalCritic.enabled && !render;
 
 		// The report key the skill tracker writes for the TRAINING arenas' team size
@@ -1371,11 +1366,6 @@ void GGL::Learner::Start() {
 		// collect worker, which owns the pool.
 		constexpr int STEER_SIM_THREADS = 4;
 		std::vector<Arena*> steerSimArenas;
-		if (practiceOn) {
-			propCfg.drillBank->Configure(
-				(int)envSet->arenas.size(), propCfg.practiceWindowSteps, propCfg.maxDrillBankSize,
-				propCfg.drillMaxTries, propCfg.drillMinTriesForRetire, propCfg.drillRetireSuccessRate);
-		}
 
 		// Static per-player maps: owning arena, slot within it, and the first opposing player
 		// (whose obs row supplies rho_opp for the control read); teams never change mid-run
@@ -1413,13 +1403,8 @@ void GGL::Learner::Start() {
 		// Slack covers overbatching: collection finishes the step (and its whole episodes)
 		// after crossing tsPerItr.
 		auto combinedTraj = Trajectory();
-		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, proposerOn, practiceOn);
+		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, false, false);
 
-		// Deliberate-practice DRILL snapshot scratch (Stage 3): one entry per (step, arena) this
-		// iteration where a snapshot was captured, keyed by step*numArenas+arenaIdx. Cleared with
-		// combinedTraj each iteration (step always restarts at 0) - the learn-prep Phi-drop pass
-		// looks these up via each row's srcStep/srcPlayer provenance before they're dropped.
-		std::unordered_map<int64_t, RLGC::ArenaSnapshot> stepSnapshots;
 		// goalCriticOn: the goal-channel recorder below indexes these maps too - without it,
 		// a goal-critic-only config would read arena 0 / slot 0 for every player and train
 		// the goal critic on garbage credit. ladderImpOn: the impossible-row tagger
@@ -1539,7 +1524,7 @@ void GGL::Learner::Start() {
 
 			traj.ballHerGoals.resize((size_t)n * 6);
 			traj.carHerGoals.resize((size_t)n * 6);
-			if (proposerCarOn || reachCarStateOn)
+			if (reachCarStateOn)
 				traj.carStateHerGoals.resize((size_t)n * 6);
 			for (int t = 0; t < n; t++) {
 				int ballOff = fnPickOffset(t, reachCfg.ballHerMinOffset, reachCfg.ballHerMaxOffset, ballBiasPow, ballGoalwardBias);
@@ -1555,7 +1540,7 @@ void GGL::Learner::Start() {
 				// states have no +y analog). Window: the head's own calibration-chosen
 				// horizon (carStateHerMaxOffset; the proposer-era code used the ball
 				// window - the proposer is off, this head's semantics own the choice now).
-				if (proposerCarOn || reachCarStateOn) {
+				if (reachCarStateOn) {
 					int carStateOff = fnPickOffset(t, reachCfg.carStateHerMinOffset, reachCfg.carStateHerMaxOffset, ballBiasPow, 0);
 					for (int d = 0; d < 6; d++)
 						traj.carStateHerGoals[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)(t + carStateOff) * 6 + d];
@@ -1579,43 +1564,6 @@ void GGL::Learner::Start() {
 			}
 		};
 
-		// Deliberate-practice proposer training targets: for each row t, records the achieved ball
-		// at t (proposerCurBall) and at t+horizonSteps, clamped to the episode's terminal outcome
-		// row (proposerTargetBall) - the (current, hindsight-target) pair the proposer regresses
-		// onto. Must run AFTER fnRelabelReachGoals (needs the n+1-row achievedBall it just built,
-		// before that scratch is dropped for the next episode).
-		auto fnAppendProposerTargets = [&](Trajectory& traj) {
-			if (!proposerOn)
-				return;
-
-			int n = (int)traj.Length();
-			if (n <= 0)
-				return;
-
-			RG_ASSERT((int)traj.achievedBall.size() == (n + 1) * 6);
-
-			int horizon = RS_MAX(1, propCfg.horizonSteps);
-			traj.proposerCurBall.resize((size_t)n * 6);
-			traj.proposerTargetBall.resize((size_t)n * 6);
-			bool carOn = proposerCarOn;
-			if (carOn) {
-				RG_ASSERT((int)traj.achievedCarState.size() == (n + 1) * 6);
-				traj.proposerCarCur.resize((size_t)n * 6);
-				traj.proposerCarTarget.resize((size_t)n * 6);
-			}
-			for (int t = 0; t < n; t++) {
-				int targetRow = RS_MIN(t + horizon, n);
-				for (int d = 0; d < 6; d++) {
-					traj.proposerCurBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)t * 6 + d];
-					traj.proposerTargetBall[(size_t)t * 6 + d] = traj.achievedBall[(size_t)targetRow * 6 + d];
-					if (carOn) {
-						traj.proposerCarCur[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)t * 6 + d];
-						traj.proposerCarTarget[(size_t)t * 6 + d] = traj.achievedCarState[(size_t)targetRow * 6 + d];
-					}
-				}
-			}
-		};
-
 
 		// ================= Pipelined collection (config.pipelinedCollection) =================
 		// Overlaps NEXT-iteration experience collection with THIS iteration's processing + Learn().
@@ -1630,7 +1578,7 @@ void GGL::Learner::Start() {
 		//     runs in the BARRIER ZONE between join and kick — never concurrent with the worker.
 		// REVERT: set config.pipelinedCollection = false — the flag-off path is the exact sequential
 		// order and call pattern (inline collect, live models, original tail call sites).
-		const bool pipelineOn = config.pipelinedCollection && !render && !practiceOn && !proposerOn;
+		const bool pipelineOn = config.pipelinedCollection && !render;
 		// The pipelined worker's frozen model set. With the steering rho-gate on, the reach
 		// heads are snapshotted too - the worker must never read weights Learn is updating.
 		std::vector<const char*> snapshotNames = { "shared_head", "policy" };
@@ -3339,7 +3287,6 @@ void GGL::Learner::Start() {
 			// -- Generate experience (scope brace removed: body now lives in the collect fn) --
 
 				combinedTrajNext.ClearKeepCapacity();
-				stepSnapshots.clear();
 
 				// Players handed to the opponent this iteration stop being collected; their in-flight
 				// partial episode must not silently SPLICE with a later episode when they return to
@@ -3381,8 +3328,6 @@ void GGL::Learner::Start() {
 						// Drop any practice window whose arena is about to reset for a reason
 						// OTHER than the drill itself (terminals still hold the PREVIOUS step's
 						// flags here - Reset() only zeroes them for arenas that actually reset)
-						if (practiceOn)
-							propCfg.drillBank->ClearWindowsForResets(envSet->state.terminals);
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
 
@@ -3583,23 +3528,6 @@ void GGL::Learner::Start() {
 						// steps, record enough of each arena's physics state to restore play from
 						// exactly here later. Serial - O(numArenas * playersPerArena), same order
 						// as the arenaTeamTouched scan just above.
-						if (practiceOn && (step % RS_MAX(1, propCfg.snapshotEveryK)) == 0) {
-							for (int arenaIdx = 0; arenaIdx < (int)envSet->arenas.size(); arenaIdx++) {
-								RLGC::ArenaSnapshot snap;
-								auto& gs = envSet->state.gameStates[arenaIdx];
-								snap.ball = gs.ball;
-								for (auto& player : gs.players) {
-									RLGC::ArenaSnapshot::CarSnap cs;
-									cs.team = player.team;
-									cs.state = (CarState)player;
-									snap.cars.push_back(cs);
-								}
-								for (BoostPad* pad : envSet->arenas[arenaIdx]->GetBoostPads())
-									snap.pads.push_back(pad->GetState());
-
-								stepSnapshots[(int64_t)step * (int64_t)envSet->arenas.size() + (int64_t)arenaIdx] = std::move(snap);
-							}
-						}
 
 						// Now that we've inferred and stepped the env, we can add that stuff to the
 						// trajectories. Parallel per-player; logProbs is indexed by the ordinal k
@@ -3654,21 +3582,9 @@ void GGL::Learner::Start() {
 
 								// Deliberate-practice DRILL per-row tagging (Stage 3): only the
 								// PRACTICING team's rows get tagged - the opponent trains normally
-								if (practiceOn) {
-									auto win = propCfg.drillBank->GetWindow(arenaIdx);
-									bool practicing = win.active && player.team == win.sourceTeam;
-									traj.practiceMask.push_back(practicing ? 1 : 0);
-									for (int d = 0; d < 6; d++)
-										traj.practiceGoals.push_back(practicing ? win.goal[d] : 0.f);
-									traj.drillIds.push_back(practicing ? (int64_t)win.drillId : 0);
-									traj.srcPlayer.push_back(newPlayerIdx);
-									traj.srcStep.push_back(step);
-								}
 							}
 						});
 
-						if (practiceOn)
-							propCfg.drillBank->DecrementWindows();
 
 						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
@@ -3722,7 +3638,6 @@ void GGL::Learner::Start() {
 
 							auto& traj = trajectories[newPlayerIdx];
 							fnRelabelReachGoals(traj, newPlayerIdx);
-							fnAppendProposerTargets(traj);
 							combinedTrajNext.Append(traj);
 							traj.Clear();
 						}
@@ -3797,10 +3712,8 @@ void GGL::Learner::Start() {
 				// no-grad rho reads) - so its inputs are captured here and Train() is called AFTER
 				// the block closes, mirroring how ppo->Learn() itself (which also needs gradients)
 				// is deferred to after this block.
-				torch::Tensor tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights;
 				// Car head shares tPropFeatures + tPropWeights (same trunk features + aspiration
 				// weights); only its regression pair differs.
-				torch::Tensor tPropCarPrevGoals, tPropCarTargets;
 
 				{ // Process timesteps
 					RG_NO_GRAD;
@@ -3896,11 +3809,11 @@ void GGL::Learner::Start() {
 
 					Timer reachReadTimer = {};
 					torch::Tensor tTrunkFeatures;
-					if ((reachReadsThisIter || proposerOn) && combinedTraj.Length() > 0) {
+					if (reachReadsThisIter && combinedTraj.Length() > 0) {
 						Model* trunkModel = ppo->models["shared_head"];
 						if (trunkModel) {
 							int64_t nRows = (int64_t)combinedTraj.Length();
-							int64_t chunk = proposerOn ? (int64_t)propCfg.featureChunkSize : (int64_t)reachCfg.scoreChunkSize;
+							int64_t chunk = (int64_t)reachCfg.scoreChunkSize;
 							if (chunk <= 0)
 								chunk = nRows;
 							std::vector<torch::Tensor> parts;
@@ -4121,404 +4034,6 @@ void GGL::Learner::Start() {
 					// above, i.e. the SAME rewards the policy is actually trained on) and never
 					// writes to them; tPropAInt (if shapingBeta > 0) is the only thing it hands to
 					// GAE's advantages below, and it's centered + explicitly zeroed at terminals.
-					torch::Tensor tPropAInt; // Stage 2 shaping term, added into tAdvantages after GAE
-						torch::Tensor tPropCarAInt; // car shaping term (carShapingBeta), added after GAE
-					if (proposerOn && combinedTraj.Length() > 0 && ppo->proposer) {
-						Timer propTimer = {};
-						int64_t n = (int64_t)combinedTraj.Length();
-
-						std::vector<int64_t> epStart, epEnd;
-						ProposerModule::SegmentEpisodes(combinedTraj.terminals, epStart, epEnd);
-
-						Model* sharedHead = ppo->models["shared_head"];
-						// Reuse the trunk features computed once above; only recompute in the (config
-						// edge) case where no shared head exists so nothing precomputed them.
-						torch::Tensor tFeatures = tTrunkFeatures.defined()
-							? tTrunkFeatures
-							: ppo->proposer->ComputeFeatures(sharedHead, tStates, propCfg.featureChunkSize);
-
-						torch::Tensor tCurBall = torch::tensor(combinedTraj.proposerCurBall).reshape({ -1, 6 });
-						torch::Tensor tTargetBall = torch::tensor(combinedTraj.proposerTargetBall).reshape({ -1, 6 });
-
-						auto unroll = ppo->proposer->Unroll(tFeatures, tCurBall, epStart, epEnd);
-						torch::Tensor tGoals = unroll.goals;         // [n,6] CPU
-						torch::Tensor tPrevGoals = unroll.prevGoals; // [n,6] CPU
-
-						// Stage 3: committed-goal override - a row inside an active practice window
-						// uses the FIXED goal that was in play when the drill was banked, not the
-						// freshly unrolled one (the point of a drill is repeated attempts at the
-						// SAME target). Done before goalQueries/tGoalsShift below are built from
-						// tGoals, so both the shaping term and the logging reflect the committed goal.
-						if (practiceOn && !combinedTraj.practiceMask.empty()) {
-							torch::Tensor tPracticeMask = torch::tensor(combinedTraj.practiceMask).to(torch::kBool);
-							torch::Tensor tPracticeGoals = torch::tensor(combinedTraj.practiceGoals).reshape({ -1, 6 });
-							tGoals = torch::where(tPracticeMask.unsqueeze(-1), tPracticeGoals, tGoals);
-						}
-
-						// N-step advantage (in GAE's own standardized/clipped reward units) drives
-						// the CRR-binary aspiration weight: rows beating the batch's aspiration
-						// percentile get weight 1, the rest get a small nonzero floor - diluted,
-						// never repelled, so a costly-but-aggressive miss never gets trained AWAY
-						// from, only outweighed by the better outcomes.
-						torch::Tensor tAN = ProposerModule::ComputeNStepAdvantages(
-							tRewards, combinedTraj.terminals, tValPreds, tTruncValPreds,
-							epStart, epEnd, propCfg.horizonSteps, config.ppo.gaeGamma,
-							returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange);
-
-						float aspirationThresh;
-						{
-							FList anSorted = TENSOR_TO_VEC<float>(tAN);
-							int64_t rank = RS_CLAMP(
-								(int64_t)(anSorted.size() * RS_CLAMP(propCfg.aspirationPercentile, 0.f, 1.f)),
-								(int64_t)0, (int64_t)anSorted.size() - 1);
-							std::nth_element(anSorted.begin(), anSorted.begin() + rank, anSorted.end());
-							aspirationThresh = anSorted[rank];
-						}
-						torch::Tensor tWeights = torch::where(
-							tAN >= aspirationThresh,
-							torch::ones_like(tAN),
-							torch::full_like(tAN, propCfg.belowAspirationWeight));
-
-						// rho(s_t -> g_t); with shaping on, also rho(s_t -> g_{t-1}) via each row's
-						// goal shifted one step forward within its episode, so ONE EvalRhoRowwise
-						// call (shared sampled actions) answers both rho(s,g) and rho(s',g) terms.
-						bool shapingOn = propCfg.shapingBeta > 0;
-						std::vector<torch::Tensor> goalQueries = { tGoals };
-						torch::Tensor tGoalsShift;
-						if (shapingOn) {
-							tGoalsShift = tGoals.clone();
-							for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
-								int64_t s = epStart[e], en = epEnd[e];
-								if (en > s)
-									tGoalsShift.slice(0, s + 1, en + 1).copy_(tGoals.slice(0, s, en));
-								// Row s keeps its cloned value (tGoals[s]) - there's no g_{t-1} to
-								// shift in at an episode's first row, and the corresponding rhoNext
-								// read (at row s-1, a different episode or out of bounds) is zeroed
-								// by the terminal mask below regardless.
-							}
-							goalQueries.push_back(tGoalsShift);
-						}
-
-						auto rhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiBall, goalQueries, tStates, tActionMasks, c10::nullopt, tTrunkFeatures);
-						torch::Tensor tRhoGoal = rhos[0]; // rho(s_t, g_t)
-
-						if (shapingOn) {
-							torch::Tensor tRhoGoalPrev = rhos[1]; // rho(s_t, g_{t-1})
-							// rhoNext[t] = rho(s_{t+1}, g_t) = tRhoGoalPrev[t+1] (tGoalsShift[t+1] == tGoals[t])
-							torch::Tensor tRhoNext = torch::zeros_like(tRhoGoal);
-							if (n > 1)
-								tRhoNext.slice(0, 0, n - 1).copy_(tRhoGoalPrev.slice(0, 1, n));
-
-							// gamma*rho(s',g) - rho(s,g), using the SAME g on both sides: the
-							// goal-motion component is excluded BY CONSTRUCTION (no difference is
-							// ever taken across the goal update), so this only ever charges the
-							// policy for progress toward a goal that stood.
-							torch::Tensor tAIntRaw = config.ppo.gaeGamma * tRhoNext - tRhoGoal;
-
-							// Zero at terminal rows: no real s_{t+1} to credit, and it happens to
-							// also absorb the cross-episode boundary noise in tRhoNext above
-							torch::Tensor tTerminalMask = (tTerminals == 0).to(torch::kFloat32);
-							tPropAInt = tAIntRaw * tTerminalMask;
-
-							// Stage 3: amplify shaping on practice-tagged rows (repeated at-bats
-							// should count for more while the policy is drilling a specific miss)
-							if (practiceOn && !combinedTraj.practiceMask.empty()) {
-								FList betaScaleVec(n, 1.f);
-								for (int64_t t = 0; t < n; t++)
-									if (combinedTraj.practiceMask[t])
-										betaScaleVec[t] = propCfg.practiceBetaScale;
-								tPropAInt = tPropAInt * torch::tensor(betaScaleVec);
-							}
-						}
-
-						// Stage 3: Phi-drop detection (banks new drills from non-practice
-						// near-misses) + drill success evaluation (retires solved practice
-						// windows). Both read tRhoGoal, which already reflects any committed-goal
-						// override above.
-						if (practiceOn && n > 0) {
-							torch::Tensor tPhi = torch::sigmoid(tRhoGoal / RS_MAX(1e-3f, propCfg.phiSquashTemp));
-							FList phi = TENSOR_TO_VEC<float>(tPhi);
-							int numArenas = (int)envSet->arenas.size();
-							int dropWindow = RS_MAX(1, propCfg.phiDropWindow);
-							int snapK = RS_MAX(1, propCfg.snapshotEveryK);
-
-							// Detector thresholds: self-calibrated from THIS batch's non-practice Phi
-							// distribution (default; tracks the drifting rho scale so the detector
-							// neither floods nor starves) or the fixed absolutes as a fallback.
-							float phiHigh = propCfg.phiHighThresh;
-							float phiDropMag = propCfg.phiDropThresh;
-							if (propCfg.phiCalibratePerIter) {
-								FList phiSorted;
-								phiSorted.reserve(n);
-								for (int64_t t = 0; t < n; t++)
-									if (combinedTraj.practiceMask.empty() || !combinedTraj.practiceMask[t])
-										phiSorted.push_back(phi[t]);
-								if (phiSorted.size() >= 8) {
-									auto pctl = [&](float p) {
-										int64_t k = RS_CLAMP((int64_t)(phiSorted.size() * RS_CLAMP(p, 0.f, 1.f)),
-											(int64_t)0, (int64_t)phiSorted.size() - 1);
-										std::nth_element(phiSorted.begin(), phiSorted.begin() + k, phiSorted.end());
-										return phiSorted[k];
-									};
-									float pHigh = pctl(propCfg.phiHighPercentile);
-									float pLow = pctl(propCfg.phiDropPercentile);
-									phiHigh = pHigh;
-									phiDropMag = RS_MAX(1e-4f, pHigh - pLow);
-								}
-							}
-							report["Proposer/Phi High Thresh"] = phiHigh;
-							report["Proposer/Phi Drop Mag"] = phiDropMag;
-
-							// Collect ALL drop candidates first, then bank the LARGEST-drop
-							// maxNewDrillsPerItr - "the worst misses this iteration", not the
-							// first-in-scan-order (which biased toward early-in-the-batch episodes).
-							struct DrillCand { float drop; int64_t highRow; int64_t epStartRow; };
-							std::vector<DrillCand> cands;
-							for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
-								int64_t s = epStart[e], en = epEnd[e];
-								float runningHigh = phi[s];
-								int64_t highRow = s;
-								for (int64_t t = s + 1; t <= en; t++) {
-									if (!combinedTraj.practiceMask.empty() && combinedTraj.practiceMask[t])
-										continue; // mid-drill mistakes aren't fresh near-misses to bank
-
-									if (phi[t] > runningHigh) {
-										runningHigh = phi[t];
-										highRow = t;
-										continue;
-									}
-
-									float drop = runningHigh - phi[t];
-									if (runningHigh >= phiHigh && drop >= phiDropMag && (t - highRow) <= dropWindow) {
-										cands.push_back({ drop, highRow, s });
-										// Don't re-trigger repeatedly on the same decline
-										runningHigh = phi[t];
-										highRow = t;
-									}
-								}
-							}
-
-							std::sort(cands.begin(), cands.end(),
-								[](const DrillCand& a, const DrillCand& b) { return a.drop > b.drop; });
-							int newDrills = 0;
-							for (const DrillCand& c : cands) {
-								if (newDrills >= propCfg.maxNewDrillsPerItr)
-									break;
-								int player = combinedTraj.srcPlayer[c.highRow];
-								int localStep = combinedTraj.srcStep[c.highRow];
-								int snapStep = (localStep / snapK) * snapK;
-									// snapStep rounds the near-miss step DOWN to the nearest snapshot
-									// multiple. Episode resets land at arbitrary steps (not multiples),
-									// so for a peak early in its episode snapStep can fall before the
-									// episode began - pointing at a stale prior-episode snapshot of the
-									// same arena. Bank only when snapStep is still inside this episode;
-									// otherwise no valid in-episode snapshot exists at/before the peak.
-									int epStartStep = combinedTraj.srcStep[c.epStartRow];
-									if (snapStep < epStartStep)
-										continue;
-								int arenaIdx = playerArenaIdx[player];
-
-								auto it = stepSnapshots.find((int64_t)snapStep * numArenas + arenaIdx);
-								if (it != stepSnapshots.end()) {
-									FList goalVec = TENSOR_TO_VEC<float>(tGoals[c.highRow]);
-									float goal6[6];
-									for (int d = 0; d < 6; d++)
-										goal6[d] = goalVec[d];
-									Team sourceTeam = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[player]].team;
-									propCfg.drillBank->AddDrill(it->second, goal6, sourceTeam, c.drop);
-									newDrills++;
-								}
-							}
-							report["Proposer/Drills Added"] = (float)newDrills;
-							report["Proposer/Drill Candidates"] = (float)cands.size();
-
-							// Drill success: a practice-tagged drillId succeeds if Phi recovered to
-							// the high threshold anywhere within its tagged rows
-							if (!combinedTraj.practiceMask.empty()) {
-								std::unordered_map<int64_t, bool> drillSuccess;
-								for (int64_t t = 0; t < n; t++) {
-									if (!combinedTraj.practiceMask[t])
-										continue;
-									int64_t drillId = combinedTraj.drillIds[t];
-									bool success = phi[t] >= phiHigh;
-									auto res = drillSuccess.emplace(drillId, success);
-									if (!res.second && success)
-										res.first->second = true;
-								}
-								for (auto& pair : drillSuccess)
-									propCfg.drillBank->ReportResult((uint64_t)pair.first, pair.second);
-
-								int64_t practiceCount = 0;
-								for (uint8_t m : combinedTraj.practiceMask)
-									practiceCount += m;
-								report["Proposer/Practice Step Fraction"] = (float)practiceCount / (float)RS_MAX((int64_t)1, n);
-							}
-
-							report["Proposer/Drill Bank Size"] = (float)propCfg.drillBank->Size();
-							report["Proposer/Drill Success Rate"] = propCfg.drillBank->AvgSuccessRate();
-
-							// JSONL dump of the bank's current contents for offline eyeballing -
-							// the "are these real near-misses (aerial whiffs, blown saves) or junk
-							// (kickoff chaos, opponent bounces)?" check before replay is ever enabled.
-							if (propCfg.drillDumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
-								(totalIterations % propCfg.drillDumpEveryNItrs == 0)) {
-								auto dumpRows = propCfg.drillBank->SnapshotForDump(propCfg.drillDumpMaxRows);
-								if (!dumpRows.empty()) {
-									std::filesystem::path dumpDir = config.checkpointFolder / "drill_dumps";
-									std::filesystem::create_directories(dumpDir);
-									std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
-									std::ofstream dumpOut(dumpPath);
-									if (dumpOut.good()) {
-										for (auto& dr : dumpRows) {
-											using namespace nlohmann;
-											json j = {};
-											j["itr"] = totalIterations;
-											j["id"] = dr.id;
-											j["ball_pos"] = { dr.ballPos[0], dr.ballPos[1], dr.ballPos[2] };
-											j["ball_vel"] = { dr.ballVel[0], dr.ballVel[1], dr.ballVel[2] };
-											j["goal"] = std::vector<float>(dr.goal, dr.goal + 6);
-											j["team"] = dr.sourceTeam;
-											j["drop"] = dr.drop;
-											j["tries"] = dr.tries;
-											j["successes"] = dr.successes;
-											dumpOut << j.dump() << "\n";
-										}
-									}
-								}
-							}
-						}
-
-						// Hand off to the deferred (gradient-requiring) Train() call after this
-						// no-grad block closes
-						tPropFeatures = tFeatures;
-						tPropPrevGoals = tPrevGoals;
-						tPropTargets = tTargetBall;
-						tPropWeights = tWeights;
-
-						report["Proposer/Aspiration Threshold"] = aspirationThresh;
-						report["Proposer/AN Mean"] = tAN.mean().item<float>();
-						report["Proposer/AN Std"] = tAN.std().item<float>();
-						report["Proposer/Weight Fraction"] = (tWeights >= 1.f).to(torch::kFloat32).mean().item<float>();
-						report["Proposer/Goal Target Dist"] = (tGoals - tTargetBall).norm(2, -1).mean().item<float>();
-						report["Proposer/Goal Drift"] = unroll.meanDeltaNorm;
-						report["Proposer/Rho Goal Mean"] = tRhoGoal.mean().item<float>();
-						if (shapingOn) {
-							report["Proposer/A Int Mean"] = tPropAInt.mean().item<float>();
-							report["Proposer/A Int Std"] = tPropAInt.std().item<float>();
-						}
-
-						// JSONL calibration dump (local disk only - metrics are scalars-only to
-						// wandb): sampled (current, proposed goal, hindsight target, A^(N), weight,
-						// rho) rows, so proposals can be sanity-checked (e.g. against a known setup
-						// like a backboard save) without any live-run risk.
-						if (propCfg.dumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
-							(totalIterations % propCfg.dumpEveryNItrs == 0) && n > 0) {
-
-							std::filesystem::path dumpDir = config.checkpointFolder / "proposer_dumps";
-							std::filesystem::create_directories(dumpDir);
-							std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
-							std::ofstream dumpOut(dumpPath);
-							if (dumpOut.good()) {
-								int64_t numRows = RS_MIN((int64_t)RS_MAX(0, propCfg.dumpMaxRows), n);
-								torch::Tensor sampleIdx = torch::randperm(n, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, numRows);
-								auto _sampleIdx = sampleIdx.const_data_ptr<int64_t>();
-								for (int64_t i = 0; i < numRows; i++) {
-									int64_t row = _sampleIdx[i];
-									using namespace nlohmann;
-									json j = {};
-									j["itr"] = totalIterations;
-									j["ts"] = totalTimesteps;
-									j["row"] = row;
-									j["cur"] = std::vector<float>(
-										combinedTraj.proposerCurBall.begin() + row * 6, combinedTraj.proposerCurBall.begin() + row * 6 + 6);
-									j["goal"] = TENSOR_TO_VEC<float>(tGoals[row]);
-									j["ach"] = std::vector<float>(
-										combinedTraj.proposerTargetBall.begin() + row * 6, combinedTraj.proposerTargetBall.begin() + row * 6 + 6);
-									j["aN"] = tAN[row].item<float>();
-									j["w"] = tWeights[row].item<float>();
-									j["rho"] = tRhoGoal[row].item<float>();
-									j["practice"] = 0;
-									dumpOut << j.dump() << "\n";
-								}
-							}
-						}
-
-						// ---- Car proposer head: second unroll on canonical car-state goals, reusing
-						// the SAME trunk features + A^(N) aspiration weights (aspiration is goal-space
-						// agnostic). Passive unless carShapingBeta > 0. rho_car uses the psiCarState
-						// head. Mirrors the ball block above.
-						if (proposerCarOn && ppo->proposerCar) {
-							torch::Tensor tCarCur = torch::tensor(combinedTraj.proposerCarCur).reshape({ -1, 6 });
-							torch::Tensor tCarTarget = torch::tensor(combinedTraj.proposerCarTarget).reshape({ -1, 6 });
-
-							auto carUnroll = ppo->proposerCar->Unroll(tFeatures, tCarCur, epStart, epEnd);
-							torch::Tensor tCarGoals = carUnroll.goals;
-							torch::Tensor tCarPrevGoals = carUnroll.prevGoals;
-
-							bool carShapingOn = propCfg.carShapingBeta > 0 && ppo->reach->psiCarState;
-							torch::Tensor tRhoCarGoal;
-							if (carShapingOn) {
-								std::vector<torch::Tensor> carQ = { tCarGoals };
-								torch::Tensor tCarGoalsShift = tCarGoals.clone();
-								for (int64_t e = 0; e < (int64_t)epStart.size(); e++) {
-									int64_t s = epStart[e], en = epEnd[e];
-									if (en > s)
-										tCarGoalsShift.slice(0, s + 1, en + 1).copy_(tCarGoals.slice(0, s, en));
-								}
-								carQ.push_back(tCarGoalsShift);
-								auto carRhos = ppo->reach->EvalRhoRowwise(sharedHead, ppo->reach->psiCarState, carQ, tStates, tActionMasks, c10::nullopt, tTrunkFeatures);
-								tRhoCarGoal = carRhos[0];
-								torch::Tensor tRhoCarNext = torch::zeros_like(tRhoCarGoal);
-								if (n > 1)
-									tRhoCarNext.slice(0, 0, n - 1).copy_(carRhos[1].slice(0, 1, n));
-								torch::Tensor tCarAIntRaw = config.ppo.gaeGamma * tRhoCarNext - tRhoCarGoal;
-								torch::Tensor tTerminalMask = (tTerminals == 0).to(torch::kFloat32);
-								tPropCarAInt = tCarAIntRaw * tTerminalMask;
-							}
-
-							tPropCarPrevGoals = tCarPrevGoals;
-							tPropCarTargets = tCarTarget;
-
-							report["Proposer/Car Goal Target Dist"] = (tCarGoals - tCarTarget).norm(2, -1).mean().item<float>();
-							report["Proposer/Car Goal Drift"] = carUnroll.meanDeltaNorm;
-							if (carShapingOn)
-								report["Proposer/Car Rho Goal Mean"] = tRhoCarGoal.mean().item<float>();
-
-							// Car JSONL dump for the tilt/separability report (same cadence as ball)
-							if (propCfg.dumpEveryNItrs > 0 && !config.checkpointFolder.empty() &&
-								(totalIterations % propCfg.dumpEveryNItrs == 0) && n > 0) {
-								std::filesystem::path dumpDir = config.checkpointFolder / "proposer_car_dumps";
-								std::filesystem::create_directories(dumpDir);
-								std::filesystem::path dumpPath = dumpDir / ("itr_" + std::to_string(totalIterations) + ".jsonl");
-								std::ofstream dumpOut(dumpPath);
-								if (dumpOut.good()) {
-									int64_t numRows = RS_MIN((int64_t)RS_MAX(0, propCfg.dumpMaxRows), n);
-									torch::Tensor sampleIdx = torch::randperm(n, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, numRows);
-									auto _sampleIdx = sampleIdx.const_data_ptr<int64_t>();
-									for (int64_t i = 0; i < numRows; i++) {
-										int64_t row = _sampleIdx[i];
-										using namespace nlohmann;
-										json j = {};
-										j["itr"] = totalIterations;
-										j["row"] = row;
-										j["cur"] = std::vector<float>(
-											combinedTraj.proposerCarCur.begin() + row * 6, combinedTraj.proposerCarCur.begin() + row * 6 + 6);
-										j["goal"] = TENSOR_TO_VEC<float>(tCarGoals[row]);
-										j["ach"] = std::vector<float>(
-											combinedTraj.proposerCarTarget.begin() + row * 6, combinedTraj.proposerCarTarget.begin() + row * 6 + 6);
-										// ball pos at this row (for the distance-to-ball separability bucket)
-										j["ball"] = std::vector<float>(
-											combinedTraj.proposerCurBall.begin() + row * 6, combinedTraj.proposerCurBall.begin() + row * 6 + 6);
-										j["aN"] = tAN[row].item<float>();
-										j["w"] = tWeights[row].item<float>();
-										dumpOut << j.dump() << "\n";
-									}
-								}
-							}
-						}
-
-						report["Proposer/Time"] = propTimer.Elapsed();
-					}
 
 					Timer gaeTimer = {};
 					// Run GAE
@@ -4656,28 +4171,10 @@ void GGL::Learner::Start() {
 					// advantages do. Centered (pushes toward above-average-progress goals, not just
 					// "more"), scaled so its std matches shapingBeta fraction of the extrinsic std,
 					// then added in. shapingBeta == 0 (the default) makes this exactly a no-op.
-					if (tPropAInt.defined() && config.ppo.proposer.shapingBeta > 0) {
-						tPropAInt = tPropAInt - tPropAInt.mean();
-						float stdExt = tAdvantages.std().item<float>();
-						float stdInt = RS_MAX(1e-6f, tPropAInt.std().item<float>());
-						float betaEff = config.ppo.proposer.shapingBeta * stdExt / stdInt;
-						tAdvantages = tAdvantages + betaEff * tPropAInt;
-						report["Proposer/Shaping BetaEff"] = betaEff;
-						report["Proposer/Shaping Injected Abs Mean"] = (betaEff * tPropAInt).abs().mean().item<float>();
-					}
 
 					// Car shaping term: identical centered/std-matched injection, own beta. stdExt
 					// is recomputed against the (possibly ball-shaped) advantages so the two terms
 					// compose to roughly shapingBeta + carShapingBeta of the extrinsic std.
-					if (tPropCarAInt.defined() && config.ppo.proposer.carShapingBeta > 0) {
-						tPropCarAInt = tPropCarAInt - tPropCarAInt.mean();
-						float stdExt = tAdvantages.std().item<float>();
-						float stdInt = RS_MAX(1e-6f, tPropCarAInt.std().item<float>());
-						float betaEff = config.ppo.proposer.carShapingBeta * stdExt / stdInt;
-						tAdvantages = tAdvantages + betaEff * tPropCarAInt;
-						report["Proposer/Car Shaping BetaEff"] = betaEff;
-						report["Proposer/Car Shaping Injected Abs Mean"] = (betaEff * tPropCarAInt).abs().mean().item<float>();
-					}
 
 					// ===== EMERGENCE RC1: frontier optimism (RND novelty -> advantages) =====
 					// See LearnerConfig.h RndOptimismConfig for the full rationale. Shape:
@@ -5193,7 +4690,7 @@ void GGL::Learner::Start() {
 						experience.data.carHerGoals = torch::tensor(combinedTraj.carHerGoals).reshape({ -1, 6 });
 						experience.data.ballHerGoals = torch::tensor(combinedTraj.ballHerGoals).reshape({ -1, 6 });
 						experience.data.ballMovedMask = torch::tensor(combinedTraj.ballMoved);
-						if ((proposerCarOn || reachCarStateOn) && !combinedTraj.carStateHerGoals.empty())
+						if (reachCarStateOn && !combinedTraj.carStateHerGoals.empty())
 							experience.data.carStateHerGoals = torch::tensor(combinedTraj.carStateHerGoals).reshape({ -1, 6 });
 					}
 
@@ -5253,18 +4750,6 @@ void GGL::Learner::Start() {
 				// deferred) so Delta's own backward pass can actually build a graph. Uses the
 				// pre-update goals/rho computed above for this iteration's shaping/logging, then
 				// updates - so what got logged/shaped this iteration reflects the OLD proposer.
-				if (proposerOn && ppo->proposer && tPropFeatures.defined()) {
-					Timer propTrainTimer = {};
-					auto propTrainResult = ppo->proposer->Train(tPropFeatures, tPropPrevGoals, tPropTargets, tPropWeights);
-					report["Proposer/Loss"] = propTrainResult.loss;
-					report["Proposer/Train Time"] = propTrainTimer.Elapsed();
-
-					// Car head trains on the SAME features + weights, its own regression pair
-					if (proposerCarOn && ppo->proposerCar && tPropCarTargets.defined()) {
-						auto carTrainResult = ppo->proposerCar->Train(tPropFeatures, tPropCarPrevGoals, tPropCarTargets, tPropWeights);
-						report["Proposer/Car Loss"] = carTrainResult.loss;
-					}
-				}
 
 				// Learn
 				Timer learnTimer = {};
