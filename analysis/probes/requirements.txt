@@ -1,6 +1,0 @@
-# CPU-only. torch from https://download.pytorch.org/whl/cpu
-torch==2.13.0+cpu
-numpy
-scikit-learn
-matplotlib
-RocketSim==2.2.1  # pip bindings (in-repo RocketSim is v2.1.1 - see REPORT.md caveats)
