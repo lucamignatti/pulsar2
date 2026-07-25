@@ -21,7 +21,7 @@ void GGL::Report::Display(std::vector<std::string> keyRows) const {
 				prefix += " - ";
 			}
 			if (Has(row)) {
-				stream << prefix << SingleToString(row, true) << std::endl;
+				stream << prefix << SingleToString(row) << std::endl;
 			} else {
 				continue;
 			}

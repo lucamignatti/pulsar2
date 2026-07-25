@@ -3,7 +3,6 @@
 #include <GigaLearnCPP/Util/Report.h>
 #include <GigaLearnCPP/Util/Timer.h>
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
-#include <GigaLearnCPP/PPO/TransferLearnConfig.h>
 
 #include "../Util/Models.h"
 #include "Reachability.h"
@@ -171,15 +170,6 @@ namespace GGL {
 			torch::Tensor rawObs, torch::Tensor trunkOut, bool halfPrec);
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
-
-		void TransferLearn(
-			ModelSet& oldModels, 
-			torch::Tensor newObs, torch::Tensor oldObs, 
-			torch::Tensor newActionMasks, torch::Tensor oldActionMasks, 
-			torch::Tensor actionMaps,
-			Report& report, 
-			const TransferLearnConfig& transferLearnConfig
-		);
 
 		void SaveTo(std::filesystem::path folderPath);
 		void LoadFrom(std::filesystem::path folderPath);

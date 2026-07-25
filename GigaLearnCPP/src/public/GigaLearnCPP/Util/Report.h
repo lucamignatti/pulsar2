@@ -30,41 +30,18 @@ namespace GGL {
 			return data.find(key) != data.end();
 		}
 
-		void Add(const std::string& key, Val val) {
-			if (Has(key)) {
-				data[key] += val;
-			} else {
-				data[key] = val;
-			}
+		// LIVE: called (unqualified) by Report::Display in Report.cpp. The old signature took a
+		// `digitCommas` flag that the body never read, and Display passed it `true` - so the
+		// formatting it implied never happened. Parameter dropped 2026-07-25; the function stays.
+		std::string SingleToString(const std::string& key) const {
+			Val val = (*this)[key];
+			return key + ": "  + Utils::NumToStr(val);
 		}
 
 		void AddAvg(const std::string& key, Val val) {
 			auto& avg = avgs[key];
 			avg.total += val;
 			avg.count++;
-		}
-
-		void FinishAvg(const std::string& key) {
-			auto itr = avgs.find(key);
-			if (itr == avgs.end())
-				RG_ERR_CLOSE("Cannot call Report::FinishAvg() on non-existent average \"" << key << "\"!");
-
-			data[key] = itr->second.total / (Val)itr->second.count;
-
-			avgs.erase(itr);
-		}
-
-		std::string SingleToString(const std::string& key, bool digitCommas = false) const {
-			Val val = (*this)[key];
-			return key + ": "  + Utils::NumToStr(val);
-		}
-
-		std::string ToString(bool digitCommas = false, const std::string& prefix = {}) const {
-			std::stringstream stream;
-			for (auto pair : data) {
-				stream << prefix << SingleToString(pair.first, digitCommas) << std::endl;
-			}
-			return stream.str();
 		}
 
 		void Finish() {
@@ -77,23 +54,12 @@ namespace GGL {
 			for (auto& pair : avgs) {
 				RG_LOG(
 					"WARNING: Unfinished average metric \"" << pair.first << "\", " <<
-					"please call FinishAvg(\"" << pair.first << "\")/Finish() before the metrics report is cleared."
+					"please call Finish() before the metrics report is cleared."
 				);
 			}
 			avgs.clear();
 
 			*this = Report();
-		}
-
-		Report operator+(const Report& other) const {
-			Report newReport = *this;
-			newReport.data.insert(other.data.begin(), other.data.end());
-			return newReport;
-		}
-
-		Report& operator+=(const Report& other) {
-			*this = *this + other;
-			return *this;
 		}
 
 		void Display(std::vector<std::string> keyRows) const;

@@ -889,62 +889,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	}
 }
 
-void GGL::PPOLearner::TransferLearn(
-	ModelSet& oldModels,
-	torch::Tensor newObs, torch::Tensor oldObs,
-	torch::Tensor newActionMasks, torch::Tensor oldActionMasks,
-	torch::Tensor actionMaps,
-	Report& report,
-	const TransferLearnConfig& tlConfig
-) {
-
-	torch::Tensor oldProbs;
-	{ // No grad for old model inference
-		RG_NO_GRAD;
-		oldProbs = InferPolicyProbsFromModels(oldModels, oldObs, oldActionMasks, config.policyTemperature, config.useHalfPrecision);
-		report["Old Policy Entropy"] = ComputeEntropy(oldProbs, oldActionMasks, config.maskEntropy).detach().cpu().item<float>();
-
-		if (actionMaps.defined())
-			oldProbs = oldProbs.gather(1, actionMaps);
-	}
-
-	for (auto& model : GetPolicyModels())
-		model->SetOptimLR(tlConfig.lr);
-
-	auto policyBefore = models["policy"]->CopyParams();
-	
-	for (int i = 0; i < tlConfig.epochs; i++) {
-		torch::Tensor newProbs = InferPolicyProbsFromModels(models, newObs, newActionMasks, config.policyTemperature, false);
-
-		// Non-summative KL div	loss
-		torch::Tensor transferLearnLoss;
-		if (tlConfig.useKLDiv) {
-			transferLearnLoss = (oldProbs * torch::log(oldProbs / newProbs)).abs();
-		} else {
-			transferLearnLoss = (oldProbs - newProbs).abs();
-		}
-		transferLearnLoss = transferLearnLoss.pow(tlConfig.lossExponent);
-		transferLearnLoss = transferLearnLoss.mean();
-		transferLearnLoss *= tlConfig.lossScale;
-
-		if (i == 0) {
-			RG_NO_GRAD;
-			torch::Tensor matchingActionsMask = (newProbs.detach().argmax(-1) == oldProbs.detach().argmax(-1));
-			report["Transfer Learn Accuracy"] = matchingActionsMask.to(torch::kFloat).mean().cpu().item<float>();
-			report["Transfer Learn Loss"] = transferLearnLoss.detach().cpu().item<float>();
-
-			report["Policy Entropy"] = ComputeEntropy(newProbs, newActionMasks, config.maskEntropy).detach().cpu().item<float>();
-		}
-
-		transferLearnLoss.backward();
-
-		models.StepOptims();
-	}
-
-	auto policyAfter = models["policy"]->CopyParams();
-	report["Policy Update Magnitude"] = (policyBefore - policyAfter).norm().item<float>();
-}
-
 void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 	models.Save(folderPath);
 }

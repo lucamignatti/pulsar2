@@ -5,7 +5,6 @@
 #include <atomic>
 #include "Util/RenderSender.h"
 #include "LearnerConfig.h"
-#include "PPO/TransferLearnConfig.h"
 
 namespace GGL {
 
@@ -152,7 +151,6 @@ namespace GGL {
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);
 		void Start();
 
-		void StartTransferLearn(const TransferLearnConfig& transferLearnConfig);
 
 		void StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread);
 
