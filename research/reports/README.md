@@ -1,5 +1,10 @@
 # The experimental record
 
+**Scope.** Research only: measurements, experiments, post-mortems, and the paper. Implementation
+specs, deploy records, audits and shipping roadmaps live in [`docs/`](../../docs/) — they were
+split out on 2026-07-25. A report here answers *what is true about the agent*; a document in
+`docs/` answers *what we did to the trainer*.
+
 One document per study. Most open with a **pre-registration block dated before
 the run** — hypothesis and success criteria fixed in advance, per the repo's
 measurement-before-machinery doctrine. That is the reason this corpus is worth
@@ -24,14 +29,7 @@ Status vocabulary:
 
 | Report | Date | Run | Topic | Status |
 |---|---|---|---|---|
-| [PULSAR5.md](PULSAR5.md) | 07-17 | 5.0v3 | Cold-start design specification | **CANONICAL** |
-| [LADDER.md](LADDER.md) | 07-18 | 5.0v3 | Optimistic-Critic Ladder deploy record | **CANONICAL** |
-| [FRONTIER.md](FRONTIER.md) | 07-23 | 5.0v3 | Quasimetric-potential drill curriculum (one axis) | **CANONICAL** |
-| [EMERGENCE.md](EMERGENCE.md) | 07-16 | 5.0v3 | RND novelty / root-cause learning fixes | **CANONICAL** |
-| [REWARD_SHAPING.md](REWARD_SHAPING.md) | 07-25 | resid | Reward-term semantics, measured gates | **CANONICAL** |
-| [DEAD_CODE_AUDIT.md](DEAD_CODE_AUDIT.md) | 07-25 | resid | Live-vs-inert feature surface audit | **CANONICAL** |
-| [ENABLED_INVENTORY.md](ENABLED_INVENTORY.md) | 07-25 | resid | What survived the strip, and the decisions still open | **CANONICAL** |
-| [LEAGUE_ANCHORS.md](LEAGUE_ANCHORS.md) | 07-19 | resid | Permanent spaced anchor opponents | **CANONICAL** |
+| [COMPOSITION_CRITIC.md](COMPOSITION_CRITIC.md) | 07-25 | testbed + resid | **The paper.** Composition critic: exploration by seeking realizable headroom | **CANONICAL** |
 | [H2_TRUNCATION.md](H2_TRUNCATION.md) | 07-19 | cross-run | Offline loader bug, fix + oracle verification | **CANONICAL** |
 | [FEAR_MINE.md](FEAR_MINE.md) | 07-15 | 4.0 | Disagreement-mined frontier drills — *graduated to live* | **CANONICAL** `h2` |
 | [GOAL_CRITIC_AUDIT.md](GOAL_CRITIC_AUDIT.md) | 07-20 | 5.0v3 | Is the goal critic driving, coasting, or hindering? | **RESULT** |

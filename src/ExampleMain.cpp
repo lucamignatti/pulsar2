@@ -17,7 +17,6 @@
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include <RLGymCPP/StateSetters/AirPlayState.h>
 #include <RLGymCPP/StateSetters/FrontierDrillState.h>
-#include <RLGymCPP/StateSetters/ImpossibleInterceptState.h>
 #include <RLGymCPP/StateSetters/CombinedState.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 
@@ -467,15 +466,6 @@ EnvCreateResult EnvCreateFunc(int index) {
 		// ESCALATE-1: useFrac 0.35 -> 0.60 (with practiceArenaFrac 0.30, fear drills
 		// now ~18% of team resets vs the ~6% that measurably did nothing)
 		result.stateSetter = new FrontierDrillState(g_FrontierPool, result.stateSetter, 0.60f, 250, 250);
-	// Ladder impossible-control family: every reset in these arenas is a certified
-	// unachievable intercept (the ladder's standing falsification regression). The
-	// normal terminal conditions stay - GoalScoreCondition ends each episode when
-	// the unreachable ball scores (~1s), which is also what feeds the concede bank's
-	// doom anchor for these states.
-	if (IsImpossibleArena(index)) {
-		delete result.stateSetter;
-		result.stateSetter = new ImpossibleInterceptState();
-	}
 	return result;
 }
 
@@ -630,9 +620,6 @@ int main(int argc, char* argv[]) {
 		// Ladder warmups collapsed so a few smoke iterations reach the FULL path
 		// (map trained, banks seeded, calibration fit, gap_PK live, wire active) -
 		// production warmups would need 50+ CPU iterations to exercise any of it
-		cfg.gapSensor.driveWarmupIters = 2;
-		cfg.gapSensor.mapWarmupIters = 2;
-		cfg.gapSensor.bankMinFill = 4;
 		// NOTE: league anchor overrides do NOT belong here - this block runs BEFORE the
 		// cfg.league.* assignments below, which would clobber them. See the GGL_SMOKE
 		// re-application right after the league anchor config.
@@ -1048,7 +1035,6 @@ int main(int argc, char* argv[]) {
 		// quasimetric axis d_goal (Phase 0 = telemetry only, actuates nothing; leaves
 		// fear-mining intact). Checkpoint-compatible with the live lineage (reuses the
 		// trained GapState map + banks; new state is RUNNING_STATS scalars, init-if-
-		// absent). Revert = unset the env and restart. Requires gapSensor.mapEnabled.
 		// HEADROOM composition critic (2026-07-24): ON BY DEFAULT (twin V-dagger trunk
 		// heads + seek drive; PPOLearnerConfig::vdagEnabled). FRESH RUNS ONLY — trunk-
 		// coupled aux must co-adapt from step 0 (the carstate incident is the mid-run
@@ -1080,73 +1066,24 @@ int main(int argc, char* argv[]) {
 		// >=3x), Miner/Dz Mean (bar: > +0.5 on banked declines), Miner/GroundedHighBall.
 		cfg.steering.emergenceMiner = true;
 	}
-
-	// EMERGENCE RC1 (2026-07-16, user-directed): frontier optimism - RND novelty as a
-	// mean-zero std-matched advantage adjustment. The RND predictor is the agent's own
-	// familiarity self-model; its error is the acquisition frontier (offline gate:
-	// enriches grounded-high-ball 2.77x, proto-dribble 3.42x - exactly the mechanic
-	// states advantage-mining avoided). Conservative dose (0.1 std/z), warmup
-	// train-only, obeys the rating latch, anneals itself as the predictor learns.
-	// Watch: RND/Loss (falling), RND/Injected Abs Mean (~0.08*advStd), RND/Novelty
-	// Std; Rating vs the drawdown monitor; mechanic census in ~3 days for emergence.
-	// Revert = false + restart (nets simply stop being consulted; checkpoints keep
-	// carrying them harmlessly). Rollback anchor: checkpoints_4.0_branch_backup.
+	// ===== OPTIMISM: the composition critic (research/reports/COMPOSITION_CRITIC.md) =====
+	// The live stack is exactly the paper's: V_real (the critic) -> V_exp (return-level
+	// expectile, measurement) -> twin composition critics V-dagger, actuated by ONE potential
+	// term, Phi = +H with H = relu(min(V1,V2) - V_real). See PPOLearnerConfig::vdagEnabled /
+	// vdagTau / vdagSeekBeta - the mechanism lives with the headroom critic, not here.
+	//
+	// REMOVED 2026-07-25 to conform to the paper: RND novelty, the quasimetric map, the
+	// goal/concede banks, V_metric, gap_PK, the closure drive Phi = -(gap_KD + gap_PK), the
+	// 5-column policy-head wire (policy input returns to trunk width), and the
+	// impossible-control falsification family that scored gap_PK. The paper's section 4.5
+	// measured the closure sign as CATASTROPHIC on a peaked field (touch 0.014/0.027 vs 0.244
+	// for plain PPO), and section 6.4 rejects the quantile variant; section 5 states plainly that
+	// the policy never consumes H, which is what retires the wire.
+	// History: git log -- docs/LADDER.md docs/EMERGENCE.md
 	if (!cfg.renderMode) {
-		cfg.rndOptimism.enabled = true;
-		// 5.0: formative dose from step 0 (PULSAR5.md) - novelty pressure during the
-		// high-entropy window is the point; the 4.0 escalation to 0.3 was end-of-life
-		// dosing against a matured attractor, not the steady-state design.
-		cfg.rndOptimism.weight = 0.1f;
-		// INTROSPECTIVE FRONTIER DRIVE Stage 1 (2026-07-18, user-directed port): the
-		// detached gap sensor, observer-only. Watch: Gap/Loss falling, Gap/Mean,
-		// and the BRIDGE - Gap/Fear Panel vs Gap/Mean (two independent frontier
-		// detectors agreeing on our data gates Stage 2: wire + gap-closing
-		// potential as one lever, per the spec's ship-together rule).
-		// STAGE-2 PROTOCOL (user-directed 2026-07-18): when the drive (wire +
-		// potential) is enabled, STEERING ACTUATION goes OFF - alpha = 0 and
-		// opponentStyleChance = 0 - while steering.enabled stays TRUE so the fear
-		// drills, census, fear panel, and miner telemetry keep running (they live in
-		// the same code path but are orthogonal to steering pushes). The drive is
-		// the principled successor to commitment steering; running both would
-		// double-dose one axis and destroy attribution.
-		// Goal-reachability advantage: considered and DEFERRED (rho is coarse -
-		// AUC 0.7, bin-only doctrine; B2G pays goal progress reward-side; the gap
-		// sensor learns the general form). Re-open only if a Gap/Rho Corr panel
-		// shows rho carrying frontier signal the gap misses.
+		// V_exp: trained every iteration on the critic's own extrinsic targets through a
+		// DETACHED trunk read. Publishes Gap/* - nothing injects from it.
 		cfg.gapSensor.enabled = true;
-		// STAGE 2a LIVE (user: "build it now", 2026-07-18): the gap-closing DRIVE at
-		// the spec's beta.
-		cfg.gapSensor.driveBeta = 0.05f;
-		// ===== FULL LADDER (user: "this is all tested and working. go ahead and
-		// impliment it in full.", 2026-07-18; spec + build order in LADDER.md) =====
-		// Quasimetric map + goal/concede banks -> V_metric -> gap_PK; drive becomes
-		// Phi = -(gap_KD + gap_PK); 5-input wire extends the policy head 512 -> 517
-		// (zero-init columns at load = behaviorally exact migration; policy Muon
-		// state resets once - a logged, accepted one-time transient). Upstream's
-		// staged V1-V4 gates are WAIVED per the user's authorization; retained here:
-		// the V0 invariants (masked rows pay zero - audited; truncation codes are
-		// nonzero terminals and episodes only enter the buffer whole), the latch
-		// coverage, branch backup, and the revert
-		// paths: mapEnabled=false kills gap_PK (drive degrades to the proven
-		// gap_KD-only form), driveBeta=0 kills the drive+wire together (Law 6), and
-		// the WIRE architecture itself reverts only via the branch backup - the
-		// 517-wide policy head is a one-way migration for checkpoints saved after it.
-		// Watch: Ladder/* panels (Map Local Loss ~0.01 target, Lambda, Bank fills,
-		// Calib A>0/A2<0, GapPK Mean self-limiting, Retention Viol flat, Wire Col
-		// Grad, Imp Touches == 0 forever, Imp GapPK Spawn < Fear GapPK, Inj Mean Imp
-		// == 0), Gap/Drive Inj Abs Mean, and Rating vs the drawdown monitor.
-		cfg.gapSensor.mapEnabled = true;
-		cfg.gapSensor.wireEnabled = true;
-		cfg.gapSensor.impossibleArenas = 8;
-		// Bank 1024 -> 256 (2026-07-18, same evening as deploy): the per-STEP wire
-		// bank-distance broadcast at 1024 anchors/side took collection inference
-		// 0.16s -> 2.5s per iteration (overall SPS halved). Capacity is one of the
-		// spec's explicitly-adaptable scale knobs (Law 8a list); 256 diverse
-		// pre-goal anchors keep the min-distance estimator honest at 1/4 the
-		// traffic, and MinBankDist now runs bf16 on GPU per the spec's own
-		// precision rule. Revisit upward only with a measured SPS budget.
-		cfg.gapSensor.bankCapacity = 256;
-		g_NumImpossibleArenas = cfg.gapSensor.impossibleArenas;
 
 		// EXTERNAL OPPONENT: NEXTO (2026-07-20, user-directed "play better bots
 		// to force the aerials"). On serveFrac of iterations the whole fleet's
@@ -1171,19 +1108,11 @@ int main(int argc, char* argv[]) {
 		if (const char* s2 = std::getenv("GGL_SMOKE"); s2 && s2[0] && std::string(s2) != "0")
 			cfg.externalOpponent.serveFrac = 0.75f;
 	} else {
-		// VIZ FIX (2026-07-18, same evening as ladder deploy): render mode was
-		// skipped by the whole block above, so it never set wireEnabled - the
-		// render policy stayed 512-wide while saved checkpoints are now 517-wide
-		// (LoadFrom's total-size check rejects most of them; the one archive entry
-		// that slipped past crashed at inference on the real shape mismatch). The
-		// Learner ctor already exempts render from the driveBeta>0 requirement
-		// (Law 6 is about training dynamics, not architecture) for exactly this
-		// case. Match the architecture ONLY: gapSensor stays otherwise inert in
-		// render (Learn() never runs there, so gapSensor->exp/mapE/mapF are never
-		// built and ladderCollect.active stays false) - the wire is fed zeros,
-		// same convention as every other eval/opponent path.
-		cfg.gapSensor.enabled = true;
-		cfg.gapSensor.wireEnabled = true;
+		// Render must build the SAME architecture as the trainer or it loads the wrong
+		// shapes (the ba4f33a bug). With the wire gone the policy head is plain trunk
+		// width again, so this is now only about gapSensor's own head; it stays inert
+		// in render because Learn() never runs there.
+		cfg.gapSensor.enabled = true; // arch parity only; Learn() never runs in render
 	}
 
 	// Make the learner with the environment creation function and the config we just made

@@ -205,40 +205,7 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 	auto sizesAfter = GetSeqSizes(seq);
 	if (!std::equal(sizesBefore.begin(), sizesBefore.end(), sizesAfter.begin(), sizesAfter.end())) {
 
-		// Ladder wire migration: a pre-wire checkpoint differs ONLY in the first
-		// Linear's weight (input columns short by exactly allowInputExpand). Zero-pad
-		// those columns in place - the padded net is bit-exact with the old one on any
-		// input (the new columns multiply into nothing) - and skip the optimizer load
-		// below (its state tensors carry the old shapes; one-time momentum reset).
-		bool migrated = false;
-		if (allowInputExpand > 0) {
-			torch::NoGradGuard noGrad;
-			auto params = seq->parameters();
-			// The first parameter of the first Linear is its weight [out, in]
-			if (!params.empty() && params[0].dim() == 2) {
-				auto& w = params[0];
-				int64_t out = w.size(0), inOld = w.size(1);
-				// Verify the ONLY mismatch is that weight's column count
-				std::vector<uint64_t> expectedOld = sizesBefore;
-				expectedOld[0] = (uint64_t)(out * (inOld + allowInputExpand)) == sizesBefore[0]
-					? (uint64_t)(out * inOld) : 0; // 0 = shapes don't line up, fall through
-				if (expectedOld[0] != 0
-					&& std::equal(sizesAfter.begin(), sizesAfter.end(), expectedOld.begin(), expectedOld.end())) {
-					auto padded = torch::cat({ w.to(device),
-						torch::zeros({ out, (int64_t)allowInputExpand },
-							w.options().device(device)) }, 1);
-					w.set_data(padded);
-					_seqHalfOutdated = true;
-					migrated = true;
-					loadOptim = false; // old-shape state; reset (logged below)
-					RG_LOG("Model \"" << modelName << "\": MIGRATED from " << path
-						<< " - first-layer input " << inOld << " -> " << (inOld + allowInputExpand)
-						<< ", new wire columns zero-init (behaviorally exact), optimizer RESET");
-				}
-			}
-		}
-
-		if (!migrated) {
+		{
 			std::stringstream stream;
 			stream << "Saved model has different size than current model, cannot load model from " << path << ":\n";
 

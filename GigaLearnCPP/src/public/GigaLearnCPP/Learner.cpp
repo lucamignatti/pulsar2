@@ -31,87 +31,22 @@
 
 using namespace RLGC;
 
-// EMERGENCE RC1 (LearnerConfig.h RndOptimismConfig): the RND self-model.
-// target = FROZEN random projection of (trunk ⊕ onehot(action)); pred chases it;
-// prediction error = novelty = the acquisition frontier. Persisted with every
-// checkpoint (RND_PRED.lt / RND_TARGET.lt) - the annealing state IS the model.
-struct GGL::RndState {
-	torch::nn::Sequential target{ nullptr }, pred{ nullptr };
-	std::shared_ptr<torch::optim::Adam> optim;
-	std::filesystem::path loadFrom; // set by the checkpoint loader, consumed at lazy build
-	int64_t updates = 0;
-
-	void Build(int64_t featIn, torch::Device device, float lr) {
-		target = torch::nn::Sequential(
-			torch::nn::Linear(featIn, 256), torch::nn::LeakyReLU(),
-			torch::nn::Linear(256, 128));
-		pred = torch::nn::Sequential(
-			torch::nn::Linear(featIn, 256), torch::nn::LeakyReLU(),
-			torch::nn::Linear(256, 256), torch::nn::LeakyReLU(),
-			torch::nn::Linear(256, 128));
-		if (!loadFrom.empty() && std::filesystem::exists(loadFrom / "RND_PRED.lt")) {
-			try {
-				torch::load(pred, (loadFrom / "RND_PRED.lt").string());
-				torch::load(target, (loadFrom / "RND_TARGET.lt").string());
-				updates = 1000; // trained state loaded: past warmup by construction
-				RG_LOG("RND self-model loaded from " << loadFrom);
-			} catch (const std::exception& e) {
-				RG_LOG("RND self-model load failed (" << e.what() << ") - starting fresh");
-			}
-		}
-		loadFrom.clear();
-		target->to(device);
-		pred->to(device);
-		for (auto& p : target->parameters())
-			p.requires_grad_(false);
-		optim = std::make_shared<torch::optim::Adam>(pred->parameters(), lr);
-	}
-};
-
-// Optimistic-Critic Ladder state (LearnerConfig.h GapSensorConfig; LADDER.md):
-//  - Stage-1 SENSOR: expectile twin of the critic on DETACHED trunk output, same
-//    GAE value targets, asymmetric loss -> the tau-expectile ("returns when it
-//    goes well"). Persisted as GAP_EXP.lt.
-//  - QUASIMETRIC MAP (rung 3): encoder E (obs->64) + head f (64->32), distance
-//    d(x,y) = sum_j relu(f(E(x))_j - f(E(y))_j). Trained QRL-style each iteration
-//    (L_local on consecutive same-agent pairs, L_spread on random pairs, dual
-//    ascent on lambda) with its OWN Adam and OWN clip group - Law 1: a shared
-//    clip_grad_norm would let the spread term's large gradients silently crush
-//    the policy gradient. Persisted as GAP_MAP_E.lt / GAP_MAP_F.lt.
-//  - BANKS: goal/concede raw-obs ring buffers (final ~1s before each scored /
-//    conceded goal) anchoring V_metric = a*g^d_g + a2*g^d_c + b; (a, a2, b) by
-//    per-iteration OLS against the critic's extrinsic value targets, EMA'd and
-//    clamped. Banks are NOT persisted (they refill within minutes; V_metric
-//    falls back to V_exp below bankMinFill) - lambda/calibration/dClamp are, in
-//    RUNNING_STATS.
+// V_exp - the return-level expectile twin of the value critic (COMPOSITION_CRITIC.md section 8,
+// ladder rung 2: "what I sometimes do"). Trained on the SAME extrinsic GAE targets as the
+// critic but read through a DETACHED trunk, so it measures without reshaping what it measures.
+// Persisted as GAP_EXP.lt.
+//
+// MEASUREMENT ONLY as of 2026-07-25. The paper's mechanism actuates from the COMPOSITION
+// critic alone (a single seek term, Phi = +H). Removed with the rest of the Ladder in that
+// conformance pass: the quasimetric map, the goal/concede banks, V_metric calibration,
+// gap_PK, the closure drive Phi = -(gap_KD + gap_PK), the 5-column policy wire, the
+// impossible-control falsification family, and RND novelty.
+// History: git log -- docs/LADDER.md docs/EMERGENCE.md
 struct GGL::GapState {
 	torch::nn::Sequential exp{ nullptr };
 	std::shared_ptr<torch::optim::Adam> optim;
 	std::filesystem::path loadFrom;
 	int64_t updates = 0;
-
-	// Quasimetric map (own gradient economy - Law 1; never touches the trunk - Law 2)
-	torch::nn::Sequential mapE{ nullptr }, mapF{ nullptr };
-	std::shared_ptr<torch::optim::Adam> mapOptim;
-	std::filesystem::path mapLoadFrom;
-	int64_t mapUpdates = 0;
-	float lambda = 1.f;      // dual variable (persisted)
-	float dClampEma = 0.f;   // EMA of mean episode steps (persisted); D_CLAMP = mult * this
-
-	// Banks: raw obs rows (CPU ring buffers) + their current-map embeddings (device)
-	std::vector<float> bankG, bankC;      // flattened [fill, obsSize]
-	size_t bankGFill = 0, bankCFill = 0;  // rows currently held
-	size_t bankGNext = 0, bankCNext = 0;  // ring cursor
-	torch::Tensor bankGEmb, bankCEmb;     // [fill, 32] on device, refreshed per iteration
-
-	// V_metric calibration (persisted)
-	float calibA = 0.f, calibA2 = 0.f, calibB = 0.f;
-	bool calibInit = false;
-
-	// Retention telemetry (required by spec 2.1): frozen consecutive pairs, the
-	// forgetting gauge. In-memory only - re-freezes on restart, longitudinal enough
-	// between restarts, and it is measurement, not mechanism.
-	torch::Tensor retA, retB;
 
 	void Build(int64_t featIn, torch::Device device, float lr) {
 		exp = torch::nn::Sequential(
@@ -131,56 +66,7 @@ struct GGL::GapState {
 		exp->to(device);
 		optim = std::make_shared<torch::optim::Adam>(exp->parameters(), lr);
 	}
-
-	void BuildMap(int64_t obsIn, torch::Device device, float lr) {
-		// Spec-fixed architecture: E: obs -> 256 -> 256 -> 64 GELU; f: 64 -> 128 -> 32 GELU
-		mapE = torch::nn::Sequential(
-			torch::nn::Linear(obsIn, 256), torch::nn::GELU(),
-			torch::nn::Linear(256, 256), torch::nn::GELU(),
-			torch::nn::Linear(256, 64));
-		mapF = torch::nn::Sequential(
-			torch::nn::Linear(64, 128), torch::nn::GELU(),
-			torch::nn::Linear(128, 32));
-		if (!mapLoadFrom.empty() && std::filesystem::exists(mapLoadFrom / "GAP_MAP_E.lt")) {
-			try {
-				torch::load(mapE, (mapLoadFrom / "GAP_MAP_E.lt").string());
-				torch::load(mapF, (mapLoadFrom / "GAP_MAP_F.lt").string());
-				if (mapUpdates == 0)
-					mapUpdates = 1000; // trained state loaded (stats normally carry the real count)
-				RG_LOG("Ladder quasimetric map loaded from " << mapLoadFrom);
-			} catch (const std::exception& e) {
-				RG_LOG("Ladder map load failed (" << e.what() << ") - starting fresh");
-			}
-		}
-		mapLoadFrom.clear();
-		mapE->to(device);
-		mapF->to(device);
-		std::vector<torch::Tensor> params = mapE->parameters();
-		for (auto& p : mapF->parameters())
-			params.push_back(p);
-		mapOptim = std::make_shared<torch::optim::Adam>(params, lr);
-	}
-
-	// Map embedding of raw obs rows (no-grad, fp32)
-	torch::Tensor Embed(torch::Tensor obs) {
-		RG_NO_GRAD;
-		return mapF->forward(mapE->forward(obs.to(torch::kFloat32)));
-	}
-
-	void PushBank(bool goal, const float* row, int obsSize, int cap) {
-		auto& bank = goal ? bankG : bankC;
-		auto& fill = goal ? bankGFill : bankCFill;
-		auto& next = goal ? bankGNext : bankCNext;
-		if ((int)fill < cap) {
-			bank.insert(bank.end(), row, row + obsSize);
-			fill++;
-		} else {
-			std::copy(row, row + obsSize, bank.begin() + (next % cap) * obsSize);
-		}
-		next = (next + 1) % RS_MAX(1, cap);
-	}
 };
-
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
 {
@@ -196,10 +82,8 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	if (config.tsPerSave == 0)
 		config.tsPerSave = config.ppo.tsPerItr;
 
-	// EMERGENCE RC1: state shell exists from boot (nets lazily built at first use so
-	// the feature width comes from the real trunk output, not a config guess)
-	if (config.rndOptimism.enabled)
-		rnd = std::make_shared<RndState>();
+	// State shell exists from boot (net lazily built at first use so the feature width
+	// comes from the real trunk output, not a config guess)
 	if (config.gapSensor.enabled)
 		gapSensor = std::make_shared<GapState>();
 
@@ -349,18 +233,6 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		RG_ERR_CLOSE("Learner::Learner(): config.ppo.deterministic is for render/eval only, "
 			"it cannot collect trainable experience");
 
-	// Ladder wire: the policy head gains 5 input columns (see LadderWire). Law 6 is
-	// HARD under Muon: a wire whose gradients are near-null (no drive paying for what
-	// it perceives) is a stability liability, so the wire refuses to exist without
-	// the drive. Render mode is exempt (checkpoints carry the 517 policy; render
-	// feeds zeros and never learns).
-	if (config.gapSensor.enabled && config.gapSensor.wireEnabled) {
-		if (config.gapSensor.driveBeta <= 0 && !config.renderMode)
-			RG_ERR_CLOSE("Learner::Learner(): gapSensor.wireEnabled requires driveBeta > 0 "
-				"(Law 6: wire and drive ship together - conditioning inputs with near-null "
-				"gradients invite an orthogonalized-optimizer random walk)");
-		config.ppo.extraPolicyInputs = 5;
-	}
 
 	try {
 		RG_LOG("\tMaking PPO learner...");
@@ -466,41 +338,6 @@ void GGL::Learner::SaveStats(std::filesystem::path path) {
 		j["steer_sigma" + suffix] = steerSigmaSave[md];
 	}
 
-	// Fear panel (in-trainer census): persisted so the probe set stays FIXED across
-	// restarts - longitudinal by construction (~700KB in the stats JSON, saved every
-	// tsPerSave; acceptable)
-	if (!fearPanelObs.empty()) {
-		j["fear_panel_obs"] = fearPanelObs;
-		j["fear_panel_timestep"] = fearPanelTimestep;
-	}
-
-	// EMERGENCE RC2 observer: rolling miner sample for offline inspection (save-only)
-	if (!minerSampleObs.empty())
-		j["miner_sample_obs"] = minerSampleObs;
-
-	// AirDrill altitude-annealing controller (AERIAL_GAP.md): the curriculum must
-	// never reset on a crash-restart
-	j["air_drill_d"] = airDrillD;
-	if (airDrillConvEMA >= 0) {
-		j["air_drill_conv_ema"] = airDrillConvEMA;
-		j["air_drill_conv_ref"] = airDrillConvRef;
-	}
-
-	// Ladder scalars (the map nets save as GAP_MAP_*.lt; banks deliberately not
-	// persisted - they refill within minutes and V_metric falls back to V_exp).
-	// The cumulative impossible-touch counter IS persisted: "zero successes EVER"
-	// is a run-lifetime claim, not a process-lifetime one.
-	if (gapSensor) {
-		j["ladder_lambda"] = gapSensor->lambda;
-		j["ladder_dclamp_ema"] = gapSensor->dClampEma;
-		j["ladder_map_updates"] = gapSensor->mapUpdates;
-		if (gapSensor->calibInit) {
-			j["ladder_calib_a"] = gapSensor->calibA;
-			j["ladder_calib_a2"] = gapSensor->calibA2;
-			j["ladder_calib_b"] = gapSensor->calibB;
-		}
-		j["ladder_imp_touches"] = (int64_t)ladderImpTouches;
-	}
 
 	// Nexto yardstick: cumulative series must survive restarts to stay longitudinal
 	if (nexto) {
@@ -571,20 +408,7 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 			config.steering.airDrillCurriculum->difficulty = airDrillD;
 	}
 
-	// Ladder scalars (map weights load via GAP_MAP_*.lt; banks refill live)
-	if (gapSensor && j.contains("ladder_lambda")) {
-		gapSensor->lambda = (float)j["ladder_lambda"];
-		gapSensor->dClampEma = j.value("ladder_dclamp_ema", 0.f);
-		gapSensor->mapUpdates = j.value("ladder_map_updates", (int64_t)0);
-		if (j.contains("ladder_calib_a")) {
-			gapSensor->calibA = (float)j["ladder_calib_a"];
-			gapSensor->calibA2 = (float)j["ladder_calib_a2"];
-			gapSensor->calibB = (float)j["ladder_calib_b"];
-			gapSensor->calibInit = true;
-		}
-	}
 	if (j.contains("ladder_imp_touches"))
-		ladderImpTouches = (int64_t)j["ladder_imp_touches"];
 	if (j.contains("nexto_goals_for")) {
 		nextoGoalsFor = (int64_t)j["nexto_goals_for"];
 		nextoGoalsAgainst = (int64_t)j["nexto_goals_against"];
@@ -688,17 +512,8 @@ void GGL::Learner::Save() {
 	RG_LOG("Saving to folder " << finalFolder << "...");
 	SaveStats(saveFolder / STATS_FILE_NAME);
 	ppo->SaveTo(saveFolder);
-	// EMERGENCE RC1: the RND self-model rides in every checkpoint
-	if (rnd && rnd->pred) {
-		torch::save(rnd->pred, (saveFolder / "RND_PRED.lt").string());
-		torch::save(rnd->target, (saveFolder / "RND_TARGET.lt").string());
-	}
 	if (gapSensor && gapSensor->exp)
 		torch::save(gapSensor->exp, (saveFolder / "GAP_EXP.lt").string());
-	if (gapSensor && gapSensor->mapE) {
-		torch::save(gapSensor->mapE, (saveFolder / "GAP_MAP_E.lt").string());
-		torch::save(gapSensor->mapF, (saveFolder / "GAP_MAP_F.lt").string());
-	}
 	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
 	std::filesystem::rename(saveFolder, finalFolder);
 
@@ -781,13 +596,8 @@ void GGL::Learner::Load() {
 	auto fnTryLoad = [&](const std::filesystem::path& loadFolder) {
 		LoadStats(loadFolder / STATS_FILE_NAME);
 		ppo->LoadFrom(loadFolder);
-		// EMERGENCE RC1: remember where the RND self-model lives; consumed at lazy build
-		if (config.rndOptimism.enabled && rnd)
-			rnd->loadFrom = loadFolder;
-		if (config.gapSensor.enabled && gapSensor) {
+		if (config.gapSensor.enabled && gapSensor)
 			gapSensor->loadFrom = loadFolder;
-			gapSensor->mapLoadFrom = loadFolder;
-		}
 
 		if (config.bootSanityCheckEnabled) {
 			float claimedRating = 0;
@@ -1030,12 +840,6 @@ void GGL::Learner::Start() {
 			std::vector<uint8_t> steerPractice;
 			std::vector<uint8_t> steerMode;
 
-			// Ladder impossible-control rows (gapSensor.impossibleArenas): 1 = the row's
-			// arena runs ImpossibleInterceptState. Masked out of the drive injection
-			// (spec 2.6 - the one labeled deviation from the validated code, responding
-			// to the measured ~0.4sigma tax on certified-unclosable rows) and used for
-			// the per-family probe panels. Only filled when the family is on.
-			std::vector<uint8_t> ladderImp;
 
 			void Clear() {
 				*this = Trajectory();
@@ -1076,7 +880,6 @@ void GGL::Learner::Start() {
 				srcStep.clear();
 				steerPractice.clear();
 				steerMode.clear();
-				ladderImp.clear();
 			}
 
 			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
@@ -1119,7 +922,6 @@ void GGL::Learner::Start() {
 
 				steerPractice.reserve(rows); // cheap; populated only when steering is on
 				steerMode.reserve(rows);
-				ladderImp.reserve(rows);     // cheap; populated only when the family is on
 			}
 
 			void Append(const Trajectory& other) {
@@ -1144,7 +946,6 @@ void GGL::Learner::Start() {
 				ballHerGoals += other.ballHerGoals;
 				steerPractice += other.steerPractice;
 				steerMode += other.steerMode;
-				ladderImp += other.ladderImp;
 				carStateHerGoals += other.carStateHerGoals;
 				ballMoved += other.ballMoved;
 
@@ -1184,8 +985,6 @@ void GGL::Learner::Start() {
 				}
 				if (!steerPractice.empty())
 					RG_ASSERT(steerPractice.size() == n && steerMode.size() == n);
-				if (!ladderImp.empty())
-					RG_ASSERT(ladderImp.size() == n);
 			}
 
 			size_t Length() const {
@@ -1282,30 +1081,6 @@ void GGL::Learner::Start() {
 			ppo->steerRhoK = RS_MAX(1, config.steering.rhoGateActionSamples);
 		}
 
-		// Ladder impossible-control family: the LAST N arenas of the contiguous 1v1
-		// block (ExampleMain's EnvCreateFunc places ImpossibleInterceptState by the
-		// SAME rule, so the two sites agree by construction - the trailing position
-		// also keeps the league's low-index eval clones and the leading practice
-		// slice clear of it). Their rows get steer role 3 (excluded from every
-		// equality-keyed steering pool: an unreachable rocket at the net must never
-		// feed the commitment derivation or the fear census).
-		ladderImpStart = ladderImpEnd = 0;
-		if (config.gapSensor.enabled && config.gapSensor.impossibleArenas > 0 && !render) {
-			auto& blk1v1 = steerBlocks[0];
-			int k = RS_MIN(config.gapSensor.impossibleArenas, blk1v1.count);
-			ladderImpEnd = blk1v1.first + blk1v1.count;
-			ladderImpStart = ladderImpEnd - k;
-			if (ladderImpStart < blk1v1.first + blk1v1.numPractice)
-				RG_ERR_CLOSE("Ladder: impossible-control arenas [" << ladderImpStart << ", "
-					<< ladderImpEnd << ") overlap the steering practice slice - shrink "
-					"impossibleArenas or practiceArenaFrac");
-			for (int a = ladderImpStart; a < ladderImpEnd; a++)
-				arenaSteerRole[a] = 3;
-			RG_LOG("Ladder impossible-control family: arenas [" << ladderImpStart << ", "
-				<< ladderImpEnd << ") (certified >= " << "1.6x speed cap per spawn; "
-				"rows masked from the drive; cumulative touches must stay 0)");
-		}
-		const bool ladderImpOn = ladderImpEnd > ladderImpStart;
 
 		// Opponent style library (roadmap phase 1), synthesized LIVE - nothing on disk.
 		// hesitant/overcommit are the commitment direction at negative / mild positive
@@ -1407,9 +1182,8 @@ void GGL::Learner::Start() {
 
 		// goalCriticOn: the goal-channel recorder below indexes these maps too - without it,
 		// a goal-critic-only config would read arena 0 / slot 0 for every player and train
-		// the goal critic on garbage credit. ladderImpOn: the impossible-row tagger
 		// indexes playerArenaIdx as well.
-		if (reachOn || steerOn || goalCriticOn || ladderImpOn) {
+		if (reachOn || steerOn || goalCriticOn) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
 				auto& players = envSet->state.gameStates[arenaIdx].players;
@@ -1590,11 +1364,6 @@ void GGL::Learner::Start() {
 			snapshotNames.push_back("reach_psi_car");
 			snapshotNames.push_back("reach_psi_carstate");
 		}
-		// Ladder wire: the collection wire's V_real must come from the same frozen
-		// generation as the policy (ComputeWire reads models["critic"])
-		const bool ladderWireOn = config.gapSensor.enabled && config.gapSensor.wireEnabled && !render;
-		if (ladderWireOn)
-			snapshotNames.push_back("critic");
 		ModelSet collectSnapshot;
 		if (pipelineOn)
 			for (const char* nm : snapshotNames)
@@ -1615,7 +1384,6 @@ void GGL::Learner::Start() {
 			}
 		};
 
-		// ===== Ladder wire generations (see PPOLearner.h LadderWire) =====
 		// fnSyncLadderCollect freezes one full wire generation for the NEXT collection
 		// (deep-cloned aux nets + bank embeddings + calibration - the pipelined worker
 		// must never read nets learn-prep is training). fnArmLadderLearn hands the
@@ -1626,54 +1394,6 @@ void GGL::Learner::Start() {
 		auto fnCloneSeq = [](const torch::nn::Sequential& src) {
 			return torch::nn::Sequential(
 				std::dynamic_pointer_cast<torch::nn::SequentialImpl>(src->clone()));
-		};
-		auto fnSyncLadderCollect = [&]() {
-			if (!ladderWireOn)
-				return;
-			RG_NO_GRAD;
-			auto& lw = ppo->ladderCollect;
-			const auto& gc = config.gapSensor;
-			lw.active = false;
-			lw.banksReady = false;
-			if (!gapSensor || !gapSensor->exp)
-				return; // fresh run, first iteration: collection runs with a zero wire
-			lw.exp = fnCloneSeq(gapSensor->exp);
-			bool mapReady = gapSensor->mapE && gapSensor->mapUpdates >= gc.mapWarmupIters;
-			if (mapReady && gapSensor->calibInit
-				&& (int)gapSensor->bankGFill >= gc.bankMinFill
-				&& (int)gapSensor->bankCFill >= gc.bankMinFill) {
-				lw.mapE = fnCloneSeq(gapSensor->mapE);
-				lw.mapF = fnCloneSeq(gapSensor->mapF);
-				auto tBankG = torch::from_blob(gapSensor->bankG.data(),
-					{ (int64_t)gapSensor->bankGFill, (int64_t)obsSize }, torch::kFloat32)
-					.to(ppo->device);
-				auto tBankC = torch::from_blob(gapSensor->bankC.data(),
-					{ (int64_t)gapSensor->bankCFill, (int64_t)obsSize }, torch::kFloat32)
-					.to(ppo->device);
-				lw.bankG = lw.mapF->forward(lw.mapE->forward(tBankG));
-				lw.bankC = lw.mapF->forward(lw.mapE->forward(tBankC));
-				lw.a = gapSensor->calibA;
-				lw.a2 = gapSensor->calibA2;
-				lw.b = gapSensor->calibB;
-				lw.banksReady = true;
-			}
-			lw.gamma = config.ppo.gaeGamma;
-			lw.dClamp = RS_MAX(1.f, gc.dClampMult * RS_MAX(1.f, gapSensor->dClampEma));
-			lw.scale = gc.wireScale;
-			lw.active = true;
-		};
-		auto fnArmLadderLearn = [&]() {
-			if (!ladderWireOn)
-				return;
-			auto& ll = ppo->ladderLearn;
-			ll = ppo->ladderCollect; // flags + bank embeddings + calibration of the joined buffer
-			if (gapSensor && gapSensor->exp)
-				ll.exp = gapSensor->exp; // live nets: "re-derived from current predictions"
-			if (gapSensor && gapSensor->mapE) {
-				ll.mapE = gapSensor->mapE;
-				ll.mapF = gapSensor->mapF;
-			}
-			ppo->ladderLearnSet = true;
 		};
 		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
 		Report collectReport;         // worker-owned between barriers; merged into the iteration report
@@ -2280,84 +2000,6 @@ void GGL::Learner::Start() {
 							report[fnModeKey("Steer/Frontier Dz", md)] = dzBankedSum / dzBanked;
 						fpool->Fill(md, std::move(entries));
 					}
-				}
-			}
-
-			// 6b) POTENTIAL FRONTIER - Phase 0 (FRONTIER.md): SENSOR ONLY. Score every
-			// mined candidate on the single quasimetric axis d_goal (min distance to the
-			// goal bank via the already-shipped GapState map) and log its distribution +
-			// sanity correlations (vs ball height, vs the incumbent Dz). Changes NO
-			// banking or selection - pure telemetry behind cfgS.frontierPotential.
-			// off = identical. Runs after the map block, so bankGEmb/dClamp are fresh.
-			if (cfgS.frontierPotential) {
-				const auto& gcfg = config.gapSensor;
-				bool mapReady = gcfg.enabled && gcfg.mapEnabled && gapSensor
-					&& gapSensor->bankGEmb.defined()
-					&& gapSensor->mapUpdates >= gcfg.mapWarmupIters
-					&& (int)gapSensor->bankGFill >= gcfg.bankMinFill;
-				std::vector<int64_t> allRows;
-				if (mapReady)
-					for (int md = 0; md < STEER_MODES; md++)
-						for (int64_t r : frontierRows[md])
-							allRows.push_back(r);
-				const int64_t Nc = (int64_t)allRows.size();
-				if (mapReady && Nc >= 32) {
-					RG_NO_GRAD;
-					std::vector<float> buf((size_t)Nc * obsSize);
-					for (int64_t i = 0; i < Nc; i++)
-						memcpy(&buf[(size_t)i * obsSize], &states[allRows[i] * (int64_t)obsSize],
-							obsSize * sizeof(float));
-					auto tCand = torch::from_blob(buf.data(), { Nc, (int64_t)obsSize }, torch::kFloat32)
-						.to(ppo->device, true);
-					float dClamp = gcfg.dClampMult * gapSensor->dClampEma;
-					auto eCand = gapSensor->Embed(tCand);
-					auto dGt = PPOLearner::MinBankDist(eCand, gapSensor->bankGEmb, dClamp)
-						.to(torch::kCPU).contiguous();
-					const float* dgp = dGt.data_ptr<float>();
-					std::vector<float> dgoal(dgp, dgp + Nc), ballZ((size_t)Nc), dzv((size_t)Nc);
-					for (int64_t i = 0; i < Nc; i++) {
-						ballZ[i] = fnObs(allRows[i], BALL_POS + 2) * POS_SCALE;
-						dzv[i] = fnDz(allRows[i]);
-					}
-					std::vector<float> srt = dgoal;
-					std::sort(srt.begin(), srt.end());
-					auto pct = [&](float q) {
-						return srt[RS_MIN((size_t)(q * (float)(Nc - 1)), (size_t)(Nc - 1))];
-					};
-					double mean = 0;
-					for (float v : dgoal) mean += v;
-					mean /= (double)Nc;
-					double var = 0;
-					for (float v : dgoal) { double d = (double)v - mean; var += d * d; }
-					var /= (double)Nc;
-					// Spearman rho (rank-based; ties broken by index - a sanity proxy)
-					auto fnSpear = [Nc](const std::vector<float>& a, const std::vector<float>& b) -> float {
-						auto rankOf = [Nc](const std::vector<float>& v) {
-							std::vector<size_t> idx((size_t)Nc);
-							for (int64_t i = 0; i < Nc; i++) idx[i] = (size_t)i;
-							std::sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return v[x] < v[y]; });
-							std::vector<double> r((size_t)Nc);
-							for (int64_t i = 0; i < Nc; i++) r[idx[i]] = (double)i;
-							return r;
-						};
-						auto ra = rankOf(a), rb = rankOf(b);
-						double m = (double)(Nc - 1) / 2.0, num = 0, da = 0, db = 0;
-						for (int64_t i = 0; i < Nc; i++) {
-							double xa = ra[i] - m, xb = rb[i] - m;
-							num += xa * xb; da += xa * xa; db += xb * xb;
-						}
-						return (da < 1e-9 || db < 1e-9) ? 0.f : (float)(num / std::sqrt(da * db));
-					};
-					report["Frontier/Dgoal P10"] = pct(0.1f);
-					report["Frontier/Dgoal P50"] = pct(0.5f);
-					report["Frontier/Dgoal P90"] = pct(0.9f);
-					report["Frontier/Dgoal Std"] = (float)std::sqrt(var);
-					report["Frontier/Dgoal vs BallZ Spearman"] = fnSpear(dgoal, ballZ);
-					report["Frontier/Dgoal Dz Spearman"] = fnSpear(dgoal, dzv);
-					report["Frontier/Candidates"] = (float)Nc;
-					report["Frontier/Map Ready"] = 1.f;
-				} else {
-					report["Frontier/Map Ready"] = 0.f;
 				}
 			}
 
@@ -3410,7 +3052,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tOldActions;
 
 							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes,
-								{}, 0, &ppo->ladderCollect);
+								{}, 0);
 							if (oppExternal) {
 								// Nexto reads GameStates directly (its own obs builder), and
 								// returns OUR action-table indices via the checked map. The
@@ -3435,7 +3077,7 @@ void GGL::Learner::Start() {
 							torch::Tensor tdStates = tStates.to(ppo->device, true);
 							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
 							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr, tSteerMask, tSteerModes,
-								{}, 0, &ppo->ladderCollect);
+								{}, 0);
 							tActions = tActions.cpu();
 						}
 						inferTime += inferTimer.Elapsed();
@@ -3493,14 +3135,6 @@ void GGL::Learner::Start() {
 										arenaTeamTouched[(int)player.team][arenaIdx] = 1;
 						}
 
-						// Ladder standing falsification: ANY ball touch in an impossible-control
-						// arena voids the certificate (the counter must stay 0 for the life of
-						// the run; Ladder/Imp Touches panel)
-						if (ladderImpOn)
-							for (int arenaIdx = ladderImpStart; arenaIdx < ladderImpEnd; arenaIdx++)
-								for (auto& player : envSet->state.gameStates[arenaIdx].players)
-									if (player.ballTouchedStep)
-										ladderImpTouches++;
 
 						// Nexto yardstick: cumulative goals for/against the external opponent
 						// (RS_TEAM_FROM_Y = the CONCEDING team; conceder == Nexto -> we scored).
@@ -3512,8 +3146,6 @@ void GGL::Learner::Start() {
 						if (oppExternal) {
 							int nArenas = (int)envSet->state.gameStates.size();
 							for (int arenaIdx = 0; arenaIdx < nArenas; arenaIdx++) {
-								if (ladderImpOn && arenaIdx >= ladderImpStart && arenaIdx < ladderImpEnd)
-									continue;
 								auto& gs = envSet->state.gameStates[arenaIdx];
 								if (gs.goalScored) {
 									if (RS_TEAM_FROM_Y(gs.ball.pos.y) == oppTeam)
@@ -3550,11 +3182,6 @@ void GGL::Learner::Start() {
 
 							// Ladder impossible-control rows: tagged by arena (the drive
 							// injection masks them; the probe panels read them)
-							if (ladderImpOn) {
-								int arena = playerArenaIdx[newPlayerIdx];
-								trajectories[newPlayerIdx].ladderImp.push_back(
-									(arena >= ladderImpStart && arena < ladderImpEnd) ? 1 : 0);
-							}
 
 							if (goalCriticOn) {
 								// Goal-only channel, straight from game outcomes (same convention as
@@ -3667,14 +3294,9 @@ void GGL::Learner::Start() {
 			Timer iterTimer = {};
 			if (collectThread.joinable()) {
 				collectThread.join();
-				// The joined buffer was collected with the CURRENT ladderCollect
-				// generation - hand it to Learn before the barrier re-syncs it
-				fnArmLadderLearn();
 			} else {
 				fnApplySteering(); // no worker in flight - safe to swap the direction
-				fnSyncLadderCollect(); // fresh wire generation for the inline collect
 				fnCollectIteration(); // first iteration, or sequential mode
-				fnArmLadderLearn();   // same generation: collect and learn agree
 			}
 			int stepsCollected = collectSteps;
 			std::swap(combinedTraj, combinedTrajNext);
@@ -3700,7 +3322,6 @@ void GGL::Learner::Start() {
 				// concurrently with this iteration's processing + Learn.
 				fnApplySteering(); // barrier zone: the worker is joined, no reader in flight
 				fnSyncSnapshot();
-				fnSyncLadderCollect(); // fresh wire generation (nets + banks + calibration)
 				collectThread = std::jthread([&]() { fnCollectIteration(); });
 			}
 
@@ -4176,89 +3797,6 @@ void GGL::Learner::Start() {
 					// is recomputed against the (possibly ball-shaped) advantages so the two terms
 					// compose to roughly shapingBeta + carShapingBeta of the extrinsic std.
 
-					// ===== EMERGENCE RC1: frontier optimism (RND novelty -> advantages) =====
-					// See LearnerConfig.h RndOptimismConfig for the full rationale. Shape:
-					// novelty = frozen-target prediction error over (trunk, action); the
-					// mean-zero z-scored novelty adds weight*std(A) per z to the advantages
-					// (actor-only: value/goal targets, eval paths and reward accounting are
-					// untouched), then the predictor trains one subsample pass so novelty
-					// anneals as states become familiar. Latch-covered; warmup train-only.
-					if (rnd && (int64_t)combinedTraj.Length() > 0) {
-						const auto& rc = config.rndOptimism;
-						Timer rndTimer = {};
-						int64_t nAll = combinedTraj.Length();
-						int64_t chunk = RS_MAX((int64_t)8192, (int64_t)ppo->config.miniBatchSize);
-						auto tActD = tActions.to(ppo->device).to(torch::kLong);
-
-						// per-row novelty, chunked (nothing large stays resident)
-						torch::Tensor tNov = torch::empty({ nAll });
-						{
-							RG_NO_GRAD;
-							for (int64_t i = 0; i < nAll; i += chunk) {
-								int64_t end = RS_MIN(i + chunk, nAll);
-								auto h2 = ppo->models["shared_head"]->Forward(
-									tStates.slice(0, i, end).to(ppo->device, true), false);
-								if (!rnd->pred)
-									rnd->Build(h2.size(1) + 90, ppo->device, rc.lr);
-								auto x = torch::cat({ h2,
-									torch::one_hot(tActD.slice(0, i, end), 90).to(torch::kFloat32) }, -1);
-								tNov.slice(0, i, end).copy_(
-									(rnd->pred->forward(x) - rnd->target->forward(x))
-										.pow(2).mean(-1).cpu());
-							}
-						}
-
-						float novStd = tNov.std().item<float>();
-						if (novStd > 1e-9f && rnd->updates >= rc.warmupIters) {
-							auto tZ = ((tNov - tNov.mean()) / novStd).clamp(-rc.clampZ, rc.clampZ);
-							float advStd = tAdvantages.std().item<float>();
-							auto injected = (rc.weight * advStd) * tZ;
-							tAdvantages = tAdvantages + injected;
-							report["RND/Injected Abs Mean"] = injected.abs().mean().item<float>();
-						}
-						report["RND/Novelty Mean"] = tNov.mean().item<float>();
-						report["RND/Novelty Std"] = novStd;
-
-						// one training pass over a subsample; annealing = the whole point.
-						// Learn-prep runs under an outer no-grad guard - re-enable grad
-						// locally so the predictor's loss has a graph (smoke-caught bug).
-						{
-							torch::AutoGradMode _rndGradOn(true);
-							auto perm = torch::randperm(nAll,
-								torch::TensorOptions().dtype(torch::kLong))
-								.slice(0, 0, RS_MIN((int64_t)rc.trainRows, nAll));
-							float lossSum = 0;
-							int lossN = 0;
-							for (int64_t i = 0; i < perm.size(0); i += chunk) {
-								auto idx = perm.slice(0, i, RS_MIN(i + chunk, perm.size(0)));
-								torch::Tensor x;
-								{
-									RG_NO_GRAD;
-									auto h2 = ppo->models["shared_head"]->Forward(
-										tStates.index_select(0, idx).to(ppo->device, true), false);
-									x = torch::cat({ h2, torch::one_hot(
-										tActD.index_select(0, idx.to(ppo->device)), 90)
-										.to(torch::kFloat32) }, -1);
-								}
-								rnd->optim->zero_grad();
-								torch::Tensor tgt;
-								{
-									RG_NO_GRAD;
-									tgt = rnd->target->forward(x);
-								}
-								auto loss = (rnd->pred->forward(x) - tgt).pow(2).mean();
-								loss.backward();
-								rnd->optim->step();
-								lossSum += loss.item<float>();
-								lossN++;
-							}
-							rnd->updates++;
-							if (lossN > 0)
-								report["RND/Loss"] = lossSum / lossN;
-						}
-						report["RND/Time"] = rndTimer.Elapsed();
-					}
-
 					// Nexto yardstick panels: cumulative counters (persisted in stats), the
 					// fixed external benchmark immune to version-pool inflation
 					if (nexto) {
@@ -4316,179 +3854,6 @@ void GGL::Learner::Start() {
 								report["Gap/Loss"] = lossSum / lossN;
 						}
 
-						// ---- Quasimetric map: one QRL step per iteration (Laws 1/2: own
-						// Adam, own clip group, raw obs in - the trunk is never touched) ----
-						if (gc.mapEnabled) {
-							torch::AutoGradMode _mapGradOn(true);
-							if (!gapSensor->mapE)
-								gapSensor->BuildMap(obsSize, ppo->device, gc.mapLr);
-
-							// D_CLAMP tracks the buffer's real episode scale (live-derived,
-							// never a constant): EMA of mean episode steps x dClampMult
-							float numEps = RS_MAX(1.f,
-								(tTerminals != 0).to(torch::kFloat32).sum().item<float>());
-							float meanEp = (float)nAll / numEps;
-							gapSensor->dClampEma = gapSensor->dClampEma <= 0
-								? meanEp : 0.99f * gapSensor->dClampEma + 0.01f * meanEp;
-							float dClamp = RS_MAX(1.f, gc.dClampMult * gapSensor->dClampEma);
-
-							// Local pairs: consecutive same-agent rows crossing no episode
-							// boundary (episodes are row-contiguous; terminals[r] != 0 marks
-							// both true ends and truncations, so eligibility = terminals == 0
-							// and the buffer's final row is always ineligible)
-							auto tEligible = (tTerminals == 0).nonzero().flatten();
-							int64_t nLoc = RS_MIN((int64_t)gc.mapLocalPairs, tEligible.size(0));
-							int64_t nSpr = RS_MIN((int64_t)gc.mapSpreadPairs, nAll);
-							if (nLoc >= 32 && nSpr >= 32) {
-								auto locIdx = tEligible.index_select(0,
-									torch::randperm(tEligible.size(0),
-										torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, nLoc));
-								auto eA = gapSensor->mapF->forward(gapSensor->mapE->forward(
-									tStates.index_select(0, locIdx).to(ppo->device, true)));
-								auto eB = gapSensor->mapF->forward(gapSensor->mapE->forward(
-									tStates.index_select(0, locIdx + 1).to(ppo->device, true)));
-								auto dLoc = torch::relu(eA - eB).sum(-1);
-								auto lLocal = torch::relu(dLoc - 1).pow(2).mean();
-
-								auto sprA = torch::randint(nAll, { nSpr },
-									torch::TensorOptions().dtype(torch::kLong));
-								auto sprB = torch::randint(nAll, { nSpr },
-									torch::TensorOptions().dtype(torch::kLong));
-								auto eSA = gapSensor->mapF->forward(gapSensor->mapE->forward(
-									tStates.index_select(0, sprA).to(ppo->device, true)));
-								auto eSB = gapSensor->mapF->forward(gapSensor->mapE->forward(
-									tStates.index_select(0, sprB).to(ppo->device, true)));
-								auto lSpread = torch::relu(eSA - eSB).sum(-1)
-									.clamp_max(dClamp).mean();
-
-								auto lMap = gapSensor->lambda * lLocal - 0.5f * lSpread;
-								gapSensor->mapOptim->zero_grad();
-								lMap.backward();
-								// OWN clip group (Law 1): the spread term's gradients are far
-								// larger than PPO's - a shared global clip would rescale the
-								// policy gradient toward zero and read as "the mechanism hurts"
-								{
-									std::vector<torch::Tensor> mp = gapSensor->mapE->parameters();
-									for (auto& p : gapSensor->mapF->parameters())
-										mp.push_back(p);
-									torch::nn::utils::clip_grad_norm_(mp, 1.0f);
-								}
-								gapSensor->mapOptim->step();
-
-								float lLocalF = lLocal.item<float>();
-								gapSensor->lambda = RS_CLAMP(
-									gapSensor->lambda + gc.lambdaLr * (lLocalF - gc.lambdaTarget),
-									gc.lambdaMin, gc.lambdaMax);
-								gapSensor->mapUpdates++;
-
-								report["Ladder/Map Local Loss"] = lLocalF;
-								report["Ladder/Map Spread"] = lSpread.item<float>();
-								report["Ladder/Lambda"] = gapSensor->lambda;
-								report["Ladder/DClamp"] = dClamp;
-
-								// Retention gauge (spec 2.1, required telemetry): freeze one
-								// set of consecutive pairs once, report their constraint
-								// violation every iteration - that number IS the forgetting
-								// rate. Trending up = apply the reservoir contingency.
-								{
-									RG_NO_GRAD;
-									if (!gapSensor->retA.defined() && nLoc >= 256) {
-										gapSensor->retA = tStates.index_select(0, locIdx).clone();
-										gapSensor->retB = tStates.index_select(0, locIdx + 1).clone();
-									}
-									if (gapSensor->retA.defined()) {
-										auto rA = gapSensor->mapF->forward(gapSensor->mapE->forward(
-											gapSensor->retA.to(ppo->device, true)));
-										auto rB = gapSensor->mapF->forward(gapSensor->mapE->forward(
-											gapSensor->retB.to(ppo->device, true)));
-										report["Ladder/Retention Viol"] = torch::relu(
-											torch::relu(rA - rB).sum(-1) - 1).pow(2).mean().item<float>();
-									}
-								}
-							}
-
-							// ---- Banks: final ~1s of play before each scored/conceded goal
-							// (per player row; the goal channel is +-1 exactly on the scoring
-							// episode's terminal row) ----
-							if (!combinedTraj.goalRews.empty()) {
-								int W = gc.preGoalWindowSteps > 0 ? gc.preGoalWindowSteps
-									: RS_MAX(1, (int)(120.f / RS_MAX(1, config.tickSkip))); // ~1s of decisions
-								int64_t epStart = 0;
-								for (int64_t r = 0; r < nAll; r++) {
-									if (!combinedTraj.terminals[r])
-										continue;
-									float gr = combinedTraj.goalRews[r];
-									if (gr != 0) {
-										int64_t from = RS_MAX(epStart, r - W + 1);
-										for (int64_t w = from; w <= r; w++)
-											gapSensor->PushBank(gr > 0,
-												&combinedTraj.states[(size_t)w * obsSize],
-												obsSize, gc.bankCapacity);
-									}
-									epStart = r + 1;
-								}
-								report["Ladder/Bank Goal Fill"] = (float)gapSensor->bankGFill;
-								report["Ladder/Bank Concede Fill"] = (float)gapSensor->bankCFill;
-							}
-
-							// ---- V_metric calibration: plain OLS of [g^d_g, g^d_c, 1] vs the
-							// critic's extrinsic value targets (the tested default: lstsq +
-							// EMA + clamps; ridge/stratification are labeled contingencies) ----
-							if (gapSensor->mapUpdates >= gc.mapWarmupIters
-								&& (int)gapSensor->bankGFill >= gc.bankMinFill
-								&& (int)gapSensor->bankCFill >= gc.bankMinFill) {
-								RG_NO_GRAD;
-								auto tBankG = torch::from_blob(gapSensor->bankG.data(),
-									{ (int64_t)gapSensor->bankGFill, (int64_t)obsSize },
-									torch::kFloat32).to(ppo->device);
-								auto tBankC = torch::from_blob(gapSensor->bankC.data(),
-									{ (int64_t)gapSensor->bankCFill, (int64_t)obsSize },
-									torch::kFloat32).to(ppo->device);
-								gapSensor->bankGEmb = gapSensor->Embed(tBankG);
-								gapSensor->bankCEmb = gapSensor->Embed(tBankC);
-
-								int64_t nCal = RS_MIN((int64_t)gc.calibRows, nAll);
-								auto calIdx = torch::randperm(nAll,
-									torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, nCal);
-								auto eCal = gapSensor->Embed(
-									tStates.index_select(0, calIdx).to(ppo->device, true));
-								auto dg = PPOLearner::MinBankDist(eCal, gapSensor->bankGEmb, dClamp);
-								auto dc = PPOLearner::MinBankDist(eCal, gapSensor->bankCEmb, dClamp);
-								float gamma = config.ppo.gaeGamma;
-								auto gdg = torch::pow(gamma, dg).cpu().to(torch::kFloat64);
-								auto gdc = torch::pow(gamma, dc).cpu().to(torch::kFloat64);
-								auto X = torch::stack({ gdg, gdc,
-									torch::ones_like(gdg) }, 1);              // [n, 3] fp64 CPU
-								auto y = tTgt.index_select(0, calIdx)
-									.cpu().to(torch::kFloat64).unsqueeze(1);  // [n, 1]
-								auto sol = std::get<0>(torch::linalg_lstsq(X, y,
-									c10::nullopt, "gelsd")).flatten();
-								float aN = (float)sol[0].item<double>();
-								float a2N = (float)sol[1].item<double>();
-								float bN = (float)sol[2].item<double>();
-								// Clamps keep the claim inside the game's value scale
-								float valScale = RS_MAX(1e-3f,
-									(float)y.abs().quantile(0.99).item<double>());
-								aN = RS_CLAMP(aN, 0.f, 2.f * valScale);
-								a2N = RS_CLAMP(a2N, -2.f * valScale, 0.f);
-								bN = RS_CLAMP(bN, -valScale, valScale);
-								if (!gapSensor->calibInit) {
-									gapSensor->calibA = aN;
-									gapSensor->calibA2 = a2N;
-									gapSensor->calibB = bN;
-									gapSensor->calibInit = true;
-								} else {
-									float e = gc.calibEma;
-									gapSensor->calibA = e * gapSensor->calibA + (1 - e) * aN;
-									gapSensor->calibA2 = e * gapSensor->calibA2 + (1 - e) * a2N;
-									gapSensor->calibB = e * gapSensor->calibB + (1 - e) * bN;
-								}
-								report["Ladder/Calib A"] = gapSensor->calibA;
-								report["Ladder/Calib A2"] = gapSensor->calibA2;
-								report["Ladder/Calib B"] = gapSensor->calibB;
-							}
-						}
-
 						// buffer-wide gap panels (no-grad, chunked, subsampled)
 						if (gapSensor->exp && gapSensor->updates >= 5) {
 							RG_NO_GRAD;
@@ -4518,159 +3883,9 @@ void GGL::Learner::Start() {
 								auto pReal = ppo->InferCritic(pObs).to(torch::kFloat32).flatten();
 								report["Gap/Fear Panel"] =
 									torch::relu(pExp - pReal).mean().item<float>();
-								if (gapSensor->bankGEmb.defined() && gapSensor->calibInit
-									&& gapSensor->mapUpdates >= gc.mapWarmupIters) {
-									float dClampP = RS_MAX(1.f, gc.dClampMult * RS_MAX(1.f, gapSensor->dClampEma));
-									auto pe = gapSensor->Embed(pObs);
-									auto pMet = gapSensor->calibA * torch::pow(config.ppo.gaeGamma,
-											PPOLearner::MinBankDist(pe, gapSensor->bankGEmb, dClampP))
-										+ gapSensor->calibA2 * torch::pow(config.ppo.gaeGamma,
-											PPOLearner::MinBankDist(pe, gapSensor->bankCEmb, dClampP))
-										+ gapSensor->calibB;
-									report["Ladder/Fear GapPK"] =
-										torch::relu(pMet - pExp).mean().item<float>();
-								}
 							}
 						}
 
-						// ===== COMBINED DRIVE: Phi = -(gap_KD + gap_PK) into the advantages =====
-						// (Stage 2a extended per LADDER.md; latch-covered, warmup train-only)
-						if (gapSensor->exp && gc.driveBeta > 0
-							&& gapSensor->updates >= gc.driveWarmupIters) {
-							RG_NO_GRAD;
-							auto tVR = tValPreds.to(torch::kFloat32).flatten();
-							torch::Tensor tVExpAll = torch::empty({ nAll });
-							for (int64_t i = 0; i < nAll; i += chunk) {
-								int64_t end = RS_MIN(i + chunk, nAll);
-								auto h2 = ppo->models["shared_head"]->Forward(
-									tStates.slice(0, i, end).to(ppo->device, true), false);
-								tVExpAll.slice(0, i, end).copy_(
-									gapSensor->exp->forward(h2).flatten().cpu());
-							}
-							auto tGKD = torch::relu(tVExpAll - tVR);
-
-							// gap_PK: the map's claim above the empiricist, once the map,
-							// banks and calibration are all live (before that: exactly 0,
-							// i.e. the incumbent gap_KD-only drive, unchanged)
-							bool pkOn = gc.mapEnabled && gapSensor->mapE
-								&& gapSensor->mapUpdates >= gc.mapWarmupIters
-								&& gapSensor->calibInit && gapSensor->bankGEmb.defined()
-								&& gapSensor->bankCEmb.defined();
-							torch::Tensor tGPK = torch::zeros({ nAll });
-							torch::Tensor tDg; // goal-side distances (credit-geometry telemetry)
-							if (pkOn) {
-								float dClampD = RS_MAX(1.f, gc.dClampMult * RS_MAX(1.f, gapSensor->dClampEma));
-								float gamma = config.ppo.gaeGamma;
-								tDg = torch::empty({ nAll });
-								for (int64_t i = 0; i < nAll; i += chunk) {
-									int64_t end = RS_MIN(i + chunk, nAll);
-									auto e = gapSensor->Embed(
-										tStates.slice(0, i, end).to(ppo->device, true));
-									auto dg = PPOLearner::MinBankDist(e, gapSensor->bankGEmb, dClampD);
-									auto dc = PPOLearner::MinBankDist(e, gapSensor->bankCEmb, dClampD);
-									auto vMet = gapSensor->calibA * torch::pow(gamma, dg)
-										+ gapSensor->calibA2 * torch::pow(gamma, dc)
-										+ gapSensor->calibB;
-									tGPK.slice(0, i, end).copy_(torch::relu(
-										vMet.cpu() - tVExpAll.slice(0, i, end)));
-									tDg.slice(0, i, end).copy_(dg.cpu());
-								}
-								report["Ladder/GapPK Mean"] = tGPK.mean().item<float>();
-								report["Ladder/GapPK P90"] = tGPK.quantile(0.9).item<float>();
-							}
-							auto tGapAll = tGKD + tGPK;
-
-							// Masks: terminal/truncation boundaries (both nonzero terminal
-							// codes) AND impossible-control rows. Centering runs over
-							// UNMASKED rows only with the mask re-applied - masked rows are
-							// identically zero through centering, scaling and clipping (the
-							// V0-checkable invariant; the validated code's all-rows centering
-							// left a common-mode epsilon on masked rows - corrected per Law 8b).
-							auto m = (tTerminals.to(torch::kFloat32).flatten() == 0)
-								.to(torch::kFloat32);
-							torch::Tensor tImp;
-							if (!combinedTraj.ladderImp.empty()
-								&& combinedTraj.ladderImp.size() == (size_t)nAll) {
-								tImp = torch::tensor(combinedTraj.ladderImp).to(torch::kFloat32);
-								m = m * (1.f - tImp);
-							}
-							float mSum = m.sum().item<float>();
-							float advStd = tAdvantages.std().item<float>();
-							if (mSum >= 2 && advStd > 1e-8f) {
-								auto d = torch::zeros({ nAll });
-								d.slice(0, 0, nAll - 1) =
-									tGapAll.slice(0, 0, nAll - 1) - tGapAll.slice(0, 1, nAll);
-								d = d * m;
-								d = (d - d.sum() / mSum) * m; // center over m=1 rows, re-mask
-								// sigma_int over unmasked rows (masked rows contribute 0 and
-								// are excluded from the count); floored so a near-flat gap
-								// field can't blow beta_eff up (spec 2.6)
-								float sigInt = std::sqrt(RS_MAX(0.f,
-									d.square().sum().item<float>() / mSum));
-								float betaEff = gc.driveBeta * advStd
-									/ RS_MAX(0.05f * advStd, sigInt);
-								auto inj = (betaEff * d).clamp(-3.f * advStd, 3.f * advStd);
-								tAdvantages = tAdvantages + inj;
-								report["Gap/Drive Inj Abs Mean"] = inj.abs().mean().item<float>();
-								report["Ladder/BetaEff"] = betaEff;
-
-								// Per-context mean injection (the known centering transfer:
-								// match rows subsidize drills; monitor, don't fix preemptively)
-								if (tImp.defined() && tImp.sum().item<float>() > 0) {
-									report["Ladder/Inj Mean Imp"] = (inj * tImp).sum().item<float>()
-										/ tImp.sum().item<float>(); // must be exactly 0
-									auto tMatch = m; // unmasked = non-terminal, non-impossible
-									report["Ladder/Inj Mean Match"] = (inj * tMatch).sum().item<float>()
-										/ RS_MAX(1.f, tMatch.sum().item<float>());
-								}
-								// Boundary-crossing credit geometry (spec 1): a_int conditioned
-								// on the sign of Delta d_g - expect the positive payment
-								// concentrated where the corridor crosses into known-payoff
-								// territory (d_g falling), a light tax on entering the claim
-								if (tDg.defined()) {
-									auto dDg = torch::zeros({ nAll });
-									dDg.slice(0, 0, nAll - 1) =
-										tDg.slice(0, 0, nAll - 1) - tDg.slice(0, 1, nAll);
-									auto down = ((dDg > 0) & (m > 0)).to(torch::kFloat32);
-									auto up = ((dDg < 0) & (m > 0)).to(torch::kFloat32);
-									if (down.sum().item<float>() > 0)
-										report["Ladder/AInt DgDown Mean"] =
-											(inj * down).sum().item<float>() / down.sum().item<float>();
-									if (up.sum().item<float>() > 0)
-										report["Ladder/AInt DgUp Mean"] =
-											(inj * up).sum().item<float>() / up.sum().item<float>();
-								}
-							}
-
-							// Impossible-family probe panels (spec 3.2 acceptance criteria,
-							// read on the family's SPAWN rows = episode-start rows): V_exp
-							// must deflate toward V_real, gap_PK must sit below the feasible
-							// (fear-panel) peaks, and touches must stay 0 forever.
-							if (tImp.defined()) {
-								std::vector<float> spawnFlags((size_t)nAll, 0.f);
-								for (int64_t r = 0; r < nAll; r++)
-									if (combinedTraj.ladderImp[r]
-										&& (r == 0 || combinedTraj.terminals[r - 1]))
-										spawnFlags[r] = 1.f;
-								auto impSpawn = torch::tensor(spawnFlags);
-								float nSpawn = impSpawn.sum().item<float>();
-								if (nSpawn > 0) {
-									report["Ladder/Imp VReal Spawn"] =
-										(tVR * impSpawn).sum().item<float>() / nSpawn;
-									report["Ladder/Imp VExp Spawn"] =
-										(tVExpAll * impSpawn).sum().item<float>() / nSpawn;
-									report["Ladder/Imp GapKD Spawn"] =
-										(tGKD * impSpawn).sum().item<float>() / nSpawn;
-									if (pkOn)
-										report["Ladder/Imp GapPK Spawn"] =
-											(tGPK * impSpawn).sum().item<float>() / nSpawn;
-								}
-							}
-						}
-						if (ladderImpOn)
-							report["Ladder/Imp Touches"] = (float)(int64_t)ladderImpTouches;
-						if (ladderWireOn)
-							report["Ladder/Wire Active"] = ppo->ladderLearn.active ? 1.f : 0.f;
 						report["Gap/Time"] = gapTimer.Elapsed();
 					}
 

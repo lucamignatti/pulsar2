@@ -87,12 +87,6 @@ namespace GGL {
 		// independently by its owning module (e.g. ProposerModule::Train()).
 		bool groupStepExempt = false;
 
-		// Ladder wire migration (PPOLearnerConfig::extraPolicyInputs): when > 0,
-		// Load() accepts a checkpoint whose FIRST Linear is exactly this many input
-		// columns narrower, zero-pads the missing columns (behaviorally exact - the
-		// new inputs contribute nothing until trained), and resets the optimizer
-		// (its state tensors have the old shapes). Set on the policy model only.
-		int allowInputExpand = 0;
 
 		Model() : config(PartialModelConfig{}), device({}), modelName(NULL) {} // Uninitialized init
 
@@ -132,7 +126,6 @@ namespace GGL {
 		// NOTE: Resets parameters
 		Model* MakeEmptyClone() {
 			Model* clone = new Model(modelName, config, device);
-			clone->allowInputExpand = allowInputExpand; // version/league clones load old files too
 			return clone;
 		}
 

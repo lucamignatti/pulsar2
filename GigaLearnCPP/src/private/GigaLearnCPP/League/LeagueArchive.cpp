@@ -119,11 +119,9 @@ void LeagueArchive::LoadAnchors() {
 		bool ok = true;
 		for (const char* name : SCRATCH_MODELS) {
 			if (!scratch[name]) continue;
-			Model* tmp = scratch[name]->MakeClone(); // carries allowInputExpand
+			Model* tmp = scratch[name]->MakeClone();
 			try {
-				// loadOptim=false: anchors are frozen opponents. Model::Load performs the
-				// pre-wire 512->517 zero-pad migration itself, so anchors from before the
-				// Ladder deploy serve correctly at the current width.
+				// loadOptim=false: anchors are frozen opponents
 				tmp->Load(adir, false, false);
 				a.params.push_back(
 					nn::utils::parameters_to_vector(tmp->parameters()).detach().cpu().clone());
@@ -179,48 +177,13 @@ std::vector<torch::Tensor> LeagueArchive::SnapshotMain() const {
 	return out;
 }
 
-// Ladder wire migration for archived flat vectors: elites stored before the
-// policy head gained its wire columns come up short by exactly out x expand
-// elements of the FIRST Linear's weight. Zero-pad those columns row-wise (flat
-// layout is row-major: weight rows first) - behaviorally exact, same rule as
-// Model::Load. Returns the input unchanged when shapes already match (or don't
-// match the migration signature). MUST run at STORAGE time (FromJSON), not just
-// at LoadInto: EvolveStep's crossover/mutation mixes stored member vectors with
-// fresh SnapshotMain() vectors arithmetically - a stale-shape member crashes the
-// add (live incident, 2026-07-18: 839770 vs 837210 = 512*5 wire columns).
-static torch::Tensor MigrateFlatVec(GGL::Model* mdl, torch::Tensor p) {
-	auto cur = mdl->parameters();
-	int64_t curTotal = 0;
-	for (auto& c : cur)
-		curTotal += c.numel();
-	if (p.numel() == curTotal || mdl->allowInputExpand <= 0
-		|| cur.empty() || cur[0].dim() != 2)
-		return p;
-	int64_t out = cur[0].size(0), inNew = cur[0].size(1);
-	int64_t inOld = inNew - mdl->allowInputExpand;
-	if (inOld <= 0 || p.numel() != curTotal - out * mdl->allowInputExpand)
-		return p;
-	auto w = p.slice(0, 0, out * inOld).view({ out, inOld });
-	auto wPad = torch::cat({ w,
-		torch::zeros({ out, (int64_t)mdl->allowInputExpand }, w.options()) }, 1)
-		.contiguous().flatten();
-	static bool loggedOnce = false;
-	if (!loggedOnce) {
-		loggedOnce = true;
-		RG_LOG("League: migrating pre-wire member vectors ("
-			<< inOld << " -> " << inNew << " policy inputs, zero-pad; "
-			"logged once, applies to every archived elite)");
-	}
-	return torch::cat({ wPad, p.slice(0, out * inOld) });
-}
-
 void LeagueArchive::LoadInto(ModelSet& set, const std::vector<torch::Tensor>& params) {
 	RG_NO_GRAD;
 	int i = 0;
 	for (const char* name : SCRATCH_MODELS) {
 		if (!set[name]) continue;
 		Model* mdl = set[name];
-		torch::Tensor p = MigrateFlatVec(mdl, params[i]); // defensive; storage migrates at FromJSON
+		torch::Tensor p = params[i]; // defensive; storage migrates at FromJSON
 		nn::utils::vector_to_parameters(p.to(device), mdl->parameters());
 		mdl->_seqHalfOutdated = true;
 		i++;
@@ -750,7 +713,7 @@ void LeagueArchive::FromJSON(const nlohmann::json& j) {
 				int k = 0;
 				for (const char* n : SCRATCH_MODELS) {
 					if (!scratch[n]) continue;
-					mem.params[k] = MigrateFlatVec(scratch[n], mem.params[k]);
+					mem.params[k] = mem.params[k];
 					k++;
 				}
 			}

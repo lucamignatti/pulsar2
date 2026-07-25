@@ -83,15 +83,11 @@ int main(int argc, char** argv) {
 	// section). InferUnit/PPOLearner::InferActionsFromModels default to a NULL ladder,
 	// which is exact zeros - the same convention every eval/opponent/render path uses,
 	// correct here too (Rating-style play, not training collection).
-	constexpr int LADDER_WIRE_COLUMNS = 5;
-
 	RG_LOG("Loading GigaLearn checkpoint from \"" << checkpoint << "\" (useGPU=" << useGPU << ")...");
 	auto* inferUnit = new InferUnit(
 		obsBuilder, obsSize, actionParser,
 		sharedHeadConfig, policyConfig,
-		checkpoint, useGPU,
-		LADDER_WIRE_COLUMNS
-	);
+		checkpoint, useGPU);
 
 	RLBotParams params = {};
 	params.tickSkip = 8;      // matches cfg.tickSkip in ExampleMain.cpp
