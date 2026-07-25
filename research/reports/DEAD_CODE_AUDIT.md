@@ -1,5 +1,31 @@
 # DEAD CODE / INERT FEATURE AUDIT — 2026-07-25
 
+> **OUTCOME (acted on the same day).** Net: **~4,270 deletions**. Restore point: tag
+> `pre-strip-20260725`.
+>
+> | Item | Outcome |
+> |---|---|
+> | PSD / Basin-Racing (~1,880 LOC) | **STRIPPED**; `EffectiveRank`/`DeadUnitFraction` promoted to `Util/Plasticity.h` as unconditional telemetry; `LeagueConfig` extracted to its own header |
+> | Proposer / drill bank (~1,220 LOC) | **STRIPPED**; carStateHead disjunct, carStateHerGoals/achievedCarState and pipelineOn semantics all verified preserved |
+> | TransferLearn chain (~280 LOC) | **STRIPPED**; `StartQuitKeyThread` preserved (it is live) |
+> | Dead types + optimizers (~480 LOC) | **STRIPPED** (PlayerReward, DrillSetter, Quat, DefaultObs pair, MagSGD, 3 unused optimizer arms) |
+> | Dead `Report` API (~45 LOC) | **STRIPPED** |
+> | HEADROOM vdag frozen at random init | **FIXED** — LR wired, twins added to the gradient-clip list, `Headroom/*` given a console block |
+> | Rating latch | **REMOVED ENTIRELY** (user-directed) — measurement kept as `RatingWatch/*`; no automatic update-damage guard exists any more |
+> | Nexto counters / league reward stack | **FIXED** (both one-liners) |
+> | Test suite | **REPAIRED** — it failed 6/30 on a clean tree; now 31/31 with new `soloFrac` coverage |
+> | Steering actuation (~340 LOC) | **NOT STRIPPED** — entangled with the live FrontierPool; deferred as its own change |
+> | `userInfo`, 109-dim branches | **NOT STRIPPED** — poor risk/reward |
+> | Offline toolkit (38 scripts) | **NOT FIXED** — still cannot load this run's checkpoints |
+>
+> **Two claims in this audit were WRONG**, caught during execution: `Report::SingleToString` is
+> live (`Display` calls it unqualified, so a `.SingleToString(` grep misses it), and
+> `digitCommas` *is* passed `true` — the dead part was the unread parameter, not the function.
+>
+> **What remains enabled, and the decisions still open: `ENABLED_INVENTORY.md`.**
+
+
+
 Scope: every feature surface in the repo, resolved against the **live config**
 (`src/ExampleMain.cpp`, not header defaults) and the **live process**
 (PID 364530 → `build/GigaLearnBot`, launched 09:57:57, run `checkpoints_resid`).

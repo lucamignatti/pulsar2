@@ -154,7 +154,7 @@ Four layers, bottom-up:
    (Basin-Racing), Proposer/DrillBank (the 9uz761ua regression machinery), and
    TransferLearn. All three had been disabled by pre-registered verdicts and had
    drifted incompatible with the live net. Their post-mortems remain in
-   `analysis/probes/*.md`; the code is one `git log -- <path>` away. PSD's two
+   `research/reports/*.md`; the code is one `git log -- <path>` away. PSD's two
    useful signals were PROMOTED, not deleted — see `Util/Plasticity.h`.
 4. **`src/ExampleMain.cpp`** — THE configuration. Everything (rewards, arenas,
    net sizes, all feature flags) is code here, heavily commented with the

@@ -30,6 +30,7 @@ Status vocabulary:
 | [EMERGENCE.md](EMERGENCE.md) | 07-16 | 5.0v3 | RND novelty / root-cause learning fixes | **CANONICAL** |
 | [REWARD_SHAPING.md](REWARD_SHAPING.md) | 07-25 | resid | Reward-term semantics, measured gates | **CANONICAL** |
 | [DEAD_CODE_AUDIT.md](DEAD_CODE_AUDIT.md) | 07-25 | resid | Live-vs-inert feature surface audit | **CANONICAL** |
+| [ENABLED_INVENTORY.md](ENABLED_INVENTORY.md) | 07-25 | resid | What survived the strip, and the decisions still open | **CANONICAL** |
 | [LEAGUE_ANCHORS.md](LEAGUE_ANCHORS.md) | 07-19 | resid | Permanent spaced anchor opponents | **CANONICAL** |
 | [H2_TRUNCATION.md](H2_TRUNCATION.md) | 07-19 | cross-run | Offline loader bug, fix + oracle verification | **CANONICAL** |
 | [FEAR_MINE.md](FEAR_MINE.md) | 07-15 | 4.0 | Disagreement-mined frontier drills — *graduated to live* | **CANONICAL** `h2` |
