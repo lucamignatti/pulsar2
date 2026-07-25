@@ -964,6 +964,18 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 		if (name == "critic" || name == "goal_critic")
 			continue;
 
+		// HEADROOM V-dagger twins mirror the CRITIC head's config, so they are value heads and
+		// belong with critic/goal_critic above. Policy versions and the render hot-swap only ever
+		// ACT (InferPolicyProbsFromModels reads shared_head + policy; eval paths feed zero wire),
+		// so cloning these into every version was pure waste: at the 5x1280 critic sizing they are
+		// ~16.1M params = ~64MB of GPU *per version*, and maxOldVersions is 32 -> ~2.06GB of the
+		// card held by value twins that are never evaluated. That is what was OOM-crashing the
+		// residual cold start (2026-07-25, 3 crashes/9h, all CUDA OOM with <200MB free).
+		// Old version dirs keep their now-unread vdag1/vdag2 files; Load() only requires the models
+		// the template asks for, so this is backward-compatible.
+		if (name.rfind("vdag", 0) == 0)
+			continue;
+
 		// Reachability heads are training-time-only; old policy versions don't carry them
 		if (name.rfind("reach_", 0) == 0)
 			continue;
