@@ -69,8 +69,24 @@ GGL::NextoOpponent::NextoOpponent(const std::string& modelPath, torch::Device de
 			model = trial;
 			this->device = device;
 		} catch (const std::exception& e) {
-			RG_LOG("NextoOpponent: CUDA probe failed (" << e.what()
-				<< ") - serving on CPU instead");
+			// EXPECTED on this model: Nexto's traced graph has CPU constants baked in, so the
+			// CUDA probe always throws and we always serve on CPU. torch::jit's what() carries
+			// the entire serialized TorchScript traceback (~40 lines of someone else's Windows
+			// paths) which drowned the boot log on every restart. Keep only the last non-empty
+			// line - that is the actual root cause ("Expected all tensors to be on the same
+			// device...") - and put the full dump behind GGL_VERBOSE_NEXTO=1 for when it is a
+			// NEW failure rather than this known one.
+			std::string msg = e.what();
+			if (const char* v = std::getenv("GGL_VERBOSE_NEXTO"); !(v && v[0] && std::string(v) != "0")) {
+				size_t end = msg.find_last_not_of(" \t\r\n");
+				if (end != std::string::npos) {
+					size_t nl = msg.find_last_of('\n', end);
+					size_t start = (nl == std::string::npos) ? 0 : nl + 1;
+					msg = msg.substr(start, end - start + 1);
+				}
+			}
+			RG_LOG("NextoOpponent: CUDA probe failed (" << msg
+				<< ") - serving on CPU instead (expected; set GGL_VERBOSE_NEXTO=1 for the full trace)");
 		}
 	}
 
