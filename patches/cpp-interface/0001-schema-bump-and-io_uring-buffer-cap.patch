@@ -1,0 +1,37 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 20c635d..cb02aa8 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,7 +22,13 @@ FetchContent_Populate(flatbuffers)
+ 
+ FetchContent_Declare(flatbuffers_schema
+ 	GIT_REPOSITORY https://github.com/RLBot/flatbuffers-schema.git
+-	GIT_TAG 70bcb31eb8e9093ca9200c913f5e1a2d57fdd025
++	# Bumped from cpp-interface's stock 70bcb31e (June 2025) to c2648b4 (June 2026):
++	# the schema pinned by RLBotServer v5.0.0-rc16, the core release built for the
++	# CURRENT Rocket League build (Bridge v0.9.2; the game's April-2026 update broke
++	# older cores - a v1.0.0-rc.3/Bridge-v0.8.2 core dropped the game link 1s after
++	# map load). For real-RL play the game is the fixed component: core, pip rlbot,
++	# and this schema must all track it.
++	GIT_TAG c2648b4fa30d9d3b228466d51746c84ee2f20a6c
+ )
+ FetchContent_Populate(flatbuffers_schema)
+ 
+diff --git a/library/Client.cpp b/library/Client.cpp
+index 0b16ddc..f1d309f 100644
+--- a/library/Client.cpp
++++ b/library/Client.cpp
+@@ -24,7 +24,12 @@ namespace
+ /// @brief Socket buffer large enough to hold at least 4 messages
+ constexpr auto SOCKET_BUFFER_SIZE = 4 * (std::numeric_limits<std::uint16_t>::max () + 1u);
+ 
+-constexpr auto PREALLOCATED_BUFFERS = 32;
++// Each registered buffer is BUFFER_SIZE (128 KB) of io_uring PINNED memory, charged
++// against RLIMIT_MEMLOCK (8 MB hard cap here, shared per-user, un-raisable without root).
++// At 32 that is 4 MB/bot, so only ONE bot could register before "Cannot allocate memory"
++// - which broke 2v2/3v3 (every extra Pulsar2 process failed to connect). 4 buffers = 512
++// KB/bot, so ~16 bots fit; a single 15 Hz bot with tiny packets needs nowhere near 32.
++constexpr auto PREALLOCATED_BUFFERS = 4;
+ 
+ constexpr auto COMPLETION_KEY_SOCKET      = 0;
+ constexpr auto COMPLETION_KEY_WRITE_QUEUE = 1;
