@@ -360,30 +360,31 @@ policy never consumes `H`, so the head is plain trunk width again), RND novelty,
 impossible-control falsification family. Deploy records for the removed machinery live in
 `docs/LADDER.md` and `docs/EMERGENCE.md` — provenance only, not a description of the system.
 
-## Steering ("optimism surgery") — actuation REMOVED, derivation retained
+## Steering ("optimism surgery") — REMOVED
 
-Activation steering was superseded by the optimism work and had been numerically inert (α=0)
-long before it was removed on 2026-07-25. Gone: `fnApplySteering`, `SetSteering`, the causal
-auto-gate, the matched trunk-mean direction/sigma derivation, META in full, the rho-band gate,
-and 27 dead config fields.
+Removed wholesale 2026-07-25 (restore tag `pre-strip-20260725`). Actuation went inert when the
+optimism work superseded it; the remainder — possession-outcome labelling, `FrontierPool`,
+`FrontierDrillState`, the practice/control arena split, the census, the learning-progress miner,
+`AttemptResolutionCondition`, opponent styles — was removed because it **contradicts** the
+constraint set of `research/reports/COMPOSITION_CRITIC.md`: **C1** forbids dedicated drill/reset
+instances (the practice split), **C2** forbids banked retrospective reset states (`FrontierPool`,
+criticised by name in that paper's §4.1). Keeping it would have made any deployment measure
+"architecture PLUS an environment-side curriculum" — confounding the claim under test.
 
-**`config.steering.enabled` is still true and no longer means steering.** What it now gates:
-airborne-reading collection, ball-only landing sims, POSSESSION-OUTCOME labelling, the frontier
-reset pool that drives `FrontierDrillState` on ~30% of arena resets, the in-trainer census, and
-the emergence miner. The name is misleading and worth changing.
+Every arena is now identical. The reset mix (BallNearCar 0.30 / AirDrill 0.20 / AirPlay 0.15 /
+Kickoff 0.10 / Random 0.25) is fixed and non-adaptive, which is what C1 asks for.
 
-**Two lessons from that program still bind, and are cited from the C++ source:**
+**Two lessons still bind, and are cited from the C++ source:**
 
 - **The clipping ratchet.** For actions a push makes much likelier than the base policy, the
   learn-pass ratio falls outside the clip window, and PPO's pessimistic min keeps the gradient
   for POSITIVE advantages while zeroing it for NEGATIVE ones — successes reinforce, punished
   failures are discarded. At α=1σ this compounded lucky overcommits into an Elo bleed while the
   viewer looked better. Any future activation-space intervention inherits this.
-- **Critic aliasing at episode boundaries** (`resolutionTermination`, still `false`, two Elo
-  collapses): a shared critic cannot price truncated and full episodes of the same observation.
-  Whoever changes episode boundaries must let the critic learn the new return structure. Full
-  post-mortem: `research/reports/STEERED_PRACTICE.md`.
-
+- **Critic aliasing at episode boundaries** (`resolutionTermination`, two Elo collapses): a
+  shared critic cannot price truncated and full episodes of the same observation. Whoever changes
+  episode boundaries must let the critic learn the new return structure. Full post-mortem:
+  `research/reports/STEERED_PRACTICE.md`.
 
 ## research/ — the measurement program
 

@@ -8,10 +8,11 @@ Companion docs: `DEAD_CODE_AUDIT.md` (what was found), `research/reports/COMPOSI
 (the paper the optimism stack now conforms to). Restore point for everything removed:
 tag `pre-strip-20260725`.
 
-**Session result: 6,478 lines of C++ deleted, 545 added — net −5,933.** Subsystems removed
+**Session result: 7,904 lines of C++ deleted, 522 added — net −7,382.** Subsystems removed
 whole: PSD/Basin-Racing, proposer/drill bank, TransferLearn, the rating latch, the Ladder's
 map/banks/`V_metric`/`gap_PK`/wire, RND novelty, the impossible-control family, and
-activation-steering actuation + META.
+**activation steering in its entirety** (actuation, META, the derivation, `FrontierPool` and
+`FrontierDrillState`, the practice/control arena split).
 
 ---
 
@@ -25,6 +26,7 @@ activation-steering actuation + META.
 | `miniBatchSize` | 20k | The learn-pass activation-peak lever. Never cut — the OOM was the vdag version-clone bug, not the activation peak. |
 | `gaeGamma` | 0.9969 | ~15s half-life at 15 Hz. **Re-derive if tickSkip changes.** |
 | Net | trunk 3×1152, policy 3×768, critic/goal/vdag×2 5×1280, residual | ~37.96M params. Policy head is plain trunk width again (wire removed). |
+| Reset mix | BallNearCar 0.30 / AirDrill 0.20 / AirPlay 0.15 / Kickoff 0.10 / Random 0.25 | **Fixed and identical in every arena** — not a curriculum, does not adapt. That is what C1 asks for. |
 
 ## 2. Optimism — now exactly the paper
 
@@ -58,23 +60,32 @@ is still computed *after* the HEADROOM injection, so the panel named for raw GAE
 hybrid. Decide the intended composite and whether both should match the same pre-injection
 reference.
 
-## 4. Steering — actuation gone, derivation retained
+## 4. Steering — GONE
 
-| Part | Live value | Status |
-|---|---|---|
-| `steering.enabled` | `true` | **No longer means steering.** It gates possession labeling + census + miner. |
-| Sections 1-3 | live | airborne readings → ball-only landing sims → POSSESSION-OUTCOME labels |
-| Section 6 | live | fills `FrontierPool` → `FrontierDrillState` on ~30% of arena resets |
-| Sections 7-8 | live | in-trainer census, emergence miner (`frontierFearMining`, `emergenceMiner`) |
-| `resolutionTermination` | `false` | **Keep disabled.** Two Elo collapses; post-mortem in `research/reports/STEERED_PRACTICE.md`. |
-| `steerTeamModes` | `true` | Vestigial in PHASE A (team blocks have count 0). |
+Removed wholesale 2026-07-25. Not just as bloat: what remained **contradicted** the constraint
+set of the paper the trainer now implements.
 
-Removed: `fnApplySteering`, `SetSteering`, derivation §4-5 (causal gate, trunk-mean contrast),
-META entirely, the rho-band gate, and **27 now-dead config fields**. That reclaimed the last of
-the "enabled but doing nothing" category — 3 GPU trunk forwards and 4 barrier-zone param copies
-per iteration feeding a delta multiplied by α=0.
+- **C1 (homogeneity)** — "all environment instances identical; no dedicated drill/reset
+  instances." The practice/control arena split violated it.
+- **C2 (no environment design)** — "no banked reset states, no success-state memories that define
+  the objective retrospectively." `FrontierPool` was exactly that; §4.1 criticises the design by
+  name.
 
-**Open:** `steering.enabled` is now a misleading name for "frontier derivation". Worth renaming.
+Gone: `CollectSteeringConfig`, `fnSteerUpdate` (all sections), `FrontierPool` +
+`FrontierDrillState`, the practice/control split and `arenaSteerRole`,
+`AttemptResolutionCondition` + `resolutionTermination`, `opponentStyleChance` and the
+opponent-style delta path, the `Steer/*` and `Miner/*` panels, and the never-assigned air-drill
+curriculum plumbing.
+
+**Behavioural consequence:** practice arenas were 20% of the fleet and drew `FrontierDrillState`
+resets 60% of the time; they now draw the standard mix. Lands with the same cold start deployment
+already required.
+
+**Every arena is now identical** — which is C1.
+
+The lessons live in `research/reports/` (`STEERING.md`, `STEERED_PRACTICE.md`, `FEAR_MINE.md`,
+`KNOWING_DOING.md`); the code is one `git log` from `pre-strip-20260725`. Two still bind and are
+cited from `ExampleMain`: the **clipping ratchet**, and **critic aliasing at episode boundaries**.
 
 ## 5. Outer loops
 
