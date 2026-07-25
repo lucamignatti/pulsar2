@@ -182,20 +182,13 @@ void GGL::PPOLearner::InferActionsFromModels(
 	}
 }
 
-void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models, torch::Tensor styleVec, float styleCoef) {
+void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
 	ModelSet& m = models ? *models : this->models;
 
 	// Activation steering was removed 2026-07-25 (it had been inert at alpha = 0 since the
 	// Ladder superseded it). The opponent-STYLE delta below is a separate, still-supported
 	// path; steerDelta stays as its carrier.
 	torch::Tensor steerDelta = {};
-
-	// Opponent-side style delta: uniform over all rows of this call ([1,trunkOut] broadcast)
-	if (styleVec.defined() && styleCoef != 0) {
-		auto style = (styleVec / styleVec.norm().clamp_min(1e-8f))
-			.to(device).to(torch::kFloat32).unsqueeze(0) * styleCoef;
-		steerDelta = steerDelta.defined() ? steerDelta + style : style;
-	}
 
 	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
 }
