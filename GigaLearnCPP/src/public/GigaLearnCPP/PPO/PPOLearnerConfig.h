@@ -177,12 +177,6 @@ namespace GGL {
 
 		PartialModelConfig policy, critic, sharedHead;
 
-		// Optimistic-Critic Ladder WIRE (set by the Learner from gapSensor.wireEnabled,
-		// never directly): extra columns appended to the policy head's input, fed with
-		// tanh([V_real, V_exp, gap_KD, V_metric, gap_PK]/scale) at collection and
-		// re-derived at learn time. Old checkpoints (without the columns) migrate at
-		// load: weights zero-padded (behaviorally exact), policy optimizer reset.
-		int extraPolicyInputs = 0;
 
 		int epochs = 2;
 		float policyLR = 3e-4f; // Policy learning rate

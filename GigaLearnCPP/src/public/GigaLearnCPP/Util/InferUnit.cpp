@@ -20,7 +20,7 @@ static at::Device BestInferDevice(bool useGPU) {
 GGL::InferUnit::InferUnit(
 	RLGC::ObsBuilder* obsBuilder, int obsSize, RLGC::ActionParser* actionParser,
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig,
-	std::filesystem::path modelsFolder, bool useGPU, int extraPolicyInputs) :
+	std::filesystem::path modelsFolder, bool useGPU) :
 	obsBuilder(obsBuilder), obsSize(obsSize), actionParser(actionParser), useGPU(useGPU) {
 
 	this->models = new ModelSet();
@@ -30,9 +30,7 @@ GGL::InferUnit::InferUnit(
 			false, obsSize, actionParser->GetActionAmount(),
 			sharedHeadConfig, policyConfig, {},
 			BestInferDevice(useGPU),
-			*this->models,
-			extraPolicyInputs
-		);
+			*this->models);
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("InferUnit: Exception when trying to construct models: " << e.what());
 	}

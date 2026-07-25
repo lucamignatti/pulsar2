@@ -104,13 +104,8 @@ namespace GGL {
 		// (save-only, refreshed each iteration - offline inspection channel)
 		std::vector<float> minerSampleObs;
 
-		// EMERGENCE RC1: RND frontier-optimism state (opaque - torch types stay out
-		// of this header; defined in Learner.cpp). Lazily built at first use, loaded
-		// from RND_PRED.lt/RND_TARGET.lt when the checkpoint carries them.
-		std::shared_ptr<struct RndState> rnd;
-
-		// Optimistic-Critic Ladder state (opaque; GAP_EXP.lt + GAP_MAP_E/F.lt): the
-		// Stage-1 gap sensor plus the quasimetric map, banks and calibration
+		// V_exp, the return-level expectile twin (opaque; GAP_EXP.lt). Measurement only -
+		// see the struct in Learner.cpp. Actuation lives with the composition critic.
 		std::shared_ptr<struct GapState> gapSensor;
 
 		// External fixed opponent (config.externalOpponent; opaque - torch types
@@ -120,15 +115,6 @@ namespace GGL {
 		std::shared_ptr<class NextoOpponent> nexto;
 		std::atomic<int64_t> nextoGoalsFor = 0, nextoGoalsAgainst = 0, nextoServeIters = 0;
 
-		// Impossible-control drill family (gapSensor.impossibleArenas): the LAST N
-		// arenas of the contiguous leading 1v1 block, computed at Start() by scanning
-		// the EnvSet (ExampleMain places ImpossibleInterceptState on the same rule).
-		// [start, end) arena indices; 0-width = family off.
-		int ladderImpStart = 0, ladderImpEnd = 0;
-		// Cumulative ball touches in impossible arenas (worker increments during
-		// collection, reports read it; persisted - "zero successes EVER" is the
-		// standing acceptance criterion, one touch voids the certificate)
-		std::atomic<int64_t> ladderImpTouches = 0;
 
 		StepCallbackFn stepCallback = NULL;
 		IterationCallbackFn iterationCallback = NULL; // optional; assign after construction

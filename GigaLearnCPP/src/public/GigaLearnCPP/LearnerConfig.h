@@ -65,6 +65,22 @@ namespace GGL {
 	// Including them makes V the honest practice/match mixture for aliased states - a much
 	// smaller, split bias. Practice rows stay excluded from the GOAL critic (its channel is
 	// structurally absent in truncated episodes) and from the goal-advantage blend.
+	// V_exp - the return-level expectile twin of the value critic. Ladder rung 2 in
+	// COMPOSITION_CRITIC.md Â§8 ("what I sometimes do"): trained on the SAME extrinsic GAE
+	// targets as the critic, read through a DETACHED trunk so it measures without reshaping.
+	//
+	// MEASUREMENT ONLY as of 2026-07-25. Nothing actuates from it. The paper's mechanism is a
+	// single seek term on the COMPOSITION critic (PPOLearnerConfig::vdagSeekBeta); the closure
+	// drive that used to run off this head, together with the quasimetric map, the goal/concede
+	// banks, V_metric, gap_PK and the 5-column policy wire, were removed in the conformance
+	// pass. History: git log -- docs/LADDER.md
+	struct GapSensorConfig {
+		bool enabled = false;
+		float tau = 0.8f;        // expectile: "returns when it goes well"
+		float lr = 1e-4f;
+		int trainRows = 98304;
+	};
+
 	struct CollectSteeringConfig {
 		bool enabled = false;
 		float alpha = 1.0f;             // strength, in units of sigma (trunk projection std, live-estimated)
@@ -168,7 +184,6 @@ namespace GGL {
 		// via the already-shipped GapState map) - instead of feasible-decline + Dz. Phase
 		// 0 = SENSOR ONLY: score every mined candidate on d_goal and log its distribution
 		// + sanity correlations (vs ball height, vs Dz), change NO banking. Requires
-		// gapSensor.mapEnabled (the map + banks the axis reads). Toggle at boot via
 		// GGL_FRONTIER_POTENTIAL (no rebuild). OFF = incumbent (identical behaviour). See
 		// FRONTIER.md for Phase 1 actuation (d_goal-quantile selection + theta controller)
 		// and the pre-registered success criteria / guards.
@@ -252,85 +267,6 @@ namespace GGL {
 		float gateReenableAbove = -0.01f; // decay path back to probing
 	};
 
-	// EMERGENCE RC1 (2026-07-16, research/reports/EMERGENCE.md): frontier optimism via
-	// RND novelty. The RND predictor is a trained SELF-MODEL of familiarity over
-	// (trunk output, action); its prediction error DEFINES the acquisition frontier,
-	// and a small mean-zero, std-matched adjustment prices optimism onto the
-	// ADVANTAGES. Never a reward: aux frontier rewards are the meta-system trap
-	// (fakeable outcomes) and break the zero-sum stack; the advantage side touches
-	// only what the actor optimizes, keeps PSD/league fitness accounting clean
-	// (precedent: the goal-critic beta blend), and SELF-ANNEALS as the predictor
-	// catches up to the policy. Offline gate PASSED (rnd_novelty_probe.py): novelty
-	// enriches grounded-high-ball 2.77x / proto-dribble 3.42x - it lands on exactly
-	// the mechanic states advantage-surprise mining (RC2, retired) avoided.
-	// Injection obeys the rating latch; revert = enabled false. Nets persist as
-	// RND_PRED.lt / RND_TARGET.lt in every checkpoint (a fresh predictor after a
-	// restart would misprice novelty for hours - the annealing state IS the model).
-	// INTROSPECTIVE FRONTIER DRIVE, Stage 1 (2026-07-18, user-directed port of the
-	// reviewed v2 spec): the GAP SENSOR only, as a detached OBSERVER. An expectile
-	// twin of the critic (tau, asymmetric loss) trained on the SAME GAE value
-	// targets, reading the trunk through detach() (pure probe - cannot reshape what
-	// it measures, per both the spec's v2 default and this repo's carstate-aux
-	// lesson). gap = relu(V_exp - V_real) is the network's own knowing-doing
-	// readout, validated in the source program at AUROC 0.75 (label-free failure
-	// prediction) + convergent validity vs an independent frontier detector.
-	// Stage 1 actuates NOTHING: panels only, including the live bridge test -
-	// gap evaluated on the frozen FEAR PANEL states (Gap/Fear Panel vs Gap/Mean;
-	// agreement of two independently built frontier detectors on OUR data is the
-	// pre-registered gate for Stage 2 = wire + gap-closing potential as one lever).
-	struct GapSensorConfig {
-		bool enabled = false;
-		float tau = 0.8f;        // expectile: "returns when it goes well"
-		float lr = 1e-4f;
-		int trainRows = 98304;
-		// Stage 2a - the DRIVE (gap-closing potential, advantage-side): pays only for
-		// CLOSING the gap (undiscounted d = gap_t - gap_{t+1}, so a constant gap pays
-		// exactly zero - the spec's loitering fix), centered, std-matched to driveBeta
-		// of extrinsic advantage std, clamped +-3 sigma, terminal-masked, latch-
-		// covered, warmup train-only. 0 = sensor-only. The WIRE (self-conditioning
-		// input) is Stage 2b - policy-head surgery, ships separately.
-		float driveBeta = 0.0f;
-		int driveWarmupIters = 50;
-
-		// ===== OPTIMISTIC-CRITIC LADDER (research/reports/LADDER.md; upstream-validated
-		// spec, user-authorized full build 2026-07-18). Third rung: a quasimetric map
-		// over raw obs (d(x,y) = sum_j relu(f(E(x))_j - f(E(y))_j): triangle inequality
-		// + asymmetry by construction, units ~ policy steps) with goal/concede obs
-		// banks -> V_metric = a*g^d_goal + a2*g^d_concede + b, the geometry's claim of
-		// what is collectible from here; gap_PK = relu(V_metric - V_exp). The drive
-		// potential becomes Phi = -(gap_KD + gap_PK); the 5-input WIRE
-		// (tanh([V_real, V_exp, gKD, V_met, gPK]/scale)) extends the policy head's
-		// input (zero-init new columns at load = behaviorally exact migration).
-		// LAWS (each violated form produced a broken system upstream): the map has its
-		// OWN Adam + clip group and never touches the trunk; the sensor/map are
-		// detached probes on extrinsic targets only; wire and drive ship TOGETHER
-		// (Muon policy: near-null input columns are a stability liability); all gates
-		// off = the pre-ladder learner.
-		bool mapEnabled = false;      // train the quasimetric map (LADDER_QM)
-		float mapLr = 1e-3f;          // own optimizer (Law 1)
-		int mapLocalPairs = 512;      // consecutive same-agent pairs per iteration
-		int mapSpreadPairs = 512;     // random pairs per iteration
-		int mapWarmupIters = 50;      // map train-only iterations before gap_PK counts
-		float lambdaLr = 0.01f;       // dual ascent: l += lr*(L_local - target)
-		float lambdaTarget = 0.01f;
-		float lambdaMin = 0.1f, lambdaMax = 100.f;
-		float dClampMult = 3.f;       // D_CLAMP = mult x EMA(mean episode steps)
-		int bankCapacity = 1024;      // goal/concede obs ring buffers (per side)
-		int bankMinFill = 32;         // below this on EITHER side: V_metric = V_exp
-		float calibEma = 0.9f;        // EMA into (a, a2, b) after each OLS refit
-		int calibRows = 8192;         // OLS subsample per iteration
-		int preGoalWindowSteps = 0;   // rows banked before each goal; 0 = auto (~1s)
-		bool wireEnabled = false;     // 5-input wire (REQUIRES driveBeta > 0 - Law 6)
-		float wireScale = 3.f;        // tanh(v / scale); typical V must land linear-ish
-		// Standing falsification family: certified-unachievable intercept drills on
-		// the LAST N arenas of the 1v1 block (ImpossibleInterceptState; the required
-		// average car speed exceeds 1.6x the hard 2300uu/s cap, re-checked per
-		// jittered spawn for every car). Rows are masked from the injection;
-		// acceptance (checked continuously via Ladder/Imp* panels): zero touches
-		// ever, V_exp deflating toward V_real, gap_PK below feasible peaks. 0 = off.
-		int impossibleArenas = 0;
-	};
-
 	// External fixed opponent (Nexto; NextoOpponent.h has the full rationale):
 	// on serveFrac of collection iterations, the non-self team across the whole
 	// fleet is played by a frozen external TorchScript bot instead of self/pool/
@@ -343,15 +279,6 @@ namespace GGL {
 		bool enabled = false;
 		std::string modelPath = {};  // TorchScript module (Nexto's nexto-model.pt)
 		float serveFrac = 0.15f;     // per-iteration serve probability
-	};
-
-	struct RndOptimismConfig {
-		bool enabled = false;
-		float weight = 0.1f;      // injected advantage-std fraction per 1z of novelty
-		float clampZ = 3.f;       // outlier clamp on the z-scored novelty
-		int warmupIters = 10;     // train-only iterations before the first injection
-		int trainRows = 98304;    // predictor training subsample per iteration
-		float lr = 1e-4f;
 	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/learner.py
@@ -450,6 +377,9 @@ namespace GGL {
 		bool trainAgainstOldVersions = false;
 		float trainAgainstOldChance = 0.15f; // Chance (from 0 - 1) that an iteration will train against an old version
 
+		// V_exp expectile twin (measurement only - see struct)
+		GapSensorConfig gapSensor = {};
+
 		SkillTrackerConfig skillTracker = {};
 
 		// Rating drawdown telemetry. No actuation - see struct.
@@ -458,11 +388,7 @@ namespace GGL {
 		// Steered-practice collection; additive and default-OFF (see struct comment above)
 		CollectSteeringConfig steering = {};
 
-		// Frontier optimism (EMERGENCE RC1); additive and default-OFF (see struct above)
-		RndOptimismConfig rndOptimism = {};
 
-		// Introspective frontier drive, Stage-1 sensor; additive and default-OFF
-		GapSensorConfig gapSensor = {};
 
 		// External fixed opponent (Nexto); additive and default-OFF
 		ExternalOpponentConfig externalOpponent = {};
