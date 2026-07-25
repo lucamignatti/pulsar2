@@ -77,7 +77,13 @@ inline int RunAllTests() {
 			std::cout << "[FAIL] " << test.name << " (exception): " << e.what() << std::endl;
 		}
 	}
-	std::cout << (failed ? "FAILED " : "PASSED ") << (GetAllTests().size() - failed) << "/"
-	          << GetAllTests().size() << " tests" << std::endl;
+	// The count printed is PASSES, so label it as such: "FAILED 24/30 tests" read as
+	// "24 failed" and hid a 6-failure baseline for days.
+	const int total = (int)GetAllTests().size();
+	std::cout << (failed ? "FAILED" : "PASSED") << ": " << (total - failed) << "/" << total
+	          << " tests passed";
+	if (failed)
+		std::cout << ", " << failed << " FAILED";
+	std::cout << std::endl;
 	return failed ? 1 : 0;
 }

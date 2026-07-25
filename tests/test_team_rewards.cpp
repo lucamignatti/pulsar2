@@ -48,11 +48,23 @@ struct StatePair {
 	}
 };
 
-// The pre-team (per-player) formula, for the 1v1 equivalence check
-static float OldPerPlayerProx(Vec prevCar, Vec curCar, Vec prevBall, Vec curBall) {
-	float cur = expf(-(curBall - curCar).Length() / SCALE);
-	float prev = expf(-(prevBall - prevCar).Length() / SCALE);
-	return GAMMA * cur - prev;
+// Single-car potential. Deliberately RESTATED here rather than calling TeamPhi: an oracle
+// that called the implementation under test would be circular, and the point of these tests
+// is that the team-closest form reduces to the per-player form at n=1.
+//
+// MUST TRACK BallProximityPotentialReward::TeamPhi. It drifted once already: 5.0 added the
+// far-field linear term (CommonRewards.h:105-108 / PULSAR5.md - the pure exp saturates past
+// ~2000uu, the measured "gradient desert" behind ~9% dead far-field frames) and this oracle
+// kept the pure exp, so all four BallProx tests failed on a clean tree from 2026-07-22 until
+// 2026-07-25. If TeamPhi's shape changes again, change it here in the same commit.
+static float Phi(Vec ball, Vec car) {
+	float d = (ball - car).Length();
+	return expf(-d / SCALE) + 0.08f * (d < 12000.f ? 1.f - d / 12000.f : 0.f);
+}
+
+// The per-player potential difference, for the 1v1 equivalence check
+static float PerPlayerProx(Vec prevCar, Vec curCar, Vec prevBall, Vec curBall) {
+	return GAMMA * Phi(curBall, curCar) - Phi(prevBall, prevCar);
 }
 
 TEST(BallProx_1v1_identical_to_per_player_form) {
@@ -64,7 +76,7 @@ TEST(BallProx_1v1_identical_to_per_player_form) {
 
 	BallProximityPotentialReward r(GAMMA);
 	for (int i = 0; i < 2; i++) {
-		float expected = OldPerPlayerProx(sp.prev.players[i].pos, sp.cur.players[i].pos,
+		float expected = PerPlayerProx(sp.prev.players[i].pos, sp.cur.players[i].pos,
 			sp.prev.ball.pos, sp.cur.ball.pos);
 		CHECK_NEAR(r.GetReward(sp.cur.players[i], sp.cur, false), expected, 1e-6f);
 	}
@@ -91,7 +103,7 @@ TEST(BallProx_1v1_demo_guard_matches_old_behavior) {
 		{ true, false }, { true, false });
 	CHECK_NEAR(r.GetReward(spSteady.cur.players[0], spSteady.cur, false), 0.f, 1e-9f);
 	// ...while the opponent (alive, ball moved) still gets its normal team diff
-	float expOpp = OldPerPlayerProx(spSteady.prev.players[1].pos, spSteady.cur.players[1].pos,
+	float expOpp = PerPlayerProx(spSteady.prev.players[1].pos, spSteady.cur.players[1].pos,
 		spSteady.prev.ball.pos, spSteady.cur.ball.pos);
 	CHECK_NEAR(r.GetReward(spSteady.cur.players[1], spSteady.cur, false), expOpp, 1e-6f);
 }
@@ -108,7 +120,7 @@ TEST(BallProx_2v2_second_man_is_free) {
 	BallProximityPotentialReward r(GAMMA);
 	// Team potential unchanged by the second man's approach: reward = (gamma-1)*Phi(closest)
 	// (distances are 3D: ball rests at z=93, cars at z=17)
-	float phiClosest = expf(-(Vec(0, 0, 93) - Vec(0, -800, 17)).Length() / SCALE);
+	float phiClosest = Phi(Vec(0, 0, 93), Vec(0, -800, 17));
 	float expected = GAMMA * phiClosest - phiClosest;
 	for (int i : { 0, 2 })
 		CHECK_NEAR(r.GetReward(sp.cur.players[i], sp.cur, false), expected, 1e-6f);
@@ -120,8 +132,8 @@ TEST(BallProx_2v2_second_man_is_free) {
 		{ Vec(0, -800, 17), Vec(0, 2000, 17), Vec(0, -3500, 17), Vec(0, 3500, 17) },
 		{ Vec(0, -600, 17), Vec(0, 2000, 17), Vec(0, -3500, 17), Vec(0, 3500, 17) },
 		Vec(0, 0, 93), Vec(0, 0, 93));
-	float expected2 = GAMMA * expf(-(Vec(0, 0, 93) - Vec(0, -600, 17)).Length() / SCALE)
-		- expf(-(Vec(0, 0, 93) - Vec(0, -800, 17)).Length() / SCALE);
+	float expected2 = GAMMA * Phi(Vec(0, 0, 93), Vec(0, -600, 17))
+		- Phi(Vec(0, 0, 93), Vec(0, -800, 17));
 	CHECK(expected2 > 0);
 	CHECK_NEAR(r.GetReward(sp2.cur.players[0], sp2.cur, false), expected2, 1e-6f);
 	CHECK_NEAR(r.GetReward(sp2.cur.players[2], sp2.cur, false), expected2, 1e-6f);
@@ -140,8 +152,8 @@ TEST(BallProx_2v2_teammate_demo_skips_step_only) {
 	BallProximityPotentialReward r(GAMMA);
 	CHECK_NEAR(r.GetReward(sp.cur.players[0], sp.cur, false), 0.f, 1e-9f);
 	CHECK_NEAR(r.GetReward(sp.cur.players[2], sp.cur, false), 0.f, 1e-9f);
-	float expOrange = GAMMA * expf(-(Vec(0, 0, 93) - Vec(0, 1800, 17)).Length() / SCALE)
-		- expf(-(Vec(0, 0, 93) - Vec(0, 2000, 17)).Length() / SCALE);
+	float expOrange = GAMMA * Phi(Vec(0, 0, 93), Vec(0, 1800, 17))
+		- Phi(Vec(0, 0, 93), Vec(0, 2000, 17));
 	CHECK_NEAR(r.GetReward(sp.cur.players[1], sp.cur, false), expOrange, 1e-6f);
 	CHECK_NEAR(r.GetReward(sp.cur.players[3], sp.cur, false), expOrange, 1e-6f);
 }

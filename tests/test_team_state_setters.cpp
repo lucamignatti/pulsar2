@@ -113,6 +113,10 @@ TEST(BallNearCar_3v3_one_contester_goal_side_supports) {
 TEST(AirDrill_1v1_both_cars_climbing) {
 	Arena* arena = MakeArena(1);
 	AirDrillState setter;
+	// Pin the CONTESTED path. The solo-completion variant (2026-07-17) makes one team a
+	// grounded support with probability soloFrac (live default 0.5), which made this test
+	// fail on ~half the resets from 07-17 until 07-25. soloFrac is covered separately below.
+	setter.soloFrac = 0.f;
 	for (int reset = 0; reset < 20; reset++) {
 		setter.ResetArena(arena);
 		Vec ballPos = arena->ball->GetState().pos;
@@ -134,6 +138,7 @@ TEST(AirDrill_1v1_both_cars_climbing) {
 TEST(AirDrill_2v2_one_climber_grounded_supports) {
 	Arena* arena = MakeArena(2);
 	AirDrillState setter;
+	setter.soloFrac = 0.f; // contested path: exactly one climber PER TEAM (see note above)
 	for (int reset = 0; reset < 20; reset++) {
 		setter.ResetArena(arena);
 		Vec ballPos = arena->ball->GetState().pos;
@@ -169,6 +174,41 @@ TEST(AirDrill_2v2_one_climber_grounded_supports) {
 		}
 		CHECK_EQ(climbers[0], 1);
 		CHECK_EQ(climbers[1], 1);
+	}
+	delete arena;
+}
+
+// SOLO-COMPLETION VARIANT (AirDrillState.h:196-212, 2026-07-17). Live soloFrac is 0.5, so
+// ~half of all air drills spawn UNCONTESTED - roughly 8% of all resets. It shipped with no
+// test and silently broke the two contested tests above; pin it here so the next change to
+// the branch is caught. 1v1 is the live case (PHASE A).
+TEST(AirDrill_1v1_solo_gives_exactly_one_climber) {
+	Arena* arena = MakeArena(1);
+	AirDrillState setter;
+	setter.soloFrac = 1.f; // always uncontested
+	for (int reset = 0; reset < 20; reset++) {
+		setter.ResetArena(arena);
+		Vec ballPos = arena->ball->GetState().pos;
+
+		int climbers = 0, supports = 0;
+		for (Car* car : arena->_cars) {
+			CarState cs = car->GetState();
+			if (cs.pos.z >= 249) {
+				climbers++;
+				// Same climber contract as the contested path
+				CHECK(cs.pos.z < ballPos.z);
+				Vec toBall = (ballPos - cs.pos).Normalized();
+				CHECK(cs.vel.Normalized().Dot(toBall) > 0.99f);
+			} else {
+				supports++;
+				CHECK_NEAR(cs.pos.z, 17.f, 1.f);
+				CHECK_NEAR(cs.vel.Length(), 0.f, 1e-3f);
+			}
+			CHECK(cs.boost >= 45 - 1e-3f);
+		}
+		// Exactly one team contests; the other's designated climber becomes a support
+		CHECK_EQ(climbers, 1);
+		CHECK_EQ(supports, 1);
 	}
 	delete arena;
 }
