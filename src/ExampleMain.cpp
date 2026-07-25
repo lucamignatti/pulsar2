@@ -192,7 +192,7 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
 		// 5.0 SCAFFOLD: 20 -> 40 (denser pre-touch climb credit for the formative
 		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
-		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 40.f },
+		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 75.f },
 
 		// CONSECUTIVE AIR TOUCHES (2026-07-21, user-directed: "reward consecutive air
 		// touches", made unfarmable "by making them pbrs"). Exact-telescoping PBRS on a
@@ -996,10 +996,12 @@ int main(int argc, char* argv[]) {
 	// times on pure volatility (2x post-flip on 5.0, 1x at 2.7B on 5.0v3 - trend
 	// rising, no pathology each time). 200 stays outside young-run noise while
 	// still catching a real collapse. TIGHTEN back toward 110 at maturity.
-	cfg.steering.ratingPeakTrip = 200.0f;
+	// NOTE (2026-07-25): these moved off cfg.steering - the guard is no longer a steering
+	// feature. It covers six live mechanisms and now runs regardless of steering.enabled.
+	cfg.ratingGuard.peakTrip = 200.0f;
 	// ...and the EMA variant likewise (75 -> 150; it tripped on the same +-80
 	// young-run wobble at 14B). Both tighten together at maturity.
-	cfg.steering.ratingDrawdownTrip = 150.0f;
+	cfg.ratingGuard.drawdownTrip = 150.0f;
 	// 1.0 -> 0.5 (2026-07-12, the ratchet fix): steered rows learn through PPO's clipped IS,
 	// and for actions steering makes MUCH likelier than the base policy (ratio << 1-clip) the
 	// clip zeroes the gradient exactly when the advantage is NEGATIVE - successes reinforce,
@@ -1189,7 +1191,7 @@ int main(int argc, char* argv[]) {
 		// staged V1-V4 gates are WAIVED per the user's authorization; retained here:
 		// the V0 invariants (masked rows pay zero - audited; truncation codes are
 		// nonzero terminals and episodes only enter the buffer whole), the latch
-		// coverage (drive obeys steerRatingTripped), branch backup, and the revert
+		// coverage (drive obeys ratingGuardTripped), branch backup, and the revert
 		// paths: mapEnabled=false kills gap_PK (drive degrades to the proven
 		// gap_KD-only form), driveBeta=0 kills the drive+wire together (Law 6), and
 		// the WIRE architecture itself reverts only via the branch backup - the

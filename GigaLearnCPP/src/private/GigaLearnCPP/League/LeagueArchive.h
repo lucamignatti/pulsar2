@@ -77,7 +77,7 @@ namespace GGL {
 		// the training collection loop to use as this iteration's opponent; nullptr if the archive is
 		// empty. This is what finally gives DESCEND arenas exposure to non-self styles.
 		// allowAnchors=false disables the anchor slice only (evolved members still serve) - the
-		// caller passes !steerRatingTripped so the rating latch kills the anchor intervention
+		// caller passes !ratingGuardTripped so the rating latch kills the anchor intervention
 		// exactly the way it kills steering/Ladder/RND (LEAGUE_ANCHORS.md guard).
 		ModelSet* LoadPFSPOpponentModels(bool allowAnchors = true);
 
