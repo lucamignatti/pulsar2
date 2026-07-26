@@ -2130,7 +2130,38 @@ void GGL::Learner::Start() {
 						auto z1 = torch::zeros({ 1 }, advF.options());
 						auto advN = torch::cat({ advF.slice(0, 1, nR), z1 });
 						auto vpN = torch::cat({ vpF.slice(0, 1, nR), z1 });
-						auto scaledR = advF - g * lmb * cont * advN - g * cont * vpN + vpF;
+						// TRUNCATION CORRECTION (2026-07-26). `cont` is the right mask for the
+						// V-dagger bootstrap below (truncations get no V+ bootstrap - we have no
+						// V+ for the unstored next state), but it is the WRONG mask here: GAE does
+						// NOT treat a truncation as done. In GAE.cpp a TRUNCATED step has done=0
+						// and bootstraps off truncValPreds, so A_i = r_i + g*V_trunc - V_i and the
+						// exact inverse is r_i = A_i + V_i - g*V_trunc. Zeroing `cont` drops only
+						// the g*V_{i+1} term, leaving the g*V_trunc debt unpaid, so every truncated
+						// row's reconstructed reward was inflated by g*V_trunc. That is one row per
+						// NoTouchCondition(20) timeout on every training arena, biased one way,
+						// which raised V+'s TD target exactly at timeout states -> raised H there ->
+						// the seek term Phi=+H paid the policy to APPROACH no-touch timeouts.
+						// Inert before 2026-07-25 (the twins were frozen at lr=0), live after.
+						// truncValPreds is compact and chronological: the k-th truncated row in
+						// FORWARD order owns element k (GAE consumes it back-to-front precisely to
+						// preserve that alignment while iterating in reverse).
+						auto vTrunc = torch::zeros({ nR }, advF.options());
+						if (tTruncValPreds.defined() && tTruncValPreds.numel() > 0) {
+							auto truncIdx = (termF == (float)RLGC::TerminalType::TRUNCATED)
+								.nonzero().flatten();
+							auto tvp = tTruncValPreds.to(torch::kFloat32).flatten();
+							// GAE already hard-fails on a count mismatch; stay defensive anyway so
+							// a future boundary change degrades to "no correction", not to a throw
+							// inside the learn pass.
+							if (truncIdx.numel() == tvp.numel())
+								vTrunc.index_copy_(0, truncIdx, tvp);
+							else
+								RG_LOG("HEADROOM: truncation count mismatch ("
+									<< truncIdx.numel() << " vs " << tvp.numel()
+									<< ") - skipping the V_trunc correction this iteration");
+						}
+						auto scaledR = advF - g * lmb * cont * advN - g * cont * vpN + vpF
+							- g * vTrunc;
 						// V-dagger on all rows (chunked trunk+head forwards)
 						auto vdag = torch::empty({ nR }, torch::kFloat32);
 						constexpr int64_t VCH = 32768;
