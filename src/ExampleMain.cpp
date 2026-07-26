@@ -927,6 +927,42 @@ int main(int argc, char* argv[]) {
 		cfg.gapSensor.enabled = true; // arch parity only; Learn() never runs in render
 	}
 
+	// Team-mode arena split, decided by the lineage-scoped phase marker (see the
+	// PHASE_B_RATING_TRIGGER comment). Must be set before the Learner is built -
+	// EnvCreateFunc reads these.
+	//
+	// RESTORED 2026-07-26. This block was deleted as collateral in 0fac55f ("Remove steering
+	// wholesale"): it sat between the g_NumPracticeArenas and g_FrontierPool steering blocks
+	// that commit was legitimately removing. The marker's WRITE side (the iteration callback
+	// below) survived, the READ side did not, so g_PhaseB was pinned false and the trigger
+	// re-fired forever - the trainer wrote the marker, exited 99, relaunched into PHASE A,
+	// and repeated every ~6 minutes for 70M+ steps (five loops in one log, ts 3.695B-3.768B).
+	// If the marker read ever disappears again the symptom is that exact restart loop.
+	g_PhaseB = std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
+	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
+	g_NumGames = cfg.numGames;
+	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
+	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
+	RG_LOG("Team curriculum: PHASE " << (g_PhaseB ? "B" : "A") << " - "
+		<< (cfg.numGames - g_NumArenas2v2 - g_NumArenas3v3) << " 1v1 / "
+		<< g_NumArenas2v2 << " 2v2 / " << g_NumArenas3v3 << " 3v3 arenas");
+
+	// Skill tracker eval mix: same fractions over its own small fleet, team arenas trailing,
+	// at least one arena per team mode in PHASE B (16 arenas -> 11 1v1 / 3 2v2 / 2 3v3).
+	// This is what puts Rating/2v2 / Rating/3v3 on wandb once the phase flips; with few
+	// arenas per team mode those Elos move slower per eval than Rating/1v1 - expect them to
+	// take some evals to leave their initial value. Without the envCreateFn assignment
+	// SkillEnvCreateFunc is orphaned and the tracker clones the TRAINING create-func over its
+	// low indices, i.e. an all-1v1 eval fleet - the bug this function exists to prevent.
+	g_SkillNumArenas = cfg.skillTracker.numArenas;
+	g_SkillArenas2v2 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_2V2)) : 0;
+	g_SkillArenas3v3 = g_PhaseB ? RS_MAX(1, (int)(g_SkillNumArenas * PHASE_B_FRAC_3V3)) : 0;
+	cfg.skillTracker.envCreateFn = SkillEnvCreateFunc;
+	if (cfg.skillTracker.enabled)
+		RG_LOG("Skill tracker eval fleet: "
+			<< (g_SkillNumArenas - g_SkillArenas2v2 - g_SkillArenas3v3) << " 1v1 / "
+			<< g_SkillArenas2v2 << " 2v2 / " << g_SkillArenas3v3 << " 3v3 arenas");
+
 	// Make the learner with the environment creation function and the config we just made
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
 
