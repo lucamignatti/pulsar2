@@ -126,16 +126,12 @@ impl WheelInfo {
         let proj_vel = contact_normal.dot(self.vel_at_contact_point);
         let denom = contact_normal.dot(up);
 
-        let suspension_relative_vel;
-        let clipped_inv_contact_dot_suspension;
-        if denom > 0.1 {
+        let (suspension_relative_vel, clipped_inv_contact_dot_suspension) = if denom > 0.1 {
             let inv = 1.0 / denom;
-            suspension_relative_vel = proj_vel * inv;
-            clipped_inv_contact_dot_suspension = inv;
+            (proj_vel * inv, inv)
         } else {
-            suspension_relative_vel = 0.0;
-            clipped_inv_contact_dot_suspension = 10.0;
-        }
+            (0.0, 10.0)
+        };
 
         if is_in_contact_with_world {
             let ray_pushback_thresh = self.suspension_rest_length_1 + self.wheels_radius
@@ -202,9 +198,8 @@ impl WheelInfo {
 
                 let car_rel_contact_point = contact_point - chassis.get_world_trans().translation;
 
-                let v1 = chassis.get_vel_in_local_point(car_rel_contact_point);
-                let v2 = ground_rb.get_vel_in_local_point(car_rel_contact_point);
-                let contact_vel = v1 - v2;
+                let contact_vel = self.vel_at_contact_point
+                    - ground_rb.get_vel_in_local_point(car_rel_contact_point);
                 let mut rel_vel = contact_vel.dot(forward_dir);
 
                 if time_step > 1.0 / 80.0 {

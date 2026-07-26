@@ -18,10 +18,10 @@ use crate::{
             discrete_dynamics_world::DiscreteDynamicsWorld,
             rigid_body::{ActivationState, CollisionFlags, RigidBody, RigidBodyConstructionInfo},
         },
-        linear_math::angle::Angle,
     },
     consts::{BT_TO_UU, UU_TO_BT, dropshot, heatseeker, snowday},
     get_neighbor_indices_1, get_neighbor_indices_2, get_tile_pos,
+    shared::Angle,
     sim::{UserInfoTypes, consts},
 };
 
@@ -131,12 +131,7 @@ impl Ball {
         self.state = state;
     }
 
-    pub(crate) fn pre_tick_update(
-        &mut self,
-        rb: &mut RigidBody,
-        game_mode: GameMode,
-        _mutator_config: &MutatorConfig, // TODO: Remove
-    ) {
+    pub(crate) fn pre_tick_update(&mut self, rb: &mut RigidBody, game_mode: GameMode) {
         match game_mode {
             GameMode::Heatseeker => {
                 if self.state.hs_info.y_target_dir == 0 {

@@ -1,8 +1,8 @@
 # RocketSimV3 — vendored Rust engine + C FFI
 
-Vendored from https://github.com/ZealanL/RocketSim branch `v3-rust`
-at commit `b1c2ece647417b672bf73129b6f1415fc68b544f`
-("Fix double jump impulse scaling", 2026-07-11), written by VirxEC/ZealanL.
+Vendored from https://github.com/VirxEC/RocketSim branch `fix-jump`
+at commit `239808fb0ce888c633de80003c6f9fc6b80a270c`.
+`fix-jump` corrects jump-time progression after the minimum jump period.
 `rocketsim/` and `rocketsim_derive/` are UNMODIFIED upstream — keep it that way;
 carry any local need in `rocketsim_ffi/` (ours) or the C++ compat layer
 (`compat/`), so upstream bumps stay a clean directory swap.
