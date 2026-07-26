@@ -27,7 +27,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${TRAINERCTL_BUILD_DIR:-$REPO_ROOT/build}"
 VIZ_BUILD_DIR="${TRAINERCTL_VIZ_BUILD_DIR:-$REPO_ROOT/build-viz}"
-CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_resid}"
+# MUST track cfg.checkpointFolder in src/ExampleMain.cpp. This has now drifted on every
+# cold start (checkpoints_6M -> checkpoints_resid -> checkpoints_5.1); the failure is silent
+# and `restore-golden` is the dangerous one, since a golden checkpoint from a SUPERSEDED
+# lineage has a different policy-head width and is not loadable by the live run - the
+# recovery doctrine's "restore a known-good FULL checkpoint" assumes the same lineage.
+CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_5.1}"
 RUN_TRAINER="$SCRIPT_DIR/run_trainer.sh"
 LOG_DIR="${RUN_TRAINER_LOG_DIR:-$REPO_ROOT/run_logs}"
 CONF_DIR="$HOME/.config/pulsar-remote"
