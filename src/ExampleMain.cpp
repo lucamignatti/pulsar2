@@ -233,17 +233,6 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// finish. Anneal once mechanic_census shows a stable flip-reset rate.
 		{ new ZeroSumReward(new FlipResetReward(), TEAM_SPIRIT), 40.f },
 
-		// IN AIR (2026-07-25, user-directed): a tiny flat reward for simply being
-		// airborne (AirReward = !isOnGround), reintroduced from the pre-FRONTIER-9
-		// lineage (was dropped, not measured against this stack). NOT PBRS - it is a
-		// raw per-step state reward, so unlike the rest of the aerial family it does
-		// not telescope to zero. Deliberately NOT ZeroSum-wrapped (user-directed) -
-		// both players are paid independently, so it is farmable in the absolute (a
-		// player can bank it by just hovering) but the weight is set low enough that
-		// this is intended as a faint per-step nudge, not a shapeable incentive.
-		// Weight 0.45 = user-specified "0.15 per 50 Goal" ratio rescaled to this
-		// stack's Goal=150 (0.15/50*150). Watch for pure-hover/flight-farming.
-		{ new AirReward(), 0.45f },
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
