@@ -37,6 +37,54 @@ static std::vector<std::array<float, 8>> MakeNextoLookup() {
 	return out;
 }
 
+// Rewrite every literal `Device = prim::Constant[value="cpu"]` in `graph` to `dev`, recursing
+// into nested blocks (if/loop bodies). Returns how many it changed.
+//
+// WHY THIS EXISTS (2026-07-26). Nexto's traced graph contains exactly one such node:
+//     %13 : Device = prim::Constant[value="cpu"]()
+//     %input.2 = aten::to(%14, dtype=float32, layout, %13, ...)   # Necto/training/agent.py:31
+// i.e. a CONSTANT tensor is explicitly sent to CPU mid-graph, and then lands as `mat1` in an
+// addmm against CUDA weights - the "Expected all tensors to be on the same device, but got mat1
+// is on cpu" that made the CUDA probe fail since the day Nexto was added. It is NOT the weights:
+// all 44 params move fine, there are 0 buffers and 0 stray tensor attributes. Neither
+// torch::jit::load(path, cuda) nor Module::to(cuda) helps, because both remap TENSORS and this
+// is a literal Device value baked into the IR.
+//
+// Cost of not fixing it (measured over 1147 iterations of the 5.1 run): Nexto-serving iterations
+// ran 19.56s of wall vs 4.26s for every other iteration, at a realized 15.6% serve rate - 36% of
+// ALL training wall clock spent with the GPU at 3% utilization while a 460k-param transformer
+// ground through ~2047 rows/step on the 2 intra-op threads that Learner.cpp:184 deliberately
+// caps libtorch to. On GPU it fits inside the ~1.7s of collection slack the pipeline already
+// wastes behind the learn pass, so it costs approximately nothing.
+static int RetargetDeviceConstants(torch::jit::Block* block, torch::Device dev) {
+	int changed = 0;
+	for (torch::jit::Node* node : block->nodes()) {
+		if (node->kind() == torch::jit::prim::Constant
+			&& node->output()->type()->kind() == c10::TypeKind::DeviceObjType
+			&& node->hasAttribute(c10::attr::value)) {
+			// Device constants are serialized as their string form ("cpu", "cuda:0").
+			if (torch::Device(node->s(c10::attr::value)).is_cpu()) {
+				node->s_(c10::attr::value, dev.str());
+				changed++;
+			}
+		}
+		for (torch::jit::Block* sub : node->blocks())
+			changed += RetargetDeviceConstants(sub, dev);
+	}
+	return changed;
+}
+
+// Same, over every method of the module and all of its submodules - the offending constant lives
+// inside a submodule's forward, not the top-level graph (the top-level graph has zero of them;
+// it only shows up once the graph is inlined).
+static int RetargetModuleDeviceConstants(torch::jit::Module& mod, torch::Device dev) {
+	int changed = 0;
+	for (const auto& sub : mod.named_modules())
+		for (auto& method : sub.value.get_methods())
+			changed += RetargetDeviceConstants(method.graph()->block(), dev);
+	return changed;
+}
+
 GGL::NextoOpponent::NextoOpponent(const std::string& modelPath, torch::Device device)
 	: device(torch::kCPU) {
 
@@ -59,23 +107,63 @@ GGL::NextoOpponent::NextoOpponent(const std::string& modelPath, torch::Device de
 			auto trial = torch::jit::load(modelPath, device);
 			trial.eval();
 			torch::NoGradGuard noGrad;
-			auto tQ = torch::zeros({ 2, 1, 32 }, torch::TensorOptions().device(device));
-			auto tKv = torch::zeros({ 2, 37, 24 }, torch::TensorOptions().device(device));
-			auto tM = torch::zeros({ 2, 37 }, torch::TensorOptions().device(device));
-			auto out = trial.forward({ std::make_tuple(tQ, tKv, tM) }).toTuple();
-			auto logits = out->elements()[0].toTensor();
-			if (!logits.isfinite().all().item<bool>())
+
+			// Move the baked-in CPU device literal(s) onto the target device. Without this the
+			// forward below throws "mat1 is on cpu" and we fall back to CPU, which is exactly
+			// what happened on every boot from 2026-07-20 to 2026-07-26.
+			int retargeted = RetargetModuleDeviceConstants(trial, device);
+
+			// RANDOM probe input, not zeros: a graph that is still half-on-CPU can survive an
+			// all-zeros forward, and zeros make every logit tie so an argmax check would be
+			// meaningless. Fixed seed so a failure is reproducible from the log.
+			torch::manual_seed(20260726);
+			auto tQ = torch::randn({ 64, 1, 32 }, torch::TensorOptions().device(torch::kCPU));
+			auto tKv = torch::randn({ 64, 37, 24 }, torch::TensorOptions().device(torch::kCPU));
+			auto tM = torch::zeros({ 64, 37 }, torch::TensorOptions().device(torch::kCPU));
+
+			auto outDev = trial.forward({ std::make_tuple(
+				tQ.to(device), tKv.to(device), tM.to(device)) }).toTuple();
+			auto logitsDev = outDev->elements()[0].toTensor().to(torch::kCPU, torch::kFloat32);
+			if (!logitsDev.isfinite().all().item<bool>())
 				throw std::runtime_error("non-finite probe logits");
+
+			// EQUIVALENCE GUARD. Being finite is not being correct - the whole point of a graph
+			// rewrite is that it could silently change semantics. `model` is still the untouched
+			// CPU load, so run it on the SAME input and require agreement. Act() only ever
+			// consumes argmax(logits), so argmax agreement is the metric that matters; the value
+			// tolerance is deliberately loose because the trainer enables TF32 (~10-bit mantissa
+			// on matmul), which is a real numeric difference and NOT a bug.
+			auto logitsRef = model.forward({ std::make_tuple(tQ, tKv, tM) })
+				.toTuple()->elements()[0].toTensor().to(torch::kFloat32);
+			float scale = std::max(1.f, logitsRef.abs().max().item<float>());
+			float maxDev = (logitsDev - logitsRef).abs().max().item<float>() / scale;
+			float agree = (logitsDev.argmax(-1) == logitsRef.argmax(-1))
+				.to(torch::kFloat32).mean().item<float>();
+			if (maxDev > 5e-2f)
+				throw std::runtime_error("CUDA/CPU logit mismatch (max rel dev "
+					+ std::to_string(maxDev) + ")");
+			if (agree < 0.95f)
+				throw std::runtime_error("CUDA/CPU argmax disagreement (agreement "
+					+ std::to_string(agree) + ")");
+
 			model = trial;
 			this->device = device;
+			RG_LOG("NextoOpponent: serving on " << device << " (retargeted " << retargeted
+				<< " baked CPU device constant(s); probe max rel dev " << maxDev
+				<< ", argmax agreement " << (agree * 100.f) << "%)");
 		} catch (const std::exception& e) {
-			// EXPECTED on this model: Nexto's traced graph has CPU constants baked in, so the
-			// CUDA probe always throws and we always serve on CPU. torch::jit's what() carries
-			// the entire serialized TorchScript traceback (~40 lines of someone else's Windows
-			// paths) which drowned the boot log on every restart. Keep only the last non-empty
-			// line - that is the actual root cause ("Expected all tensors to be on the same
-			// device...") - and put the full dump behind GGL_VERBOSE_NEXTO=1 for when it is a
-			// NEW failure rather than this known one.
+			// No longer expected: as of 2026-07-26 the baked CPU device constant is retargeted
+			// above, so this path should now be genuinely rare. Landing here means either the
+			// rewrite missed a constant (new/changed model file) or the equivalence guard
+			// rejected the CUDA output - in BOTH cases falling back to CPU is correct and
+			// costs only throughput, never correctness. If it fires, the run silently loses
+			// ~36% of its wall clock, so treat a "serving on CPU" line as a perf regression
+			// worth chasing rather than routine noise.
+			//
+			// torch::jit's what() carries the entire serialized TorchScript traceback (~40 lines
+			// of someone else's Windows paths) which drowned the boot log on every restart. Keep
+			// only the last non-empty line - that is the actual root cause - and put the full
+			// dump behind GGL_VERBOSE_NEXTO=1.
 			std::string msg = e.what();
 			if (const char* v = std::getenv("GGL_VERBOSE_NEXTO"); !(v && v[0] && std::string(v) != "0")) {
 				size_t end = msg.find_last_not_of(" \t\r\n");
