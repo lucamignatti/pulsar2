@@ -303,9 +303,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
-		learnCalls++;
 		dbgVdagRows = experience.data.vdagTargets.defined() ? (float)experience.data.vdagTargets.numel() : -2.f;
-		dbgRhatEntry = experience.data.rhatTargets.defined() ? (float)experience.data.rhatTargets.numel() : -2.f;
 		dbgRhatEntry = experience.data.rhatTargets.defined() ? (float)experience.data.rhatTargets.numel() : -2.f;
 		auto batches = experience.GetAllBatchesShuffled(config.batchSize, config.overbatching);
 		if (dbgVdagRows > 0 && !batches.empty())
@@ -471,8 +469,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// interior predictions is ballast that flattens the field and kills the
 					// backward relay (measured). Seed only where it predicts a real event.
 					torch::Tensor ySeed, mSeed;
-					if (models["rhat1"] && models["rhat2"] && rhatMaxObserved > 0
-						&& avgRhatLoss.count > 0 && learnCalls > 300) {
+					if (models["rhat1"] && models["rhat2"] && rhatMaxObserved > 0) {
 						RG_NO_GRAD;
 						auto ra = models["rhat1"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
 						auto rb = models["rhat2"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
@@ -495,7 +492,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						vdagLoss = vdagLoss.defined() ? vdagLoss + l : l;
 					}
 					avgVdagLoss += vdagLoss.detach().cpu().item<float>();
-					dbgVdagRaw = vdagLoss.detach().cpu().item<float>();
 					dbgVdagRaw = vdagLoss.detach().cpu().item<float>();
 					dbgYvAbs = yv.abs().mean().item<float>();
 				}
