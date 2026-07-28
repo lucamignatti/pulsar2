@@ -221,7 +221,34 @@ namespace GGL {
 		// deploys). Revert = set false here and rebuild.
 		bool vdagEnabled = true;
 		float vdagTau = 0.75f;
-		float vdagSeekBeta = 0.15f;
+		// Dose curve measured (rltest, n=2/point, 25M): inverted-U, optimum 0.30-0.45.
+		// 0.15 -> 0.30 gave touch +45% / air +93%. beta >= 1.0 is WORSE THAN BASE (the
+		// +-3sigma clamp binds, clipped potential diffs stop telescoping, PBRS
+		// invariance is destroyed and the term becomes reward distortion).
+		float vdagSeekBeta = 0.30f;
+
+		// THEORY (r-hat): twin optimistic REWARD models, expectile tau on arrival
+		// rewards + group-L1 over input features (Occam). Supplies "what kind of state
+		// pays" so V-dagger can be seeded with hypotheses at states whose payoff has
+		// never been collected. PLANT: event-masked seeding rows (only where the theory
+		// predicts a significant event; interior seeds measured as relay-killing
+		// ballast). Set false to ablate back to composition-only.
+		bool vdagTheoryEnabled = true;
+		float vdagTheoryTau = 0.9f;
+		float vdagTheoryL1 = 0.02f;    // Occam weight on r-hat input-feature columns
+		float vdagSeedWeight = 0.25f;  // weight of hypothesis rows in the V-dagger loss
+		float vdagSeedFrac = 0.5f;     // event mask: seed only where r-hat > frac * max observed reward
+
+		// ARCHIVE: persistent field-ascent transitions, replayed as weighted BC and
+		// RE-SCORED with the CURRENT field (stale entries silently drop out). This is
+		// the non-invariant actuation channel: PBRS with a good field is neutral BY
+		// THEOREM, so the field must be converted to policy directly. Measured: the
+		// buffer-free (weights-only) alternative plateaus at ~1/4 of this.
+		bool vdagArchiveEnabled = true;
+		int vdagArchiveCap = 8192;
+		float vdagArchiveWeight = 0.5f;
+		float vdagArchiveBankThresh = 2.0f;  // bank rows with normalized ascent above this
+		float vdagArchiveLiveThresh = 0.05f; // replay only rows still ascending now
 
 		PPOLearnerConfig() {
 			policy = {};

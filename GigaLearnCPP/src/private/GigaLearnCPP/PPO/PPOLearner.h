@@ -91,6 +91,16 @@ namespace GGL {
 		// HEADROOM composition critic: min of the twin V-dagger heads (shared trunk).
 		// No-grad; used at learn-prep for one-iteration-frozen TD targets + the H field.
 		torch::Tensor InferVdagMin(torch::Tensor obs);
+		// THEORY: max of the twin reward models (optimism under ambiguity), clamped by
+		// the caller to the largest reward actually observed (never invent magnitudes).
+		torch::Tensor InferRhatMax(torch::Tensor obs);
+		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
+		torch::Tensor archObs, archNextObs, archAct;
+		float rhatMaxObserved = 0.f;
+		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;
+		int64_t learnCalls = 0; // seeding warmup gate   // bound on hypothesis magnitude (never invent)
+		int64_t archFill = 0, archPtr = 0;
+		void BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap);
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
