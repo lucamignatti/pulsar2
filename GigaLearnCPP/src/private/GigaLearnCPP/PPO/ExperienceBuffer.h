@@ -24,6 +24,9 @@ namespace GGL {
 			practiceMask,
 			// HEADROOM: one-iteration-frozen V-dagger TD targets (undefined unless vdagEnabled)
 			vdagTargets,
+			// THEORY: scaled per-step reward that LANDED on this row's arrival state
+			// (r-hat regression target; undefined unless vdagTheoryEnabled)
+			rhatTargets,
 			advantages;
 
 		auto begin() { return &states; }

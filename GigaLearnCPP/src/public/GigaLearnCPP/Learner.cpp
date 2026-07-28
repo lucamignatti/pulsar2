@@ -2094,7 +2094,7 @@ void GGL::Learner::Start() {
 
 					Timer gaeTimer = {};
 					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets;
+					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -2174,16 +2174,57 @@ void GGL::Learner::Start() {
 						float vScale = tTargetVals.abs().to(torch::kFloat32).quantile(0.99).item<float>();
 						tVdagTargets = (scaledR + g * cont * vdagN)
 							.clamp(-2.f * RS_MAX(vScale, 1.f), 2.f * RS_MAX(vScale, 1.f));
-						// H field + seek injection
+						// SEEK POTENTIAL = V-dagger ITSELF, not the headroom gap.
+						// Measured (rltest chain L=20): Phi = relu(Vdag - Vreal) goes to ZERO
+						// at success (Vreal catches Vdag), so the term is NEGATIVE on the final
+						// approach - it PENALIZES finishing (0/3 seeds solved). Ng et al: the
+						// ideal shaping potential is V*, and V-dagger IS an optimistic estimate
+						// of V* built from executed transitions => Phi = Vdag solved 3/3.
+						// H is retained below as TELEMETRY only.
 						auto tH = torch::relu(vdag - vpF);
-						auto tHN = torch::cat({ tH.slice(0, 1, nR), z1 });
-						auto aInt = g * cont * tHN - tH;
+						auto tPhi = vdag;
+						auto tPhiN = torch::cat({ tPhi.slice(0, 1, nR), z1 });
+						auto aInt = g * cont * tPhiN - tPhi;
 						aInt = aInt - aInt.mean();
 						float sExt = advF.std().item<float>();
 						float sInt = RS_MAX(0.05f * sExt, aInt.std().item<float>());
 						auto inj = ((config.ppo.vdagSeekBeta * sExt / sInt) * aInt)
 							.clamp(-3.f * sExt, 3.f * sExt);
 						tAdvantages = tAdvantages + inj.view_as(tAdvantages);
+						// THEORY targets: the scaled reward that LANDED on each arrival state.
+						// scaledR_i is the reward for the transition i -> i+1, so it belongs to
+						// row i+1 (the arrival). Shift by one; boundary rows get 0 (no arrival
+						// inside this segment). Getting this association backwards makes the
+						// theory learn the reward of the state you LEFT (measured in rltest:
+						// it learned the pattern inverted and never transferred).
+						if (config.ppo.vdagTheoryEnabled) {
+							auto z0 = torch::zeros({ 1 }, scaledR.options());
+							auto arrival = torch::cat({ z0, scaledR.slice(0, 0, nR - 1) });
+							auto contPrev = torch::cat({ z0, cont.slice(0, 0, nR - 1) });
+							tRhatTargets = arrival * contPrev;   // zero across segment boundaries
+							ppo->rhatMaxObserved = RS_MAX(ppo->rhatMaxObserved,
+								tRhatTargets.max().item<float>());
+							report["Headroom/Rhat Target Max"] = tRhatTargets.max().item<float>();
+						}
+						// ARCHIVE: bank transitions where the FIELD ascended (normalized), so
+						// the actuation channel has persistent evidence of what climbs.
+						if (config.ppo.vdagArchiveEnabled) {
+							auto asc = torch::relu(g * cont * vdagN - vdag);
+							float am = asc.mean().item<float>();
+							if (am > 1e-8f) {
+								auto ascN = asc / am;
+								auto hot = (ascN > config.ppo.vdagArchiveBankThresh).nonzero().flatten();
+								if (hot.numel() > 0) {
+									if (hot.numel() > 256)
+										hot = hot.slice(0, 0, 256);
+									auto hotN = (hot + 1).clamp_max(nR - 1);
+									ppo->BankAscent(tStates.index_select(0, hot),
+										tStates.index_select(0, hotN),
+										tActions.index_select(0, hot).to(torch::kCPU),
+										config.ppo.vdagArchiveCap);
+								}
+							}
+						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
 						report["Headroom/H Mean"] = tH.mean().item<float>();
 						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
@@ -2371,8 +2412,13 @@ void GGL::Learner::Start() {
 					experience.data.states = tStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					report["Headroom/Tgt Set"] = tVdagTargets.defined()
+						? (float)tVdagTargets.numel() : -1.f;
+					report["Headroom/Rows N"] = (float)tStates.size(0);
 					if (tVdagTargets.defined())
 						experience.data.vdagTargets = tVdagTargets;
+					if (tRhatTargets.defined())
+						experience.data.rhatTargets = tRhatTargets;
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 
@@ -2495,6 +2541,15 @@ void GGL::Learner::Start() {
 						// twins are not training and the injection is a random projection.
 						"Headroom/Vdag Update Magnitude",
 						"Headroom/Vdag Loss",
+						"Headroom/Vdag Rows",
+						"Headroom/Tgt Set",
+						"Headroom/Rows N",
+						"Headroom/Rhat Rows",
+						"Headroom/Rhat Entry",
+						"Headroom/Vdag Raw",
+						"Headroom/Yv Abs",
+						"Headroom/Rhat Loss",
+						"Headroom/Archive Fill",
 						"Headroom/H Mean",
 						"Headroom/Inj Abs Mean",
 						"",
