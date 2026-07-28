@@ -97,8 +97,7 @@ namespace GGL {
 		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
 		torch::Tensor archObs, archNextObs, archAct;
 		float rhatMaxObserved = 0.f;
-		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;
-		int64_t learnCalls = 0; // seeding warmup gate   // bound on hypothesis magnitude (never invent)
+		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;   // bound on hypothesis magnitude (never invent)
 		int64_t archFill = 0, archPtr = 0;
 		void BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap);
 
