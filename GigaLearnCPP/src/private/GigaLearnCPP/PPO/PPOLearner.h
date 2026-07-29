@@ -101,6 +101,18 @@ namespace GGL {
 		int64_t archFill = 0, archPtr = 0;
 		void BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap);
 
+		// ===== IMPLICIT WORLD MODEL =====
+		torch::Tensor InferImagValue(torch::Tensor obs);
+		void TrainWorldModel(torch::Tensor states, torch::Tensor actions, torch::Tensor cont);
+		void TrainImagValue(torch::Tensor states);
+		// One sweep of optimistic value iteration for the given (device) states. When
+		// outRing is non-null it receives the TRUSTED imagined successors, which are then
+		// trained on as well so the solved region advances one ring beyond the data.
+		torch::Tensor ImagTargetsFor(torch::Tensor sDev, torch::Tensor* outRing);
+		int numActionsCached = 0, obsSizeCached = 0;
+		float dbgWmDyn = -1.f, dbgWmVi = -1.f, dbgWmTrust = -1.f, dbgImag = -1.f;
+		float dbgEntGate = -1.f;
+
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
 		// before the policy head. Requires a shared head. Collection-only (opponent styles).

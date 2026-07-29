@@ -17,6 +17,7 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.batchSize % config.miniBatchSize != 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
 
+	numActionsCached = numActions; obsSizeCached = obsSize;
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
 
 	// Secondary goal-only critic: a fully independent net (raw obs in, no shared trunk) so its
@@ -43,6 +44,30 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		if (config.vdagTheoryEnabled) {
 			models.Add(new Model("rhat1", vc, device));
 			models.Add(new Model("rhat2", vc, device));
+		}
+		// IMPLICIT WORLD MODEL. Dynamics live in OBS space (not trunk space) so their
+		// targets stay well-defined as the trunk drifts under training, and an imagined
+		// state can be pushed straight back through shared_head into the existing heads.
+		if (config.vdagWmEnabled && config.vdagTheoryEnabled) {
+			ModelConfig dynCfg = models["critic"]->config;
+			dynCfg.addResiduals = false;
+			dynCfg.layerSizes = config.vdagWmLayers;
+			dynCfg.numInputs = obsSize + numActions;   // state + action one-hot
+			dynCfg.numOutputs = obsSize;               // predicted DELTA
+			ModelConfig imCfg = models["critic"]->config;
+			imCfg.addResiduals = false;
+			imCfg.layerSizes = config.vdagWmLayers;
+			imCfg.numOutputs = 1;
+			for (const char* n : { "wm_dyn1", "wm_dyn2" }) {
+				Model* m = new Model(n, dynCfg, device);
+				m->groupStepExempt = true;   // stepped by TrainWorldModel, not the PPO loop
+				models.Add(m);
+			}
+			for (const char* n : { "wm_v1", "wm_v2" }) {
+				Model* m = new Model(n, imCfg, device);
+				m->groupStepExempt = true;   // stepped by TrainImagValue
+				models.Add(m);
+			}
 		}
 	}
 
@@ -223,7 +248,192 @@ torch::Tensor GGL::PPOLearner::InferRhatMax(torch::Tensor obs) {
 		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
 	auto a = models["rhat1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	auto b = models["rhat2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
-	return torch::maximum(a, b);
+	// the heads regress a NORMALISED reward; scale back to reward units on read
+	return torch::maximum(a, b).clamp(0.f, 1.f) * rhatMaxObserved;
+}
+
+
+// ===================== IMPLICIT WORLD MODEL =====================
+// One-step twin dynamics in OBS space, trained only on executed transitions, then
+// optimistic value iteration over that model read out through the worth theory.
+// No rollout, no tree, no buffer: exactly one imagined hop per update, with the
+// multi-step composition emerging across updates (amortised background planning).
+
+void GGL::PPOLearner::TrainWorldModel(torch::Tensor states, torch::Tensor actions, torch::Tensor cont) {
+	if (!models["wm_dyn1"] || !models["wm_dyn2"])
+		return;
+	int64_t nR = states.size(0);
+	if (nR < 256)
+		return;
+
+	torch::Tensor sel;
+	{
+		RG_NO_GRAD;
+		// cont[i] == 1 means row i+1 IS the successor of row i (no episode boundary)
+		auto ok = (cont.slice(0, 0, nR - 1) > 0.5f).nonzero().flatten().to(torch::kCPU);
+		if (ok.numel() < 128)
+			return;
+		int64_t take = RS_MIN((int64_t)config.vdagWmRows, ok.numel());
+		auto perm = torch::randperm(ok.numel(), torch::TensorOptions().dtype(torch::kLong));
+		sel = ok.index_select(0, perm.slice(0, 0, take));
+	}
+
+	auto s = states.index_select(0, sel).to(device, true);
+	auto s2 = states.index_select(0, sel + 1).to(device, true);
+	auto a = actions.index_select(0, sel).to(device, true).to(torch::kLong).flatten();
+	auto in = torch::cat({ s, torch::one_hot(a, numActionsCached).to(torch::kFloat32) }, 1);
+	torch::Tensor tgt = (s2 - s).detach();
+
+	float lossSum = 0.f;
+	for (int it = 0; it < 2; it++) {
+		torch::Tensor l;
+		for (const char* n : { "wm_dyn1", "wm_dyn2" }) {
+			auto pred = models[n]->Forward(in, false).to(torch::kFloat32);
+			auto li = (pred - tgt).pow(2).mean();
+			// OCCAM ON THE DYNAMICS: among models equally consistent with the observed
+			// transitions, prefer the one reading FEWER state features. Physics that does
+			// not depend on a feature loses that input entirely, so prediction in a
+			// never-visited region is the SAME computation as in a visited one. This is
+			// the only measured cure for arbitrary off-support extrapolation, and it is
+			// what makes the twins AGREE out there instead of vetoing each other -
+			// without it the trust gate switches imagination off exactly where it is
+			// needed. (Measured: disagreement 300x under threshold in unvisited regions.)
+			auto& w0 = models[n]->seq->named_parameters()["0.weight"];
+			li = li + config.vdagWmOccam * w0.norm(2, /*dim=*/0).sum();
+			l = l.defined() ? l + li : li;
+		}
+		l.backward();
+		for (const char* n : { "wm_dyn1", "wm_dyn2" })
+			models[n]->StepOptim();
+		lossSum += l.detach().cpu().item<float>();
+	}
+	dbgWmDyn = lossSum / 2.f;
+}
+
+torch::Tensor GGL::PPOLearner::ImagTargetsFor(torch::Tensor sDev, torch::Tensor* outRing) {
+	RG_NO_GRAD;
+	int64_t B = sDev.size(0), W = sDev.size(1);
+	int64_t K = RS_MAX(1, (int64_t)config.vdagWmActions);
+
+	// Candidate actions sampled UNIFORMLY, never top-k by policy: the conduct we are
+	// hunting is by definition improbable under the current policy, so scoring only
+	// the likely actions would exclude precisely what we are looking for.
+	auto acts = torch::randint(0, numActionsCached, { B * K },
+		torch::TensorOptions().dtype(torch::kLong).device(sDev.device()));
+	auto sRep = sDev.unsqueeze(1).expand({ B, K, W }).reshape({ B * K, W });
+	auto in = torch::cat({ sRep, torch::one_hot(acts, numActionsCached).to(torch::kFloat32) }, 1);
+
+	auto d1 = models["wm_dyn1"]->Forward(in, false).to(torch::kFloat32);
+	auto d2 = models["wm_dyn2"]->Forward(in, false).to(torch::kFloat32);
+	auto dis = (d1 - d2).pow(2).mean(1).view({ B, K });
+	auto imag = sRep + 0.5f * (d1 + d2);
+
+	auto trunkI = models["shared_head"] ? models["shared_head"]->Forward(imag, false) : imag;
+	auto ra = models["rhat1"]->Forward(trunkI, false).flatten().to(torch::kFloat32);
+	auto rb = models["rhat2"]->Forward(trunkI, false).flatten().to(torch::kFloat32);
+	auto rImg = (torch::maximum(ra, rb).clamp(0.f, 1.f) * rhatMaxObserved).view({ B, K });
+	auto va = models["wm_v1"]->Forward(trunkI, false).flatten().to(torch::kFloat32);
+	auto vb = models["wm_v2"]->Forward(trunkI, false).flatten().to(torch::kFloat32);
+	auto vImg = torch::minimum(va, vb).clamp(0.f, rhatMaxObserved).view({ B, K });
+
+	// EVENT-TERMINAL optimistic value iteration: arriving somewhere the worth theory
+	// says pays, PAYS and stops. The max over actions is a gamma-contraction, and this
+	// head never feeds the honest critic, so it cannot ratchet. Accumulating small
+	// step costs instead (no terminal) drives the fixed point to -kappa/(1-gamma) and
+	// the whole field collapses to its clamp.
+	auto isEv = (rImg > 0.5f * rhatMaxObserved).to(torch::kFloat32);
+	auto cand = config.vdagWmGammaIm * (isEv * rImg + (1.f - isEv) * vImg) - config.vdagWmKappa;
+
+	// UNKNOWN IS A PLATEAU, NEVER A CLIFF. An untrusted action makes no new claim and
+	// simply keeps the state's own value. Defaulting untrusted candidates to zero (or
+	// -inf then clamping) makes moving toward unexplored territory read as
+	// catastrophic, which inverts the entire field - measured, and the single most
+	// confusing failure in this family.
+	auto trunkS = models["shared_head"] ? models["shared_head"]->Forward(sDev, false) : sDev;
+	auto oa = models["wm_v1"]->Forward(trunkS, false).flatten().to(torch::kFloat32);
+	auto ob = models["wm_v2"]->Forward(trunkS, false).flatten().to(torch::kFloat32);
+	auto own = torch::minimum(oa, ob).clamp(0.f, rhatMaxObserved).unsqueeze(1).expand({ B, K });
+	auto trust = dis < config.vdagWmDisTh;
+	cand = torch::where(trust, cand, own);
+	dbgWmTrust = trust.to(torch::kFloat32).mean().item<float>();
+
+	if (outRing) {
+		auto keep = trust.reshape({ -1 }).nonzero().flatten();
+		if (keep.numel() > 64) {
+			int64_t take = RS_MIN(B, keep.numel());
+			auto perm = torch::randperm(keep.numel(),
+				torch::TensorOptions().dtype(torch::kLong).device(keep.device())).slice(0, 0, take);
+			*outRing = imag.index_select(0, keep.index_select(0, perm)).detach();
+		}
+	}
+	return std::get<0>(cand.max(1)).clamp(0.f, rhatMaxObserved);
+}
+
+void GGL::PPOLearner::TrainImagValue(torch::Tensor states) {
+	if (!models["wm_v1"] || !models["wm_dyn1"] || !models["rhat1"])
+		return;
+	if (rhatMaxObserved <= 0.f)
+		return;   // no reward scale observed yet: nothing to bound a hypothesis with
+	int64_t nR = states.size(0);
+	if (nR < 256)
+		return;
+
+	torch::Tensor S, Y;
+	{
+		RG_NO_GRAD;
+		int64_t take = RS_MIN((int64_t)config.vdagWmRows, nR);
+		auto perm = torch::randperm(nR, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, take);
+		auto sBase = states.index_select(0, perm).to(device, true);
+		torch::Tensor ring;
+		auto yBase = ImagTargetsFor(sBase, &ring);
+		// BACKGROUND PLANNING: anchor the iteration on MODEL-GENERATED successors as
+		// well, so the solved region advances one ring past the data every update.
+		// Fitting only on visited states leaves the field's readings everywhere else as
+		// unconstrained network extrapolation rather than computed values (measured: a
+		// dead-flat field that carried no gradient at all).
+		if (ring.defined() && ring.size(0) > 0) {
+			auto yRing = ImagTargetsFor(ring, nullptr);
+			S = torch::cat({ sBase, ring }, 0);
+			Y = torch::cat({ yBase, yRing }, 0);
+		} else {
+			S = sBase;
+			Y = yBase;
+		}
+		dbgImag = Y.mean().item<float>();
+	}
+
+	float lossSum = 0.f;
+	for (int it = 0; it < 2; it++) {
+		torch::Tensor trunkS;
+		{
+			// Trunk DETACHED: the world model is a read-only consumer of the shared
+			// representation. V-dagger and r-hat deliberately co-adapt the trunk; this
+			// one does not get to reshape it.
+			RG_NO_GRAD;
+			trunkS = models["shared_head"] ? models["shared_head"]->Forward(S, false) : S;
+		}
+		torch::Tensor l;
+		for (const char* n : { "wm_v1", "wm_v2" }) {
+			auto pr = models[n]->Forward(trunkS, false).flatten().to(torch::kFloat32);
+			auto li = (pr - Y).pow(2).mean();
+			l = l.defined() ? l + li : li;
+		}
+		l.backward();
+		for (const char* n : { "wm_v1", "wm_v2" })
+			models[n]->StepOptim();
+		lossSum += l.detach().cpu().item<float>();
+	}
+	dbgWmVi = lossSum / 2.f;
+}
+
+torch::Tensor GGL::PPOLearner::InferImagValue(torch::Tensor obs) {
+	RG_NO_GRAD;
+	obs = obs.to(device, true);
+	if (models["shared_head"])
+		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+	auto a = models["wm_v1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
+	auto b = models["wm_v2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
+	return torch::minimum(a, b);
 }
 
 void GGL::PPOLearner::BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap) {
@@ -248,7 +458,7 @@ torch::Tensor GGL::PPOLearner::InferGoalCritic(torch::Tensor obs) {
 	return models["goal_critic"]->Forward(obs, config.useHalfPrecision).flatten();
 }
 
-torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
+torch::Tensor ComputeEntropyRows(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
 	// Compute log probs and entropy
 	auto entropy = -(probs.log() * probs).sum(-1);
 
@@ -263,7 +473,11 @@ torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, boo
 		entropy /= logf(actionMasks.size(-1));
 	}
 
-	return entropy.mean();
+	return entropy;
+}
+
+torch::Tensor ComputeEntropy(torch::Tensor probs, torch::Tensor actionMasks, bool maskEntropy) {
+	return ComputeEntropyRows(probs, actionMasks, maskEntropy).mean();
 }
 
 void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration) {
@@ -347,9 +561,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					{
 						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
-						entropy = ComputeEntropy(probs, actionMasks, config.maskEntropy);
-						curEntropy = entropy.detach().cpu().item<float>();
+						auto entRows = ComputeEntropyRows(probs, actionMasks, config.maskEntropy);
+						// Report the UNWEIGHTED mean so the panel stays comparable to runs
+						// without the gate.
+						curEntropy = entRows.mean().detach().cpu().item<float>();
 						avgEntropy += curEntropy;
+						// H-GATED ENTROPY: sample harder where the critic says there is
+						// unrealised value. Only ever ADDS stochasticity -> the entropy
+						// floor is strengthened by construction.
+						if (batch.entWeights.defined()) {
+							auto ew = batch.entWeights.slice(0, start, stop)
+								.to(device, true, true).view_as(entRows);
+							entropy = (entRows * ew).mean();
+							dbgEntGate = ew.mean().detach().cpu().item<float>();
+						} else {
+							entropy = entRows.mean();
+						}
 					}
 
 					logProbs = logProbs.view_as(oldProbs);
@@ -441,7 +668,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// generalizes to configurations never paid at.
 				torch::Tensor rhatLoss;
 				if (batch.rhatTargets.defined() && models["rhat1"] && models["rhat2"]) {
-					auto yr = batch.rhatTargets.slice(0, start, stop).to(device, true, true).flatten();
+					auto yrRaw = batch.rhatTargets.slice(0, start, stop).to(device, true, true).flatten();
+					// DIMENSIONLESS target: regress r/scale, so the Occam coefficient means
+					// the same thing at any reward magnitude. Against a raw target it was
+					// ~40x too weak here relative to the corridor it was set on, and the
+					// theory kept its confounds instead of its signal.
+					float rsc = RS_MAX(rhatMaxObserved, 1e-6f);
+					auto yr = yrRaw / rsc;
+					// EVENT-BALANCED: reward events are a small minority of rows, so an
+					// unweighted loss makes "predict nothing" near-optimal and Occam then
+					// deletes the very geometry the theory needs. Balancing keeps the
+					// signal and prunes the confounds instead.
+					auto evM = (yrRaw > 0.25f * rsc).to(torch::kFloat32);
+					auto nEv = evM.sum().clamp_min(1.f);
+					auto nNo = (1.f - evM).sum().clamp_min(1.f);
+					float nAll = (float)yr.numel();
+					auto wBal = evM * (0.5f * nAll / nEv) + (1.f - evM) * (0.5f * nAll / nNo);
 					torch::Tensor trunkR = models["shared_head"]
 						? models["shared_head"]->Forward(obs, false) : obs;
 					for (Model* rh : { models["rhat1"], models["rhat2"] }) {
@@ -449,7 +691,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						auto u = yr - pred;
 						auto tau = config.vdagTheoryTau;
 						auto w = torch::where(u > 0, torch::full_like(u, tau), torch::full_like(u, 1.f - tau));
-						auto l = (w * u * u).mean() * batchSizeRatio;
+						auto l = (wBal * w * u * u).mean() * batchSizeRatio;
 						auto& firstLin = rh->seq->named_parameters()["0.weight"];
 						l = l + config.vdagTheoryL1 * firstLin.norm(2, /*dim=*/0).sum() * batchSizeRatio;
 						rhatLoss = rhatLoss.defined() ? rhatLoss + l : l;
@@ -473,7 +715,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						RG_NO_GRAD;
 						auto ra = models["rhat1"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
 						auto rb = models["rhat2"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
-						ySeed = torch::maximum(ra, rb).clamp(0.f, rhatMaxObserved);
+						ySeed = torch::maximum(ra, rb).clamp(0.f, 1.f) * rhatMaxObserved;
 						mSeed = (ySeed > config.vdagSeedFrac * rhatMaxObserved).to(torch::kFloat32);
 					}
 					for (Model* vh : { models["vdag1"], models["vdag2"] }) {
@@ -724,6 +966,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// which is indistinguishable from "loss is small" on the loss panel alone.
 		report["Headroom/Vdag Rows"] = dbgVdagRows;
 		report["Headroom/Rhat Rows"] = dbgRhatRows;
+		if (dbgEntGate >= 0.f)
+			report["Headroom/Ent Gate"] = dbgEntGate;
+		if (config.vdagWmEnabled) {
+			report["Headroom/WM Dyn Loss"] = dbgWmDyn;
+			report["Headroom/WM VI Loss"] = dbgWmVi;
+			report["Headroom/WM Trust Frac"] = dbgWmTrust;
+			report["Headroom/Imag Mean"] = dbgImag;
+		}
 		report["Headroom/Rhat Entry"] = dbgRhatEntry;
 		report["Headroom/Vdag Raw"] = dbgVdagRaw;
 		report["Headroom/Rhat Entry"] = dbgRhatEntry;
@@ -819,6 +1069,11 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	// THEORY r-hat twins: same trap (ctor builds optimizers at lr=0 = exact no-op under
 	// Muon). They regress a REWARD, not a return, so they take criticLR as well.
 	for (const char* n : { "rhat1", "rhat2" })
+		if (models[n])
+			models[n]->SetOptimLR(criticLR);
+
+	// World-model heads: same ctor lr=0 trap as every other added head.
+	for (const char* n : { "wm_dyn1", "wm_dyn2", "wm_v1", "wm_v2" })
 		if (models[n])
 			models[n]->SetOptimLR(criticLR);
 

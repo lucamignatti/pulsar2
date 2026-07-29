@@ -234,9 +234,14 @@ namespace GGL {
 		// predicts a significant event; interior seeds measured as relay-killing
 		// ballast). Set false to ablate back to composition-only.
 		bool vdagTheoryEnabled = true;
-		float vdagTheoryTau = 0.9f;
+		float vdagTheoryTau = 0.5f;    // ACCURATE, not optimistic. Measured degeneracy: an
+		                               // optimistic expectile and the Occam penalty share a
+		                               // minimiser - a high CONSTANT satisfies both - so the
+		                               // theory prunes its own features and stops
+		                               // discriminating. Optimism is the field's job.
 		float vdagTheoryL1 = 0.02f;    // Occam weight on r-hat input-feature columns
-		float vdagSeedWeight = 0.25f;  // weight of hypothesis rows in the V-dagger loss
+		float vdagSeedWeight = 0.0f;   // 0 = OFF: seeding measured 1.7x SLOWER to ignite
+		                               // than the same stack without it (410k vs 246k, 6 seeds)  // weight of hypothesis rows in the V-dagger loss
 		float vdagSeedFrac = 0.5f;     // event mask: seed only where r-hat > frac * max observed reward
 
 		// ARCHIVE: persistent field-ascent transitions, replayed as weighted BC and
@@ -244,7 +249,48 @@ namespace GGL {
 		// the non-invariant actuation channel: PBRS with a good field is neutral BY
 		// THEOREM, so the field must be converted to policy directly. Measured: the
 		// buffer-free (weights-only) alternative plateaus at ~1/4 of this.
-		bool vdagArchiveEnabled = true;
+		// ===== H-GATED ENTROPY =====
+		// Per-state entropy scaling by headroom H = relu(Vdag - Vreal): keep sampling
+		// where the critic says there is unrealised value, anneal as Vreal catches up.
+		// Measured (airtoy, 6 seeds/arm): seek alone ignites 6/6 but median 369k steps
+		// with a 5x seed spread (246k-1.31M); seek + this gate ignites 6/6 at 246k with
+		// ZERO spread. The gate ALONE (no seek) never ignites 0/6 - it is a variance
+		// killer, not a driver. It only ever ADDS stochasticity, so the entropy floor
+		// is strengthened by construction (cf. the archive, which destroyed it).
+		bool vdagEntGateEnabled = true;
+		float vdagEntGateK = 3.0f;
+		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
+
+		// ===== IMPLICIT WORLD MODEL (theorised-achievable-value field) =====
+		// Twin one-step OBS-space dynamics + optimistic value iteration read out through
+		// the worth theory. No rollout, no search, no buffer: one hop per update, and
+		// multi-step composition happens across updates (amortised background planning).
+		// Enters ONLY as an additive potential alongside Phi=Vdag - the sum of two
+		// potentials is a potential, so PBRS invariance is preserved and the honest
+		// critic is never corrupted.
+		bool vdagWmEnabled = true;
+		int vdagWmRows = 4096;        // states per iteration used for dynamics + VI
+		int vdagWmActions = 6;        // candidate actions imagined per state
+		float vdagWmGammaIm = 0.92f;  // OWN, shorter horizon: at the task gamma a distant
+		                              // opportunity is nearly as good as a near one, so the
+		                              // field goes flat and the seek gradient vanishes.
+		float vdagWmKappa = 0.02f;    // per-hop cost of imagining (grounding by attrition)
+		float vdagWmDisTh = 0.02f;    // twin-disagreement trust threshold
+		float vdagWmLambda = 0.5f;    // weight of the imagined potential vs Vdag
+		float vdagWmOccam = 0.02f;    // group-L1 on the model's INPUTS. This is what makes
+		                              // off-support prediction lawful: physics that does not
+		                              // depend on a feature loses that input, so the model
+		                              // computes the same way in never-visited regions and
+		                              // the twins agree there (measured: disagreement 300x
+		                              // under threshold seven units up in unvisited air).
+		std::vector<int> vdagWmLayers = { 512, 512 };
+
+		// ARCHIVE: DISABLED. It caused the measured pulsar collapse (entropy 4.5 -> 0.004
+		// nats) - behaviour cloning toward banked actions is a sharpening force with no
+		// counterweight, and early in training the "discoveries" it banks are just noise.
+		// Buffer-free arms then matched or beat it in shared-physics envs, so it is off
+		// on both safety AND performance grounds. Code retained for reproducibility.
+		bool vdagArchiveEnabled = false;
 		int vdagArchiveCap = 8192;
 		float vdagArchiveWeight = 0.5f;
 		float vdagArchiveBankThresh = 2.0f;  // bank rows with normalized ascent above this

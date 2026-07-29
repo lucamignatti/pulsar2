@@ -27,6 +27,8 @@ namespace GGL {
 			// THEORY: scaled per-step reward that LANDED on this row's arrival state
 			// (r-hat regression target; undefined unless vdagTheoryEnabled)
 			rhatTargets,
+			// HEADROOM: per-row entropy multiplier from H (undefined unless vdagEntGateEnabled)
+			entWeights,
 			advantages;
 
 		auto begin() { return &states; }
