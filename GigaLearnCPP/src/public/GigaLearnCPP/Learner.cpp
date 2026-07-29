@@ -2207,25 +2207,6 @@ void GGL::Learner::Start() {
 								tRhatTargets.max().item<float>());
 							report["Headroom/Rhat Target Max"] = tRhatTargets.max().item<float>();
 						}
-						// ARCHIVE: bank transitions where the FIELD ascended (normalized), so
-						// the actuation channel has persistent evidence of what climbs.
-						if (config.ppo.vdagArchiveEnabled) {
-							auto asc = torch::relu(g * cont * vdagN - vdag);
-							float am = asc.mean().item<float>();
-							if (am > 1e-8f) {
-								auto ascN = asc / am;
-								auto hot = (ascN > config.ppo.vdagArchiveBankThresh).nonzero().flatten();
-								if (hot.numel() > 0) {
-									if (hot.numel() > 256)
-										hot = hot.slice(0, 0, 256);
-									auto hotN = (hot + 1).clamp_max(nR - 1);
-									ppo->BankAscent(tStates.index_select(0, hot),
-										tStates.index_select(0, hotN),
-										tActions.index_select(0, hot).to(torch::kCPU),
-										config.ppo.vdagArchiveCap);
-								}
-							}
-						}
 						// H-GATED ENTROPY: per-row entropy multiplier. Adds stochasticity where
 						// the critic reports unrealised value and anneals as the policy realises
 						// it. Measured to take the seek mechanism from a 5x seed spread in

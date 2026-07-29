@@ -436,23 +436,6 @@ torch::Tensor GGL::PPOLearner::InferImagValue(torch::Tensor obs) {
 	return torch::minimum(a, b);
 }
 
-void GGL::PPOLearner::BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap) {
-	// Ring-bank ascent transitions on CPU; replay re-scores them with the CURRENT field.
-	int64_t n = obs.size(0);
-	if (n <= 0) return;
-	if (!archObs.defined()) {
-		archObs = torch::zeros({ (int64_t)cap, obs.size(1) }, torch::kFloat32);
-		archNextObs = torch::zeros({ (int64_t)cap, obs.size(1) }, torch::kFloat32);
-		archAct = torch::zeros({ (int64_t)cap }, torch::kLong);
-	}
-	auto o = obs.to(torch::kCPU, torch::kFloat32), no = nextObs.to(torch::kCPU, torch::kFloat32);
-	auto ac = acts.to(torch::kCPU, torch::kLong);
-	for (int64_t i = 0; i < n; i++) {
-		archObs[archPtr] = o[i]; archNextObs[archPtr] = no[i]; archAct[archPtr] = ac[i];
-		archPtr = (archPtr + 1) % cap; archFill = RS_MIN(archFill + 1, (int64_t)cap);
-	}
-}
-
 torch::Tensor GGL::PPOLearner::InferGoalCritic(torch::Tensor obs) {
 	// Independent net: raw obs in, NO shared trunk (by design — zero gradient interference)
 	return models["goal_critic"]->Forward(obs, config.useHalfPrecision).flatten();
@@ -500,8 +483,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgReachCarStateLoss,
 		avgReachLoss,
 		avgVdagLoss,
-		avgRhatLoss,
-		avgArchLive;
+		avgRhatLoss;
 
 	// Save parameters first
 	auto policyBefore = models["policy"]->CopyParams();
@@ -706,31 +688,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					auto yv = batch.vdagTargets.slice(0, start, stop).to(device, true, true).flatten();
 					torch::Tensor trunkV = models["shared_head"]
 						? models["shared_head"]->Forward(obs, false) : obs;
-					// PLANT: hypothesis rows from the theory, EVENT-MASKED. r-hat is a
-					// REWARD theory, not a VALUE theory - seeding V-dagger with its small
-					// interior predictions is ballast that flattens the field and kills the
-					// backward relay (measured). Seed only where it predicts a real event.
-					torch::Tensor ySeed, mSeed;
-					if (models["rhat1"] && models["rhat2"] && rhatMaxObserved > 0) {
-						RG_NO_GRAD;
-						auto ra = models["rhat1"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
-						auto rb = models["rhat2"]->Forward(trunkV.detach(), false).flatten().to(torch::kFloat32);
-						ySeed = torch::maximum(ra, rb).clamp(0.f, 1.f) * rhatMaxObserved;
-						mSeed = (ySeed > config.vdagSeedFrac * rhatMaxObserved).to(torch::kFloat32);
-					}
 					for (Model* vh : { models["vdag1"], models["vdag2"] }) {
 						auto pred = vh->Forward(trunkV, false).flatten().to(torch::kFloat32);
 						auto u = yv - pred;
 						auto w = torch::where(u > 0,
 							torch::full_like(u, config.vdagTau), torch::full_like(u, 1.f - config.vdagTau));
 						auto l = (w * u * u).mean() * batchSizeRatio;
-						if (ySeed.defined() && mSeed.sum().item<float>() > 0) {
-							auto us = ySeed - pred;
-							auto ws = torch::where(us > 0,
-								torch::full_like(us, config.vdagTau), torch::full_like(us, 1.f - config.vdagTau));
-							l = l + config.vdagSeedWeight * ((mSeed * ws * us * us).sum()
-								/ (mSeed.sum() + 1e-6f)) * batchSizeRatio;
-						}
 						vdagLoss = vdagLoss.defined() ? vdagLoss + l : l;
 					}
 					avgVdagLoss += vdagLoss.detach().cpu().item<float>();
@@ -850,39 +813,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (rhatLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + rhatLoss : rhatLoss;
 
-				// ARCHIVE replay: convert the field into POLICY. PBRS with a good field is
-				// neutral BY THEOREM, so ascent must be imitated directly. Weights are
-				// RE-COMPUTED with the CURRENT field, so entries that no longer climb drop
-				// out on their own (no eviction heuristic, no stale imitation).
-				if (config.vdagArchiveEnabled && trainPolicy && archFill > 64 && models["vdag1"]) {
-					int64_t nRep = RS_MIN((int64_t)512, archFill);
-					auto ridx = torch::randint(0, archFill, { nRep }, torch::TensorOptions().dtype(torch::kLong));
-					auto rs = archObs.index_select(0, ridx).to(device, true);
-					auto rsn = archNextObs.index_select(0, ridx).to(device, true);
-					auto ra = archAct.index_select(0, ridx).to(device, true);
-					torch::Tensor wr;
-					{
-						RG_NO_GRAD;
-						wr = torch::relu(config.gaeGamma * InferVdagMin(rsn) - InferVdagMin(rs));
-					}
-					auto live = wr > config.vdagArchiveLiveThresh;
-					float liveFrac = live.to(torch::kFloat32).mean().item<float>();
-					avgArchLive += liveFrac;
-					if (live.any().item<bool>()) {
-						auto li = live.nonzero().flatten();
-						auto sObs = rs.index_select(0, li);
-						auto sAct = ra.index_select(0, li);
-						auto wSel = wr.index_select(0, li);
-						wSel = (wSel / (wSel.mean() + 1e-8f)).clamp(0.f, 10.f);
-						auto trunkA = models["shared_head"] ? models["shared_head"]->Forward(sObs, false) : sObs;
-						auto logits = models["policy"]->Forward(trunkA, false);
-						auto logp = torch::log_softmax(logits.to(torch::kFloat32), -1)
-							.gather(1, sAct.view({ -1, 1 })).flatten();
-						auto bc = config.vdagArchiveWeight * (wSel * (-logp)).mean() * batchSizeRatio;
-						totalLoss = totalLoss.defined() ? totalLoss + bc : bc;
-					}
-				}
-
 				if (totalLoss.defined())
 					totalLoss.backward();
 			};
@@ -982,10 +912,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (models["rhat1"]) {
 			report["Headroom/Rhat Loss"] = avgRhatLoss.Get();
 			report["Headroom/Rhat Max Obs"] = rhatMaxObserved;
-		}
-		if (archFill > 0) {
-			report["Headroom/Archive Fill"] = (float)archFill;
-			report["Headroom/Archive Live Frac"] = avgArchLive.Get();
 		}
 	}
 	}

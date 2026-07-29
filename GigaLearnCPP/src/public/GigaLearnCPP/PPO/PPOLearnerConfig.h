@@ -240,23 +240,7 @@ namespace GGL {
 		                               // theory prunes its own features and stops
 		                               // discriminating. Optimism is the field's job.
 		float vdagTheoryL1 = 0.02f;    // Occam weight on r-hat input-feature columns
-		float vdagSeedWeight = 0.0f;   // 0 = OFF: seeding measured 1.7x SLOWER to ignite
-		                               // than the same stack without it (410k vs 246k, 6 seeds)  // weight of hypothesis rows in the V-dagger loss
-		float vdagSeedFrac = 0.5f;     // event mask: seed only where r-hat > frac * max observed reward
 
-		// ARCHIVE: persistent field-ascent transitions, replayed as weighted BC and
-		// RE-SCORED with the CURRENT field (stale entries silently drop out). This is
-		// the non-invariant actuation channel: PBRS with a good field is neutral BY
-		// THEOREM, so the field must be converted to policy directly. Measured: the
-		// buffer-free (weights-only) alternative plateaus at ~1/4 of this.
-		// ===== H-GATED ENTROPY =====
-		// Per-state entropy scaling by headroom H = relu(Vdag - Vreal): keep sampling
-		// where the critic says there is unrealised value, anneal as Vreal catches up.
-		// Measured (airtoy, 6 seeds/arm): seek alone ignites 6/6 but median 369k steps
-		// with a 5x seed spread (246k-1.31M); seek + this gate ignites 6/6 at 246k with
-		// ZERO spread. The gate ALONE (no seek) never ignites 0/6 - it is a variance
-		// killer, not a driver. It only ever ADDS stochasticity, so the entropy floor
-		// is strengthened by construction (cf. the archive, which destroyed it).
 		bool vdagEntGateEnabled = true;
 		float vdagEntGateK = 3.0f;
 		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
@@ -285,16 +269,6 @@ namespace GGL {
 		                              // under threshold seven units up in unvisited air).
 		std::vector<int> vdagWmLayers = { 512, 512 };
 
-		// ARCHIVE: DISABLED. It caused the measured pulsar collapse (entropy 4.5 -> 0.004
-		// nats) - behaviour cloning toward banked actions is a sharpening force with no
-		// counterweight, and early in training the "discoveries" it banks are just noise.
-		// Buffer-free arms then matched or beat it in shared-physics envs, so it is off
-		// on both safety AND performance grounds. Code retained for reproducibility.
-		bool vdagArchiveEnabled = false;
-		int vdagArchiveCap = 8192;
-		float vdagArchiveWeight = 0.5f;
-		float vdagArchiveBankThresh = 2.0f;  // bank rows with normalized ascent above this
-		float vdagArchiveLiveThresh = 0.05f; // replay only rows still ascending now
 
 		PPOLearnerConfig() {
 			policy = {};
