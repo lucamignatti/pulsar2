@@ -28,11 +28,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${TRAINERCTL_BUILD_DIR:-$REPO_ROOT/build}"
 VIZ_BUILD_DIR="${TRAINERCTL_VIZ_BUILD_DIR:-$REPO_ROOT/build-viz}"
 # MUST track cfg.checkpointFolder in src/ExampleMain.cpp. This has now drifted on every
-# cold start (checkpoints_6M -> checkpoints_resid -> checkpoints_5.1); the failure is silent
-# and `restore-golden` is the dangerous one, since a golden checkpoint from a SUPERSEDED
-# lineage has a different policy-head width and is not loadable by the live run - the
-# recovery doctrine's "restore a known-good FULL checkpoint" assumes the same lineage.
-CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_5.1}"
+# cold start (checkpoints_6M -> checkpoints_resid -> checkpoints_5.1 -> 5.2, caught only at
+# the 5.3 cut); the failure is silent and `restore-golden` is the dangerous one, since a
+# golden checkpoint from a SUPERSEDED lineage has a different policy-head width and is not
+# loadable by the live run - the recovery doctrine's "restore a known-good FULL checkpoint"
+# assumes the same lineage. `trainerctl doctor` now diffs this against ExampleMain.cpp.
+CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_5.3}"
 RUN_TRAINER="$SCRIPT_DIR/run_trainer.sh"
 LOG_DIR="${RUN_TRAINER_LOG_DIR:-$REPO_ROOT/run_logs}"
 CONF_DIR="$HOME/.config/pulsar-remote"
@@ -318,6 +319,16 @@ WorkingDirectory=$VIZ_BUILD_DIR
 Environment=GGL_RENDER=1
 Environment=GGL_DEVICE=cpu
 Environment=GGL_RENDER_TEAM_SIZE=$(viz_mode)
+# Reproducible inference, so the control panel's rewind replays the same play.
+# Multi-threaded CPU matmuls sum partial products in thread-completion order, which
+# differs run to run and is enough to flip the policy's argmax near a decision
+# boundary. at::set_num_threads(1) in render mode covers ATen's own pool; these cover
+# the BLAS/OpenMP layers underneath it. The viewer is one arena at 15 Hz, so it loses
+# nothing. (The other half of replay determinism is the obs builder's slot shuffle —
+# see AdvancedObsPadded's shuffleSlots.)
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
@@ -427,6 +438,12 @@ cmd_doctor() {
     check "dashboard answering"            curl -sf --max-time 3 http://127.0.0.1:8500/api/status
     check "PIN configured"                 test -s "$CONF_DIR/pin.json"
     check "linger enabled (survive logout)" sh -c "loginctl show-user $USER 2>/dev/null | grep -q Linger=yes"
+    # CKPT_DIR drifted silently on EVERY cold start before this check existed, and
+    # `restore-golden` against a superseded lineage is the dangerous failure. Compare to the
+    # one source of truth: cfg.checkpointFolder in ExampleMain.cpp.
+    check "ckpt dir matches ExampleMain"   sh -c '
+        want=$(grep -oP "cfg\.checkpointFolder\s*=\s*\"\K[^\"]+" "$1/src/ExampleMain.cpp" | tail -1)
+        [ -n "$want" ] && [ "$(basename "$2")" = "$want" ]' _ "$REPO_ROOT" "$CKPT_DIR"
     check "trainer binary present"         test -x "$BUILD_DIR/GigaLearnBot"
     check "viz viewer binary present"      test -x "$VIZ_BUILD_DIR/GigaLearnBot"
     check "viz venv present"               test -x "$VIZ_PY"

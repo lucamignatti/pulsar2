@@ -14,7 +14,7 @@ use std::os::raw::{c_char, c_int};
 use glam::{Mat3A, Vec3A};
 use rocketsim::{
     Arena, ArenaConfig, ArenaEvent, BallState, BoostPadState, CarBodyConfig, CarControls,
-    CarState, GameMode, Team,
+    CarExtraState, CarState, GameMode, Team,
 };
 
 // A Rust panic aborts (panic="abort") rather than unwinding into C++; arena
@@ -452,6 +452,59 @@ pub unsafe extern "C" fn rsf_arena_set_car_state(
 ) {
     let state: CarState = unsafe { &*s }.into();
     unsafe { arena(p) }.arena.set_car_state(idx as usize, state);
+}
+
+// -- Exact-restore extras ----------------------------------------------------
+//
+// RsfCarState covers everything CarState expresses, but a car also carries raycast
+// suspension state and a pending bump impulse that CarState cannot represent. Without
+// those, set_car_state produces a restore that looks right and then diverges (measured
+// ~23uu after one second of identical inputs).
+//
+// This pair is deliberately OPAQUE: C++ asks for the size and moves that many bytes
+// around without naming a single field. That breaks the hand-mirroring contract in the
+// best way — CarExtraState can gain fields with no C++ header change and no chance of
+// the two drifting apart, which is exactly the failure mode that produced the bug.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rsf_car_extra_state_size() -> u32 {
+    size_of::<CarExtraState>() as u32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_get_car_extra_state(
+    p: *mut FfiArena,
+    idx: u32,
+    out: *mut std::ffi::c_void,
+) {
+    let s = unsafe { arena(p) }.arena.get_car_extra_state(idx as usize);
+    unsafe { std::ptr::write_unaligned(out.cast::<CarExtraState>(), s) };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_set_car_extra_state(
+    p: *mut FfiArena,
+    idx: u32,
+    s: *const std::ffi::c_void,
+) {
+    let state = unsafe { std::ptr::read_unaligned(s.cast::<CarExtraState>()) };
+    unsafe { arena(p) }
+        .arena
+        .set_car_extra_state(idx as usize, &state);
+}
+
+// The arena RNG. Only demo respawns draw from it (Car::respawn picks a spawn location),
+// but that is enough to make a rewind across a demo land the victim somewhere else.
+// fastrand's WyRand state is a single u64, so the seed IS the state.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_get_rng_state(p: *mut FfiArena) -> u64 {
+    unsafe { arena(p) }.arena.rng.get_seed()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_set_rng_state(p: *mut FfiArena, state: u64) {
+    unsafe { arena(p) }.arena.rng.seed(state);
 }
 
 #[unsafe(no_mangle)]

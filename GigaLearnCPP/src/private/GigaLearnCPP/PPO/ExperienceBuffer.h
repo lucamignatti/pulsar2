@@ -27,6 +27,11 @@ namespace GGL {
 			// THEORY: scaled per-step reward that LANDED on this row's arrival state
 			// (r-hat regression target; undefined unless vdagTheoryEnabled)
 			rhatTargets,
+			// ADVANTAGE FILTERING: float 0/1, 1 = this row ranked in the top advFilterFrac of
+			// the iteration - by signed advantage or by |advantage|, per advFilterMode - and the
+			// POLICY may train on it (value heads ignore this mask). Undefined unless
+			// advFilterFrac < 1.
+			advFilterMask,
 			advantages;
 
 		auto begin() { return &states; }

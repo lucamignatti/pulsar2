@@ -47,6 +47,7 @@ namespace GGL {
 			bool makeCritic,
 			int obsSize, int numActions,
 			PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
+			PartialModelConfig criticTrunkConfig,
 			torch::Device device,
 			ModelSet& outModels);
 
@@ -85,8 +86,13 @@ namespace GGL {
 		// If models is null, this->models will be used - which is how the opponent half of a
 		// served iteration is inferred (pass the archived version's ModelSet).
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
+		// The value-side body: main trunk, then the critic trunk if one is configured. EVERY value
+		// head (critic, goal critic, V-dagger twins, r-hat twins) reads this, so they all see the
+		// same features and the trunks are forwarded once per call instead of once per head.
+		torch::Tensor ValueTrunk(torch::Tensor obs, bool halfPrec);
 		torch::Tensor InferCritic(torch::Tensor obs);
-		// Secondary goal-only critic (independent net, raw obs). Only valid when goalCritic.enabled.
+		// Secondary goal-only critic. Reads the CRITIC TRUNK when one is configured; with no critic
+		// trunk it keeps its historical independent form (own net, raw obs, no shared body).
 		torch::Tensor InferGoalCritic(torch::Tensor obs);
 		// HEADROOM composition critic: min of the twin V-dagger heads (shared trunk).
 		// No-grad; used at learn-prep for one-iteration-frozen TD targets + the H field.
@@ -94,6 +100,17 @@ namespace GGL {
 		// THEORY: max of the twin reward models (optimism under ambiguity), clamped by
 		// the caller to the largest reward actually observed (never invent magnitudes).
 		torch::Tensor InferRhatMax(torch::Tensor obs);
+		// GEOMETRY (4th rung): V_geo, the HJB fixed point. No-grad read for the field.
+		torch::Tensor InferGeoV(torch::Tensor obs);
+		// Reservoir over (obs, nextObs, scaledReward) for the STATIONARY world-facing fits
+		// (r_hat, Sigma). Reward and one-step displacement spread are properties of the
+		// environment; only where we sample them moves as the policy changes. Fitting them on
+		// the sliding buffer makes them forget regions the policy left, which is what made the
+		// HJB residual run away 100-250x offline.
+		torch::Tensor geoResObs, geoResNext, geoResRew;
+		int64_t geoResFill = 0, geoResSeen = 0;
+		void GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap);
+		float dbgGeoResid = -1.f, dbgGeoRew = -1.f, dbgGeoMean = -9.f;
 		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
 		torch::Tensor archObs, archNextObs, archAct;
 		float rhatMaxObserved = 0.f;
@@ -104,12 +121,17 @@ namespace GGL {
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output
 		// before the policy head. Requires a shared head. Collection-only (opponent styles).
+		// outRowOk (optional): when non-null, the non-finite-logits guard does NOT sync here.
+		// Bad rows are sanitized to uniform (sampling stays safe) and the per-row finite flags
+		// are returned for a DEFERRED verdict at the caller's existing sync point. When null,
+		// the original synchronous check-and-die with full forensics runs in place.
 		static torch::Tensor InferPolicyProbsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
 			bool halfPrec,
-			torch::Tensor steerDelta = {});
+			torch::Tensor steerDelta = {},
+			torch::Tensor* outRowOk = nullptr);
 		static void InferActionsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,

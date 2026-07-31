@@ -30,6 +30,7 @@ Status vocabulary:
 | Report | Date | Run | Topic | Status |
 |---|---|---|---|---|
 | [COMPOSITION_CRITIC.md](COMPOSITION_CRITIC.md) | 07-25 | testbed + resid | **The paper.** Composition critic: exploration by seeking realizable headroom | **CANONICAL** |
+| [GEOMETRIC_CRITIC.md](GEOMETRIC_CRITIC.md) | 07-30 | testbed + 5.3 | **The ladder paper.** 4th rung: value read from environment geometry (HJB), permanent constant mix beside V-dagger. Live from step 0 of 5.3 | **CANONICAL** |
 | [H2_TRUNCATION.md](H2_TRUNCATION.md) | 07-19 | cross-run | Offline loader bug, fix + oracle verification | **CANONICAL** |
 | [FEAR_MINE.md](FEAR_MINE.md) | 07-15 | 4.0 | Disagreement-mined frontier drills — *graduated to live* | **CANONICAL** `h2` |
 | [GOAL_CRITIC_AUDIT.md](GOAL_CRITIC_AUDIT.md) | 07-20 | 5.0v3 | Is the goal critic driving, coasting, or hindering? | **RESULT** |

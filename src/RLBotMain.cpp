@@ -63,9 +63,18 @@ int main(int argc, char** argv) {
 	RG_LOG("RLBot bot obs size: " << obsSize);
 
 	// Must mirror ExampleMain.cpp's cfg.ppo.sharedHead / cfg.ppo.policy exactly, or the
-	// saved weights won't load into a matching architecture.
+	// saved weights won't load into a matching architecture. Current lineage: the
+	// residual/asymmetric net (trunk 1152 kept wide, policy SHRUNK to 768).
+	//
+	// addResiduals IS LOAD-INVISIBLE AND BEHAVIOUR-CRITICAL: the module list stays flat,
+	// so a residual checkpoint loads shape-clean into a non-residual model and then plays
+	// WRONG silently (Model::Forward applies the skips from recorded index spans). A
+	// mismatch here produces no error at all - only a bot that looks lobotomized.
+	bool addResiduals = true;
+
 	PartialModelConfig sharedHeadConfig;
-	sharedHeadConfig.layerSizes = { 512, 512 };
+	sharedHeadConfig.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
+	sharedHeadConfig.addResiduals = addResiduals;
 	sharedHeadConfig.activationType = ModelActivationType::LEAKY_RELU;
 	sharedHeadConfig.addLayerNorm = true;
 	// The shared head is a pure feature trunk; the policy head owns the output layer
@@ -74,15 +83,17 @@ int main(int argc, char** argv) {
 	sharedHeadConfig.addOutputLayer = false;
 
 	PartialModelConfig policyConfig;
-	policyConfig.layerSizes = { 512, 512, 512 };
+	policyConfig.layerSizes = { 768, 768, 768 };         // stem + 1 residual block
+	policyConfig.addResiduals = addResiduals;
 	policyConfig.activationType = ModelActivationType::LEAKY_RELU;
 	policyConfig.addLayerNorm = true;
 
-	// Optimistic-Critic Ladder wire: the policy head's input is widened by 5 columns
-	// ([V_real, V_exp, gap_KD, V_metric, gap_PK], tanh-squashed - see CLAUDE.md's Ladder
-	// section). InferUnit/PPOLearner::InferActionsFromModels default to a NULL ladder,
-	// which is exact zeros - the same convention every eval/opponent/render path uses,
-	// correct here too (Rating-style play, not training collection).
+	// NOTE: the policy head is at plain trunk width. The Optimistic-Critic Ladder's
+	// 5-column policy wire (which made this head's input 512+5=517 on the 5.0v3 lineage
+	// from 18.88B on) was REMOVED 2026-07-25 with the rest of the Ladder actuation; the
+	// composition critic that replaced it never feeds H to the policy. Ladder-era 5.0v3
+	// checkpoints therefore DO NOT load here - they abort with 264704 vs 262144 on
+	// POLICY.lt layer 0. Restore tag for that architecture: pre-strip-20260725.
 	RG_LOG("Loading GigaLearn checkpoint from \"" << checkpoint << "\" (useGPU=" << useGPU << ")...");
 	auto* inferUnit = new InferUnit(
 		obsBuilder, obsSize, actionParser,

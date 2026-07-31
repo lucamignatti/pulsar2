@@ -1,5 +1,10 @@
 #include <GigaLearnCPP/Learner.h>
 
+#ifdef GGL_VIZ_RLBOT
+// Viewer-only: hosts an RLBot bot as the opponent (see CMake's GGL_VIZ_RLBOT).
+#include "VizRLBotServer.h"
+#endif
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -197,42 +202,6 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
 		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 75.f },
 
-		// CONSECUTIVE AIR TOUCHES (2026-07-21, user-directed: "reward consecutive air
-		// touches", made unfarmable "by making them pbrs"). Exact-telescoping PBRS on a
-		// per-player air-touch streak (Phi = 1-exp(-max(0,streak-1)/2)): credit begins on
-		// the 2nd airborne touch of a chain and is refunded in full on landing, so it
-		// shapes sustained aerial CONTROL (juggling) without being farmable - the
-		// discounted sum telescopes to -Phi(start) over any path. Zero-sum wrapped (a
-		// linear map of a per-player potential stays a telescoping potential -> keeps the
-		// whole-stack zero-sum invariant); gamma threaded from TRAIN_GAMMA; NEVER gated.
-		// SCAFFOLD weight 30: in the aerial-emergence family (AirIntercept/FlipReset 40),
-		// deliberately BELOW them and far below the single-touch primary (AerialTouch 120)
-		// - it is a bonus stacked on already-rewarded individual aerial touches, not the
-		// finish. Being exact PBRS the weight is a pure credit-density knob (unfarmable at
-		// any value). Anneal once mechanic_census shows a stable air-touch-chain rate.
-		{ new ZeroSumReward(new ConsecutiveAirTouchReward(gamma), TEAM_SPIRIT), 30.f },
-
-		// WALL-JUMP-TO-BALL (2026-07-21, user-directed: "reward for hitting the ball after
-		// jumping off the wall", unfarmable "by making them pbrs"). Exact-telescoping PBRS:
-		// while airborne after leaving a wall, Phi = exp(-|ball-car|/1410); closing on the
-		// ball post-launch pays +dPhi, landing refunds it in full, so it shapes the
-		// wall-read aerial (drive the wall, jump off, strike the ball) without being
-		// farmable. Wall exits AWAY from the ball pay ~0. Zero-sum wrapped, gamma threaded,
-		// NEVER gated. SCAFFOLD weight 30: matches ConsecutiveAirTouch and sits in the
-		// aerial-scaffold band; its potential is nonzero only in the narrow post-wall-launch
-		// airborne subset, so its average stack share is small even so. Anneal with the rest
-		// of the aerial family once wall-play establishes.
-		{ new ZeroSumReward(new WallJumpToBallReward(gamma), TEAM_SPIRIT), 30.f },
-
-		// FLIP RESET (2026-07-20, user-directed): a gradient for the reset event,
-		// paired with AirPlayState's FLIP_RESET_READY seeding (reward + exposure -
-		// a zero-rate mechanic needs both). Gated hard (genuine airborne wheel
-		// reset, high ball, ~1s cooldown - see FlipResetReward); the residual
-		// ceiling-juggle farm advances the ball nowhere so B2G/Goal dominate it.
-		// SCAFFOLD 40 (== AirIntercept, < AerialTouch 120): a precursor, not the
-		// finish. Anneal once mechanic_census shows a stable flip-reset rate.
-		{ new ZeroSumReward(new FlipResetReward(), TEAM_SPIRIT), 40.f },
-
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
 		// genuinely opponent-created shots pay. Deliberately NO paired ShotReward (see file header
@@ -279,7 +248,7 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// (~the KickoffState reset slice), inert otherwise. Weight 25 (~1/6 of a
 		// goal for a fast contested win) - meaningful on kickoffs, small in the
 		// stack average since it only fires on kickoff resets.
-		{ new ZeroSumReward(new KickoffRaceReward(), TEAM_SPIRIT), 25.f },
+		{ new ZeroSumReward(new KickoffRaceReward(), TEAM_SPIRIT), 60.f },
 
 		// The objective. Scorer +150 / conceder -150, exactly zero-sum.
 		{ new GoalReward(), 150 }
@@ -358,7 +327,11 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	// player slots + 5 presence flags). Ball@0 and self@51 offsets match AdvancedObs exactly,
 	// which the steering landing sims and analysis tooling rely on. NOT weight-compatible
 	// with the 3.1 lineage's 109-dim AdvancedObs checkpoints - 4.0 is a fresh run.
-	result.obsBuilder = new AdvancedObsPadded(MAX_PLAYERS_PER_TEAM);
+	// Slot shuffling OFF in the viewer: it draws from a clock-seeded engine, so with it on
+	// the same game state yields a different obs (and can yield a different action) every
+	// build — which makes the control panel's rewind unable to replay a play. Training
+	// keeps it on; the policy is trained slot-invariant, so the viewer loses nothing.
+	result.obsBuilder = new AdvancedObsPadded(MAX_PLAYERS_PER_TEAM, /*shuffleSlots=*/g_RenderTeamSize == 0);
 	// The proven cf993b7 reset mix - effective near-ball share 0.55 (0.35 ground + 0.20 aerial
 	// drill), no drill-replay slice (that came with the drill bank in the regression).
 	// Aerial drill, REVERSE CURRICULUM: classically the car spawns ALREADY AIRBORNE and
@@ -543,7 +516,38 @@ int main(int argc, char* argv[]) {
 	// identical update, 10 passes instead of 4). Raise back toward 25-30k only if the card shows
 	// headroom in practice (no desktop-graphics contention). The reachability InfoNCE subsample
 	// (512/minibatch) now runs 10x/epoch - same benign side effect as the earlier 200k->50k cuts.
-	cfg.ppo.miniBatchSize = 20'000;
+	// 2026-07-28: the theory-from-parts merge added the rhat1/rhat2 twins, which mirror the
+	// critic's config like the vdag twins do - so the 5x1280 critic-family head count went 3 -> 5
+	// and it is that count, times the per-row saved activations, that dominates the learn peak
+	// (measured: 11.91GB of PyTorch tensors, OOM on a 20000x1280 head forward = the 98MiB alloc
+	// in the crash, on a card with ~13.2GB free after desktop graphics). That path is now
+	// DISABLED (PPOLearnerConfig::vdagTheoryEnabled), putting the head count back at 3.
+	// Held at 10k rather than restored to 20k: the overnight 2026-07-28 run (theory ON, 10k)
+	// trained fine for ~5h but sat at 12.0-12.7GB with ~240MB free and took 8 memory-pressure
+	// crash-restarts in 8h as desktop graphics moved. Dropping to 3 heads at this same 10k is
+	// what buys the headroom back; 20k would spend it again.
+	// ^ That paragraph is stale: the value has been 20k since (committed), so the run has in fact
+	// been spending that headroom. Recorded rather than deleted because the crash-restart count is
+	// the only measured datapoint on this card's real margin.
+	// 2026-07-29 (critic trunk): the value heads were factored behind a shared critic_trunk, so
+	// per-row saved activations fall to ~57% of the previous config. Counting 1280-equivalent
+	// width x layers per row, ignoring the LN/act intermediates that scale everything alike:
+	//     before  trunk 3456 x2 forwards + critic 6400 + vdag 12800 + goal 6400 + policy 2304
+	//             ~= 34.8k
+	//     after   trunk 3456 x1 + critic_trunk 3840 + 4 heads x 2560 + policy 2304 ~= 19.8k
+	// So the ROW BUDGET at a constant peak rises ~1.75x: 20k -> ~35k. Spending only part of that
+	// (20k -> 25k, ~0.71x the previous peak) deliberately banks the rest as OOM margin, because
+	// this run has NO automatic memory guard and the measured history above is 8 crash-restarts in
+	// 8h at ~240MB free. 40k is the next rung and is ~1.14x the previous peak - i.e. RISKIER than
+	// what was already crash-looping; only go there after watching actual GPU memory across a
+	// learn pass with the viz running.
+	// miniBatchSize MUST DIVIDE batchSize (200k) - PPOLearner's ctor hard-fails otherwise, so the
+	// tempting round numbers 32k/30k are not available. Legal rungs from here: 25k, 40k, 50k.
+	// DO NOT put this back to 100k: that value belongs to the 512-wide era two architecture
+	// changes ago (see the 200k->100k->50k->20k ladder above, each step forced by a capacity
+	// increase). At this width 100k is ~10x the per-minibatch activation peak of a config that
+	// already measured ~12GB of 16.3GB - it OOMs on the first learn pass.
+	cfg.ppo.miniBatchSize = 25'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
@@ -578,6 +582,30 @@ int main(int argc, char* argv[]) {
 
 	cfg.ppo.epochs = 2;
 	cfg.ppo.entropyScale = 0.035f;
+
+	// ADVANTAGE FILTERING (2026-07-29, user-directed): the policy trains only on the top 50% of
+	// rows by post-injection advantage; the threshold is a buffer-wide quantile taken after GAE
+	// and after the HEADROOM/goal-critic injectors, so it selects on the number the policy loss
+	// actually consumes. Value heads (critic, goal critic, V-dagger twins, reachability) keep
+	// every row - only the PPO term is filtered - and the kept rows are renormalized by their
+	// count, so this is a change of WHICH rows teach, not of step size. Revert = 1.0f.
+	// Watch, in order: AdvFilter/Kept Positive Frac (near 1.0 = the update is pure
+	// self-imitation, the clipping-ratchet asymmetry that once bled Elo while the viewer looked
+	// better), Policy Entropy (a collapse means overcommitment), then the Nexto/* goal slope -
+	// the only pool-inflation-proof read on whether this actually helped.
+	cfg.ppo.advFilterFrac = 0.5f;
+	// MAGNITUDE (2026-07-30, user-directed): rank by |advantage|, not signed advantage, so the
+	// retained half is the two TAILS rather than "everything above the median". Reason: the PPO
+	// per-row gradient is |A| * grad(log pi), so a median cut spends the entire budget on the
+	// least informative half of the positives (rows near A ~ +0 that the critic already
+	// predicted) while discarding the largest-|A| rows in the buffer. Same kept count, same
+	// renormalization - only WHICH rows teach changes. This also defuses the known ratchet risk
+	// above rather than merely watching it.
+	// PRE-REGISTERED: Kept Positive Frac must fall off ~1.0 (confirms the switch took effect) and
+	// Dropped Abs Adv Mean must fall relative to its TOP_SIGNED value (confirms the dropped rows
+	// really are the low-information ones). Success = Nexto/* goal slope at or above its current
+	// trend over the next ~1B steps; Policy Entropy must not collapse. Revert = TOP_SIGNED.
+	cfg.ppo.advFilterMode = AdvFilterMode::MAGNITUDE;
 
 	// Reachability: aux InfoNCE heads on the shared trunk. gateEnabled = false under FRONTIER-9:
 	// every reward component is now zero-sum/antisymmetric and ungated by design (gating breaks ZS
@@ -625,7 +653,10 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.goalCritic.gamma = 0.9994f;   // ~77s half-life at 15Hz (5.0 tickSkip 8; re-derived)
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
-	cfg.ppo.goalCritic.model.layerSizes = { 1280, 1280, 1280, 1280, 1280 }; // aux-head scale-up (see the block below)
+	// Private head on top of critic_trunk (2026-07-29): 5x1280 on raw obs -> 2x1280 on the shared
+	// value body, 6.87M -> 3.29M. This is the change that gives up its gradient isolation - see
+	// the criticTrunk block below and PPOLearnerConfig::criticTrunk.
+	cfg.ppo.goalCritic.model.layerSizes = { 1280, 1280 };
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
@@ -654,6 +685,10 @@ int main(int argc, char* argv[]) {
 	//       *** COST WARNING: vdag1/vdag2 mirror the critic's config automatically
 	//       (PPOLearner.cpp), so every critic parameter is paid THREE times: critic-family goes
 	//       ~11.9M -> ~24.1M. Total dense params ~20M -> ~38M. ***
+	//       ^ SUPERSEDED 2026-07-29: those numbers described four INDEPENDENT 5x1280 value stacks.
+	//       They are now factored behind a shared critic_trunk (see the criticTrunk block below),
+	//       critic family ~17.9M / net ~24.9M. The "paid three times" mechanism is unchanged and
+	//       still the reason head depth is the expensive dimension here.
 	//       Widths stay 128-aligned (768=6x128, 1280=10x128) for tensor cores. The learn-pass
 	//       activation peak grows with width x depth, so watch for OOM - the 512->1152 bump
 	//       already forced a miniBatchSize cut, and this one may force another.
@@ -670,13 +705,35 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.sharedHead.addResiduals = addResiduals;
 	cfg.ppo.policy.addResiduals = addResiduals;
 	cfg.ppo.critic.addResiduals = addResiduals;
+	cfg.ppo.criticTrunk.addResiduals = addResiduals;
 	cfg.ppo.goalCritic.model.addResiduals = addResiduals;
 	cfg.ppo.reachability.phi.addResiduals = addResiduals;
 	cfg.ppo.reachability.psi.addResiduals = addResiduals;
 
+
 	cfg.ppo.sharedHead.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
 	cfg.ppo.policy.layerSizes = { 768, 768, 768 };         // SHRUNK: stem + 1 block
-	cfg.ppo.critic.layerSizes = { 1280, 1280, 1280, 1280, 1280 };  // stem + 2 blocks (x3 w/ vdag twins)
+
+	// SECOND SHARED TRUNK, VALUE-SIDE ONLY (2026-07-29, user-directed). The four value heads used
+	// to be four independent 5x1280 stacks reading the main trunk (critic + vdag1 + vdag2, which
+	// mirror the critic's config automatically, + a standalone raw-obs goal critic) = ~31.0M
+	// params, 82% of the whole net. The first three layers are now factored out into critic_trunk
+	// and each head keeps two private layers:
+	//     critic_trunk {1280,1280,1280} = 4.76M     (stem + 1 block, on the 1152 main trunk)
+	//     critic / vdag1 / vdag2 / goal_critic {1280,1280} = 3.29M each
+	//     critic family 31.0M -> 17.9M (-42%); whole net ~38.0M -> ~24.9M (-34%)
+	// The point is NOT the parameter count - it is the learn-pass activation peak, which is what
+	// actually caps miniBatchSize: saved 1280-wide layer activations per row go 20 -> 11, and the
+	// main trunk is now materialized ONCE for all value heads instead of twice (PPOLearner::Learn's
+	// fnValueTrunk). That is what funds the miniBatchSize bump above.
+	// TWO LAYERS PER HEAD IS A FLOOR, NOT A TUNING CHOICE: vdag1/vdag2 are only useful as the
+	// min() anti-ratchet if they are genuinely different functions. Give them one private layer
+	// each on a shared body and they collapse toward the same function, disarming the guard that
+	// COMPOSITION_CRITIC.md section 4.4 measured (H inflating 0.3 -> 11.8 with nothing behind it).
+	// If params must come down further, take them from critic_trunk's depth, not the heads'.
+	cfg.ppo.criticTrunk.layerSizes = { 1280, 1280, 1280 };
+	cfg.ppo.criticTrunk.addOutputLayer = false;  // it is a body; MakeModels asserts this
+	cfg.ppo.critic.layerSizes = { 1280, 1280 };  // private head on top of critic_trunk
 	// Reachability phi/psi are CONTRASTIVE/regression heads, not value
 	// heads: the critic-scaling evidence above does not cover them, and over-parameterized
 	// InfoNCE embeddings can overfit the contrastive task. Grown only modestly (256x2 ->
@@ -696,7 +753,15 @@ int main(int argc, char* argv[]) {
 	auto optim = ModelOptimType::MUON;
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
+	cfg.ppo.criticTrunk.optimType = optim;
 	cfg.ppo.sharedHead.optimType = optim;
+	// The goal critic was the ONLY dense net still on Adam, and not by decision: its
+	// activationType / addLayerNorm / addResiduals were all set explicitly on the lines around
+	// here while optimType was never assigned, so it fell through to PartialModelConfig's ADAM
+	// default. Muon now, like every other dense net (2026-07-29). The vdag twins get it for free
+	// by mirroring the critic's config. NOTE this is a real change, not a cleanup: the LRs here
+	// were chosen as Adam LRs that transfer to Muon RMS-matched, so it lands with the cold start.
+	cfg.ppo.goalCritic.model.optimType = optim;
 
 	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
@@ -709,10 +774,25 @@ int main(int argc, char* argv[]) {
 	bool addLayerNorm = true;
 	cfg.ppo.policy.addLayerNorm = addLayerNorm;
 	cfg.ppo.critic.addLayerNorm = addLayerNorm;
+	cfg.ppo.criticTrunk.addLayerNorm = addLayerNorm;
 	cfg.ppo.sharedHead.addLayerNorm = addLayerNorm;
 	cfg.ppo.reachability.phi.addLayerNorm = addLayerNorm;
 	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
 	cfg.ppo.goalCritic.model.addLayerNorm = addLayerNorm;
+
+	// GEOMETRY (4th rung) — three INDEPENDENT nets on raw obs, no trunk. Deliberately small:
+	// geo_v is a scalar field whose only job is to satisfy a local PDE, and its cost is one
+	// extra input-gradient per minibatch, so width here buys little and costs learn-pass peak
+	// memory (the constraint that forced the r-hat heads off in the first place).
+	// ON as of the 5.3 cold start. This is a FRESH-RUN mechanism (see the config comment and
+	// research/reports/GEOMETRIC_CRITIC.md): it actuates as a PERMANENT 4th potential at a
+	// constant mix weight, and its largest measured wins are early, so it belongs to a lineage
+	// from step 0 rather than being inserted mid-run. Revert is this flag.
+	cfg.ppo.geoEnabled = true;
+	cfg.ppo.geoModel.layerSizes = { 384, 384 };
+	cfg.ppo.geoModel.activationType = activation;
+	cfg.ppo.geoModel.addLayerNorm = addLayerNorm;
+	cfg.ppo.geoModel.addResiduals = false;   // 2 layers: addResiduals is a no-op at this depth
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.
@@ -776,8 +856,29 @@ int main(int argc, char* argv[]) {
 	// fully intact (7.0 GB, 8 checkpoints, ~950M steps) instead of having every checkpoint in it
 	// renamed corrupt_* by the loader's fallback, and PHASE A / an empty version pool / no
 	// PHASE_B marker all follow by construction (the marker lives in the checkpoint folder).
-	cfg.checkpointFolder = "checkpoints_5.1";
-	cfg.metricsRunName = "5.1-noleague";
+	// 5.2 (2026-07-29): the critic trunk changes CRITIC.lt, GOAL_CRITIC.lt and both VDAG*.lt
+	// shapes, so 5.1's checkpoints cannot load. The folder MUST move with the architecture and
+	// this line is the whole safety mechanism: the loader walks newest->oldest and RENAMES every
+	// checkpoint it fails to load to corrupt_<ts>, so booting this binary against checkpoints_5.1
+	// would destroy that lineage (13.87B steps) rather than merely refuse to start. Same reason
+	// the 5.1 cold start got its own folder instead of trusting the loader to abort loudly.
+	// checkpoints_5.1 is therefore left fully intact as the restore point for this change: revert
+	// = put this line and the criticTrunk/goalCritic/advFilter blocks back, rebuild, restart.
+	// NOTE the flip side: with the code staged but not deployed, any restart of a REBUILT binary
+	// starts 5.2 from step 0 rather than resuming 5.1. That is loud (Total Timesteps resets, new
+	// wandb run) and non-destructive, but it is not a resume.
+	// 5.3 (2026-07-30): the geometric critic (4th rung) is ON from step 0. Unlike 5.2 this is
+	// NOT a shape break in the existing nets — geo_sigma/geo_rew/geo_v are three ADDITIONAL
+	// files, so 5.2's checkpoints would technically load. The fresh folder is deliberate anyway,
+	// for two reasons. First, the mechanism is validated as a cold-start accelerant actuating a
+	// permanent potential; resuming a 175M-step policy into it measures neither the cold start
+	// nor a clean ablation. Second, and the reason this is a hard rule rather than a preference:
+	// a resumed 5.2 would carry a V_geo initialised at random into a live advantage stream, and
+	// the HJB field needs to solve before its gap term means anything (Geo/Residual is the gate).
+	// checkpoints_5.2 stays fully intact (2.3 GB, ~175M steps) as the restore point: revert =
+	// put this line back and set cfg.ppo.geoEnabled = false, rebuild, restart.
+	cfg.checkpointFolder = "checkpoints_5.3";
+	cfg.metricsRunName = "5.3-geo";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
@@ -824,6 +925,68 @@ int main(int argc, char* argv[]) {
 			g_RenderTeamSize = n;
 		}
 		RG_LOG("Render mode: " << g_RenderTeamSize << "v" << g_RenderTeamSize << " arena");
+
+#ifdef GGL_VIZ_RLBOT
+		// Let the viewer hand the other team to a real RLBot bot playing in OUR arena, so
+		// pause/rewind/editing keep working against it. Built only with
+		// -DGGL_VIZ_RLBOT=ON; the trainer links none of this.
+		{
+			// Relative to the build dir the viewer runs from (build-viz/), which is where
+			// the rest of this file's relative paths are anchored too.
+			static const std::string botRoot = std::filesystem::absolute("../rlbot-run").string();
+			static GGL::VizRLBotServer rlbotServer;
+
+			cfg.vizBotFinder = []() { return GGL::VizRLBotServer::FindBotConfigs(botRoot); };
+
+			cfg.externalControlSource = [](
+				const std::string& spec, Team team, const RLGC::GameState& state,
+				const std::vector<int>& indices, std::vector<RLGC::Action>& out,
+				std::vector<uint8_t>& outValid,
+				LearnerConfig::ExternalControlStatus& status) -> bool {
+
+				const std::string prefix = "rlbot:";
+				std::string wantConfig;
+				if (spec.rfind(prefix, 0) == 0)
+					wantConfig = botRoot + "/" + spec.substr(prefix.size());
+
+				// What is actually running, so a change of bot, side, or car count
+				// relaunches, and deselecting shuts the bot down rather than leaving it
+				// holding a car nobody is watching.
+				static std::string liveConfig;
+				static Team liveTeam = Team::ORANGE;
+				static size_t liveCars = 0;
+
+				if (wantConfig.empty()) {
+					if (!liveConfig.empty()) {
+						rlbotServer.StopBot();
+						liveConfig.clear();
+					}
+					return false;
+				}
+
+				if (wantConfig != liveConfig || team != liveTeam || indices.size() != liveCars) {
+					if (rlbotServer.Listen(GGL::VizRLBotServer::DEFAULT_PORT)
+						&& rlbotServer.LaunchBot(wantConfig, team, (int)indices.size())) {
+						liveConfig = wantConfig;
+						liveTeam = team;
+						liveCars = indices.size();
+					} else {
+						status.error = rlbotServer.LastError();
+						liveConfig.clear();
+						return false;
+					}
+				}
+
+				rlbotServer.Poll(state, indices);
+				status.running = rlbotServer.BotRunning();
+				status.connected = rlbotServer.Connected();
+				status.name = rlbotServer.BotName();
+				const bool got = rlbotServer.GetControls(out, outValid);
+				status.controlling = got;
+				return got;
+			};
+		}
+#endif
 	}
 	// PSD (Basin-Racing) was REMOVED 2026-07-25. It had been disabled by a pre-registered
 	// verdict since 2026-07-13 and had drifted architecturally incompatible with the live net

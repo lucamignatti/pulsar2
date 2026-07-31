@@ -68,7 +68,11 @@ RLGC::FList RLGC::AdvancedObsPadded::BuildObs(const Player& player, const GameSt
 		std::vector<int> slotOrder(slotCount);
 		for (int i = 0; i < slotCount; i++)
 			slotOrder[i] = i;
-		std::shuffle(slotOrder.begin(), slotOrder.end(), ::Math::GetRandEngine());
+		// Identity order when shuffling is off: the draw is from a clock-seeded engine,
+		// so it would otherwise make the obs — and therefore the chosen action —
+		// unreproducible for a fixed game state. See the header.
+		if (shuffleSlots)
+			std::shuffle(slotOrder.begin(), slotOrder.end(), ::Math::GetRandEngine());
 
 		std::vector<const FList*> slots(slotCount, nullptr);
 		for (int i = 0; i < (int)playerList.size(); i++)

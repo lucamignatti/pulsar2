@@ -3,9 +3,9 @@ use crate::{
     ARENA_COLLISION_SHAPES, ArenaConfig,
     ArenaEvent::{BallHitWorld, CarPickupBoost},
     ArenaMemWeightMode, ArenaState, BallHitWorldEvent, BoostPadConfig, BoostPadGrid, BoostPadState,
-    Car, CarBodyConfig, CarControls, CarInfo, CarPickupBoostEvent, CarState, GameMode,
-    MutatorConfig, PhysState, RaycastHitInfo, RaycastQuery, RaycastResult, Team, TileDamageState,
-    TileStates,
+    Car, CarBodyConfig, CarControls, CarExtraState, CarInfo, CarPickupBoostEvent, CarState,
+    GameMode, MutatorConfig, PhysState, RaycastHitInfo, RaycastQuery, RaycastResult, Team,
+    TileDamageState, TileStates, WheelExtraState,
     bullet::{
         collision::{
             broadphase::{CollisionFilterGroups, GridBroadphase},
@@ -668,6 +668,42 @@ impl Arena {
             &mut self.bullet_world.bodies_mut()[car.rigid_body_idx],
             &state,
         );
+    }
+
+    /// The part of a car's state `get_car_state`/`set_car_state` cannot express:
+    /// raycast-vehicle suspension state and any pending bump impulse.
+    ///
+    /// Capturing this alongside `CarState` is what makes a state restore exact.
+    /// Without it `set_car_state` silently resumes on whatever suspension state the
+    /// car happened to be carrying, and replaying identical inputs diverges — see
+    /// `sim::car::car_extra_state` for the measurement and the rationale.
+    #[must_use]
+    pub fn get_car_extra_state(&self, car_idx: usize) -> CarExtraState {
+        let car = &self.cars[car_idx];
+        let mut out = CarExtraState {
+            vel_impulse_cache: [
+                car.vel_impulse_cache.x,
+                car.vel_impulse_cache.y,
+                car.vel_impulse_cache.z,
+            ],
+            ..Default::default()
+        };
+        for (slot, wheel) in out.wheels.iter_mut().zip(car.bullet_vehicle.wheels.iter()) {
+            *slot = WheelExtraState::capture(wheel);
+        }
+        out
+    }
+
+    pub fn set_car_extra_state(&mut self, car_idx: usize, state: &CarExtraState) {
+        let car = &mut self.cars[car_idx];
+        car.vel_impulse_cache = Vec3A::new(
+            state.vel_impulse_cache[0],
+            state.vel_impulse_cache[1],
+            state.vel_impulse_cache[2],
+        );
+        for (src, wheel) in state.wheels.iter().zip(car.bullet_vehicle.wheels.iter_mut()) {
+            src.apply(wheel);
+        }
     }
 
     pub fn set_car_controls(&mut self, car_idx: usize, controls: CarControls) {

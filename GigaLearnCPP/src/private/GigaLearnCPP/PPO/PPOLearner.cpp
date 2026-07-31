@@ -2,6 +2,7 @@
 
 #include <torch/nn/utils/convert_parameters.h>
 #include <torch/nn/utils/clip_grad.h>
+#include <torch/csrc/autograd/autograd.h>   // torch::autograd::grad — the input-gradient the HJB residual needs
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <RLGymCPP/CommonValues.h>
@@ -17,16 +18,23 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.batchSize % config.miniBatchSize != 0)
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
 
-	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, models);
+	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic,
+		config.criticTrunk, device, models);
 
-	// Secondary goal-only critic: a fully independent net (raw obs in, no shared trunk) so its
-	// gradients can't touch the proven policy/critic path. Lives in `models` so it checkpoints and
-	// steps with everything else; excluded from GetPolicyModels() like the main critic.
+	// Secondary goal-only critic. Lives in `models` so it checkpoints and steps with everything
+	// else; excluded from GetPolicyModels() like the main critic.
+	// Its input is the CRITIC TRUNK's output when one is configured — so unlike every version
+	// before 2026-07-29 its gradient DOES reach the shared perception path. With no critic trunk
+	// it falls back to the original fully-independent form: raw obs in, no shared body, gradients
+	// structurally unable to touch the policy. See PPOLearnerConfig::criticTrunk for the tradeoff.
 	if (config.goalCritic.enabled) {
 		RG_ASSERT(config.goalCritic.model.IsValid());
 		RG_ASSERT(config.goalCritic.beta >= 0); // a negative blend would train AWAY from goals
 		ModelConfig gcConfig = config.goalCritic.model;
-		gcConfig.numInputs = obsSize;
+		// models["critic"]->config.numInputs is whatever the critic head reads: critic-trunk
+		// width, or main-trunk width, or obsSize. Deriving it keeps the two heads in lockstep
+		// instead of re-deriving the same width from two places.
+		gcConfig.numInputs = models["critic_trunk"] ? models["critic"]->config.numInputs : obsSize;
 		gcConfig.numOutputs = 1;
 		models.Add(new Model("goal_critic", gcConfig, device));
 	}
@@ -44,6 +52,24 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			models.Add(new Model("rhat1", vc, device));
 			models.Add(new Model("rhat2", vc, device));
 		}
+	}
+
+	// GEOMETRY (4th rung). Three INDEPENDENT nets on raw obs — no trunk, like the original
+	// goal-critic form — so this rung cannot co-adapt the shared perception path on day one.
+	//   geo_sigma : obs -> 2*obs   conditional (mean, log-std) of the one-step displacement.
+	//               Only the log-std is used by the HJB; the mean exists so that std is the
+	//               spread AROUND the drift (what the action buys) rather than total motion
+	//               (which would include the ball falling whether we act or not).
+	//   geo_rew   : obs -> 1       r_hat on the ARRIVAL state, fit on the reservoir.
+	//   geo_v     : obs -> 1       V_geo, trained to zero the HJB residual.
+	if (config.geoEnabled) {
+		RG_ASSERT(config.geoModel.IsValid());
+		ModelConfig gs = config.geoModel; gs.numInputs = obsSize; gs.numOutputs = obsSize * 2;
+		ModelConfig gr = config.geoModel; gr.numInputs = obsSize; gr.numOutputs = 1;
+		ModelConfig gv = config.geoModel; gv.numInputs = obsSize; gv.numOutputs = 1;
+		models.Add(new Model("geo_sigma", gs, device));
+		models.Add(new Model("geo_rew", gr, device));
+		models.Add(new Model("geo_v", gv, device));
 	}
 
 	if (config.reachability.enabled) {
@@ -66,7 +92,9 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 
 	if (config.useGuidingPolicy) {
 		RG_LOG("Guiding policy enabled, loading from " << config.guidingPolicyPath << "...");
-		MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic, device, guidingPolicyModels);
+		// makeCritic=false, so no critic trunk either (it is value-side only)
+		MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic,
+			/*criticTrunkConfig=*/{}, device, guidingPolicyModels);
 		guidingPolicyModels.Load(config.guidingPolicyPath, false, false);
 	}
 }
@@ -75,6 +103,7 @@ void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
 	int obsSize, int numActions,
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
+	PartialModelConfig criticTrunkConfig,
 	torch::Device device,
 	ModelSet& outModels) {
 
@@ -102,15 +131,29 @@ void GGL::PPOLearner::MakeModels(
 
 	outModels.Add(new Model("policy", fullPolicyConfig, device));
 
-	if (makeCritic)
+	if (makeCritic) {
+		// CRITIC TRUNK: a second shared body between the main trunk and the value heads. Built
+		// only alongside the critics, so inference-only model sets (InferUnit, old policy
+		// versions) never carry it. Every value head's input width becomes its output width;
+		// the goal critic picks that up from models["critic"] in the ctor above.
+		if (criticTrunkConfig.IsValid()) {
+			RG_ASSERT(!criticTrunkConfig.addOutputLayer); // it is a body, not a head
+			ModelConfig fullCriticTrunkConfig = criticTrunkConfig;
+			fullCriticTrunkConfig.numInputs = fullCriticConfig.numInputs;
+			fullCriticTrunkConfig.numOutputs = 0;
+			outModels.Add(new Model("critic_trunk", fullCriticTrunkConfig, device));
+			fullCriticConfig.numInputs = criticTrunkConfig.layerSizes.back();
+		}
+
 		outModels.Add(new Model("critic", fullCriticConfig, device));
+	}
 }
 
 torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
 	float temperature, bool halfPrec,
-	torch::Tensor steerDelta) {
+	torch::Tensor steerDelta, torch::Tensor* outRowOk) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -131,10 +174,19 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 
 	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
 
-	// A non-finite logit row would crash multinomial downstream with an opaque assert
-	// ("probability tensor contains inf/nan") - identify the SOURCE here instead. Cheap:
-	// one fused reduction per inference batch.
-	if (!logits.isfinite().all().item<bool>()) {
+	// A non-finite logit row would crash multinomial downstream with a device-side assert that
+	// poisons the CUDA context - identify the SOURCE here instead. The reduction is cheap; the
+	// .item() is NOT: it is a blocking sync between the forward and the sample, once per
+	// collection step (and on a shared stream it drained queued learn kernels too). So the hot
+	// path (outRowOk set) does not sync: bad rows are sanitized to uniform logits so sampling
+	// stays safe, and the flags are returned for a deferred verdict at a sync the caller pays
+	// anyway. On failure the caller re-invokes with outRowOk = null, which lands in the
+	// synchronous branch below and dies with the full forensic message.
+	auto rowOk = logits.isfinite().all(-1, /*keepdim=*/true);
+	if (outRowOk) {
+		*outRowOk = rowOk;
+		logits = torch::where(rowOk, logits, torch::zeros_like(logits));
+	} else if (!rowOk.all().item<bool>()) {
 		bool trunkOutFinite = obs.isfinite().all().item<bool>(); // post-trunk (+delta)
 		auto rawBadRows = (~rawObs.isfinite().all(-1)).nonzero().flatten();
 		bool policyWFinite = true, trunkWFinite = true;
@@ -170,7 +222,8 @@ void GGL::PPOLearner::InferActionsFromModels(
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
 	torch::Tensor steerDelta) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
+	torch::Tensor rowOk;
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta, &rowOk);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -185,6 +238,16 @@ void GGL::PPOLearner::InferActionsFromModels(
 		if (outLogProbs)
 			*outLogProbs = logProb.flatten();
 	}
+
+	// Deferred non-finite verdict. This drain sits AFTER the sample, immediately before the
+	// caller's D2H of the actions (which then costs ~nothing) - vs the old mid-pipeline sync
+	// that left a GPU bubble between forward and multinomial on every collection step. On
+	// failure, the re-invocation takes the synchronous branch and RG_ERR_CLOSEs with the full
+	// forensic message; sampling above was safe because bad rows were sanitized to uniform.
+	if (!rowOk.all().item<bool>()) {
+		InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
+		RG_ERR_CLOSE("InferActionsFromModels: non-finite logits, but the diagnostic rerun did not reproduce them");
+	}
 }
 
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
@@ -198,19 +261,22 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
 }
 
-torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
-
+torch::Tensor GGL::PPOLearner::ValueTrunk(torch::Tensor obs, bool halfPrec) {
 	if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+		obs = models["shared_head"]->Forward(obs, halfPrec);
+	if (models["critic_trunk"])
+		obs = models["critic_trunk"]->Forward(obs, halfPrec);
+	return obs;
+}
 
-	return models["critic"]->Forward(obs, config.useHalfPrecision).flatten();
+torch::Tensor GGL::PPOLearner::InferCritic(torch::Tensor obs) {
+	return models["critic"]->Forward(
+		ValueTrunk(obs, config.useHalfPrecision), config.useHalfPrecision).flatten();
 }
 
 torch::Tensor GGL::PPOLearner::InferVdagMin(torch::Tensor obs) {
 	RG_NO_GRAD;
-	obs = obs.to(device, true);
-	if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+	obs = ValueTrunk(obs.to(device, true), config.useHalfPrecision);
 	auto a = models["vdag1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	auto b = models["vdag2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	return torch::minimum(a, b);
@@ -218,12 +284,52 @@ torch::Tensor GGL::PPOLearner::InferVdagMin(torch::Tensor obs) {
 
 torch::Tensor GGL::PPOLearner::InferRhatMax(torch::Tensor obs) {
 	RG_NO_GRAD;
-	obs = obs.to(device, true);
-	if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, config.useHalfPrecision);
+	obs = ValueTrunk(obs.to(device, true), config.useHalfPrecision);
 	auto a = models["rhat1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	auto b = models["rhat2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	return torch::maximum(a, b);
+}
+
+torch::Tensor GGL::PPOLearner::InferGeoV(torch::Tensor obs) {
+	RG_NO_GRAD;
+	obs = obs.to(device, true);
+	return models["geo_v"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
+}
+
+void GGL::PPOLearner::GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap) {
+	// Uniform reservoir over the whole run. Vectorised: a per-row loop over a 6144-row buffer
+	// dominated runtime in the offline harness.
+	RG_NO_GRAD;
+	int64_t n = obs.size(0);
+	if (n <= 0 || cap <= 0) return;
+	auto o = obs.to(torch::kCPU, torch::kFloat32);
+	auto no = nextObs.to(torch::kCPU, torch::kFloat32);
+	auto r = rew.to(torch::kCPU, torch::kFloat32).flatten();
+	if (!geoResObs.defined()) {
+		geoResObs = torch::zeros({ (int64_t)cap, o.size(1) }, torch::kFloat32);
+		geoResNext = torch::zeros({ (int64_t)cap, o.size(1) }, torch::kFloat32);
+		geoResRew = torch::zeros({ (int64_t)cap }, torch::kFloat32);
+	}
+	int64_t take = RS_MIN((int64_t)cap - geoResFill, n);
+	if (take > 0) {
+		geoResObs.slice(0, geoResFill, geoResFill + take).copy_(o.slice(0, 0, take));
+		geoResNext.slice(0, geoResFill, geoResFill + take).copy_(no.slice(0, 0, take));
+		geoResRew.slice(0, geoResFill, geoResFill + take).copy_(r.slice(0, 0, take));
+		geoResFill += take;
+	}
+	int64_t rest = n - take;
+	if (rest > 0) {
+		auto idx = torch::randint(0, cap, { rest }, torch::TensorOptions().dtype(torch::kLong));
+		auto keep = torch::rand({ rest }) < ((float)cap / (float)(geoResSeen + n));
+		auto sel = keep.nonzero().flatten();
+		if (sel.numel() > 0) {
+			auto dst = idx.index_select(0, sel);
+			geoResObs.index_copy_(0, dst, o.slice(0, take, n).index_select(0, sel));
+			geoResNext.index_copy_(0, dst, no.slice(0, take, n).index_select(0, sel));
+			geoResRew.index_copy_(0, dst, r.slice(0, take, n).index_select(0, sel));
+		}
+	}
+	geoResSeen += n;
 }
 
 void GGL::PPOLearner::BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor acts, int cap) {
@@ -244,7 +350,10 @@ void GGL::PPOLearner::BankAscent(torch::Tensor obs, torch::Tensor nextObs, torch
 }
 
 torch::Tensor GGL::PPOLearner::InferGoalCritic(torch::Tensor obs) {
-	// Independent net: raw obs in, NO shared trunk (by design — zero gradient interference)
+	// Reads the critic trunk when one exists (its gradient therefore reaches shared perception —
+	// see PPOLearnerConfig::criticTrunk); otherwise the original independent raw-obs path.
+	if (models["critic_trunk"])
+		obs = ValueTrunk(obs, config.useHalfPrecision);
 	return models["goal_critic"]->Forward(obs, config.useHalfPrecision).flatten();
 }
 
@@ -286,6 +395,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		avgReachCarStateLoss,
 		avgReachLoss,
 		avgVdagLoss,
+		avgVdagTwinSpread,
 		avgRhatLoss,
 		avgArchLive;
 
@@ -299,6 +409,57 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	bool trainPolicy = config.policyLR != 0;
 	bool trainCritic = config.criticLR != 0;
 	bool trainSharedHead = models["shared_head"] && (trainPolicy || trainCritic);
+
+	// GEOMETRY world-facing fits, ONCE per Learn call. r_hat and Sigma are STATIONARY targets
+	// fit on the reservoir, so they neither need nor benefit from a pass per PPO minibatch:
+	// the previous form retrained them epochs x minibatches (16x) per iteration, whose
+	// reservoir sampling alone moved ~740 MB over PCIe per iteration for two tiny supervised
+	// regressions. A fixed 4-chunk budget matches the offline validation's per-iteration dose;
+	// Geo/Residual and Geo/Rew Loss are the panels that would show it starving. The HJB
+	// residual stays per-minibatch below - the FIELD must track the policy's states; the world
+	// does not move. The geo nets touch no shared parameters, so stepping them here is
+	// independent of the main backward.
+	if (models["geo_v"] && geoResFill > 1024) {
+		torch::Tensor sigAcc, rewAcc;
+		int64_t chunk = RS_MIN((int64_t)config.miniBatchSize, geoResFill);
+		constexpr int GEO_FIT_CHUNKS = 4;
+		for (int k = 0; k < GEO_FIT_CHUNKS; k++) {
+			auto ridx = torch::randint(0, geoResFill, { chunk },
+				torch::TensorOptions().dtype(torch::kLong));
+			auto ro = geoResObs.index_select(0, ridx).to(device, true);
+			auto rn = geoResNext.index_select(0, ridx).to(device, true);
+			auto rr = geoResRew.index_select(0, ridx).to(device, true).flatten();
+			int64_t od = ro.size(1);
+
+			// Sigma: Gaussian NLL of the displacement. Predicting the mean as well makes the
+			// std the spread AROUND the drift (what the action buys) rather than total motion
+			// (which the world supplies regardless of what we do).
+			auto sOut = models["geo_sigma"]->Forward(ro, false).to(torch::kFloat32);
+			auto sMu = sOut.slice(1, 0, od);
+			auto sLs = sOut.slice(1, od, 2 * od).clamp(-8.f, 2.f);
+			auto dlt = rn - ro;
+			auto sigLoss = (sLs + 0.5f * ((dlt - sMu) / sLs.exp()).pow(2)).mean();
+
+			auto rPred = models["geo_rew"]->Forward(rn, false).flatten().to(torch::kFloat32);
+			auto rewLoss = mseLoss(rPred, rr);
+
+			(sigLoss + rewLoss).backward();
+			nn::utils::clip_grad_norm_(models["geo_sigma"]->parameters(), 1.0f);
+			nn::utils::clip_grad_norm_(models["geo_rew"]->parameters(), 1.0f);
+			models["geo_sigma"]->StepOptim();
+			models["geo_rew"]->StepOptim();
+
+			sigAcc = sigAcc.defined() ? sigAcc + sigLoss.detach() : sigLoss.detach();
+			rewAcc = rewAcc.defined() ? rewAcc + rewLoss.detach() : rewLoss.detach();
+		}
+		// One sync for the panel value, outside the minibatch hot loop.
+		dbgGeoRew = (rewAcc / (float)GEO_FIT_CHUNKS).cpu().item<float>();
+	}
+	// HJB debug accumulators: summed as GPU tensors across minibatches, synced ONCE after the
+	// epoch loop. The previous form did three .item() syncs per minibatch (48 per iteration)
+	// in the middle of the learn pass.
+	torch::Tensor geoResidAcc, geoMeanAcc;
+	int geoMbCount = 0;
 
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
@@ -326,6 +487,19 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			// (possibly larger) batch — otherwise the overshoot rows are silently dropped.
 			const int64_t curBatchSize = batch.states.size(0);
 
+			// ADVANTAGE FILTERING: rows outside the top advFilterFrac (threshold computed
+			// buffer-wide in Learner.cpp) are dropped from the POLICY loss only. The batch-wide
+			// kept count is the denominator every minibatch shares, so the accumulated policy
+			// gradient is the exact mean over the batch's kept rows - filtering changes WHICH
+			// rows teach, not the step size (a per-minibatch mean would instead have scaled the
+			// effective policy LR by the kept fraction, i.e. a silent LR cut disguised as a
+			// selection rule). Mask stays on CPU: the counts below are host-side scalars, so
+			// reading them costs no device sync.
+			torch::Tensor batchAdvFilter = batch.advFilterMask;
+			float batchKeptRows = (float)curBatchSize;
+			if (batchAdvFilter.defined())
+				batchKeptRows = RS_MAX(batchAdvFilter.sum().item<float>(), 1.f);
+
 			auto fnRunMinibatch = [&](int64_t start, int64_t stop) {
 
 				float batchSizeRatio = (stop - start) / (float)curBatchSize;
@@ -338,6 +512,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto advantages = batchAdvantages.slice(0, start, stop).to(device, true, true);
 				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
 				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
+
+				// Advantage filtering (policy only; see the note above the minibatch lambda)
+				torch::Tensor advKeep;
+				float mbKeptRows = (float)(stop - start);
+				if (batchAdvFilter.defined()) {
+					auto keepCpu = batchAdvFilter.slice(0, start, stop);
+					mbKeptRows = keepCpu.sum().item<float>();
+					advKeep = keepCpu.to(device, true, true);
+				}
 
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
@@ -361,16 +544,33 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						ratio, 1 - config.clipRange, 1 + config.clipRange
 					);
 
-					// Compute policy loss
-					policyLoss = -min(
+					// Compute policy loss (mean over the rows the policy is allowed to train on:
+					// all of them, or the advantage-filtered subset)
+					auto ppoPerRow = -min(
 						ratio * advantages, clipped * advantages
-					).mean();
+					);
+					// policyLossRatio is this minibatch's share of the batch-wide mean; with no
+					// filter that is just its row share (the original batchSizeRatio)
+					float policyLossRatio = batchSizeRatio;
+					if (advKeep.defined()) {
+						policyLoss = (ppoPerRow * advKeep.view_as(ppoPerRow)).sum()
+							/ RS_MAX(mbKeptRows, 1.f);
+						policyLossRatio = mbKeptRows / batchKeptRows;
+					} else {
+						policyLoss = ppoPerRow.mean();
+					}
 					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
 					avgPolicyLoss += curPolicyLoss;
 
-					avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+					// A fully-filtered minibatch (no kept rows) gives policyLoss == 0 exactly, and
+					// one inf would poison this tracker for the whole report
+					if (curPolicyLoss != 0)
+						avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
 
-					ppoLoss = (policyLoss - entropy * config.entropyScale) * batchSizeRatio;
+					// Entropy keeps the unfiltered row share: it regularizes the policy over the
+					// whole visited state distribution, not just the rows that scored well.
+					ppoLoss = policyLoss * policyLossRatio
+						- entropy * config.entropyScale * batchSizeRatio;
 
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
@@ -411,9 +611,34 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					return ((pred - target).square() * keep).sum() / keep.sum().clamp_min(1);
 				};
 
+				// ONE forward of the value-side body (main trunk -> critic trunk) serves EVERY
+				// value head below: critic, goal critic, V-dagger twins, r-hat twins. Autograd
+				// accumulates their trunk gradients identically whether they share a graph or
+				// not - but a separate forward per head RETAINS a separate full-minibatch
+				// activation set per head, and that product (heads x depth x width x rows) is
+				// what sets the learn-pass memory peak and therefore the miniBatchSize ceiling.
+				// Before this, InferCritic re-forwarded the main trunk on its own while the
+				// V-dagger family used its own copy, so the trunk was materialized twice per
+				// minibatch for nothing.
+				torch::Tensor trunkVR, valueTrunkVR;
+				auto fnTrunkVR = [&]() -> torch::Tensor& {
+					if (!trunkVR.defined())
+						trunkVR = models["shared_head"]
+							? models["shared_head"]->Forward(obs, false) : obs;
+					return trunkVR;
+				};
+				auto fnValueTrunk = [&]() -> torch::Tensor& {
+					if (!valueTrunkVR.defined()) {
+						torch::Tensor& t = fnTrunkVR();
+						valueTrunkVR = models["critic_trunk"]
+							? models["critic_trunk"]->Forward(t, false) : t;
+					}
+					return valueTrunkVR;
+				};
+
 				torch::Tensor criticLoss;
 				if (trainCritic) {
-					auto vals = InferCritic(obs);
+					auto vals = models["critic"]->Forward(fnValueTrunk(), false).flatten();
 
 					// Compute value loss (ALL rows - see comment above)
 					vals = vals.view_as(targetValues);
@@ -421,12 +646,17 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					avgCriticLoss += criticLoss.detach().cpu().item<float>();
 				}
 
-				// Secondary goal-only critic: plain value regression on its own channel. Fully
-				// independent net, so this gradient touches nothing else.
+				// Secondary goal-only critic: plain value regression on its own channel. It reads
+				// the same value-side body as the main critic (2026-07-29), so unlike every
+				// version before it this gradient DOES reach shared perception - the tradeoff is
+				// argued in PPOLearnerConfig::criticTrunk. With no critic trunk configured,
+				// InferGoalCritic's raw-obs path keeps the old isolation.
 				torch::Tensor goalCriticLoss;
 				if (batchGoalTargetValues.defined() && models["goal_critic"]) {
 					auto goalTargets = batchGoalTargetValues.slice(0, start, stop).to(device, true, true);
-					auto goalVals = InferGoalCritic(obs).view_as(goalTargets);
+					auto goalVals = (models["critic_trunk"]
+						? models["goal_critic"]->Forward(fnValueTrunk(), false).flatten()
+						: InferGoalCritic(obs)).view_as(goalTargets);
 					goalCriticLoss = fnMaskedMSE(goalVals, goalTargets) * batchSizeRatio;
 					avgGoalCriticLoss += goalCriticLoss.detach().cpu().item<float>();
 				}
@@ -439,11 +669,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// makes the theory TRANSFER: among theories equally consistent with the
 				// data, prefer the one using fewer features, so "this kind of state pays"
 				// generalizes to configurations never paid at.
+				// Both families read the SAME memoized value-side body as the critic above
+				// (fnValueTrunk) - see the note there for why one shared forward matters.
 				torch::Tensor rhatLoss;
 				if (batch.rhatTargets.defined() && models["rhat1"] && models["rhat2"]) {
 					auto yr = batch.rhatTargets.slice(0, start, stop).to(device, true, true).flatten();
-					torch::Tensor trunkR = models["shared_head"]
-						? models["shared_head"]->Forward(obs, false) : obs;
+					torch::Tensor& trunkR = fnValueTrunk();
 					for (Model* rh : { models["rhat1"], models["rhat2"] }) {
 						auto pred = rh->Forward(trunkR, false).flatten().to(torch::kFloat32);
 						auto u = yr - pred;
@@ -462,8 +693,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				dbgRhatRows = batch.rhatTargets.defined() ? (float)batch.rhatTargets.numel() : -1.f;
 				if (batch.vdagTargets.defined() && models["vdag1"] && models["vdag2"]) {
 					auto yv = batch.vdagTargets.slice(0, start, stop).to(device, true, true).flatten();
-					torch::Tensor trunkV = models["shared_head"]
-						? models["shared_head"]->Forward(obs, false) : obs;
+					torch::Tensor& trunkV = fnValueTrunk();
 					// PLANT: hypothesis rows from the theory, EVENT-MASKED. r-hat is a
 					// REWARD theory, not a VALUE theory - seeding V-dagger with its small
 					// interior predictions is ballast that flattens the field and kills the
@@ -476,8 +706,21 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						ySeed = torch::maximum(ra, rb).clamp(0.f, rhatMaxObserved);
 						mSeed = (ySeed > config.vdagSeedFrac * rhatMaxObserved).to(torch::kFloat32);
 					}
+					// TWIN SPREAD: mean |V1 - V2| on the same rows. The min-in-target anti-ratchet
+					// only works while the twins are DIFFERENT functions, and as of 2026-07-29
+					// they share a critic_trunk and keep just two private layers each - so their
+					// disagreement is now a thing that can quietly go to zero. Compare against
+					// Headroom/Yv Abs (the target scale): a spread collapsing toward 0 while H
+					// climbs is the 0.3 -> 11.8 inflation shape from COMPOSITION_CRITIC.md 4.4.
+					torch::Tensor twinPredA;
 					for (Model* vh : { models["vdag1"], models["vdag2"] }) {
 						auto pred = vh->Forward(trunkV, false).flatten().to(torch::kFloat32);
+						if (!twinPredA.defined()) {
+							twinPredA = pred.detach();
+						} else {
+							avgVdagTwinSpread += (twinPredA - pred.detach())
+								.abs().mean().item<float>();
+						}
 						auto u = yv - pred;
 						auto w = torch::where(u > 0,
 							torch::full_like(u, config.vdagTau), torch::full_like(u, 1.f - config.vdagTau));
@@ -494,6 +737,46 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					avgVdagLoss += vdagLoss.detach().cpu().item<float>();
 					dbgVdagRaw = vdagLoss.detach().cpu().item<float>();
 					dbgYvAbs = yv.abs().mean().item<float>();
+				}
+
+				// ===================== GEOMETRY: the HJB residual =====================
+				// (1 - gamma) V(s) = r_hat(s) + gamma * || grad_s V(s) ||_Sigma(s)
+				//
+				// The gradient here is w.r.t. the INPUT, not the parameters — that is the whole
+				// cost of this rung: one extra backward through geo_v per minibatch. create_graph
+				// is required so the residual stays differentiable in the parameters.
+				//
+				// r_hat and Sigma are fit on the RESERVOIR (stationary targets, see config); the
+				// residual is solved on the CURRENT states, which is where the field is read.
+				torch::Tensor geoLoss;
+				if (models["geo_v"] && geoResFill > 1024) {
+					// HJB residual ONLY - the world-facing fits (Sigma, r_hat) train once per
+					// Learn call before the epoch loop, and are read here frozen (no_grad).
+					auto gin = obs.detach().clone().set_requires_grad(true);
+					auto vg = models["geo_v"]->Forward(gin, false).flatten().to(torch::kFloat32);
+					auto grads = torch::autograd::grad({ vg.sum() }, { gin }, {}, true, true);
+					auto gx = grads[0];
+					int64_t od = gin.size(1);
+					torch::Tensor sig, rh;
+					{
+						RG_NO_GRAD;
+						auto so = models["geo_sigma"]->Forward(obs, false).to(torch::kFloat32);
+						sig = so.slice(1, od, 2 * od).clamp(-8.f, 2.f).exp() * config.geoSigmaScale;
+						rh = models["geo_rew"]->Forward(obs, false).flatten().to(torch::kFloat32);
+					}
+					// NO advection term: mu is estimated under the POLICY, so including it
+					// re-imports the habit this rung exists to see past (measured: drift-on
+					// loses the beats-habit property at every sigma).
+					auto gnorm = (gx.pow(2) * sig.pow(2)).sum(-1).clamp_min(1e-12f).sqrt();
+					auto resid = (1.f - config.gaeGamma) * vg - rh - config.gaeGamma * gnorm;
+					auto hjb = resid.pow(2).mean() * batchSizeRatio;
+
+					geoLoss = hjb;
+					// No syncs here: accumulate, item once after the epoch loop.
+					geoResidAcc = geoResidAcc.defined() ? geoResidAcc + hjb.detach() : hjb.detach();
+					auto vgm = vg.detach().mean();
+					geoMeanAcc = geoMeanAcc.defined() ? geoMeanAcc + vgm : vgm;
+					geoMbCount++;
 				}
 
 				// Reachability aux losses (InfoNCE on a subsample; gradient flows into the shared head)
@@ -607,6 +890,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					totalLoss = totalLoss.defined() ? totalLoss + vdagLoss : vdagLoss;
 				if (rhatLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + rhatLoss : rhatLoss;
+				if (geoLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + geoLoss : geoLoss;
 
 				// ARCHIVE replay: convert the field into POLICY. PBRS with a good field is
 				// neutral BY THEOREM, so ascent must be imitated directly. Weights are
@@ -666,6 +951,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			if (trainSharedHead)
 				nn::utils::clip_grad_norm_(models["shared_head"]->parameters(), 0.5f);
 
+			// Same 0.5 as every other block. It carries the SUM of four value heads' gradients,
+			// so it is the last place an unclipped block would be acceptable.
+			if (models["critic_trunk"])
+				nn::utils::clip_grad_norm_(models["critic_trunk"]->parameters(), 0.5f);
+
 			if (models["goal_critic"])
 				nn::utils::clip_grad_norm_(models["goal_critic"]->parameters(), 0.5f);
 
@@ -677,6 +967,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (models[n])
 					nn::utils::clip_grad_norm_(models[n]->parameters(), 0.5f);
 
+			for (const char* n : { "geo_sigma", "geo_rew", "geo_v" })
+				if (models[n])
+					nn::utils::clip_grad_norm_(models[n]->parameters(), 1.0f);
+
 			if (reach) {
 				nn::utils::clip_grad_norm_(reach->phi->parameters(), 0.5f);
 				nn::utils::clip_grad_norm_(reach->psiCar->parameters(), 0.5f);
@@ -687,6 +981,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 			models.StepOptims();
 		}
+	}
+
+	// GEOMETRY debug panel values: one sync for the whole learn pass (see accumulators above).
+	if (geoMbCount > 0) {
+		dbgGeoResid = (geoResidAcc / (float)geoMbCount).cpu().item<float>();
+		dbgGeoMean = (geoMeanAcc / (float)geoMbCount).cpu().item<float>();
 	}
 
 	// Compute magnitude of updates made to the policy and value estimator
@@ -720,6 +1020,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// Must be > 0. It was exactly 0 for the whole run until the LR was wired (2026-07-25);
 		// if it reads 0 again, HEADROOM is inert and its 0.15-sigma injection is noise.
 		report["Headroom/Vdag Update Magnitude"] = vdagUpdateMagnitude;
+		// Must stay clearly above 0 - read it against Headroom/Yv Abs (the target scale).
+		// 0 means the twins have converged to a single function and min(V1,V2) has stopped
+		// being a pessimism operator, which is how the seek term inflates with nothing
+		// behind it. Added 2026-07-29 with the critic trunk, which is what made twin
+		// collapse plausible: they now share their first three layers.
+		if (avgVdagTwinSpread.count > 0)
+			report["Headroom/Vdag Twin Spread"] = avgVdagTwinSpread.Get();
 		// Row counts: -1 means the targets never reached the batch (broken plumbing),
 		// which is indistinguishable from "loss is small" on the loss panel alone.
 		report["Headroom/Vdag Rows"] = dbgVdagRows;
@@ -736,6 +1043,18 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (archFill > 0) {
 			report["Headroom/Archive Fill"] = (float)archFill;
 			report["Headroom/Archive Live Frac"] = avgArchLive.Get();
+		}
+		if (models["geo_v"]) {
+			// Geo/Residual is the HEALTH GATE for this rung. Offline it sat at ~1e-4 while the
+			// mechanism worked and grew 100-250x once r_hat drifted under it — which is exactly
+			// when every actuation variant stopped helping. A rising trend means the field is no
+			// longer V_geo and the injection has become a persistent orthogonal push. Reservoir
+			// Fill should saturate at geoReservoir; if it does not, the stationary fits are
+			// effectively still on a sliding window and the residual will run away.
+			report["Geo/Residual"] = dbgGeoResid;
+			report["Geo/Rew Loss"] = dbgGeoRew;
+			report["Geo/V Mean"] = dbgGeoMean;
+			report["Geo/Reservoir Fill"] = (float)geoResFill;
 		}
 	}
 	}
@@ -801,6 +1120,14 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	if (models["shared_head"])
 		models["shared_head"]->SetOptimLR(RS_MIN(policyLR, criticLR));
 
+	// The critic trunk is value-side only (nothing but value heads read it), so it takes the
+	// critic's LR rather than the shared trunk's min(policy, critic). Same trap as the V-dagger
+	// twins below: omit it here and Model's ctor leaves its optimizer at lr = 0, which under Muon
+	// is an exact no-op - the entire shared value body would sit frozen at random init while
+	// every head trained on its output.
+	if (models["critic_trunk"])
+		models["critic_trunk"]->SetOptimLR(criticLR);
+
 	if (models["goal_critic"])
 		models["goal_critic"]->SetOptimLR(config.goalCritic.lr);
 
@@ -816,6 +1143,13 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 		if (models[n])
 			models[n]->SetOptimLR(criticLR);
 
+	// GEOMETRY nets. Same lr=0 trap as every head above (Model's ctor builds optimizers at
+	// zero, which is an exact no-op under Muon) — the fault that left V-dagger frozen at random
+	// init for 3.4B steps while its loss still reshaped the trunk. Named explicitly.
+	for (const char* n : { "geo_sigma", "geo_rew", "geo_v" })
+		if (models[n])
+			models[n]->SetOptimLR(config.geoLR);
+
 	// THEORY r-hat twins: same trap (ctor builds optimizers at lr=0 = exact no-op under
 	// Muon). They regress a REWARD, not a return, so they take criticLR as well.
 	for (const char* n : { "rhat1", "rhat2" })
@@ -829,7 +1163,10 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 	ModelSet result = {};
 	for (Model* model : models) {
 		std::string name = model->modelName;
-		if (name == "critic" || name == "goal_critic")
+		// "critic_trunk" is the value-side shared body - value-only, like the heads that read it.
+		// Eval/act paths never touch it (InferPolicyProbsFromModels reads shared_head + policy),
+		// and at 4.76M params it would otherwise be cloned into all 32 archived versions.
+		if (name == "critic" || name == "goal_critic" || name == "critic_trunk")
 			continue;
 
 		// HEADROOM V-dagger twins mirror the CRITIC head's config, so they are value heads and

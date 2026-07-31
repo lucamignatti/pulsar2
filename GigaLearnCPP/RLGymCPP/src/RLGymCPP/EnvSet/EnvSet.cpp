@@ -162,10 +162,17 @@ void RLGC::EnvSet::StepSecondHalf(const IList& actionIndices, bool async) {
 		// Parse and set actions
 		auto actions = std::vector<Action>(gs.players.size());
 		auto carItr = arena->_cars.begin();
+		const bool anyOverrides = !controlOverrideMask.empty();
 		for (int i = 0; i < gs.players.size(); i++, carItr++) {
 			auto& player = gs.players[i];
 			Car* car = *carItr;
-			Action action = actionParsers[arenaIdx]->ParseAction(actionIndices[playerStartIdx + i], player, gs);
+			int globalIdx = playerStartIdx + i;
+			// Raw override wins over the action table (viewer-only; see the declaration).
+			// The chosen Action still lands in `actions`, so the obs's prevAction keeps
+			// describing what the car was actually told to do.
+			Action action = (anyOverrides && controlOverrideMask[globalIdx])
+				? controlOverrides[globalIdx]
+				: actionParsers[arenaIdx]->ParseAction(actionIndices[globalIdx], player, gs);
 			car->controls = (CarControls)action;
 			actions[i] = action;
 		}
@@ -300,6 +307,26 @@ void RLGC::EnvSet::ResetArena(int index) {
 	for (Car* car : arenas[index]->_cars)
 		car->controls = {};
 
+	RefreshArenaState(index);
+}
+
+// The tail of ResetArena, minus the state setter and the control clear: re-derive
+// everything downstream of the arena (gamestate, obs, masks, per-episode trackers)
+// without stepping and without choosing a new situation.
+//
+// Split out for the viz control panel, which teleports the ball/cars or restores a
+// history snapshot directly into the arena and must then make the rest of the env
+// agree — otherwise the next action is chosen from pre-edit obs. Building a fresh
+// GameState (rather than UpdateFromArena against the previous one) is deliberate:
+// a teleport is a discontinuity, and diffing across it would synthesize phantom
+// touch/bump events and leave pre-teleport timers running.
+void RLGC::EnvSet::RefreshArenaState(int index) {
+	// NOTE: deliberately does NOT clear state.terminals[index], even though a restored
+	// or edited arena is not at an episode boundary. ResetArena() calls this from the
+	// thread pool while Reset() concurrently std::fills that same vector, so writing it
+	// here would put a (benign-valued, but real) race on the TRAINING path for the sake
+	// of the viewer. The viewer clears the flag itself at its own call site, where it is
+	// single-threaded.
 	GameState newState = GameState(arenas[index]);
 	newState.userInfo = userInfos[index]; // must be set before the copy below or the live state loses it
 	state.gameStates[index] = newState;

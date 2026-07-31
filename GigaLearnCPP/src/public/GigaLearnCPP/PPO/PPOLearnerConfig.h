@@ -151,6 +151,28 @@ namespace GGL {
 		PartialModelConfig model;   // independent net, raw obs -> 1; set layerSizes in your main
 	};
 
+	// How advantage filtering picks the rows the policy trains on. See advFilterFrac below.
+	enum class AdvFilterMode {
+		// Top `advFilterFrac` by SIGNED advantage — the V-MPO shape, whose improvement
+		// guarantee comes from a positive-only nonparametric reweighting. At frac 0.5 the
+		// threshold is the buffer median, so the retained set is essentially "every positive
+		// row" and the whole negative tail is discarded from the policy gradient.
+		TOP_SIGNED,
+		// Top `advFilterFrac` by |advantage|, i.e. drop the MIDDLE of the distribution and
+		// keep both tails. Rationale: the PPO per-row gradient is |A| * grad(log pi), so
+		// information content scales with MAGNITUDE and the sign only picks a direction.
+		// A median cut spends the whole budget on the least informative half of the positives
+		// (rows near A ~ +0 the critic already predicted) while discarding the largest-|A|
+		// material in the buffer. Magnitude selection keeps the surprises in both directions
+		// for the same kept count, and drops `AdvFilter/Kept Positive Frac` off 1.0, which is
+		// the buffer-wide clipping-ratchet read (CLAUDE.md / STEERED_PRACTICE.md).
+		// Quantile is taken on |A| rather than as explicit symmetric tails (top frac/2 +
+		// bottom frac/2) because advantages here are heavily right-skewed — rare goals,
+		// TouchAccel spikes — so whichever tail is genuinely fatter should claim more of the
+		// budget instead of being forced into a balance the data does not have.
+		MAGNITUDE,
+	};
+
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/ppo_learner.py
 	struct PPOLearnerConfig {
 
@@ -158,8 +180,8 @@ namespace GGL {
 		int64_t batchSize = 50'000;
 		int64_t miniBatchSize = 0; // Set to 0 to just use batchSize
 
-		// On the last batch of the iteration, 
-		//	if the amount of remaining experience exceeds the batch size, 
+		// On the last batch of the iteration,
+		//	if the amount of remaining experience exceeds the batch size,
 		//	all remaining experience is used as a larger batch.
 		// This prevents experience loss due to batch size rounding.
 		// This will only happen if the amount of remaining experience is < batchSize*2.
@@ -178,6 +200,29 @@ namespace GGL {
 
 		PartialModelConfig policy, critic, sharedHead;
 
+		// CRITIC TRUNK (2026-07-29, user-directed): a SECOND shared body stacked on top of
+		// `sharedHead`, feeding every value head - critic, goal critic, and the V-dagger twins.
+		// Empty layerSizes = disabled, in which case every head reads the main trunk directly and
+		// the goal critic keeps its historical independent raw-obs form (the pre-2026-07-29 shape).
+		//
+		// WHY: the value heads were four independent 5x1280 stacks (~31.0M params, 82% of the net)
+		// because vdag1/vdag2 mirror the critic's config and the goal critic had its own. Factoring
+		// the first three layers out of all four is what makes them affordable: the shared features
+		// are computed and STORED once per row instead of four times, and the learn-pass activation
+		// peak - not the parameter count - is what sets the miniBatchSize ceiling.
+		// KEEP THE HEADS AT >= 2 LAYERS. vdag1/vdag2 exist to be DIFFERENT functions: the target
+		// takes min(V1,V2) as the anti-ratchet against asymmetric TD self-amplifying through its
+		// own bootstrap (COMPOSITION_CRITIC.md section 4.4 measured H inflating 0.3 -> 11.8 with no
+		// conversion behind it). Collapse them onto a shared body with one private layer each and
+		// they become near-identical, which silently disarms that guard.
+		// COST: the goal critic's gradient now reaches the main trunk (and therefore the policy).
+		// That was previously impossible BY CONSTRUCTION - it was an independent net on raw obs
+		// specifically so its sparse 77s-horizon +-1 channel could not reshape the proven
+		// perception path. Accepted deliberately for the param/activation win; if the policy
+		// regresses on a fresh lineage, this is the first thing to suspect. Reverting it alone =
+		// give the goal critic back its own layerSizes on raw obs (see PPOLearner's ctor).
+		PartialModelConfig criticTrunk;
+
 
 		int epochs = 2;
 		float policyLR = 3e-4f; // Policy learning rate
@@ -186,12 +231,32 @@ namespace GGL {
 		float entropyScale = 0.018f; // The scale of the normalized entropy loss
 		// Whether to ignore invalid actions in the entropy calculation.
 		// True means that entropy will be determined only from available actions.
-		// False means that entropy for unavailable actions will be zero, 
+		// False means that entropy for unavailable actions will be zero,
 		//	meaning the entropy of the state is limited to the fraction of available actions in that state.
-		bool maskEntropy = false; 
+		bool maskEntropy = false;
 
 		float clipRange = 0.2f;
-		
+
+		// ADVANTAGE FILTERING (V-MPO-style top-fraction policy update, 2026-07-29 user-directed).
+		// The POLICY trains only on the rows whose post-injection advantage is in the top
+		// `advFilterFrac` of the iteration; the threshold is a buffer-wide quantile computed AFTER
+		// GAE and after every injector (Learner.cpp), so it selects on the same number the policy
+		// loss actually consumes. 1.0 = disabled (train on all rows).
+		// The CRITIC, goal critic, V-dagger twins and reachability heads keep ALL rows by design:
+		// value heads must learn the honest return structure of everything that happened (the
+		// 2026-07-12 phantom -V(s_end) freefall is what excluding rows from a value head costs).
+		// Gradient scale is preserved — the retained rows are renormalized by the kept count, so
+		// this is a selection, NOT a silent policy-LR cut.
+		// KNOWN RISK, watch it: under TOP_SIGNED at 0.5 nearly every retained row has positive
+		// advantage, which is the CLIPPING RATCHET asymmetry (CLAUDE.md / STEERED_PRACTICE.md)
+		// applied buffer-wide — successes reinforce and punished failures are discarded, which
+		// once compounded lucky overcommits into an Elo bleed while the viewer looked better.
+		// MAGNITUDE mode exists to defuse exactly that; see the enum above. Watch Policy Entropy
+		// (a collapse means overcommitment), SB3 Clip Fraction, and the Nexto/* goal slope (the
+		// only inflation-proof yardstick). Revert = set this back to 1.
+		float advFilterFrac = 1.0f;
+		AdvFilterMode advFilterMode = AdvFilterMode::TOP_SIGNED;
+
 		// Temperature of the policy's softmax distribution
 		float policyTemperature = 1;
 
@@ -233,7 +298,14 @@ namespace GGL {
 		// never been collected. PLANT: event-masked seeding rows (only where the theory
 		// predicts a significant event; interior seeds measured as relay-killing
 		// ballast). Set false to ablate back to composition-only.
-		bool vdagTheoryEnabled = true;
+		// DISABLED 2026-07-28 (user-directed), code intentionally LEFT IN PLACE. rhat1/rhat2
+		// mirror the CRITIC's config (PPOLearner ctor), so enabling them took the 5x1280
+		// critic-family head count 3 -> 5. That count times the per-row saved activations is
+		// what sets the learn-pass peak: measured 11.91GB of PyTorch tensors and a hard OOM on
+		// a 20000x1280 head forward, on a card with ~13.2GB free after desktop graphics. Flip
+		// back on only together with a miniBatchSize cut (or narrower rhat heads - a reward
+		// model with group-L1 Occam has no obvious need for critic width).
+		bool vdagTheoryEnabled = false;
 		float vdagTheoryTau = 0.9f;
 		float vdagTheoryL1 = 0.02f;    // Occam weight on r-hat input-feature columns
 		float vdagSeedWeight = 0.25f;  // weight of hypothesis rows in the V-dagger loss
@@ -244,7 +316,83 @@ namespace GGL {
 		// the non-invariant actuation channel: PBRS with a good field is neutral BY
 		// THEOREM, so the field must be converted to policy directly. Measured: the
 		// buffer-free (weights-only) alternative plateaus at ~1/4 of this.
-		bool vdagArchiveEnabled = true;
+		// DISABLED 2026-07-28 (user-directed) alongside the theory path, code LEFT IN PLACE.
+		// Its own footprint is small (512 replay rows), but it is the same untested batch of
+		// changes; re-enable it on its own once the composition-only baseline is running.
+		// ===================== GEOMETRY — the 4th rung (2026-07-30) =====================
+		// Validated offline in ~/Projects/experiments/possibility (see
+		// research/reports/GEOMETRIC_CRITIC.md). The ladder reads:
+		//   V_real    what we normally get     expectation over executed transitions
+		//   V_exp     what we get when it goes well   upper expectile of the same returns
+		//   V_dag     what we can get          upper envelope over EXECUTED transitions
+		//   V_geo     what may be POSSIBLE     value implied by the environment's GEOMETRY
+		//
+		// V_geo is the fixed point of a discrete Hamilton-Jacobi-Bellman equation. Bellman over
+		// the feasible one-step displacement set, max linearised (one step at 15Hz is small),
+		// displacement set modelled as an ellipsoid with per-coordinate scale Sigma(s):
+		//
+		//     (1 - gamma) V(s)  =  r_hat(s)  +  gamma * || grad_s V(s) ||_Sigma(s)
+		//
+		// One MLP trained to zero that residual. NOT a world model: Sigma is a conditional
+		// VARIANCE statistic, it never predicts where you go, only how far you could. No
+		// rollouts, no search, no action-set expansion — one extra input-gradient per minibatch.
+		//
+		// Why it is not bounded by max-proven like every rung below it: the residual is a LOCAL
+		// CONSISTENCY CONDITION, evaluable wherever r_hat and Sigma are defined, including states
+		// nothing has ever visited. Value flows through the PDE, not through the buffer.
+		//
+		// Measured (200 oracle-scored probes, 2 seeds): rho(V*) 0.698 against V_real 0.665 and
+		// V_dag 0.577, and it is the ONLY rung whose value tracks what the ENVIRONMENT allows
+		// (rho 0.698) more than what the POLICY does (rho 0.679). Controls: sigma_scale=0
+		// collapses it to 0.360 (the geometry term is load-bearing), r_hat alone scores 0.228,
+		// mobility alone -0.114, and rho(V_geo, mobility) is NEGATIVE — not a mobility proxy.
+		//
+		// DEPLOY SHAPE: this is a COLD-START ACCELERANT, not a lift. Its advantage is 4.7x air
+		// over V_dag at 0-3M and decays to parity by ~9M, because V_geo estimates V* — most
+		// informative when the policy is worst. Actuation therefore CROSSFADES to the
+		// composition critic. Enabling it on a mature run is a no-op at best: the crossfade
+		// weight is already 1. FRESH RUNS ONLY.
+		bool geoEnabled = false;      // OFF by default: fresh-run mechanism, see above
+		float geoLR = 1e-3f;
+		// Shrinks the feasible-displacement ellipsoid. rho(V*) is flat at 0.697-0.698 across
+		// {0.5, 1, 2}, but 0.5 is the only setting that also keeps rho(V*) > rho(V_pi).
+		float geoSigmaScale = 0.5f;
+		// The advection term grad V . mu is DELIBERATELY ABSENT. mu = E[ds|s] is estimated
+		// under the POLICY, so including it re-imports the habit the rung exists to see past:
+		// measured, drift-on loses the beats-habit property at every sigma (0.634 vs 0.698).
+		//
+		// RESERVOIR. r(s) and the displacement spread are properties of the ENVIRONMENT and are
+		// STATIONARY; only where we sample them moves. Fitting them on the sliding on-policy
+		// buffer makes them forget regions the policy has left — measured as the HJB residual
+		// growing 100-250x over training, flat to ~6M then runaway, exactly tracking where every
+		// actuation variant stopped helping. A uniform reservoir over all data holds it flat
+		// (~13x lower at the runaway point) and is the correct fit for a stationary target.
+		int geoReservoir = 200000;
+		// Dose. THE most expensive error in the offline study: nominal beta equal for two
+		// potentials still gave V_geo ~4x V_dag's ACTUAL injection (inj_std/adv_std 1.22 vs
+		// 0.31), and eight comparisons were run over-dosed before it was measured. Watch
+		// Geo/Inj Std Ratio and set this by the RATIO, not by the nominal number.
+		float geoSeekBeta = 0.04f;
+		// Mix: Phi = (1-w) norm(H_geo) + w norm(Phi_dag). Each potential is used in the FORM
+		// its own validation supports — H_geo = relu(V_geo - V_real) (the gap; the raw level
+		// measured neutral), Phi_dag = V_dag itself (the level; the gap measured to penalise
+		// finishing, see the seek block in Learner.cpp). Both are functions of state alone, so
+		// PBRS validity is exact throughout, and each is normalised to unit scale so w is a
+		// genuine mix rather than a hidden dose ramp.
+		//
+		// w is CONSTANT: V_geo is a PERMANENT 4th rung, on the same footing as the other three.
+		// In the paired test (same device, same seeds, only the mixing rule differing) w=0.5
+		// beat a 2M->6M crossfade that retired V_geo in 6 of 8 step-bucket cells (touch 3/4,
+		// air 3/4) and collapsed nowhere; the crossfade won only 0-3M air, mechanically,
+		// because early it is PURE geo while the constant mix dilutes geo with a still-empty
+		// V_dag rung. The one earlier failure of the permanent shape (testbed U_both) ran 4x
+		// over-dosed at beta 0.15 before the dose confound was found, and is retired as
+		// evidence about the shape. No schedule: a rung that expires was the assumption the
+		// measurement refuted, so there is nothing here to fall back to.
+		float geoMixW = 0.5f;
+		PartialModelConfig geoModel;   // shared shape for the sigma / r-hat / value nets
+
+		bool vdagArchiveEnabled = false;
 		int vdagArchiveCap = 8192;
 		float vdagArchiveWeight = 0.5f;
 		float vdagArchiveBankThresh = 2.0f;  // bank rows with normalized ascent above this
@@ -258,6 +406,10 @@ namespace GGL {
 			sharedHead = {};
 			sharedHead.layerSizes = { 256 };
 			sharedHead.addOutputLayer = false;
+			// layerSizes stays EMPTY: the critic trunk is opt-in (IsValid() == false disables it),
+			// so existing configs keep the four-independent-heads shape they were tuned on.
+			criticTrunk = {};
+			criticTrunk.addOutputLayer = false;
 		}
 	};
 }

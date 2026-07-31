@@ -12,6 +12,8 @@
 
 #ifdef RG_CUDA_SUPPORT
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
@@ -184,6 +186,28 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		at::set_num_threads(2);
 	}
 
+	if (config.renderMode) {
+		// Single-threaded inference, so the viewer's rewind replays the same play.
+		//
+		// A multi-threaded CPU matmul sums partial products in thread-completion order,
+		// so the same obs gives answers differing in the last bits run to run — enough
+		// to flip the policy's argmax near a decision boundary. Irrelevant while
+		// training, fatal for replay.
+		//
+		// This was ONE OF TWO causes, and on its own it is not sufficient: the other is
+		// the obs builder shuffling player slots from a clock-seeded engine (see
+		// AdvancedObsPadded's shuffleSlots). Both had to go before four replays from one
+		// restored state came out bit-identical; removing either brought divergence back.
+		// Nor is this line sufficient by itself for the threading half — the BLAS/OpenMP
+		// layers under ATen have their own pools, pinned via OMP_NUM_THREADS and friends
+		// in the viz unit that tools/trainerctl generates.
+		//
+		// Costs nothing: the viewer steps ONE arena at 15 Hz. Note the cap above is
+		// deliberately skipped on CPU — exactly the device the viewer runs on — so
+		// without this it inherits libtorch's default of one thread per core.
+		at::set_num_threads(1);
+	}
+
 	if (RocketSim::GetStage() != RocketSimStage::INITIALIZED) {
 		RG_LOG("\tInitializing RocketSim...");
 		RocketSim::Init("collision_meshes", true);
@@ -241,8 +265,14 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	if (config.renderMode) {
 		renderSender = new RenderSender(config.renderTimeScale);
+		// The viewer's control panel: transport, rewind history, live state editing.
+		// Render-only by construction — the trainer never opens a port and never pays
+		// for a snapshot.
+		vizControl = new VizControl(config.vizControlPort, config.vizHistoryFrames);
+		RefreshVizOpponentList();
 	} else {
 		renderSender = NULL;
+		vizControl = NULL;
 	}
 
 	// External fixed opponent (Nexto): fail LOUD at boot if the model is missing -
@@ -634,6 +664,60 @@ void GGL::Learner::Load() {
 
 	if (!loaded)
 		RG_LOG(" > No (loadable) checkpoints found, starting new model.")
+}
+
+// Checkpoint dirs the viewer's panel can serve as an opponent: the golden archive
+// first (those are the ones anyone actually wants to play against — the top-rated
+// checkpoints, held outside rotation), then reference versions, then the plain
+// numbered checkpoints newest-first. Names only; the panel sends one back verbatim.
+void GGL::Learner::RefreshVizOpponentList() {
+	if (!vizControl || config.checkpointFolder.empty())
+		return;
+
+	std::vector<std::string> golden, refs, numbered;
+	try {
+		for (const auto& entry : std::filesystem::directory_iterator(config.checkpointFolder)) {
+			if (!entry.is_directory())
+				continue;
+			std::string name = entry.path().filename().string();
+			if (name.rfind("best_r", 0) == 0)
+				golden.push_back(name);
+			else if (!name.empty() && std::all_of(name.begin(), name.end(), ::isdigit))
+				numbered.push_back(name);
+		}
+		std::filesystem::path versionDir = config.checkpointFolder / "policy_versions";
+		if (std::filesystem::exists(versionDir)) {
+			for (const auto& entry : std::filesystem::directory_iterator(versionDir)) {
+				if (entry.is_directory() && entry.path().filename().string().rfind("ref_", 0) == 0)
+					refs.push_back("policy_versions/" + entry.path().filename().string());
+			}
+		}
+	} catch (const std::exception&) {
+		return; // checkpoint rotation raced us; the previous list stays good enough
+	}
+
+	// Newest first within each group. Golden names sort by rating then timestep, which
+	// is close enough to "best first" to be the useful order.
+	std::sort(golden.rbegin(), golden.rend());
+	std::sort(refs.rbegin(), refs.rend());
+	std::sort(numbered.begin(), numbered.end(), [](const std::string& a, const std::string& b) {
+		return a.size() != b.size() ? a.size() > b.size() : a > b;
+	});
+	// The numbered checkpoints rotate constantly and are mostly interchangeable; a
+	// handful is enough to pick a recent one to play against.
+	if (numbered.size() > 8)
+		numbered.resize(8);
+
+	std::vector<std::string> all;
+	all.insert(all.end(), golden.begin(), golden.end());
+	all.insert(all.end(), refs.begin(), refs.end());
+	all.insert(all.end(), numbered.begin(), numbered.end());
+	vizControl->availableOpponents = std::move(all);
+
+	// RLBot configs are discovered by the executable (it owns the RLBot integration and
+	// knows where the harness lives); this only publishes what it found.
+	if (config.vizBotFinder && vizControl->availableBots.empty())
+		vizControl->availableBots = config.vizBotFinder();
 }
 
 bool GGL::Learner::ReloadNewestCheckpointForRender(int64_t& loadedTimesteps) {
@@ -1311,6 +1395,23 @@ void GGL::Learner::Start() {
 		// compiler enforces this — loop locals aren't in scope here), because in pipelined mode it
 		// executes concurrently with the NEXT iteration's locals.
 		auto fnCollectIteration = [&]() {
+			// Collection runs concurrently with the learn phase (collectThread below), and
+			// libtorch queues both threads' GPU work on the DEFAULT stream unless told
+			// otherwise - so every ~2k-row inference forward here queued BEHIND the learn
+			// pass's 25k-row minibatch kernels, and every sync in this loop drained them.
+			// Measured: ~30 ms per inference call for ~1 ms of actual forward, Inference Time
+			// 1.4-3.2 s of a 2-4.6 s collection window, and the 82k<->176k SPS oscillation
+			// (fast when collection landed between learn phases, slow on collision). A
+			// dedicated HIGH-PRIORITY stream lets the small inference kernels interleave ahead
+			// of the learn kernels instead of queuing behind them. Safe: everything this
+			// thread hands to the learn phase leaves as CPU tensors within the loop (actions,
+			// log-probs, obs are CPU-built), and the learner joins this thread before
+			// consuming, so no GPU tensor crosses streams. Weight staleness during overlap is
+			// the standing async-PPO one-update lag and is unchanged by the stream split.
+			std::optional<c10::cuda::CUDAStreamGuard> collectStreamGuard;
+			if (ppo->device.is_cuda())
+				collectStreamGuard.emplace(c10::cuda::getStreamFromPool(
+					/*isHighPriority=*/true, ppo->device.index()));
 			// This iteration's opponent for the non-self team: Nexto, an archived past self, or
 			// (default) the current self. `oppModels` is the opponent's network (null = mirror
 			// self-play); the player masking, trajectory exclusion, and split inference below are
@@ -1349,16 +1450,18 @@ void GGL::Learner::Start() {
 				}
 			}
 
-			const bool oppServed = oppModels || oppExternal;
-			if (oppServed) {
-				oppTeam = Team(RocketSim::Math::RandInt(0, 2));
-
+			// Split every player row into "ours" and "the opponent's" for the given team.
+			// Factored out of the setup below because the VIEWER can change opponent (and
+			// side) mid-run: a training iteration picks once and lives with it, but the
+			// control panel expects the swap to take effect on the next step.
+			auto fnBuildOppSplit = [&](Team team) {
 				newPlayerIndices.clear();
-				oldVersionPlayerMask.resize(numPlayers);
+				oldPlayerIndices.clear();
+				oldVersionPlayerMask.assign(numPlayers, false);
 				int i = 0;
 				for (auto& state : envSet->state.gameStates) {
 					for (auto& player : state.players) {
-						if (player.team == oppTeam) {
+						if (player.team == team) {
 							oldVersionPlayerMask[i] = true;
 							oldPlayerIndices.push_back(i);
 						} else {
@@ -1368,10 +1471,69 @@ void GGL::Learner::Start() {
 						i++;
 					}
 				}
-
 				tNewPlayerIndices = torch::tensor(newPlayerIndices);
 				tOldPlayerIndices = torch::tensor(oldPlayerIndices);
+			};
+
+			bool oppServed = oppModels || oppExternal;
+			if (oppServed) {
+				oppTeam = Team(RocketSim::Math::RandInt(0, 2));
+				fnBuildOppSplit(oppTeam);
 			}
+
+			// The viewer's opponent models, loaded on demand from the panel's choice and
+			// owned here: this outlives every step because render mode never leaves this
+			// call. Deliberately NOT the version manager's ring — that loads all 32
+			// versions, which is far more than a viewer needs resident.
+			// Per-team policy for the viewer. The split below is fixed as BLUE = "new"
+			// group and ORANGE = "old" group, and each side gets its own models, so the
+			// two teams are configured independently — including checkpoint-vs-checkpoint
+			// and checkpoint-vs-bot, which a single "opponent + side" field cannot express.
+			ModelSet renderBlueModels, renderOrangeModels;
+			auto fnFreeRenderOpp = [&]() {
+				if (!renderBlueModels.map.empty()) renderBlueModels.Free();
+				if (!renderOrangeModels.map.empty()) renderOrangeModels.Free();
+			};
+
+			// Loads a team's spec. Empty spec or an RLBot spec leaves the set empty: the
+			// former means the live policy, the latter means an external agent supplies
+			// controls (with the live policy inferring underneath as the fallback).
+			auto fnLoadAgent = [&](const std::string& spec, ModelSet& into) -> bool {
+				if (spec.empty() || VizControl::IsRLBot(spec))
+					return true;
+				try {
+					// Policy nets only — a viewer never runs the critic or the aux heads,
+					// and skipping them keeps this cheap enough to do mid-match.
+					into = ppo->GetPolicyModels().CloneAll();
+					into.Load(config.checkpointFolder / spec, /*allowNotExist=*/false, /*loadOptims=*/false);
+					return true;
+				} catch (std::exception& e) {
+					if (!into.map.empty()) into.Free();
+					vizControl->opponentError = e.what();
+					RG_LOG("[viz] agent load failed (" << e.what() << ")");
+					return false;
+				}
+			};
+
+			auto fnApplyRenderOpponent = [&]() {
+				vizControl->opponentDirty = false;
+				vizControl->opponentError.clear();
+				fnFreeRenderOpp();
+
+				if (!fnLoadAgent(vizControl->blueAgent, renderBlueModels))
+					vizControl->blueAgent.clear();
+				if (!fnLoadAgent(vizControl->orangeAgent, renderOrangeModels))
+					vizControl->orangeAgent.clear();
+
+				// Always "served": the two groups ARE the two teams now, whichever policy
+				// each happens to be running.
+				oppServed = true;
+				oppTeam = Team::ORANGE;
+				fnBuildOppSplit(oppTeam);
+
+				RG_LOG("[viz] blue=" << (vizControl->blueAgent.empty() ? "live" : vizControl->blueAgent)
+					<< "  orange=" << (vizControl->orangeAgent.empty() ? "live" : vizControl->orangeAgent));
+			};
 
 			int numRealPlayers = oppServed ? newPlayerIndices.size() : envSet->state.numPlayers;
 
@@ -1417,6 +1579,53 @@ void GGL::Learner::Start() {
 
 					for (int step = 0; combinedTrajNext.Length() < config.ppo.tsPerItr || render; step++, collectSteps += numRealPlayers) {
 						Timer stepTimer = {};
+
+						// -- Viewer control panel (render only) --
+						// Sits ABOVE envSet->Reset() on purpose: while parked, the arena must not
+						// step AND must not be reset out from under a state the user is inspecting
+						// or editing. The panel is a remote control, so all of this is driven by
+						// whatever arrived on the socket since the last step.
+						if (render && vizControl) {
+							vizControl->Poll();
+							renderSender->timeScale = vizControl->speed;
+
+							// Opponent swaps apply before the halt check, so the choice takes
+							// effect even while parked — you can line a situation up, pick who
+							// is on the other side, and only then let it run.
+							if (vizControl->opponentDirty)
+								fnApplyRenderOpponent();
+							// Read per-inference, so flipping it here takes effect on the very
+							// next action. Render-only: the boot check forbids deterministic
+							// mode outside the viewer, since PPO cannot learn from an argmax.
+							ppo->config.deterministic = vizControl->deterministic;
+
+							// Seeks and edits write engine state straight into the arena, so the
+							// env's derived view of it (gamestate, obs, action masks) is stale
+							// until refreshed — otherwise the next action is chosen from obs
+							// describing where things were before. Edits apply AFTER the seek so
+							// that scrubbing to a frame and adjusting it in one go lands in the
+							// order the user did it.
+							bool arenaEdited = vizControl->ApplySeek(envSet->arenas[0]);
+							arenaEdited |= vizControl->ApplyEdits(envSet->arenas[0]);
+							if (arenaEdited) {
+								envSet->RefreshArenaState(0);
+								// A restored or hand-edited arena is not at an episode boundary.
+								// Left set, a terminal from whatever step ran last would make the
+								// next EnvSet::Reset() throw the state away and re-roll a random
+								// one — losing the edit, and (since state setters draw from a
+								// clock-seeded RNG) making replays diverge.
+								envSet->state.terminals[0] = TerminalType::NOT_TERMINAL;
+							}
+
+							if (vizControl->ConsumeHalt()) {
+								// Parked: keep streaming so the page stays live and shows edits,
+								// but don't simulate and don't sleep a simulated frame's worth.
+								renderSender->Send(envSet->state.gameStates[0], vizControl->StatusJSON(), false);
+								std::this_thread::sleep_for(std::chrono::milliseconds(16));
+								continue;
+							}
+						}
+
 						// Drop any practice window whose arena is about to reset for a reason
 						// OTHER than the drill itself (terminals still hold the PREVIOUS step's
 						// flags here - Reset() only zeroes them for arenas that actually reset)
@@ -1465,6 +1674,14 @@ void GGL::Learner::Start() {
 							{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] },
 							torch::kUInt8);
 
+						// Snapshot the obs the policy is about to act on. StepSecondHalf rewrites
+						// the shared buffer in place, so by the time the frame is streamed the
+						// original is gone — and this exists to answer "did the policy see the
+						// same thing?" during a replay, which is unanswerable afterwards.
+						std::vector<float> obsForInference;
+						if (render && vizControl)
+							obsForInference.assign(envSet->state.obs.data.begin(), envSet->state.obs.data.end());
+
 						if (!render) {
 							// Parallel per-player: each body writes only trajectories[newPlayerIdx]
 							Timer prepTimer = {};
@@ -1501,7 +1718,11 @@ void GGL::Learner::Start() {
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
 
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, collectModelsPtr);
+							// BLUE group. In render this is whichever policy the blue slot names.
+					ModelSet* newModelsPtr = collectModelsPtr;
+					if (render && !renderBlueModels.map.empty())
+						newModelsPtr = &renderBlueModels;
+					ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
 							if (oppExternal) {
 								// Nexto reads GameStates directly (its own obs builder), and
 								// returns OUR action-table indices via the checked map. The
@@ -1515,7 +1736,10 @@ void GGL::Learner::Start() {
 							} else {
 								torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
 								torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-								ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oppModels);
+								ModelSet* oldModelsPtr = oppModels;
+						if (render)
+							oldModelsPtr = renderOrangeModels.map.empty() ? NULL : &renderOrangeModels;
+						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr);
 							}
 
 							tActions = torch::zeros(numPlayers, tNewActions.dtype());
@@ -1534,6 +1758,51 @@ void GGL::Learner::Start() {
 						if (tLogProbs.defined() && !render)
 							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);	
 
+						// External opponent (viewer only): let an RLBot agent drive its cars with
+						// raw controller state. Set per step and cleared when it declines, so a
+						// bot that disconnects mid-match hands its cars straight back to the
+						// action table rather than freezing them on their last input.
+						if (render && config.externalControlSource && vizControl) {
+							if (envSet->controlOverrideMask.size() != (size_t)numPlayers) {
+								envSet->controlOverrideMask.assign(numPlayers, 0);
+								envSet->controlOverrides.assign(numPlayers, Action{});
+							}
+							std::fill(envSet->controlOverrideMask.begin(), envSet->controlOverrideMask.end(), 0);
+
+							// Called even when no external opponent is selected, so the source
+							// can see the spec change and shut its agent down.
+							// Whichever side named a bot owns the external rows; blue is the
+							// "new" group and orange the "old" one.
+							Team botTeam = Team::ORANGE;
+							const bool haveBot = vizControl->RLBotTeam(botTeam);
+							const std::vector<int>& botRows =
+								(botTeam == Team::BLUE) ? newPlayerIndices : oldPlayerIndices;
+
+							LearnerConfig::ExternalControlStatus extStatus;
+							std::vector<Action> extControls(botRows.size());
+							std::vector<uint8_t> extValid;
+							bool got = config.externalControlSource(
+								haveBot ? vizControl->Agent(botTeam) : std::string(),
+								botTeam, envSet->state.gameStates[0],
+								botRows, extControls, extValid, extStatus);
+
+							if (got && haveBot) {
+								for (size_t k = 0; k < botRows.size(); k++) {
+									// Only rows an agent actually drove; the rest stay on the
+									// policy instead of freezing.
+									if (k >= extValid.size() || !extValid[k])
+										continue;
+									envSet->controlOverrideMask[botRows[k]] = 1;
+									envSet->controlOverrides[botRows[k]] = extControls[k];
+								}
+							}
+							vizControl->rlbotRunning = extStatus.running;
+							vizControl->rlbotConnected = extStatus.connected;
+							vizControl->rlbotControlling = got && oppServed;
+							if (!extStatus.error.empty())
+								vizControl->opponentError = extStatus.error;
+						}
+
 						stepTimer.Reset();
 						envSet->Sync(); // Make sure the first half is done
 						envSet->StepSecondHalf(curActions, false);
@@ -1543,10 +1812,36 @@ void GGL::Learner::Start() {
 							stepCallback(this, envSet->state.gameStates, collectReport);
 
 						if (render) {
-							renderSender->Send(envSet->state.gameStates[0]);
+							// Record the post-step arena before streaming it, so the frame the
+							// page is told it is looking at is the one now in the ring.
+							std::string vizStatus;
+							if (vizControl) {
+								// Score first: the tally is per-opponent, so it has to be taken
+								// against the opponent that was actually playing this step.
+								vizControl->TrackScore(envSet->state.gameStates[0]);
+								// Checksum the obs that produced THIS step's actions (the buffer
+								// is rewritten by StepSecondHalf above, so hash the copy the
+								// inference actually consumed). FNV-1a over the raw float bits.
+								uint64_t h = 1469598103934665603ull;
+								for (float f : obsForInference) {
+									uint32_t bits;
+									std::memcpy(&bits, &f, sizeof(bits));
+									for (int b = 0; b < 4; b++) {
+										h ^= (uint8_t)(bits >> (b * 8));
+										h *= 1099511628211ull;
+									}
+								}
+								vizControl->lastObsHash = h;
+								vizControl->RecordFrame(envSet->arenas[0]);
+								vizStatus = vizControl->StatusJSON();
+							}
+							renderSender->Send(envSet->state.gameStates[0], vizStatus);
 							if (config.renderReloadSecs > 0 && renderReloadTimer.Elapsed() >= config.renderReloadSecs) {
 								renderReloadTimer.Reset();
 								ReloadNewestCheckpointForRender(renderLoadedTS);
+								// Same poll: a golden entry or reference version written since
+								// boot should reach the panel without needing a restart.
+								RefreshVizOpponentList();
 							}
 							continue;
 						}
@@ -2094,7 +2389,7 @@ void GGL::Learner::Start() {
 
 					Timer gaeTimer = {};
 					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets;
+					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -2190,6 +2485,58 @@ void GGL::Learner::Start() {
 						float sInt = RS_MAX(0.05f * sExt, aInt.std().item<float>());
 						auto inj = ((config.ppo.vdagSeekBeta * sExt / sInt) * aInt)
 							.clamp(-3.f * sExt, 3.f * sExt);
+
+						// ============ GEOMETRY: the permanent 4th rung ============
+						// V_geo estimates V*, so it is most informative when the policy is worst
+						// (measured: 4.7x air over V-dagger at 0-3M). The mix of POTENTIALS:
+						//
+						//   Phi = (1-w) * norm(relu(V_geo - V_real))  +  w * norm(V_dag)
+						//
+						// Each potential is in the FORM its own validation supports: the gap for
+						// V_geo (the raw level measured neutral), the level for V-dagger (the gap
+						// measured to penalise finishing, see the comment above). Both are
+						// functions of state alone so PBRS validity is exact, and each is
+						// normalised to unit scale so w is a genuine mix and not a dose ramp.
+						//
+						// w is CONSTANT: in the paired test the permanent mix beat a retiring
+						// crossfade in 6/8 step-bucket cells and collapsed nowhere, so V_geo
+						// stays in the ladder for good rather than expiring into V-dagger.
+						if (config.ppo.geoEnabled && ppo->models["geo_v"]) {
+							float w = RS_CLAMP(config.ppo.geoMixW, 0.f, 1.f);
+
+							auto geoV = torch::empty({ nR }, torch::kFloat32);
+							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+								int64_t i1 = RS_MIN(i0 + VCH, nR);
+								geoV.slice(0, i0, i1).copy_(
+									ppo->InferGeoV(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
+							}
+							// put V_geo on V_real's scale before differencing (affine, PBRS-safe)
+							float gm = geoV.mean().item<float>(), gs = geoV.std().item<float>() + 1e-8f;
+							float vm = vpF.mean().item<float>(), vs = vpF.std().item<float>() + 1e-8f;
+							auto geoScaled = (geoV - gm) / gs * vs + vm;
+							auto hGeo = torch::relu(geoScaled - vpF);
+
+							auto unit = [](torch::Tensor x) { return x / (x.std() + 1e-8f); };
+							auto phiMix = (1.f - w) * unit(hGeo) + w * unit(tPhi);
+							auto phiMixN = torch::cat({ phiMix.slice(0, 1, nR), z1 });
+							auto aGeo = g * cont * phiMixN - phiMix;
+							aGeo = aGeo - aGeo.mean();
+							float sGeo = RS_MAX(0.05f * sExt, aGeo.std().item<float>());
+							inj = ((config.ppo.geoSeekBeta * sExt / sGeo) * aGeo)
+								.clamp(-3.f * sExt, 3.f * sExt);
+
+							report["Geo/Mix W"] = w;
+							report["Geo/H Geo Mean"] = hGeo.mean().item<float>();
+							report["Geo/H Geo P90"] = hGeo.quantile(0.9).item<float>();
+						}
+						// THE DOSE PANEL. The most expensive error in the offline study: two
+						// potentials at the same nominal beta delivered injections 4x apart in
+						// actual strength (inj_std/adv_std 1.22 vs 0.31), and eight comparisons
+						// were run over-dosed before anyone measured it. sigma-matching sets the
+						// std of the CENTRED potential difference, not of the injection that
+						// survives the clamp — so read the dose HERE, not from beta.
+						report["Headroom/Inj Std Ratio"] = inj.std().item<float>() / RS_MAX(sExt, 1e-8f);
+
 						tAdvantages = tAdvantages + inj.view_as(tAdvantages);
 						// THEORY targets: the scaled reward that LANDED on each arrival state.
 						// scaledR_i is the reward for the transition i -> i+1, so it belongs to
@@ -2197,6 +2544,18 @@ void GGL::Learner::Start() {
 						// inside this segment). Getting this association backwards makes the
 						// theory learn the reward of the state you LEFT (measured in rltest:
 						// it learned the pattern inverted and never transferred).
+						// GEOMETRY reservoir: obs, arrival obs, and the SCALED reward that
+						// landed on the arrival state (same reconstruction the theory head uses,
+						// so r_hat is in the critic's units).
+						if (config.ppo.geoEnabled) {
+							auto z0g = torch::zeros({ 1 }, scaledR.options());
+							auto arrivalG = torch::cat({ z0g, scaledR.slice(0, 0, nR - 1) });
+							auto contPrevG = torch::cat({ z0g, cont.slice(0, 0, nR - 1) });
+							ppo->GeoReservoirAdd(tStates.slice(0, 0, nR - 1),
+								tStates.slice(0, 1, nR),
+								(arrivalG * contPrevG).slice(0, 1, nR),
+								config.ppo.geoReservoir);
+						}
 						if (config.ppo.vdagTheoryEnabled) {
 							auto z0 = torch::zeros({ 1 }, scaledR.options());
 							auto arrival = torch::cat({ z0, scaledR.slice(0, 0, nR - 1) });
@@ -2300,6 +2659,70 @@ void GGL::Learner::Start() {
 						report["GAE/Avg Advantage Post-Inj"] = postAdvAbsMean;
 						if (rawAdvAbsMean > 1e-8f)
 							report["GAE/Injected Frac"] = (postAdvAbsMean - rawAdvAbsMean) / rawAdvAbsMean;
+					}
+
+					// ===== ADVANTAGE FILTERING (top-fraction policy update) =====
+					// Deliberately the LAST thing to touch the advantage channel: the threshold is a
+					// buffer-wide quantile of the FINAL advantages, so it selects on exactly the
+					// number the policy loss consumes (injections included) rather than on raw GAE.
+					// A mask, not a rewrite - tAdvantages keeps its values so every panel above
+					// still means what it says, and the value heads (which ignore this mask) keep
+					// training on all rows. Renormalization by the kept count happens in the learn
+					// pass, so this changes WHICH rows the policy sees, not how hard it steps.
+					if (config.ppo.advFilterFrac < 1.f && (int64_t)combinedTraj.Length() > 1) {
+						RG_NO_GRAD;
+						float frac = RS_CLAMP(config.ppo.advFilterFrac, 0.01f, 1.f);
+						auto advF = tAdvantages.to(torch::kFloat32).flatten();
+						// The statistic the quantile ranks on. TOP_SIGNED takes the best rows;
+						// MAGNITUDE takes the most informative ones in EITHER direction, since the
+						// PPO per-row gradient scales with |A| and the sign only chooses a
+						// direction (see AdvFilterMode in PPOLearnerConfig.h). Only the ranking
+						// key changes - kept count, mask semantics and the learn-pass
+						// renormalization are identical, so this stays a selection rule and not a
+						// disguised policy-LR change.
+						bool byMagnitude =
+							config.ppo.advFilterMode == AdvFilterMode::MAGNITUDE;
+						auto advKey = byMagnitude ? advF.abs() : advF;
+						// quantile() sorts, so it needs the (1 - frac) cut point for the TOP frac
+						float thresh = advKey.quantile(1.f - frac).item<float>();
+						auto keep = (advKey >= thresh).to(torch::kFloat32);
+						float keptN = keep.sum().item<float>();
+						// Ties at the threshold (a flat advantage region, e.g. an all-zero-reward
+						// stretch) can push the kept set well past frac; that is honest - dropping
+						// tied rows arbitrarily would make the selection depend on row order.
+						tAdvFilterMask = keep;
+						report["AdvFilter/Kept Frac"] = keptN / (float)advF.numel();
+						// NOTE: a cut point on the RANKING KEY - signed advantage under
+						// TOP_SIGNED, |advantage| under MAGNITUDE. Not comparable across modes.
+						report["AdvFilter/Threshold"] = thresh;
+						auto advAbs = advF.abs();
+						if (keptN > 0) {
+							report["AdvFilter/Kept Adv Mean"] =
+								(advF * keep).sum().item<float>() / keptN;
+							report["AdvFilter/Kept Abs Adv Mean"] =
+								(advAbs * keep).sum().item<float>() / keptN;
+						}
+						float droppedN = (float)advF.numel() - keptN;
+						if (droppedN > 0) {
+							report["AdvFilter/Dropped Adv Mean"] =
+								(advF * (1.f - keep)).sum().item<float>() / droppedN;
+							// THE selection-quality read, and the one comparable across modes:
+							// mean |A| of what we threw away. Filtering is only free when the
+							// dropped rows carry little gradient, so this should sit WELL BELOW
+							// Kept Abs Adv Mean. Under TOP_SIGNED it is instead the size of the
+							// discarded negative tail - i.e. the cost of the current rule.
+							report["AdvFilter/Dropped Abs Adv Mean"] =
+								(advAbs * (1.f - keep)).sum().item<float>() / droppedN;
+						}
+						// The ratchet read: what share of retained rows is a POSITIVE advantage.
+						// 1.0 means the policy is being taught purely by self-imitation and the
+						// "don't do that" signal is entirely gone. Expected ~1.0 under TOP_SIGNED
+						// at frac 0.5; under MAGNITUDE it should sit near the positive share of
+						// the two tails, and its DEPARTURE from 1.0 is the pre-registered
+						// confirmation that the mode switch actually took effect.
+						report["AdvFilter/Kept Positive Frac"] = keptN > 0
+							? ((advF > 0).to(torch::kFloat32) * keep).sum().item<float>() / keptN
+							: 0.f;
 					}
 
 					// Stage 2 (deliberate-practice shaping): added AFTER GAE has already derived
@@ -2419,6 +2842,10 @@ void GGL::Learner::Start() {
 						experience.data.vdagTargets = tVdagTargets;
 					if (tRhatTargets.defined())
 						experience.data.rhatTargets = tRhatTargets;
+					// Assigned unconditionally (undefined included): the learn pass reads
+					// "mask defined" as "filtering is on", so a leftover mask from a previous
+					// iteration would keep filtering after advFilterFrac was set back to 1.
+					experience.data.advFilterMask = tAdvFilterMask;
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 
@@ -2539,6 +2966,14 @@ void GGL::Learner::Start() {
 						// advantages - which is how 16.1M frozen params went unnoticed for the
 						// life of the run. Update Magnitude is the load-bearing one: 0 means the
 						// twins are not training and the injection is a random projection.
+						"Geo/Residual",
+						"Geo/Rew Loss",
+						"Geo/V Mean",
+						"Geo/Reservoir Fill",
+						"Geo/Mix W",
+						"Geo/H Geo Mean",
+						"Geo/H Geo P90",
+						"Headroom/Inj Std Ratio",
 						"Headroom/Vdag Update Magnitude",
 						"Headroom/Vdag Loss",
 						"Headroom/Vdag Rows",
@@ -2616,5 +3051,6 @@ GGL::Learner::~Learner() {
 	delete versionMgr;
 	delete metricSender;
 	delete renderSender;
+	delete vizControl;
 	pybind11::finalize_interpreter();
 }

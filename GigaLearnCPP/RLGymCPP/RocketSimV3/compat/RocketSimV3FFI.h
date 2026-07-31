@@ -69,6 +69,19 @@ void rsf_arena_step(RsfArena* arena, uint32_t ticks);
 uint32_t rsf_arena_get_events(RsfArena* arena, RsfEvent* out, uint32_t cap, uint32_t* total);
 void rsf_arena_get_car_state(RsfArena* arena, uint32_t idx, RsfCarState* out);
 void rsf_arena_set_car_state(RsfArena* arena, uint32_t idx, const RsfCarState* s);
+
+// Suspension / pending-bump state that RsfCarState cannot express, moved as an OPAQUE
+// block: ask for the size, keep that many bytes, hand them back. Nothing on this side
+// names a field, so the Rust struct can grow without a header change here — unlike the
+// rest of this file, these two cannot drift out of sync. Needed only for exact state
+// restore (the viz control panel's rewind); ordinary stepping never calls them.
+uint32_t rsf_car_extra_state_size(void);
+void rsf_arena_get_car_extra_state(RsfArena* arena, uint32_t idx, void* out);
+void rsf_arena_set_car_extra_state(RsfArena* arena, uint32_t idx, const void* s);
+
+// Arena RNG state (demo respawn spawn-point selection is its only consumer).
+uint64_t rsf_arena_get_rng_state(RsfArena* arena);
+void rsf_arena_set_rng_state(RsfArena* arena, uint64_t state);
 void rsf_arena_set_car_controls(RsfArena* arena, uint32_t idx, const RsfCarControls* c);
 void rsf_arena_respawn_car(RsfArena* arena, uint32_t idx);
 void rsf_arena_get_ball_state(RsfArena* arena, RsfBallState* out);

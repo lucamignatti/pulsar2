@@ -98,6 +98,17 @@ namespace RLGC {
 
 		EnvState state = {};
 
+		// Per-player RAW control override, indexed like EnvState's player arrays. Where
+		// the mask is set, StepSecondHalf applies the paired Action verbatim instead of
+		// parsing an action-table index.
+		//
+		// This exists for external bots driven by the viewer: an RLBot agent emits
+		// continuous controller state, and squashing that onto our 90-row discrete table
+		// would measure a handicapped version of the bot rather than the bot. Both
+		// vectors stay EMPTY during training, where every car is on the action table.
+		std::vector<uint8_t> controlOverrideMask = {};
+		std::vector<Action> controlOverrides = {};
+
 		EnvSet(const EnvSetConfig& config);
 
 		RG_NO_COPY(EnvSet);
@@ -118,6 +129,10 @@ namespace RLGC {
 		void StepSecondHalf(const IList& actionIndices, bool async);
 		void Sync() { g_ThreadPool.WaitUntilDone(); }
 		void ResetArena(int index);
+		// Re-derive gamestate/obs/masks from the arena as it currently stands, without
+		// stepping and without running the state setter. Call after writing car/ball
+		// state into an arena directly (viz control panel edits and history seeks).
+		void RefreshArenaState(int index);
 		void Reset();
 	};
 }

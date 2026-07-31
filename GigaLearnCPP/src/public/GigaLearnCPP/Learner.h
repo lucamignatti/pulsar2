@@ -4,6 +4,7 @@
 #include "Util/MetricSender.h"
 #include <atomic>
 #include "Util/RenderSender.h"
+#include "Util/VizControl.h"
 #include "LearnerConfig.h"
 
 namespace GGL {
@@ -28,6 +29,8 @@ namespace GGL {
 		RLGC::EnvCreateFn envCreateFn;
 		MetricSender* metricSender;
 		RenderSender* renderSender;
+		// Render mode only (NULL in the trainer): the viewer's control panel channel.
+		struct VizControl* vizControl;
 
 		int obsSize;
 		int numActions;
@@ -138,6 +141,8 @@ namespace GGL {
 		// update loadedTimesteps. Returns true on a successful swap. Guarded so a mid-write race
 		// against the (uncontrolled) training process can only cost a retry, never the process.
 		bool ReloadNewestCheckpointForRender(int64_t& loadedTimesteps);
+		// Render mode only: repopulate the viewer panel's opponent dropdown from disk.
+		void RefreshVizOpponentList();
 
 		RG_NO_COPY(Learner);
 

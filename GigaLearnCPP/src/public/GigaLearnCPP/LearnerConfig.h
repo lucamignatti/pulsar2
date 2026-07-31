@@ -78,6 +78,62 @@ namespace GGL {
 		// as it learns. Set <= 0 to pin to whatever checkpoint was loaded at startup.
 		float renderReloadSecs = 5.0f;
 
+		// RENDER MODE ONLY. Supplies raw controller state for the opponent's cars, so an
+		// external agent (an RLBot bot) can play them with continuous controls instead
+		// of our discrete action table.
+		//
+		// Injected as a callback rather than an interface the Learner knows about, on
+		// purpose: the RLBot side needs flatbuffers and the RLBot schema, and none of
+		// that belongs in GigaLearnCPP. The implementation lives with the executable
+		// (src/), which already links RLBotCPP.
+		//
+		// Called once per decision step with the arena's current state and the set of
+		// player rows the opponent owns. Fill `outControls` for those rows and return
+		// true; return false to fall back to the action table for this step (bot not
+		// connected yet, no fresh input, etc).
+		// What the source wants the panel to display about itself.
+		struct ExternalControlStatus {
+			bool running = false;   // the agent's process is up
+			bool connected = false; // ...and it has completed its handshake
+			bool controlling = false; // ...and is actually sending inputs we applied
+			std::string error;
+			std::string name;
+		};
+
+		// Called once per decision step with the opponent spec the panel selected (the
+		// source owns interpreting it), the arena state, and the player rows the opponent
+		// holds. Fill `outControls` for those rows and return true; return false to fall
+		// back to the action table for this step (agent not connected, no fresh input,
+		// or this spec isn't one the source handles).
+		//
+		// `outValid` is PER ROW, not all-or-nothing: in a 2v2 one agent can be connected
+		// while the other is still starting, and the car without an agent must keep
+		// playing on the policy rather than freeze on a zeroed control.
+		//
+		// Servicing the agent's lifecycle here — rather than through a separate hook —
+		// keeps it to one call site: render mode never leaves the collection loop, so
+		// this callback is the only place that reliably runs every step.
+		std::function<bool(
+			const std::string& opponentSpec,
+			RocketSim::Team opponentTeam,
+			const RLGC::GameState& state,
+			const std::vector<int>& opponentPlayerIndices,
+			std::vector<RLGC::Action>& outControls,
+			std::vector<uint8_t>& outValid,
+			ExternalControlStatus& outStatus)> externalControlSource = nullptr;
+
+		// Render only: lists the external agents the panel may offer as opponents. Kept
+		// alongside externalControlSource because whoever can serve an agent is also the
+		// only thing that knows how to find one.
+		std::function<std::vector<std::string>()> vizBotFinder = nullptr;
+
+		// If renderMode, the UDP port the viewer's control panel sends commands to
+		// (bound on loopback only). See Util/VizControl.h.
+		int vizControlPort = 9276;
+		// Rewind history depth, in decision steps. 900 at 15 Hz is a 60-second scrubback;
+		// a snapshot is ~1KB at 3v3, so the whole ring is under a megabyte.
+		int vizHistoryFrames = 900;
+
 		PPOLearnerConfig ppo = {};
 
 		// Checkpoints are saved here as timestep-numbered subfolders

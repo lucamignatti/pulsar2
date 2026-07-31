@@ -223,3 +223,46 @@ TEST(test_padded_team_canonicalization) {
 	for (int i = 0; i < (int)pb.size(); i++)
 		CHECK_NEAR(pb[i], po[i], 1e-5f);
 }
+
+// The viewer's rewind can only replay a play if the same game state produces the same
+// observation. It did not: slot assignment is shuffled from a clock-seeded engine, so
+// the obs (and sometimes the chosen action) changed on every build. shuffleSlots=false
+// is what the render viewer runs with — this pins that it is genuinely deterministic
+// and that real players land in the low slots when it is off.
+TEST(test_padded_unshuffled_slots_are_deterministic) {
+	GameState gs = MakeStateNvN(2);
+	AdvancedObsPadded padded(3, /*shuffleSlots=*/false);
+
+	// Deliberately NOT seeding the shared engine between builds: the point is that the
+	// result must not depend on it at all.
+	FList first = padded.BuildObs(gs.players[0], gs);
+	for (int repeat = 0; repeat < 8; repeat++) {
+		::Math::GetRandEngine().seed(repeat * 7919 + 1);
+		FList again = padded.BuildObs(gs.players[0], gs);
+		CHECK_EQ(again.size(), first.size());
+		for (int i = 0; i < (int)first.size(); i++) {
+			if (again[i] != first[i])
+				throw TestFailure{ "unshuffled obs changed between builds at element "
+					+ std::to_string(i) };
+		}
+	}
+
+	// With one teammate and two opponents in a 3-per-team layout, the occupied slots
+	// must be the first of each group, not wherever a shuffle put them.
+	const int teammateSlots = 2, opponentSlots = 3;
+	const int firstTeammate = HEADER + PLAYER_ELEMS;
+	const int firstOpponent = firstTeammate + teammateSlots * PLAYER_ELEMS;
+	CHECK(!BlockIsZero(first, firstTeammate, PLAYER_ELEMS));                    // teammate slot 0 filled
+	CHECK(BlockIsZero(first, firstTeammate + PLAYER_ELEMS, PLAYER_ELEMS));      // slot 1 empty
+	CHECK(!BlockIsZero(first, firstOpponent, PLAYER_ELEMS));                    // opponent slot 0 filled
+	CHECK(!BlockIsZero(first, firstOpponent + PLAYER_ELEMS, PLAYER_ELEMS));     // opponent slot 1 filled
+	CHECK(BlockIsZero(first, firstOpponent + 2 * PLAYER_ELEMS, PLAYER_ELEMS));  // slot 2 empty
+
+	// Presence flags trail every player block, in the same slot order.
+	const int flags = firstOpponent + opponentSlots * PLAYER_ELEMS;
+	CHECK_EQ(first[flags + 0], 1.f);
+	CHECK_EQ(first[flags + 1], 0.f);
+	CHECK_EQ(first[flags + 2], 1.f);
+	CHECK_EQ(first[flags + 3], 1.f);
+	CHECK_EQ(first[flags + 4], 0.f);
+}

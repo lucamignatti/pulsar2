@@ -29,6 +29,7 @@ GGL::InferUnit::InferUnit(
 		PPOLearner::MakeModels(
 			false, obsSize, actionParser->GetActionAmount(),
 			sharedHeadConfig, policyConfig, {},
+			/*criticTrunkConfig=*/{},   // inference-only: no critics, so no critic trunk
 			BestInferDevice(useGPU),
 			*this->models);
 	} catch (std::exception& e) {

@@ -42,6 +42,20 @@ add_executable(GigaLearnRLBot src/RLBotClient.cpp src/RLBotMain.cpp)
 set_target_properties(GigaLearnRLBot PROPERTIES CXX_STANDARD 20)
 target_link_libraries(GigaLearnRLBot GigaLearnCPP RLBotCPP)
 
+# Let the VIEWER host an RLBot bot as the opponent inside its own arena (see
+# src/VizRLBotServer.h). OFF by default for the same reason GGL_BUILD_TESTS is: the
+# training box's `cmake --build build` must stay byte-identical, and the trainer has no
+# business linking a bot server. Turn it on for the viz tree:
+#     cmake -S . -B build-viz -DGGL_VIZ_RLBOT=ON
+option(GGL_VIZ_RLBOT "Viewer can host an RLBot bot as the opponent" OFF)
+if (GGL_VIZ_RLBOT)
+	target_sources(GigaLearnBot PRIVATE src/VizRLBotServer.cpp)
+	target_compile_definitions(GigaLearnBot PRIVATE GGL_VIZ_RLBOT)
+	# RLBotCPP for the generated flatbuffer types; its own socket layer is unused,
+	# since this is the SERVER side of the protocol and that library is the client.
+	target_link_libraries(GigaLearnBot RLBotCPP)
+endif()
+
 # Offline unit tests (GigaLearnTests). OFF by default so the training box's
 # `cmake --build build` stays byte-identical; enable with -DGGL_BUILD_TESTS=ON.
 option(GGL_BUILD_TESTS "Build the GigaLearnTests unit test binary" OFF)

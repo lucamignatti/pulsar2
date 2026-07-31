@@ -77,7 +77,7 @@ std::vector<json> ActionSetToJSON(const std::vector<Action>& actions) {
 	return js;
 }
 
-void GGL::RenderSender::Send(const GameState& state) {
+void GGL::RenderSender::Send(const GameState& state, const std::string& controlJson, bool pace) {
 	json j = {};
 	j["gamemode"] = state.lastArena ? GAMEMODE_STRS[(int)state.lastArena->gameMode] : "soccar";
 	j["state"] = GameStateToJSON(state);
@@ -87,7 +87,16 @@ void GGL::RenderSender::Send(const GameState& state) {
 		actions.push_back(player.prevAction);
 
 	j["actions"] = ActionSetToJSON(actions);
-	
+
+	// Parsed rather than embedded as a string so the page reads a real object. A
+	// malformed blob is dropped rather than corrupting the whole frame.
+	if (!controlJson.empty()) {
+		try {
+			j["pulsar"] = json::parse(controlJson);
+		} catch (const std::exception&) {
+		}
+	}
+
 	std::string jStr = j.dump();
 
 	try {
@@ -97,7 +106,7 @@ void GGL::RenderSender::Send(const GameState& state) {
 	}
 
 	// Delay
-	{
+	if (pace) {
 		namespace chr = std::chrono;
 
 		// Determine the desired delay and the actual delay (in seconds)
@@ -119,6 +128,12 @@ void GGL::RenderSender::Send(const GameState& state) {
 		// Sleep for the new adaptive delay
 		int64_t sleepMics = (int64_t)(adaptiveRenderDelay * 1'000'000);
 		std::this_thread::sleep_for(chr::microseconds(sleepMics));
+	} else {
+		// Unpaced frames still have to keep the pacing clock honest. Without this, the
+		// whole paused stretch reads as one enormous inter-frame gap on resume, and the
+		// adaptive delay collapses to zero — the sim would sprint until it caught up
+		// with a schedule it was never on.
+		renderTimer.Reset();
 	}
 }
 
