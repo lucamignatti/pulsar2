@@ -32,6 +32,8 @@ namespace GGL {
 			// POLICY may train on it (value heads ignore this mask). Undefined unless
 			// advFilterFrac < 1.
 			advFilterMask,
+			// HEADROOM: per-row entropy multiplier from H (undefined unless vdagEntGateEnabled)
+			entWeights,
 			advantages;
 
 		auto begin() { return &states; }

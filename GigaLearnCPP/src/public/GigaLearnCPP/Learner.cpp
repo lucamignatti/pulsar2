@@ -2389,7 +2389,7 @@ void GGL::Learner::Start() {
 
 					Timer gaeTimer = {};
 					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask;
+					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -2477,7 +2477,39 @@ void GGL::Learner::Start() {
 						// of V* built from executed transitions => Phi = Vdag solved 3/3.
 						// H is retained below as TELEMETRY only.
 						auto tH = torch::relu(vdag - vpF);
+
+						// ===== IMPLICIT WORLD MODEL =====
+						// Train one-step twin dynamics on executed transitions, run a sweep of
+						// optimistic value iteration over them (read out through the worth
+						// theory), and add the resulting achievable-value field to the seek
+						// potential. Sum of two potentials is itself a potential, so PBRS
+						// invariance survives - and unlike max() composition it is immune to
+						// the scale mismatch between a RETURN (V-dagger) and a single event
+						// PAYOFF (the imagined field), which otherwise makes the imagined term
+						// silently lose every comparison and contribute nothing.
+						torch::Tensor imag;
+						if (config.ppo.vdagWmEnabled && config.ppo.vdagTheoryEnabled) {
+							ppo->TrainWorldModel(tStates, tActions, cont);
+							ppo->TrainImagValue(tStates);
+							imag = torch::empty({ nR }, torch::kFloat32);
+							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+								int64_t i1 = RS_MIN(i0 + VCH, nR);
+								imag.slice(0, i0, i1).copy_(
+									ppo->InferImagValue(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
+							}
+						}
+
 						auto tPhi = vdag;
+						if (imag.defined()) {
+							float sv = vdag.std().item<float>();
+							float si = imag.std().item<float>();
+							float sc = (si > 1e-6f)
+								? RS_MIN(sv / si, 5.f) * config.ppo.vdagWmLambda : 0.f;
+							tPhi = vdag + sc * imag;
+							report["Headroom/Imag Field Mean"] = imag.mean().item<float>();
+							report["Headroom/Imag Field STD"] = si;
+							report["Headroom/Imag Scale"] = sc;
+						}
 						auto tPhiN = torch::cat({ tPhi.slice(0, 1, nR), z1 });
 						auto aInt = g * cont * tPhiN - tPhi;
 						aInt = aInt - aInt.mean();
@@ -2565,24 +2597,16 @@ void GGL::Learner::Start() {
 								tRhatTargets.max().item<float>());
 							report["Headroom/Rhat Target Max"] = tRhatTargets.max().item<float>();
 						}
-						// ARCHIVE: bank transitions where the FIELD ascended (normalized), so
-						// the actuation channel has persistent evidence of what climbs.
-						if (config.ppo.vdagArchiveEnabled) {
-							auto asc = torch::relu(g * cont * vdagN - vdag);
-							float am = asc.mean().item<float>();
-							if (am > 1e-8f) {
-								auto ascN = asc / am;
-								auto hot = (ascN > config.ppo.vdagArchiveBankThresh).nonzero().flatten();
-								if (hot.numel() > 0) {
-									if (hot.numel() > 256)
-										hot = hot.slice(0, 0, 256);
-									auto hotN = (hot + 1).clamp_max(nR - 1);
-									ppo->BankAscent(tStates.index_select(0, hot),
-										tStates.index_select(0, hotN),
-										tActions.index_select(0, hot).to(torch::kCPU),
-										config.ppo.vdagArchiveCap);
-								}
-							}
+						// H-GATED ENTROPY: per-row entropy multiplier. Adds stochasticity where
+						// the critic reports unrealised value and anneals as the policy realises
+						// it. Measured to take the seek mechanism from a 5x seed spread in
+						// ignition time down to none, while only ever RAISING entropy.
+						if (config.ppo.vdagEntGateEnabled) {
+							auto hn = tH / (tH.mean() + 1e-8f);
+							tEntWeights = (1.f + config.ppo.vdagEntGateK * hn)
+								.clamp(1.f, config.ppo.vdagEntGateCap);
+							report["Headroom/Ent Gate Mean"] = tEntWeights.mean().item<float>();
+							report["Headroom/Ent Gate Max"] = tEntWeights.max().item<float>();
 						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
 						report["Headroom/H Mean"] = tH.mean().item<float>();
@@ -2846,6 +2870,8 @@ void GGL::Learner::Start() {
 					// "mask defined" as "filtering is on", so a leftover mask from a previous
 					// iteration would keep filtering after advFilterFrac was set back to 1.
 					experience.data.advFilterMask = tAdvFilterMask;
+					if (tEntWeights.defined())
+						experience.data.entWeights = tEntWeights;
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 
@@ -2980,6 +3006,10 @@ void GGL::Learner::Start() {
 						"Headroom/Tgt Set",
 						"Headroom/Rows N",
 						"Headroom/Rhat Rows",
+						"Headroom/Ent Gate Mean",
+						"Headroom/Imag Field Mean",
+						"Headroom/WM Dyn Loss",
+						"Headroom/WM Trust Frac",
 						"Headroom/Rhat Entry",
 						"Headroom/Vdag Raw",
 						"Headroom/Yv Abs",

@@ -793,6 +793,13 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.geoModel.activationType = activation;
 	cfg.ppo.geoModel.addLayerNorm = addLayerNorm;
 	cfg.ppo.geoModel.addResiduals = false;   // 2 layers: addResiduals is a no-op at this depth
+	// The implicit-world-model potential and H-gated entropy arrived by merge from a parallel
+	// experiment line (e1b02b9) with enabled-by-default config. EXPLICITLY OFF for the 5.3
+	// lineage: it cold-started 2026-07-30 as the four-rung-ladder run, and adding a second
+	// theorised-value potential mid-lineage would confound the geometry rung's at-scale test.
+	// Enable deliberately, on its own restart, with its own panels watched.
+	cfg.ppo.vdagWmEnabled = false;
+	cfg.ppo.vdagEntGateEnabled = false;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.

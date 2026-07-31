@@ -305,20 +305,18 @@ namespace GGL {
 		// a 20000x1280 head forward, on a card with ~13.2GB free after desktop graphics. Flip
 		// back on only together with a miniBatchSize cut (or narrower rhat heads - a reward
 		// model with group-L1 Occam has no obvious need for critic width).
+		// (The 5.3 lineage runs with this OFF; the geometry rung supplies its own r-hat.)
 		bool vdagTheoryEnabled = false;
-		float vdagTheoryTau = 0.9f;
+		float vdagTheoryTau = 0.5f;    // ACCURATE, not optimistic. Measured degeneracy: an
+		                               // optimistic expectile and the Occam penalty share a
+		                               // minimiser - a high CONSTANT satisfies both - so the
+		                               // theory prunes its own features and stops
+		                               // discriminating. Optimism is the field's job.
 		float vdagTheoryL1 = 0.02f;    // Occam weight on r-hat input-feature columns
-		float vdagSeedWeight = 0.25f;  // weight of hypothesis rows in the V-dagger loss
-		float vdagSeedFrac = 0.5f;     // event mask: seed only where r-hat > frac * max observed reward
 
-		// ARCHIVE: persistent field-ascent transitions, replayed as weighted BC and
-		// RE-SCORED with the CURRENT field (stale entries silently drop out). This is
-		// the non-invariant actuation channel: PBRS with a good field is neutral BY
-		// THEOREM, so the field must be converted to policy directly. Measured: the
-		// buffer-free (weights-only) alternative plateaus at ~1/4 of this.
-		// DISABLED 2026-07-28 (user-directed) alongside the theory path, code LEFT IN PLACE.
-		// Its own footprint is small (512 replay rows), but it is the same untested batch of
-		// changes; re-enable it on its own once the composition-only baseline is running.
+		// (The ARCHIVE channel — persistent field-ascent transitions replayed as weighted BC —
+		// was removed entirely on the parallel line, commit 10979db; its config went with it.)
+
 		// ===================== GEOMETRY — the 4th rung (2026-07-30) =====================
 		// Validated offline in ~/Projects/experiments/possibility (see
 		// research/reports/GEOMETRIC_CRITIC.md). The ladder reads:
@@ -347,11 +345,10 @@ namespace GGL {
 		// collapses it to 0.360 (the geometry term is load-bearing), r_hat alone scores 0.228,
 		// mobility alone -0.114, and rho(V_geo, mobility) is NEGATIVE — not a mobility proxy.
 		//
-		// DEPLOY SHAPE: this is a COLD-START ACCELERANT, not a lift. Its advantage is 4.7x air
-		// over V_dag at 0-3M and decays to parity by ~9M, because V_geo estimates V* — most
-		// informative when the policy is worst. Actuation therefore CROSSFADES to the
-		// composition critic. Enabling it on a mature run is a no-op at best: the crossfade
-		// weight is already 1. FRESH RUNS ONLY.
+		// DEPLOY SHAPE: largest measured wins are the EARLIEST buckets (4.7x air over V_dag at
+		// 0-3M), because V_geo estimates V* — most informative when the policy is worst. But
+		// the rung is PERMANENT, not a fading bootstrap: see geoMixW below. Fresh runs only in
+		// the sense that no mid-run insertion has been tested.
 		bool geoEnabled = false;      // OFF by default: fresh-run mechanism, see above
 		float geoLR = 1e-3f;
 		// Shrinks the feasible-displacement ellipsoid. rho(V*) is flat at 0.697-0.698 across
@@ -392,11 +389,33 @@ namespace GGL {
 		float geoMixW = 0.5f;
 		PartialModelConfig geoModel;   // shared shape for the sigma / r-hat / value nets
 
-		bool vdagArchiveEnabled = false;
-		int vdagArchiveCap = 8192;
-		float vdagArchiveWeight = 0.5f;
-		float vdagArchiveBankThresh = 2.0f;  // bank rows with normalized ascent above this
-		float vdagArchiveLiveThresh = 0.05f; // replay only rows still ascending now
+		bool vdagEntGateEnabled = true;
+		float vdagEntGateK = 3.0f;
+		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
+
+		// ===== IMPLICIT WORLD MODEL (theorised-achievable-value field) =====
+		// Twin one-step OBS-space dynamics + optimistic value iteration read out through
+		// the worth theory. No rollout, no search, no buffer: one hop per update, and
+		// multi-step composition happens across updates (amortised background planning).
+		// Enters ONLY as an additive potential alongside Phi=Vdag - the sum of two
+		// potentials is a potential, so PBRS invariance is preserved and the honest
+		// critic is never corrupted.
+		bool vdagWmEnabled = true;
+		int vdagWmRows = 4096;        // states per iteration used for dynamics + VI
+		int vdagWmActions = 6;        // candidate actions imagined per state
+		float vdagWmGammaIm = 0.92f;  // OWN, shorter horizon: at the task gamma a distant
+		                              // opportunity is nearly as good as a near one, so the
+		                              // field goes flat and the seek gradient vanishes.
+		float vdagWmKappa = 0.02f;    // per-hop cost of imagining (grounding by attrition)
+		float vdagWmDisTh = 0.02f;    // twin-disagreement trust threshold
+		float vdagWmLambda = 0.5f;    // weight of the imagined potential vs Vdag
+		float vdagWmOccam = 0.02f;    // group-L1 on the model's INPUTS. This is what makes
+		                              // off-support prediction lawful: physics that does not
+		                              // depend on a feature loses that input, so the model
+		                              // computes the same way in never-visited regions and
+		                              // the twins agree there (measured: disagreement 300x
+		                              // under threshold seven units up in unvisited air).
+		std::vector<int> vdagWmLayers = { 512, 512 };
 
 		PPOLearnerConfig() {
 			policy = {};
