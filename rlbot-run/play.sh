@@ -35,11 +35,21 @@ CONFIG="${1:-match_vs_human.toml}"
 [ $# -gt 0 ] && shift   # drop the config arg; scan the rest for team_size / eval
 TEAM_SIZE=1
 REPLAY=0
+MODE=""
 for a in "$@"; do
 	case "$a" in
 		1|2|3)                 TEAM_SIZE="$a" ;;
 		eval|replay|--eval|--replay) REPLAY=1 ;;
-		*) echo "Unknown arg '$a' (expected a team size 1-3 and/or 'eval')"; exit 1 ;;
+		# Gap-verification modes. Written to HANDICAPS marker files (and exported), because
+		# env prefixes on this chain (play.sh -> RLBotServer -> launch manager -> bot) are
+		# unverifiable and silently failed to propagate on 2026-07-31 - the debug log
+		# showed our kickoff tape running in a run that was supposed to disable it.
+		#   bugnexto:  PERFECT Pulsar (tape + argmax + fixed reconstruction) vs viz-style
+		#              Nexto (flip-never-expires bug, no kickoff script).
+		#   simparity: same Nexto, and Pulsar ALSO drops to sim conditions (no tape,
+		#              sampling) - the full sim-reproduction.
+		bugnexto|simparity)    MODE="$a" ;;
+		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'bugnexto' or 'simparity')"; exit 1 ;;
 	esac
 done
 export REPLAY
@@ -144,6 +154,20 @@ trap 'echo; echo "Ending session..."; save_replay_if_eval; kill_all; exit 0' INT
 pkill -f RLBotServer 2>/dev/null
 sleep 1
 : > core_play.log; : > watchdog.log; : > procs.log; rm -f pulsar-bot/bot.*.log pulsar-bot/debug.*.jsonl 2>/dev/null
+# Marker files ALWAYS cleared first (a crashed handicap run must never leak its
+# handicaps into the next normal match), then re-written only if this run asks.
+rm -f nexto/HANDICAPS pulsar-bot/HANDICAPS 2>/dev/null
+if [ "$MODE" = "bugnexto" ] || [ "$MODE" = "simparity" ]; then
+	printf "NEXTO_VIZ_BUG=1\nNEXTO_NO_KICKOFF=1\n" > nexto/HANDICAPS
+	export NEXTO_VIZ_BUG=1 NEXTO_NO_KICKOFF=1
+	log "MODE $MODE: Nexto handicapped (viz flip bug + no kickoff script)"
+fi
+if [ "$MODE" = "simparity" ]; then
+	printf "GGL_NO_KICKOFF_SCRIPT=1\nGGL_SAMPLE_ACTIONS=1\n" > pulsar-bot/HANDICAPS
+	export GGL_NO_KICKOFF_SCRIPT=1 GGL_SAMPLE_ACTIONS=1
+	log "MODE simparity: Pulsar also at sim conditions (no tape, sampling)"
+fi
+[ -n "$MODE" ] && log "RECEIPTS: check core_play.log for 'Nexto HANDICAPS' and pulsar-bot/bot.*.log for 'RLBot flags' - a missing receipt means the flag did NOT land"
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"
 if eac_active; then log "Refusing to start: EAC already running ($EAC_MATCH)"; abort_eac; fi
 if trainer_active && [ "${ALLOW_TRAINER:-0}" != "1" ]; then

@@ -539,6 +539,16 @@ void RLBotClient::Run(const RLBotParams& params) {
 	if (!agentId || !*agentId)
 		RG_ERR_CLOSE("RLBotClient: RLBOT_AGENT_ID environment variable is not set");
 
+	// RECEIPT for gap-verification runs: bot.<pid>.log must show the flags a mode
+	// expects, or they did not land (the env chain silently dropped them once).
+	auto fnFlag = [](const char* name) {
+		const char* v = std::getenv(name);
+		return v && *v && std::string(v) != "0";
+	};
+	RG_LOG("RLBotClient flags: GGL_NO_KICKOFF_SCRIPT=" << fnFlag("GGL_NO_KICKOFF_SCRIPT")
+		<< " GGL_SAMPLE_ACTIONS=" << fnFlag("GGL_SAMPLE_ACTIONS")
+		<< " GGL_DEBUG_JSONL=" << fnFlag("GGL_DEBUG_JSONL"));
+
 	RG_LOG("RLBotClient: connecting to RLBotServer at " << host << ":" << port << " as \"" << agentId << "\"...");
 
 	rlbot::BotManager<RLBotBot> manager{false /* batchHivemind */};

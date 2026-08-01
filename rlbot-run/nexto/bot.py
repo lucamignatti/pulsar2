@@ -63,9 +63,25 @@ class Nexto(Bot):
     #   NEXTO_VIZ_BUG=1     - see get_output: has_flip never expires by window lapse,
     #                         the exact effect the bridge's old dodge_timeout sentinel
     #                         had on rlgym_compat's reconstruction.
-    hardcoded_kickoffs = os.environ.get("NEXTO_NO_KICKOFF") != "1"
-    stochastic_kickoffs = os.environ.get("NEXTO_NO_KICKOFF") != "1"
-    viz_bug = os.environ.get("NEXTO_VIZ_BUG") == "1"
+    # Read from the environment OR a HANDICAPS marker file next to this script - the
+    # env chain through RLBotServer's launch manager is unverifiable and silently
+    # dropped these on first attempt (2026-07-31); play.sh owns the marker's lifecycle
+    # and always clears it at startup so a crashed run can't leak handicaps forward.
+    @staticmethod
+    def _handicap(name):
+        if os.environ.get(name) == "1":
+            return True
+        try:
+            marker = os.path.join(
+                os.path.dirname(os.path.realpath(__file__)), "HANDICAPS")
+            with open(marker) as f:
+                return any(line.strip() == f"{name}=1" for line in f)
+        except OSError:
+            return False
+
+    hardcoded_kickoffs = not _handicap.__func__("NEXTO_NO_KICKOFF")
+    stochastic_kickoffs = not _handicap.__func__("NEXTO_NO_KICKOFF")
+    viz_bug = _handicap.__func__("NEXTO_VIZ_BUG")
 
     agent = Agent()
     tick_skip = 8
@@ -104,6 +120,13 @@ class Nexto(Bot):
             "Remember to run Necto at 120fps with vsync off! "
             "Stable 240/360 is second best if that's better for your eyes"
         )
+        # RECEIPT for gap-verification runs: if a mode was requested and this line is
+        # absent from core_play.log, the flags did NOT reach this process.
+        if self.viz_bug or not self.hardcoded_kickoffs:
+            self.logger.warning(
+                "Nexto HANDICAPS active: viz_bug=%s hardcoded_kickoffs=%s stochastic_kickoffs=%s",
+                self.viz_bug, self.hardcoded_kickoffs, self.stochastic_kickoffs,
+            )
         self.logger.info(
             "Also check out the RLGym Twitch stream to watch live bot training and occasional showmatches!"
         )

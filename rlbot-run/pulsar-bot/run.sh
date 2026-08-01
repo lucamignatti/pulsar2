@@ -10,6 +10,11 @@ export LD_LIBRARY_PATH="$REPO/build:$REPO/GigaLearnCPP/libtorch/lib:$LD_LIBRARY_
 # transitions) -> debug.<pid>.jsonl next to this script. A few MB per match; used to
 # compare real-game inputs against sim. Set to 0 to disable.
 export GGL_DEBUG_JSONL="${GGL_DEBUG_JSONL:-1}"
+# Gap-verification handicaps, written by play.sh's mode tokens (see its comments for
+# why a marker file instead of env prefixes: the env chain silently dropped them once).
+if [ -f "$HERE/HANDICAPS" ]; then
+	set -a; . "$HERE/HANDICAPS"; set +a
+fi
 # Capture each car's stdout+stderr + exit code to bot.<pid>.log (one file per Pulsar2 car,
 # so 2v2/3v3 instances don't clobber each other). Segfault leaves exit 139; an uncaught
 # C++ exception leaves its what() text here.

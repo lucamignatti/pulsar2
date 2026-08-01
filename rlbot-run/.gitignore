@@ -15,3 +15,7 @@ pulsar-bot/checkpoint_*/
 
 # Per-decision debug JSONL from the bot (GGL_DEBUG_JSONL; a few MB per match)
 pulsar-bot/debug.*.jsonl
+
+# Gap-verification handicap markers (written/cleared by play.sh modes, never committed)
+nexto/HANDICAPS
+pulsar-bot/HANDICAPS
