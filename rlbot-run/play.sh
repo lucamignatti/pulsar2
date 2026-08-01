@@ -48,8 +48,10 @@ for a in "$@"; do
 		#              Nexto (flip-never-expires bug, no kickoff script).
 		#   simparity: same Nexto, and Pulsar ALSO drops to sim conditions (no tape,
 		#              sampling) - the full sim-reproduction.
-		bugnexto|simparity)    MODE="$a" ;;
-		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'bugnexto' or 'simparity')"; exit 1 ;;
+		#   sample: ONE lever - Pulsar samples from the policy like every sim evaluation
+		#           does, instead of the client's argmax default. Nexto untouched.
+		bugnexto|simparity|sample) MODE="$a" ;;
+		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
 	esac
 done
 export REPLAY
@@ -166,6 +168,11 @@ if [ "$MODE" = "simparity" ]; then
 	printf "GGL_NO_KICKOFF_SCRIPT=1\nGGL_SAMPLE_ACTIONS=1\n" > pulsar-bot/HANDICAPS
 	export GGL_NO_KICKOFF_SCRIPT=1 GGL_SAMPLE_ACTIONS=1
 	log "MODE simparity: Pulsar also at sim conditions (no tape, sampling)"
+fi
+if [ "$MODE" = "sample" ]; then
+	printf "GGL_SAMPLE_ACTIONS=1\n" > pulsar-bot/HANDICAPS
+	export GGL_SAMPLE_ACTIONS=1
+	log "MODE sample: Pulsar samples from the policy (every sim evaluation samples; the client's argmax default has never been evaluated anywhere else)"
 fi
 [ -n "$MODE" ] && log "RECEIPTS: check core_play.log for 'Nexto HANDICAPS' and pulsar-bot/bot.*.log for 'RLBot flags' - a missing receipt means the flag did NOT land"
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"
