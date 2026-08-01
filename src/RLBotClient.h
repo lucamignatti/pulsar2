@@ -67,6 +67,13 @@ private:
 		int kickoffIndex = -1;
 		// Previous packet's air_state for this car, for transition logging (255 = unseen).
 		uint8_t prevAirState = 255;
+		// Actuation-latency probe: when the controls we SEND change, remember what and
+		// when; the packet's last_input echoes what the game APPLIED, so the first echo
+		// matching the new controls dates the actuation. Lag in ticks = the venue's
+		// real actionDelay (training uses 0).
+		RLGC::Action echoSent = {};
+		uint32_t echoSentFrame = 0;
+		bool echoWaiting = false;
 	};
 	std::unordered_map<unsigned, CarCtx> ctxByIndex;
 

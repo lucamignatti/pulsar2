@@ -512,6 +512,42 @@ void RLBotBot::update(
 			ctx.kickoffIndex = -1;
 		}
 
+		// ACTUATION-LATENCY PROBE (dbgOn only). Training applies the chosen action at the
+		// very tick its source state was read (actionDelay 0); the real game cannot. The
+		// packet's last_input echoes what the game actually applied, so: when our sent
+		// controls change, stamp the frame; when the echo first matches, the frame delta
+		// is the venue's true actionDelay in ticks (floor - the echo itself reports the
+		// previous frame's input, so true lag is within [lag-ticksElapsed, lag]).
+		if (dbgOn && rawSelf && matchInfo) {
+			const uint32_t frameNum = matchInfo->frame_num();
+			if (ctx.echoWaiting && rawSelf->last_input()) {
+				const auto* li = rawSelf->last_input();
+				const Action& s = ctx.echoSent;
+				auto near = [](float a, float b) { return fabsf(a - b) < 1e-3f; };
+				if (near(li->throttle(), s.throttle) && near(li->steer(), s.steer)
+					&& near(li->pitch(), s.pitch) && near(li->yaw(), s.yaw)
+					&& near(li->roll(), s.roll)
+					&& li->jump() == (s.jump != 0.f) && li->boost() == (s.boost != 0.f)
+					&& li->handbrake() == (s.handbrake != 0.f)) {
+					std::ostringstream e;
+					e << "{\"type\":\"echo\",\"t\":" << curTime << ",\"i\":" << index
+						<< ",\"lag\":" << (frameNum - ctx.echoSentFrame)
+						<< ",\"ke\":" << ticksElapsed << "}";
+					DebugLogLine(e.str());
+					ctx.echoWaiting = false;
+				}
+			}
+			// Arm on every change of what we send (decision boundaries and tape rows).
+			bool changed = false;
+			for (int d = 0; d < 8 && !changed; d++)
+				changed = (ctx.controls[d] != ctx.echoSent[d]);
+			if (changed) {
+				ctx.echoSent = ctx.controls;
+				ctx.echoSentFrame = frameNum;
+				ctx.echoWaiting = true;
+			}
+		}
+
 		const Action& c = ctx.controls;
 		setOutput(index, {
 			c.throttle, c.steer,
