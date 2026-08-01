@@ -422,8 +422,15 @@ void RLBotBot::update(
 
 		if (ctx.updateAction) {
 			ctx.updateAction = false;
+			// GGL_SAMPLE_ACTIONS=1 -> sample from the policy instead of argmax. The viz
+			// viewer samples by default (matching how the bot trains and self-plays), so
+			// sim-parity experiments should set this; deployment default stays argmax.
+			static const bool sampleActions = [] {
+				const char* v = std::getenv("GGL_SAMPLE_ACTIONS");
+				return v && *v && std::string(v) != "0";
+			}();
 			GGL::InferUnit::InferDebug dbg;
-			ctx.action = params.inferUnit->InferAction(localPlayer, gs, true, 1,
+			ctx.action = params.inferUnit->InferAction(localPlayer, gs, !sampleActions, 1,
 				dbgOn ? &dbg : nullptr);
 
 			// Decision line: the exact obs/mask/action inference consumed, the raw

@@ -1,4 +1,5 @@
 import math
+import os
 import random
 
 import numpy as np
@@ -52,8 +53,19 @@ class Nexto(Bot):
     # 1=best action, 0.5=sampling from probability, 0=random, -1=worst action, or anywhere inbetween
     beta = 1
     render = False
-    hardcoded_kickoffs = True
-    stochastic_kickoffs = True
+    # GAP-VERIFICATION HANDICAPS (2026-07-31, default OFF - normal Nexto unless set).
+    # Together they recreate the conditions viz-Nexto played under, so a real-game match
+    # with both enabled should reproduce the sim's scoreline IF the sim-vs-real gap is
+    # explained by those conditions (and not by e.g. physics nativeness):
+    #   NEXTO_NO_KICKOFF=1  - no scripted speedflip, no stochastic kickoffs. The viz
+    #                         bridge always reports MatchPhase::Active, so neither ever
+    #                         fires there.
+    #   NEXTO_VIZ_BUG=1     - see get_output: has_flip never expires by window lapse,
+    #                         the exact effect the bridge's old dodge_timeout sentinel
+    #                         had on rlgym_compat's reconstruction.
+    hardcoded_kickoffs = os.environ.get("NEXTO_NO_KICKOFF") != "1"
+    stochastic_kickoffs = os.environ.get("NEXTO_NO_KICKOFF") != "1"
+    viz_bug = os.environ.get("NEXTO_VIZ_BUG") == "1"
 
     agent = Agent()
     tick_skip = 8
@@ -155,6 +167,18 @@ class Nexto(Bot):
             return self.controls
 
         self.game_state.update(packet)
+
+        # NEXTO_VIZ_BUG: reproduce the old viz-bridge dodge_timeout bug. The bridge sent
+        # a sentinel (1.0 while a flip was notionally available, -1 otherwise); through
+        # rlgym_compat's air_time_since_jump reconstruction that made has_flip equal to
+        #     not has_dodged and not has_double_jumped
+        # i.e. the 1.25s dodge window NEVER expires by lapse - Nexto believes it can
+        # still dodge long after the window closed, for itself and every other car it
+        # observes. game_state.update() rebuilds players in packet order every call, so
+        # the zip aligns.
+        if self.viz_bug:
+            for p, pk in zip(self.game_state.players, packet.players):
+                p.has_flip = (not pk.has_dodged) and (not pk.has_double_jumped)
 
         if self.update_action and len(self.game_state.players) > self.index:
             self.update_action = False
