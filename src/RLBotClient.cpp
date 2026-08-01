@@ -497,9 +497,15 @@ void RLBotBot::update(
 		const bool kickoffPhase = matchInfo
 			&& matchInfo->match_phase() == rlbot::flat::MatchPhase::Kickoff;
 		if (kickoffPhase && !noKickoffScript) {
-			if (ctx.kickoffIndex == -1)
-				ctx.kickoffIndex = IsKickoffTaker(packet, index, this->team) ? 0 : -2;
-			else if (ctx.kickoffIndex >= 0)
+			if (ctx.kickoffIndex == -1) {
+				const bool taker = IsKickoffTaker(packet, index, this->team);
+				ctx.kickoffIndex = taker ? 0 : -2;
+				// Visible in bot.<pid>.log, so "did the tape fire" never again needs a
+				// JSONL parse to answer.
+				RG_LOG("[kickoff] car " << index << ": tape "
+					<< (taker ? "ENGAGED" : "skipped (teammate is taker)")
+					<< " at t=" << curTime);
+			} else if (ctx.kickoffIndex >= 0)
 				ctx.kickoffIndex += ticksElapsed;
 
 			auto balls = packet->balls();
@@ -581,9 +587,13 @@ void RLBotClient::Run(const RLBotParams& params) {
 		const char* v = std::getenv(name);
 		return v && *v && std::string(v) != "0";
 	};
-	RG_LOG("RLBotClient flags: GGL_NO_KICKOFF_SCRIPT=" << fnFlag("GGL_NO_KICKOFF_SCRIPT")
-		<< " GGL_SAMPLE_ACTIONS=" << fnFlag("GGL_SAMPLE_ACTIONS")
-		<< " GGL_DEBUG_JSONL=" << fnFlag("GGL_DEBUG_JSONL"));
+	// Stated as what IS happening, never as the raw negative flag: the first version
+	// printed "GGL_NO_KICKOFF_SCRIPT=0", which reads as "kickoff script = off" when it
+	// means the opposite, and cost a debugging round on 2026-08-01.
+	RG_LOG("RLBotClient config: kickoffScript="
+		<< (fnFlag("GGL_NO_KICKOFF_SCRIPT") ? "OFF" : "ON")
+		<< " actionSelection=" << (fnFlag("GGL_SAMPLE_ACTIONS") ? "SAMPLE" : "ARGMAX")
+		<< " debugJsonl=" << (fnFlag("GGL_DEBUG_JSONL") ? "ON" : "OFF"));
 
 	RG_LOG("RLBotClient: connecting to RLBotServer at " << host << ":" << port << " as \"" << agentId << "\"...");
 

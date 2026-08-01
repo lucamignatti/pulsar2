@@ -189,6 +189,11 @@ bot_spawned()  { grep -qs "Created RLBot bot" pulsar-bot/bot.*.log 2>/dev/null; 
 log() { echo "$@"; echo "$(date '+%H:%M:%S') $*" >> watchdog.log; }
 
 kill_all() {
+	# Markers must never outlive the run that wrote them. play.sh clears them at
+	# startup, but pulsar-bot/run.sh and nexto/bot.py also read them and the VIZ
+	# launches those directly - so a handicap run that ended without this cleanup
+	# would silently disable the kickoff tape (or bug Nexto) in the next viz session.
+	rm -f nexto/HANDICAPS pulsar-bot/HANDICAPS 2>/dev/null
 	pkill -f 'RocketLeague_EAC\.exe' 2>/dev/null
 	pkill -f 'EasyAntiCheat_EOS\.exe' 2>/dev/null
 	pkill -f GigaLearnRLBot 2>/dev/null
