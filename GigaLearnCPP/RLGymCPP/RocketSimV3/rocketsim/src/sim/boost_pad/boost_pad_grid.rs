@@ -1,3 +1,5 @@
+use glam::Vec3A;
+
 use crate::{
     BoostPad, BoostPadConfig, CarState, MutatorConfig,
     consts::{TICK_TIME, boost_pads},
@@ -10,6 +12,8 @@ pub struct BoostPadProcessor<'a> {
     mutator_config: &'a MutatorConfig,
     tick_count: u64,
     pad_idx: Option<usize>,
+    /// VENDOR PATCH (pulsar 2026-08-01): full hitbox size of the car body.
+    car_hitbox_size: Vec3A,
 }
 
 impl bvh::ProcessNode for BoostPadProcessor<'_> {
@@ -27,13 +31,38 @@ impl bvh::ProcessNode for BoostPadProcessor<'_> {
             return;
         }
 
-        // Check if car origin is inside the cylinder hitbox
         let pad_pos = pad.config().pos;
-        let dist_sq_2d = pad_pos
-            .truncate()
-            .distance_squared(self.car_state.pos.truncate());
-        let overlapping = dist_sq_2d < pad.cyl_radius.powi(2)
-            && (self.car_state.pos.z - pad_pos.z).abs() <= boost_pads::CYL_HEIGHT;
+
+        // VENDOR PATCH (pulsar 2026-08-01): test the pad cylinder against the CAR BODY,
+        // not the car's origin point.
+        //
+        // Rocket League decides pickups from UE3's `Touching` array
+        // (`AVehiclePickup_TA::IsTouchingAVehicle` -> RocketLeague.exe FUN_140f0d590),
+        // i.e. a collision-primitive overlap between the pad volume and the car's
+        // collision body. Testing only the origin misses pickups where the car body
+        // covers the pad: measured on real telemetry, RocketSim missed 10 of 19 real
+        // pickups, at closest origin approaches of 146-170uu against a 144uu radius.
+        //
+        // The car's ORIENTED box is used deliberately -- an axis-aligned box of a rotated
+        // car is much larger than the car and over-triggers badly (a tested AABB variant
+        // produced 116 false pickups in 1508 frames).
+        // See research/reports/SIM2REAL_AUDIT.md S14.
+        let half = self.car_hitbox_size * 0.5;
+        let rot = self.car_state.rot_mat;
+        let rel = pad_pos - self.car_state.pos;
+        // pad centre in car-local space, then clamped onto the box => closest point
+        let local = Vec3A::new(rel.dot(rot.x_axis), rel.dot(rot.y_axis), rel.dot(rot.z_axis));
+        let clamped = local.clamp(-half, half);
+        let closest =
+            self.car_state.pos + rot.x_axis * clamped.x + rot.y_axis * clamped.y + rot.z_axis * clamped.z;
+
+        let dist_sq_2d = pad_pos.truncate().distance_squared(closest.truncate());
+        // Radius is BOX_RAD (120 small / 160 big), not CYL_RAD (144/208): the larger
+        // cylinder radii are origin-test approximations that already bake in typical car
+        // body reach, so pairing them with a body test double-counts it. Using the box
+        // radii -- previously dead constants -- against the car body reproduces the game.
+        let overlapping = dist_sq_2d < pad.box_radius.powi(2)
+            && (closest.z - pad_pos.z).abs() <= boost_pads::CYL_HEIGHT;
         if overlapping {
             // Give boost
             self.car_state.boost = (self.car_state.boost + pad.boost_amount)
@@ -114,6 +143,7 @@ impl BoostPadGrid {
         car_state: &mut CarState,
         mutator_config: &MutatorConfig,
         tick_count: u64,
+        car_hitbox_size: Vec3A,
     ) -> Option<usize> {
         if car_state.boost >= mutator_config.car_max_boost_amount {
             return None; // Already full on boost
@@ -123,7 +153,9 @@ impl BoostPadGrid {
             return None; // Can't possibly overlap with a boost pad
         }
 
-        let car_center_aabb = Aabb::new(car_state.pos, car_state.pos);
+        // VENDOR PATCH: broad-phase must cover the car body, matching the test below.
+        let body_reach = car_hitbox_size * 0.5;
+        let car_center_aabb = Aabb::new(car_state.pos - body_reach, car_state.pos + body_reach);
 
         let mut pad_processor = BoostPadProcessor {
             all_pads: &mut self.all_pads,
@@ -131,6 +163,7 @@ impl BoostPadGrid {
             mutator_config,
             tick_count,
             pad_idx: None,
+            car_hitbox_size,
         };
         self.bvh_tree
             .report_aabb_overlapping_node(&mut pad_processor, &car_center_aabb);

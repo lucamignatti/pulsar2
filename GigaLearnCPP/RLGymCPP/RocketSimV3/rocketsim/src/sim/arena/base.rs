@@ -576,6 +576,7 @@ impl Arena {
                     &mut car.state,
                     &self.config.mutators,
                     self.tick_count,
+                    car.info.config.hitbox_size,
                 );
 
                 if let Some(collected_pad_idx) = collected_pad_op {

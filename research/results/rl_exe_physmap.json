@@ -1,0 +1,333 @@
+{
+"ABall_TA::execOverrideBallTexture": [
+[
+"FUN_14038e000",
+"FUN_1403a7ec0",
+"FUN_14038f280"
+],
+[]
+],
+"ABall_TA::execPredictGroundPosition": [
+[
+"FUN_14081cb20",
+"FUN_140962370",
+"FUN_140f1d990"
+],
+[]
+],
+"ABall_TA::execPredictPosition": [
+[
+"FUN_140f1dfd0"
+],
+[]
+],
+"ACarComponent_AirControl_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_AirControl_TA::execGetDesiredRotationTowardsTarget": [
+[
+"FUN_140eede60"
+],
+[]
+],
+"ACarComponent_AirControl_TA::execGetDirectionToTarget": [
+[
+"FUN_140eee170"
+],
+[]
+],
+"ACarComponent_AirControl_TA::execGetInputForRotationAxis": [
+[
+"FUN_140ef0fc0"
+],
+[]
+],
+"ACarComponent_AirControl_TA::execIsTargetFinding": [
+[],
+[]
+],
+"ACarComponent_AirControl_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_Boost_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_Boost_TA::execCanActivate": [
+[],
+[
+"0x698"
+]
+],
+"ACarComponent_Boost_TA::execCanDeactivate": [
+[],
+[
+"0x6b0"
+]
+],
+"ACarComponent_Boost_TA::execIsBoostRestricted": [
+[],
+[]
+],
+"ACarComponent_Boost_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_Boost_TA::execSetBoostAmount": [
+[
+"FUN_140f2f590"
+],
+[]
+],
+"ACarComponent_Dodge_TA::execApplyDodgeImpulse": [
+[],
+[
+"0x6b8"
+]
+],
+"ACarComponent_Dodge_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_Dodge_TA::execApplyTorqueForces": [
+[],
+[]
+],
+"ACarComponent_Dodge_TA::execGetDodgeImpulse": [
+[],
+[
+"0x6b0"
+]
+],
+"ACarComponent_Dodge_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_DoubleJump_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_DoubleJump_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_FlipCar_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_FlipCar_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_Jump_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"ACarComponent_Jump_TA::execPrePhysicsStep": [
+[],
+[
+"0x6a0"
+]
+],
+"ACarComponent_Torque_TA::execApplyForces": [
+[],
+[
+"0x6a8"
+]
+],
+"AVehicle_TA::execDrawCollisionBox": [
+[],
+[]
+],
+"AVehicle_TA::execDumpVehicleSetup": [
+[],
+[]
+],
+"AVehicle_TA::execDumpVehicleSetupForBalboa": [
+[],
+[]
+],
+"AVehicle_TA::execForceNetPacketIfNearBall": [
+[
+"FUN_140f35130"
+],
+[]
+],
+"AVehicle_TA::execGetForwardSpeed": [
+[
+"FUN_14036b6c0"
+],
+[]
+],
+"AVehicle_TA::execGetGroundNormal": [
+[
+"FUN_140ef00c0"
+],
+[]
+],
+"AVehicle_TA::execGetNumWheelContacts": [
+[
+"FUN_140ef4040"
+],
+[]
+],
+"AVehicle_TA::execGetNumWheelWorldContacts": [
+[],
+[]
+],
+"AVehicle_TA::execGetTimeOffGround": [
+[],
+[]
+],
+"AVehicle_TA::execGetTimeOnGround": [
+[],
+[]
+],
+"AVehicle_TA::execGetWheelContactRBActor": [
+[
+"FUN_140f36a50"
+],
+[]
+],
+"AVehicle_TA::execIsCarHitAngleWithinForwardAngle": [
+[
+"FUN_140f0c2a0"
+],
+[]
+],
+"AVehicle_TA::execIsCarHitAngleWithinForwardAngleCurve": [
+[
+"FUN_140f0c450",
+"FUN_14031c480",
+"FUN_14031c480"
+],
+[]
+],
+"AVehicle_TA::execIsCarWithinForwardEllipticalCone": [
+[
+"FUN_140f0c940"
+],
+[]
+],
+"AVehicle_TA::execIsHitLocationWithinForwardAngle": [
+[
+"FUN_1403634c0",
+"FUN_140f0d620"
+],
+[]
+],
+"AVehicle_TA::execIsOnGround": [
+[],
+[
+"0x838"
+]
+],
+"AVehicle_TA::execIsOnRBActor": [
+[
+"FUN_140ef4040"
+],
+[]
+],
+"AVehicle_TA::execIsOnWall": [
+[],
+[
+"0x840"
+]
+],
+"AVehicle_TA::execSetAudioPMCAnimIdx": [
+[
+"FUN_140d9f5b0",
+"FUN_140d9f750"
+],
+[]
+],
+"AVehicle_TA::execSetAudioPodiumSpot": [
+[
+"FUN_140d9f5b0",
+"FUN_140d9f750"
+],
+[]
+],
+"AVehicle_TA::execSetVehicleInput": [
+[],
+[
+"0x830"
+]
+],
+"AVehicle_TA::execUpdateRestrictedInput": [
+[],
+[]
+],
+"UVehicleSim_TA::execAddTireFrictionScale": [
+[
+"FUN_14031c870"
+],
+[]
+],
+"UVehicleSim_TA::execGetMaxTurningCircle": [
+[
+"FUN_140ef2190"
+],
+[]
+],
+"UVehicleSim_TA::execGetMaxTurningCircleAt": [
+[
+"FUN_140ef2310"
+],
+[]
+],
+"UVehicleSim_TA::execRemoveTireFrictionScale": [
+[
+"FUN_14031c870"
+],
+[]
+],
+"UWheel_TA::execGetLinearVelocity": [
+[
+"FUN_140ef18c0"
+],
+[]
+],
+"UWheel_TA::execGetLocalWheelLocation": [
+[],
+[]
+],
+"UWheel_TA::execGetRefWheelLocation": [
+[
+"FUN_140ef8590"
+],
+[]
+],
+"UWheel_TA::execGetSteer": [
+[],
+[]
+],
+"UWheel_TA::execGetSuspensionDistance": [
+[],
+[]
+]
+}

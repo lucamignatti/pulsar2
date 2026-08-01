@@ -130,7 +130,15 @@ pub mod car {
         /// If we are costing with less than this forward vel, we full-brake
         pub const STOPPING_FORWARD_VEL: f32 = 25.0;
         /// How much the brake is applied when coasting
-        pub const COASTING_BRAKE_FACTOR: f32 = 0.15;
+        ///
+        /// VENDOR PATCH (pulsar 2026-08-01): 0.15 -> 0.11. RocketSim's coasting
+        /// deceleration was ~20% too strong. Measured against real match telemetry
+        /// (8811 live transitions): real coast decel -640.7 uu/s^2 vs sim -768, and the
+        /// forward-velocity error was 93% one-sided (median -8.504 uu/s per 8-tick
+        /// window, n=237). At 0.11 that becomes 49% one-sided, median +0.13.
+        /// Isolated to coasting: explicit braking (brake factor 1.0) is only 3.5% off,
+        /// so this is NOT a brake-torque scaling error -- see SIM2REAL_AUDIT.md S14.
+        pub const COASTING_BRAKE_FACTOR: f32 = 0.11;
         /// If we are braking and moving faster than this, disable throttle
         pub const BRAKING_NO_THROTTLE_SPEED_THRESH: f32 = 0.01;
         /// Throttle input of less than this is ignored

@@ -5,7 +5,7 @@ use crate::{BoostPadConfig, MutatorConfig, consts::boost_pads, shared::Aabb};
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct BoostPad {
     pub config: BoostPadConfig,
-    pub _box_radius: f32, // TODO: Implement car-locking with box hitbox
+    pub box_radius: f32,
     pub cyl_radius: f32,
     pub max_cooldown: f32,
     pub boost_amount: f32,
@@ -39,12 +39,21 @@ impl BoostPad {
             mutator_config.boost_pad_amount_small
         };
 
-        let extent = Vec3A::new(box_radius, box_radius, boost_pads::CYL_HEIGHT);
+        // VENDOR PATCH (pulsar 2026-08-01): the BVH broad-phase AABB must cover the
+        // CYLINDER used by the actual pickup test, not the (unused) box radius.
+        // It was built with box_radius (120 small / 160 big) while
+        // BoostPadGrid::process_node tests dist_2d < cyl_radius (144 / 208), so any pad
+        // between those radii was culled by the broad phase and never tested. Measured on
+        // real match telemetry: RocketSim missed 10 of 19 real pickups (53%), all on small
+        // pads, at closest approaches of 123-170uu -- several INSIDE the 144uu cylinder.
+        // See research/reports/SIM2REAL_AUDIT.md S14.
+        let _ = box_radius;
+        let extent = Vec3A::new(cyl_radius, cyl_radius, boost_pads::CYL_HEIGHT);
         let aabb = Aabb::new(config.pos - extent, config.pos + extent);
 
         Self {
             config,
-            _box_radius: box_radius,
+            box_radius,
             cyl_radius,
             max_cooldown,
             boost_amount,

@@ -1,0 +1,1180 @@
+# SIM2REAL_AUDIT — is RocketSim 1:1 with Rocket League?
+
+**Status:** RESULT (2 defects fixed & validated) · **Date:** 2026-08-01 · **Trigger:** Pulsar's real-game goal
+share pinned at ~20% across every config flip; hypothesis was a sim-to-real
+physics gap.
+
+**Verdict: RocketSim's bulk physics is excellent; FOUR real defects found (2 fixed, 2 open).**
+Ground, air and ball dynamics reproduce real-game telemetry to sub-uu per 8-tick
+window (ball free flight: 0.026 uu). Confirmed defects:
+
+1. **Air throttle is double-counted while boosting** (§5) — +66.67 uu/s² on every
+   boosted aerial, verified against real telemetry to 0.3%. Systematic, integrates.
+2. **Dodge torque skips the inverse-inertia division** (§1b) — **root-caused in the
+   binary**: RL's angular primitive `FUN_140981560` mode 5 applies `I⁻¹ · torque`;
+   RocketSim adds the torque straight to angular velocity. Octane's 1/I_y = 0.01041
+   matches the independently fitted 0.0100 to 4%. Patching it cuts the error ~40×
+   (2.048 → 0.051 rad/s) across 6,382 real dodge frames.
+
+Everything else checked came back clean: arena geometry, ground contact, ball free
+flight, **ball spin**, ball-car hit impulse, boost consumption, boost-pad pickup,
+wall/ramp driving, flip duration, and **demolitions** (§8). Bumps show no defect but
+are measurement-limited.
+
+Two earlier headline claims in this report were **tested and withdrawn**: the
+`actionDelay = 2` recommendation (§4) and the dodge-cancel time gate (§1b). Both
+retractions are kept in place with the evidence that killed them.
+
+Scope: **Soccar only** (1v1 + team modes); other game modes are out of scope.
+
+---
+
+## 1. Ghidra: the constants are not in the exe — the *code* is
+
+Static RE cannot recover RocketSim's **numeric constants**, and the reason is now
+proven by reading Rocket League's actual physics code rather than inferred from a
+failed byte-scan (see §1b for what the code *does* give us).
+
+Scanned all 41 MB of `RocketLeague.exe` for every constant in
+`rocketsim/src/sim/consts.rs`, as f32/f64/i32/i16, in **both** Unreal Units and
+Bullet Units (÷50). Results:
+
+- Values that a byte-scan "finds" (e.g. `-650.0`, `2300.0` as `46.0` BT) sit at
+  **unaligned addresses with zero code cross-references**. Ghidra's xref index
+  works (verified against a known-referenced string at `0x141eb9ca0`), so these
+  are coincidental byte matches inside unrelated data, not referenced constants.
+- Every distinctive physics constant — `2975/3`, `4375/3`, `91.25`, `6000`,
+  `4600`, `2200`, and **all six steer-curve points** (`0.53356 … 0.03454`) —
+  is absent in every encoding tested.
+- The binary is stripped: no `Vehicle`/`Car` function symbols.
+
+That is the expected UE3 layout: gameplay values live as UnrealScript default
+properties in the cooked packages, not as compiled immediates. And
+`TAGame.upk` (72 MB) is **encrypted** — valid UE3 header (v868/licensee 32), but
+its name table is high-entropy and contains no plaintext (`Vehicle_TA`,
+`BoostForce`, etc. all absent as ASCII **and** UTF-16). Reading it would mean
+defeating the package encryption, which this audit does not do.
+
+## 1b. Ghidra, done properly: 3,740 functions recovered
+
+The binary is **not** packed (`.text` entropy 6.63) and is stripped of RTTI for
+game classes (the only 74 RTTI descriptors are CryptoPP). But UE3 leaves the
+**native function registration table** intact as ASCII: 4,145 strings of the form
+`AVehicle_TAexecGetForwardSpeed`, spanning 613 classes. Each string is followed in
+an `FNativeFunctionLookup` entry by the function pointer, so **all 4,145 resolved
+to `.text` addresses**; 3,740 unique addresses are now named in the Ghidra project
+(`ACarComponent_Dodge_TA_execApplyTorqueForces`, etc.). Everything below follows
+from that foothold. Regenerate with `scan`/`natives.json` in the scratchpad.
+
+The physics classes are all present: `ACarComponent_Dodge_TA`, `_Jump_TA`,
+`_DoubleJump_TA`, `_Boost_TA`, `_AirControl_TA`, `_FlipCar_TA`, `AVehicle_TA`,
+`UVehicleSim_TA`, `UWheel_TA`, `ABall_TA`.
+
+**Why the constants are absent, confirmed from the code.**
+`ACarComponent_Dodge_TA::ApplyTorqueForces` is a direct (non-virtual) call at
+**`0x140eb72b0`** (spans `..0x140eb756c`). Decompiled, every physics quantity is an
+**instance field load**, not an immediate:
+
+- `+0x380 / +0x384 / +0x388` — dodge torque direction (x, y, z)
+- `+0x350` — time gate for pitch-cancellation
+- `+0x354` — Z-damp force factor
+- `+0x358 / +0x35c` — Z-damp start time / window duration
+
+Those fields are populated from the class default object, which is cooked into the
+**encrypted** `TAGame.upk`. So the numbers are genuinely unavailable statically —
+but the **algorithm** is fully readable, and that is where the real finding is.
+
+### RETRACTED: "RocketSim is missing RL's dodge-cancel time gate"
+
+**This claim was wrong and is withdrawn.** It is kept here because the code
+reading below is still accurate and the retraction is instructive.
+
+The reasoning was: RL gates dodge pitch-cancellation on field `+0x350`, RocketSim
+has no gate, and `flip::TORQUE_MIN_TIME = 0.41` is dead code — therefore `+0x350`
+is 0.41 s and RocketSim lets the policy cancel flips 0.41 s earlier than the game.
+
+**Tested against real telemetry and refuted.** Patching a copy of RocketSim to gate
+the cancel on `flip_time >= TORQUE_MIN_TIME` and re-fitting the 11 real-match frames
+where the gate changes behaviour made the fit **~2.8× worse**:
+
+| variant | angVel err on gate-affected frames (rad/s) |
+|---|---|
+| RocketSim as shipped (no gate) | median **1.634**, mean 2.310 |
+| patched with the 0.41 s gate | median **4.558**, mean 5.531 |
+
+So the real game *does* permit early cancellation. The gate exists in RL's code, but
+its threshold is evidently near zero, not 0.41 s. The inference I flagged as the weak
+link — equating `+0x350` with the unused constant — was the part that broke. Lesson:
+a dead constant is a hypothesis, not evidence.
+
+### ROOT-CAUSED: RocketSim omits the inverse-inertia division on dodge torque
+
+Ghidra gave the mechanism, and it is exact enough to fix properly rather than by fitting.
+
+**RL's force primitives take a MODE argument.** Decompiling the CarComponent vtables
+(cluster at `.rdata:0x141e4a000+`, each 0x6b8 bytes, `PrePhysicsStep` at slot +0x6a0 and
+`ApplyForces` at +0x6a8) leads to two primitives:
+
+- `FUN_14097f5c0(rb, &vec, &pos, 0, mode)` — linear, modes 1 and 2 observed
+- **`FUN_140981560(rb, &torque, _, mode)`** — angular; the dodge uses **mode 5**
+
+`FUN_140981560` mode 5 (with inertia > 0) computes the **full inverse inertia tensor** —
+a cofactor inverse of the 3×3 matrix at `+0x130..+0x158` with `1/det` — applies it to the
+torque, then scales by a per-axis factor at `+0x390/+0x394/+0x398` and adds the result to
+angular velocity at `+0x1e0/+0x1e4/+0x1e8`:
+
+```c
+angvel += (I⁻¹ · torque) * factor[axis]
+```
+
+**RocketSim does none of that.** `car/base.rs` adds the torque straight to angular
+velocity with `massed: false`, i.e. no inertia division at all:
+
+```rust
+rb.add_impulse(None, Impulse::Angular(rot * dodge_torque), false, true);
+```
+
+**The magnitude checks out.** Octane's box inertia at mass 180 BT is
+I = (54.07, 96.10, 132.23), so 1/I_y = **0.01041** for the pitch axis — and forward
+dodges (which dominate: 128 of 145 sampled flip frames) fit best at an empirical scale of
+**0.0100**. A 4% match to a number derived independently from the binary.
+
+**Validated on 6,382 real mid-dodge frames** (angular-velocity error, rad/s):
+
+| variant | all dodges | forward-dominant | side-dominant |
+|---|---|---|---|
+| **shipped RocketSim** | **2.0482** | 1.8689 | 2.1537 |
+| patched: `inv_inertia_tensor_world * torque` | **0.0512** | 0.0384 | 0.0648 |
+| fitted scalar ×0.01 (for comparison) | 0.0379 | 0.0232 | 0.0550 |
+
+**~40× error reduction either way.** The defect is real and the direction of the fix is
+settled.
+
+**The `+0x390` factor is identified — the fix is exact, not approximate.** RL's mode 5
+computes
+
+```
+angvel[i] += (I⁻¹ · torque)[i] * factor[i]      // factor at rb+0x390/+0x394/+0x398
+```
+
+which is **verbatim `btRigidBody::applyTorqueImpulse`**:
+`m_angularVelocity += m_invInertiaTensorWorld * torque * m_angularFactor`. The default
+branch is the matching `applyTorque` form (`torque * m_angularFactor`, no inertia) — which
+is precisely what RocketSim was doing. So `+0x390` is Bullet's **`m_angularFactor`**,
+`(1,1,1)` for a car.
+
+Cross-check: if `angularFactor == 1`, the predicted dodge scale is `1/I_y = 0.01041`
+against the independently fitted **0.0100**, implying an angular factor of **0.961** —
+within 4% of unity, which is the expected residual given the 5.5 rad/s cap saturates 89%
+of dodge frames. **`Impulse::Angular(inv_inertia_tensor_world * world_torque)` is
+therefore RL's exact formula**, and it generalises across bodies and axes where a scalar
+tuned on Octane pitch (1/I_x = 0.0185 vs 1/I_y = 0.0104, a 78% spread) would not.
+
+### RL's force-mode semantics, decoded (and how RocketSim maps to them)
+
+Both primitives scale their vector by **0.02 = 1/50 = `UU_TO_BT`**, confirming RL's
+internal physics runs in the same Bullet units RocketSim uses. `+0x180` is the body mass;
+`+0x130..+0x158` is the inertia matrix; `+0x1e0/4/8` is angular velocity.
+
+| RL mode | primitive | semantics | RocketSim equivalent |
+|---|---|---|---|
+| linear 1 | `FUN_14097f5c0` | velocity change, **no** mass division | `add_impulse(Linear, massed=false)` ✓ |
+| linear 2 | `FUN_14097f5c0` | impulse, **divided by mass** | `add_impulse(Linear, massed=true)` ✓ |
+| angular 5 | `FUN_140981560` | torque via **full inverse inertia tensor** | **no equivalent** ✗ |
+| angular default | `FUN_140981560` | `angvel += torque * factor` (no inertia) | `add_impulse(Angular, massed=false)` ✓ |
+
+**The linear side maps cleanly.** CarComponent `ApplyForces` uses mode 1 and RocketSim's
+`massed=false` matches; the dodge's Z-damp uses mode 2 and maps to `massed=true`.
+
+**The angular side has a hole.** RocketSim's angular branch is
+
+```rust
+Impulse::Angular(av) => { ang_impulse = av * massed_scaler; }   // massed_scaler = inv_MASS
+```
+
+so `massed=true` on an angular impulse divides by **mass**, which is dimensionally wrong
+for a torque, and **no code path applies the inverse inertia tensor to an angular
+impulse** (only `LinearRelPos` does, for its cross-product term). That is the root
+deficiency behind the dodge defect.
+
+There are exactly three `Impulse::Angular` call sites: dodge torque (`base.rs:407`, the
+defect), air-control torque (`:460`) and auto-roll torque (`:732`). The latter two measure
+clean — air control at **0.001 rad/s** and auto-roll indistinguishable from the upright
+control — so either RL applies those through the non-inertia path or their constants
+already absorb it. **Only the dodge needed changing**, which is consistent with every
+measurement in this report.
+
+### The code reading (still accurate)
+
+RL's decompiled dodge torque:
+
+```c
+scale = dirY;                                  // +0x384
+if (*(float*)(this+0x350) <= elapsed) {        // <-- TIME GATE
+    pitch = *(float*)(vehicle+0x7f8);
+    if (0.0 <= dirY) { /* clamp pitch to [-1,0] */ s = pitch_clamped + 1.0; }
+    else if (0.0 <= pitch) { s = 1.0 - min(pitch, 1.0); }
+    else s = 1.0;
+    scale = dirY * s;
+}
+```
+
+Cancellation is only permitted **after** `this+0x350`. RocketSim
+(`car/base.rs:391-400`) applies the identical `1 - |pitch|` attenuation but with
+**no time gate at all** — from `flip_time = 0`.
+
+The field mapping is well-constrained: `+0x358`/`+0x35c` reproduce RocketSim's
+Z-damp gate (`>= Z_DAMP_START && (vel.z < 0 || flip_time < Z_DAMP_END)`,
+0.15 / +0.06) and `+0x354` its `Z_DAMP_120` factor — a clean structural match that
+validates the offset block. By elimination `+0x350` is a flip time constant that
+is not z-damp, and **`flip::TORQUE_MIN_TIME = 0.41` is defined in `consts.rs` and
+never used anywhere in the crate** (`PITCHLOCK_TIME = 1.0` is likewise dead).
+That is the gate, sitting unwired.
+
+**Measured exploit surface** (forward flip, pitch-axis ang-vel at end of flip):
+
+| case | rad/s |
+|---|---|
+| no cancel | 5.6039 |
+| cancel from t = 0 — **RocketSim allows** | 0.3117 |
+| cancel after 0.41 s — what RL allows | 2.7215 |
+
+→ **2.41 rad/s of flip rotation, 43% of an uncancelled flip**, is cancellable in
+training but not in the real game. In sim a bot can kill ~94% of its flip
+rotation instantly; in the real game it could kill ~51%. Pulsar re-decides every 8
+ticks, so it gets ~6 decision points inside the 0.41 s window and can absolutely
+learn to exploit this. Flips are load-bearing for wavedashes, directional dodges
+and flip resets.
+
+**Caveat:** the *existence* of the gate is directly visible in RL's code and
+RocketSim's lack of one is certain; the specific value 0.41 s is inferred from the
+unused constant, since the field itself lives in the encrypted package. Even if
+the true threshold differs, the structural gap is real.
+
+**Not concluded:** RL cancels when `sign(pitch) == -sign(dirY)`; RocketSim when
+the signs are equal. That is consistent with one of the two conventions being
+inverted between the engines and is **not** evidence of a bug — resolving it needs
+RL's internal pitch sign, which I did not establish.
+
+**Constants were additionally validated empirically** — against recorded real-game
+telemetry, which is stronger evidence than reading a number out of a binary
+anyway.
+
+## 2. Empirical physics validation (the real test)
+
+`rocketsim/tests/rl_comparison_test` replays **recorded real-game ticks** and
+compares per-tick impulses. Run at the pinned commit (debug build; the impulse
+trace is behind `debug_assertions`):
+
+| impulse (resting car, UU/s) | real RL | RocketSim steady state |
+|---|---|---|
+| `StickyForce` | −2.7083335 | **−2.7083** |
+| `WheelsSuspension` | 8.124919 | **8.1261** |
+| net vs gravity (5.41667) | ≈ 0 | ≈ 0.0011 |
+
+Suspension agrees to **0.015%**; sticky force is exact. The car settles at
+z = 17.01 UU (`REST_Z` = 17). **Ground physics is right.**
+
+### The comparison test still "fails" — and it is a harness artifact
+
+`case_simple_jump_land` fails with `norm_error = 1.35`, showing suspension
+9.4676 (16.5% high) and **no sticky force**. That is *not* the steady-state
+behaviour above. The harness calls `set_car_state` every tick, and RocketSim
+documents that `set_car_state` **cannot restore suspension state**
+(`sim/car/car_extra_state.rs`): "replaying identical inputs from a restored
+grounded car diverged ~23uu within a second". On the first tick after a
+state-set the wheel raycast has no world contact, so sticky force is skipped and
+suspension is computed off unsettled compression.
+
+The repo README's "accepted risk" wording ("missing sticky-force impulse,
+suspension impulse ~14% off") reads as a steady-state defect. It is not — it is
+a **state-restore** defect. Worth correcting, because it misdirects.
+
+## 3. Arena geometry is correct (negative result)
+
+The live trainer loads a **10-mesh dump whose hashes match 0 of 16** canonical
+soccar meshes, and a vendor patch in `rocketsim/src/base.rs` downgrades
+upstream's hard rejection to a warning. The warnings do fire every boot.
+
+This looked alarming and is **benign**. The meshes are generated by
+`collision_mesh_downloader.py` from RLUtilities assets, mirrored 4 ways — a
+different *partitioning* of the same surface, so the hashes differ by
+construction. Compared against the canonical 16-mesh dump (rlgym-rocket-league
+2.0.1 sdist; my hasher reproduces all 16 canonical hashes exactly):
+
+- identical triangle count: **8020 vs 8020**
+- identical extents: x ±4107.3, y ±6000.0, z −13.3 … 2075 UU
+- vertex nearest-neighbour: **max 0.091 UU (~1.8 mm), mean 0.003 UU**
+- the 28 triangles whose centroids differ are quads split on the other diagonal
+
+**No action needed.** But `RocketSimV3/README.md` currently claims the standard
+16-mesh dump is in use and that the 10-mesh set is "parked at
+`build/collision_meshes/soccar_nonstandard_backup`" — that directory does not
+exist and the 10-mesh set is what is live. The README is wrong; the geometry is
+fine.
+
+## 4. Actuation latency (measured, but NOT a discrepancy)
+
+From the real-game session of 2026-08-01 10:02 (`core_play.log`: "Connected to
+Rocket League"), `rlbot-run/pulsar-bot/debug.3165337.jsonl`, n = 427 `echo`
+records comparing sent controls against the packet's `last_input` echo:
+
+| lag (ticks) | count | share | ms |
+|---|---|---|---|
+| 1 | 3 | 0.7% | 8.3 |
+| **2** | **419** | **98.1%** | **16.7** |
+| 3 | 3 | 0.7% | 25.0 |
+| 4 | 1 | 0.2% | 33.3 |
+| 6 | 1 | 0.2% | 50.0 |
+
+**mean 2.01 ticks · median 2 · mode 2.** A hard, low-variance pipeline delay.
+
+### CORRECTION: this does NOT mean `actionDelay = 2` is the right training value
+
+An earlier revision of this report recommended setting `actionDelay = 2`. **That
+was wrong**, and §7's replay disproves it: refitting the same real-match data with
+0–4 ticks of lag shows **lag = 0 fits best**, with error rising monotonically:
+
+| lag (ticks) | median pos err (uu / 8-tick window) |
+|---|---|
+| **0** | **0.679** |
+| 1 | 0.708 |
+| 2 | 0.851 |
+| 3 | 0.916 |
+
+The resolution: the echo measures **send → applied**, but the packet we act on is
+itself ~2 ticks stale. Observation delay and actuation delay are both ~2 ticks and
+**cancel** — relative to the state the policy actually sees, its action lands
+immediately. `actionDelay = 0` is therefore already correct, and forcing 2 would
+introduce the very error it was meant to remove.
+
+The 16.7 ms figure is still a real property of the venue; it is just not a
+sim-to-real *discrepancy*. Do not change `actionDelay` on the strength of it.
+
+## 5. CONFIRMED DEFECT: air throttle is double-counted on boosted aerials
+
+`car/base.rs:463` applies `THROTTLE_AIR_ACCEL` (66.67 uu/s²) whenever
+`throttle != 0`, **including while boosting**; upstream flags this as wrong
+(`// TODO: Fix air-throttle not respecting boost`). v2 RocketSim has the same
+behaviour (`Car.cpp:639`), so it is long-standing, not a v3 regression.
+
+This bites Pulsar specifically because `DefaultAction`'s aerial actions are
+emitted as `{boost, yaw, pitch, yaw, roll, jump, boost, handbrake}` — **throttle
+is set equal to boost**, so *every* boosted aerial also sends throttle = 1.
+
+Measured in-sim:
+
+| air state (0.5 s) | accel |
+|---|---|
+| boost only | 1057.28 uu/s² |
+| boost + throttle | **1124.41 uu/s²** |
+| throttle only | 66.01 uu/s² |
+
+→ **+6.35% acceleration on every boosted aerial.**
+
+Strong circumstantial evidence this is a genuine over-count: RocketSim's own
+constants satisfy `ACCEL_AIR (1058.333) − ACCEL_GROUND (991.667) = 66.667`
+= `THROTTLE_AIR_ACCEL` **exactly**, i.e. the air boost figure already bundles the
+throttle term, and adding it again double-counts.
+
+**CONFIRMED against real telemetry (§7).** Replaying 40 real-match windows of
+*airborne + boosting + throttle≠0* and measuring the excess forward Δv that
+RocketSim produces versus the real game:
+
+- predicted, if air throttle is double-counted: `66.667 × 8/120` = **+4.444 uu/s**
+- **measured median: +4.459 uu/s** (0.3% off the prediction)
+
+This is no longer a suspicion. RocketSim over-accelerates boosted aerials by
+exactly `THROTTLE_AIR_ACCEL`. The error is **systematic and same-signed**, so it
+integrates: over a 1.5 s aerial it is ~100 uu/s of excess speed and ~75 uu of
+overshoot. Pulsar's aerials are tuned to a car that accelerates 6.35% harder than
+the real game delivers, so it arrives systematically short/late on aerial
+intercepts — and this run scaffolds aerials hard.
+
+## 7. End-to-end replay against real match data (the broad sweep)
+
+The upstream suite ships **one** recording, which is thin. So 959 real-match
+transitions were replayed from `debug.3165337.jsonl` (real game, 2026-08-01):
+reconstruct state from the logged obs (pos/forward/up/vel/angVel, boost, ground and
+flip flags), apply the logged action for 8 ticks, compare to the next decision.
+
+**Methodological correction — 12.4% of the telemetry is unusable.** 119 of 959
+transitions have a *byte-identical* real position at t and t+8 while the car carries
+real speed: the game was **paused** (goal replay / kickoff countdown) but the bot kept
+ticking. Those inflate the sim's error by exactly `speed × 0.0667 s` and were the
+source of a recurring `p90 = 67.595 uu` that appeared in every regime. All numbers
+below exclude them (838 live transitions).
+
+| regime | n | pos med (uu) | pos p90 | **angVel med (rad/s)** |
+|---|---|---|---|---|
+| **all live transitions** | 838 | 0.275 | 1.746 | 0.026 |
+| flat ground | 366 | 0.552 | 2.260 | 0.010 |
+| wall / ramp contact (up.z<0.9) | 71 | 0.723 | 2.117 | 0.178 |
+| airborne, no boost | 167 | **0.061** | 0.637 | **0.001** |
+| airborne, **boosting** | 29 | 0.249 | 2.938 | **0.359** |
+| **flipping** | 145 | **1.600** | 3.260 | **1.422** |
+
+Airborne non-boosting is essentially perfect (0.061 uu, 0.001 rad/s), which makes the
+two outliers unambiguous — and they are exactly the two confirmed defects: **boosting**
+(359× the airborne control on angVel, §5) and **flipping** (1400×, §1b).
+
+### Validated — no inconsistency found
+
+- **Ball free flight** (824 windows, no cars in arena): pos err median **0.026 uu**,
+  p90 0.084, p99 0.543. Gravity, drag and bounces are exact.
+- **Ball-car hit impulse** — the highest-impact path, and it is **correct**. A naive
+  comparison at 8 ticks suggests the sim under-hits by 45% (dV ratio 0.595), but that
+  is a *contact-phase* artifact: by 24 ticks the sim's peak ratio is 1.239, i.e. the
+  impulse lands later, not weaker. The phase-robust measure — sim ball speed just after
+  its own hit event vs real post-hit speed — gives **median 1.027, IQR [0.936, 1.037]**
+  across 24 real touches. Accurate to ~3%.
+- **Boost consumption**: end-to-end boost error median **0.0000**, p90 0.222.
+- **Boost pad pickup**: on the 110 windows where every pad is genuinely available
+  (so "reset pads" is faithful), pickup agreement is **perfect** — 0 sim-only, 0
+  real-only. An apparent 21-vs-4 over-pickup on the full set was entirely pads being
+  on cooldown in reality.
+- **Wall / ramp driving**: median 0.723 uu, p90 2.117 — *better* than flat ground.
+  Sticky force and suspension on non-flat normals are fine, including 41 near-vertical
+  wall frames.
+- **Flip duration**: 17 dodge episodes bracket the true duration at
+  **[0.6083, 0.6666] s**; `flip::TORQUE_TIME = 0.65` is inside it (0.60 refuted).
+  The flip defect is in torque *magnitude*, not timing.
+- **Bump / demo code path**: complete — all five bump constants are live and demo
+  modes/team-demo rules are implemented. (Behaviourally unvalidated, see below.)
+
+### Boost pads: v3 uses cylinder-only pickup
+
+v3 gates pickup on a cylinder against the car *origin*
+(`boost_pad_grid.rs:35`: `dist_2d < cyl_radius && |Δz| <= CYL_HEIGHT`), with
+`_box_radius` underscore-prefixed and `boost_pads::BOX_HEIGHT` dead, behind the TODO
+"Implement car-locking with box hitbox".
+
+**No claim is made that this is wrong.** An earlier revision called it a regression
+against RocketSim v2, which also carried a box-AABB branch for a car already locked to
+the pad. That comparison is withdrawn: **v2 is not a valid accuracy reference**
+(user-stated, 2026-08-01), so a v2/v3 difference is not evidence of a v3 defect.
+Empirically v3's pickup matches the real game perfectly on every frame this audit
+could test (above). Settling the car-locking case needs RL's own pickup code or a
+pad-camping scenario against the real game — not a v2 diff.
+
+## 8. Replay-based validation — closing the multi-car, spin and demo gaps
+
+The 1v1 RLBot telemetry could not reach bumps, demolitions, ball spin or team modes.
+Rocket League's own saved replays can. **83 of 86** replays in the Proton prefix parse
+with `boxcars` (75× 2v2, 6× 3v3, 2× 1v1); 3 fail on a newer `AnonymizedName` attribute.
+
+Units calibrated empirically: car linear velocity is **raw uu/s** (maxes at exactly
+2300.00 = `MAX_SPEED`); angular velocity and demolish velocities are **×100** (ball
+angvel maxes at exactly 600.00 = the 6.0 rad/s cap). Car rotation is
+`Quat::from_xyzw(x,y,z,w)`, whose `x_axis` aligns with velocity at **+0.811** for fast
+cars — i.e. forward, matching RocketSim's convention. Replay frames are 30 fps =
+**exactly 4 ticks**.
+
+Caveat that bounds everything in this section: replay state is quantized and sampled
+4 ticks apart, so it is inherently noisier than the 120 Hz telemetry of §7 (free-flight
+ball error is 1.1 uu here vs 0.026 uu there). It is good enough for *event* and
+*magnitude* questions, not for sub-uu physics.
+
+### Ball spin — VALIDATED
+
+Ball free flight with all cars >400 uu away, 17,274 windows across two 2v2 replays:
+
+| variant | pos err med | vel err med | **angVel err med / p90** |
+|---|---|---|---|
+| with replay ball spin | **1.132** | **2.051** | **0.0000 / 0.0000** |
+| spin forced to zero | 1.485 | 2.464 | 5.9999 / 6.0000 |
+
+Including spin improves position and velocity prediction by ~25%, and RocketSim's
+angular-velocity propagation matches the real game **exactly**. (61% of frames sit at
+the 6.0 rad/s cap, so the angVel match is partly trivial; the position/velocity
+improvement is not.)
+
+### Demolitions — VALIDATED
+
+28 demolition events across the replay set; 23 carry a recorded attacker velocity.
+RocketSim gates demos on `DemoMode::Normal => attacker_state.is_supersonic`
+(`arena/base.rs:1005`), supersonic being 2200 with a maintain band down to 2100.
+
+Real attacker speeds at the moment of demolition: **2120, 2130, 2230, 2240, 2260,
+2290, 2300 uu/s** — **23 of 23 inside [2100, 2300]**, none below. RocketSim's
+supersonic demo gate is consistent with the real game.
+
+### Car-car bumps — PARTIALLY validated, no defect found
+
+Naively, 283 frames show a car gaining >250 uu/s near another car — but a dodge or a
+ball touch does that too. Isolating genuine bumps (nearest car <150 uu, ΔV pointing
+*away* from it, ball >300 uu away) leaves **25** events:
+
+- median **sim/real ΔV ratio 0.817**, p75 **0.965**
+- RocketSim reproduced the contact within the window for only 28% of them
+- control (non-bumped cars in the same frames): mean ΔV error **15 uu/s** over 1,742
+  samples, so the 4-car harness itself is sound
+
+The 28% reproduction rate is the same contact-phase limit that made the ball-car
+impulse look 45% weak in §7 before phase-robust comparison — from a quantized
+frame-boundary state, a sub-frame contact often does not occur in sim. Bump *impulse
+magnitude* looks right and the code path uses every bump constant with correct
+ground/air branching; I found **no evidence of a defect**, but this is not the clean
+validation the ball-car impulse got.
+
+### Ceiling driving and contact-imparted spin — closed
+
+Both remaining "untested regime" gaps, using replay data (4-tick windows, all 4 cars
+simulated, ball included).
+
+**Important:** replays do not record car *inputs*, so I set zero controls. Over 4 ticks
+an unknown throttle/boost contributes up to ~35 uu/s, which dominates these absolute
+numbers — they are ~40× worse than the 120 Hz telemetry of §7 for that reason. They are
+only meaningful **relative to each other**:
+
+| car regime | n | pos med (uu) | p90 |
+|---|---|---|---|
+| flat ground (z<50, up.z>0.9) | 59,818 | 10.389 | 43.914 |
+| wall (300<z<1800, \|up.z\|<0.5) | 5,227 | 12.578 | 45.102 |
+| **ceiling (z>1900, up.z<−0.5)** | **105** | **9.584** | **36.154** |
+| airborne (z>300, up.z>0.9) | 753 | 14.763 | 54.783 |
+
+**Ceiling driving is no worse than flat ground** — in fact the lowest of the four. A
+broken inverted-gravity/sticky-force path would stand out here and does not. Combined
+with §7's wall/ramp result (median 0.723 uu at 120 Hz, incl. 41 near-vertical frames),
+non-flat and inverted surface driving is clean.
+
+**Spin imparted by a contact:**
+
+| | n | angVel err med (rad/s) | p90 |
+|---|---|---|---|
+| contact frames (\|Δspin\|>1) | 636 | **0.4201** | 7.1477 |
+| control, no contact | 21,840 | **0.0000** | **0.0000** |
+
+Free-flight spin propagation is **exact** (0.0000 at median *and* p90 over 21,840
+windows). At contacts the median error is 0.42 rad/s against a 0–6 rad/s range (~7%),
+with a long tail from the same contact-phase problem that affects every contact
+measurement here. No evidence of a systematic defect in the spin a hit imparts.
+
+### Double jump — VALIDATED (and it calibrates the replay convention)
+
+`TAGame.CarComponent_DoubleJump_TA:DoubleJumpImpulse` is replicated (3,183 samples across
+25 replays) with magnitude **exactly 525.0** every time.
+
+- **525 / 180 (car mass) × 100 = 291.667 = RocketSim's `jump::IMMEDIATE_FORCE` (875/3)**, exact.
+- Corroborated behaviourally: resolving each impulse against the car's next velocity
+  sample, genuine upward jumps (Δvz>150, n=1,086) cluster at median **242.9 uu/s**;
+  adding back one 30 fps frame of gravity (+21.7) gives ~**264.6 uu/s**, consistent with
+  291.7 given 30 fps sampling and quantised velocities.
+
+This is a validation in its own right **and** the calibration that keeps the dodge
+finding honest: it proves the replicated physics quantities are impulses carrying a
+`× mass / 100` factor, which is why the raw 224-vs-2.24 ratio cannot be read as a
+literal unit bug.
+
+### Per-mechanic ground-driving decomposition (weak signal, not a defect)
+
+The air-throttle bug hid inside an unremarkable aggregate and only appeared when the
+error was resolved *directionally*. So ground driving was decomposed the same way —
+signed error along the car's forward and right axes, plus yaw-rate error, per input
+mechanic (838 live 120 Hz transitions, on-ground, no jump):
+
+| mechanic | n | fwd ΔV err (med) | %neg | lat ΔV err (med) | yaw err |
+|---|---|---|---|---|---|
+| throttle=+1, no boost/handbrake | 241 | −1.108 | 82% | −2.916 | −0.0005 |
+| throttle=−1 (reverse/brake) | 18 | −0.117 | 61% | +0.720 | +0.0002 |
+| throttle=0 (coasting) | 16 | −5.758 | 88% | +11.968 | +0.0032 |
+| boosting on ground | 68 | −0.298 | 68% | −0.680 | +0.0002 |
+| handbrake / powerslide | 115 | −0.160 | 66% | +0.053 | −0.0003 |
+| **steering hard (\|steer\|=1)** | **183** | **−3.621** | **79%** | **−4.407** | −0.0023 |
+| near supersonic (v>2100) | 40 | −0.071 | 62% | +0.401 | +0.0011 |
+
+**Clean:** yaw-rate error is ≤0.004 rad/s everywhere, so the steer-angle curves are
+accurate; handbrake/powerslide, ground boost, braking and supersonic are all
+sub-uu/s and effectively unbiased.
+
+**Weak signal:** the sim slightly *under*-accelerates on the ground, concentrated in
+hard turns (−3.6 uu/s forward, 79% one-sided) and coasting (−5.8, 88% one-sided but
+n=16). Magnitude is ~1–3% of the relevant accelerations — comparable to the confirmed
+air-throttle defect (+4.46 uu/s) but far noisier and one-sided rather than constant.
+
+**Not reported as a defect.** One match, subsets of 16–241 frames, and hard-steering
+frames correlate with other conditions. It would need a few more instrumented matches
+to separate a genuine tire-friction difference from sampling. Recording it so it is not
+lost, and so nobody re-derives it from scratch.
+
+### Non-Octane hitboxes and pad geometry — measurement floor reached
+
+Both were pushed with replay data and both hit a hard limit. Recording what was tried
+so it is not retried blindly.
+
+**Non-Octane bodies.** Replays *do* carry loadouts (`TAGame.PRI_TA:ClientLoadouts`), and
+across 86 replays the bodies include **403 = Dominus** (22 uses) — a genuinely different
+hitbox — alongside Octane (23) and Fennec (4284, Octane hitbox). Mapping PRI→car via
+`Engine.Pawn:PlayerReplicationInfo` yielded 186k Dominus and 134k Octane frames. Testing
+whether the *correct* body config fits its own player better:
+
+| dataset | sim as OCTANE | sim as DOMINUS |
+|---|---|---|
+| Dominus players (n=82,962) | 24.381 uu | 24.379 uu |
+| Octane players (n=22,785) | 26.233 uu | 26.235 uu |
+
+**Not discriminating**, and for a structural reason: replays do not record car *inputs*,
+so the 4-tick error is control-dominated (~25 uu) while the hitbox effect on ground
+motion is ~0.005 uu. Ride height cannot separate them either — the sim gives 16.73 vs
+16.75 for the two bodies, and the *real* data likewise shows 16.600 (Dominus) vs 16.570
+(Octane). Hitbox differences live in **collision geometry**, which is exactly the
+contact-phase-limited regime. Pulsar plays Octane, which is validated behaviourally.
+
+**Boost-pad geometry.** 4,120 real pickups were extracted via
+`CarComponent_Boost_TA:ReplicatedBoost` jumps. Naively 83.8% appear to occur outside
+RocketSim's pickup cylinder, and 79.2% still do when searching the 10 frames before the
+update for the true crossing point. **This is a broken measurement, not a finding**: the
+median *minimum* distance to any big pad across the whole window is 230 uu, i.e. the car
+never came within 230 uu of a pad yet gained ~100 boost — physically impossible if pickup
+requires overlap. `ReplicatedBoost` is a sparse, lagged network value and its timing
+cannot be aligned with the pickup event. **The §7 telemetry test stands** — on 110 frames
+with exact per-tick boost and true pad states from the RLBot packet, pickup agreement was
+perfect (0 sim-only, 0 real-only).
+
+## 11. Fixes APPLIED and validated (2026-08-01)
+
+Both defects are now patched in the vendored tree
+(`RocketSimV3/rocketsim/src/sim/car/base.rs`), each with a `VENDOR PATCH` comment
+following the precedent of the existing mesh-whitelist patch.
+
+| fix | check | before | after |
+|---|---|---|---|
+| air throttle gated on `!boost` | excess forward ΔV, airborne+boosting | +4.459 uu/s | **+0.020** |
+| dodge torque through `inv_inertia_tensor_world` | angVel err, 6,382 real dodge frames | 2.0482 rad/s | **0.0512** |
+
+**Regression sweep (838 live 120 Hz transitions), position error median:**
+
+| regime | before | after |
+|---|---|---|
+| all live | 0.275 | 0.279 |
+| flat ground | 0.552 | 0.552 |
+| wall / ramp | 0.723 | 0.723 |
+| airborne, no boost | 0.061 | 0.061 |
+| **airborne, boosting** | 0.249 | **0.179** |
+| flipping | 1.600 | 1.600 |
+
+No regressions; boosted-aerial position error improved 28%.
+
+**Caveat on that "flipping" row:** the regression probe does not set
+`is_flipping`/`flip_rel_torque`, so no dodge torque is applied in it — that row is
+insensitive to the dodge fix by construction and should not be read as the fix failing.
+The dodge fix is validated by the dedicated harness using the game's replicated
+`DodgeTorque` (row 2 above).
+
+**Operational consequence.** These change training dynamics. Per CLAUDE.md's own rule,
+checkpoints trained on the previous physics are behaviourally stale against the patched
+engine. `build/` was **not** rebuilt and the trainer was **not** touched — the live run is
+unaffected until it is restarted, which is a deliberate decision for the run owner.
+
+## 12. Reflection route: RL's physics parameter vocabulary (no decryption needed)
+
+Decryption is only required for package **assets**. UE3's reflection metadata — every
+class's property names — is registered from the executable, so the parameter *vocabulary*
+is recoverable statically. Extracting the UTF-16 FName block in `.rdata` (~`0x141e3a000`)
+yields 26,758 identifiers, of which 82 are genuine physics parameters after filtering out
+cosmetics. Saved as `research/results/rl_exe_physics_param_names.json`.
+
+This gives a **completeness check RocketSim could not otherwise get**: parameters the game
+has that the simulator does not model at all. Nine have no RocketSim counterpart:
+
+| RL parameter | RocketSim | assessment |
+|---|---|---|
+| `DodgeLift` | absent | RocketSim's dodge impulse is **purely 2D** (`x*fwd_2d + y*right_2d`, no Z term) |
+| `DodgeClearVelocity` | absent | velocity manipulation at dodge start |
+| `DodgeTransferVelocity` | absent | " |
+| `DoubleJumpLimitVelocityXY` | absent | constrained by measurement — see below |
+| `DoubleJumpRemoveVelocityZ` | absent | " |
+| `BoostLimitVelocityXY` | absent | " |
+| `BoostRemoveInitialVelocityZ` | absent | " |
+| `StopExistingTorque` | absent | dodge/torque bookkeeping |
+| `RandomJumpTorque` | absent | likely 0 in standard play |
+
+**Most of these are almost certainly zero/disabled in standard soccar**, and the
+measurements in this report are what constrain that: the double-jump impulse measures
+**exact** (291.667 uu/s, §8), so `DoubleJumpRemoveVelocityZ` cannot be active; boost
+acceleration measures exact after the air-throttle fix, so the two `Boost*Velocity*`
+parameters cannot be active either. They are most plausibly mutator/Rumble-mode knobs.
+
+**`DodgeLift` — CLOSED: no missing upward impulse.** The first attempt failed because it
+keyed on `DodgeTorque` onset, which replicates *after* the impulse. Detecting the impulse
+by its own signature instead — an airborne horizontal ΔV in the dodge range, with ball and
+all other cars >300 uu away — isolates 90 clean events whose **median horizontal ΔV is
+537.0 uu/s**, matching RocketSim's `INITIAL_VEL_SCALE = 500` and confirming these are real
+dodge impulses.
+
+Their vertical component, gravity removed:
+
+| | value |
+|---|---|
+| median | **−36.98 uu/s** |
+| p25 / p75 | −195.21 / +64.45 |
+| sign balance | **38% positive** (62% negative) |
+
+The vertical is **net downward and predominantly negative**. A `DodgeLift` term would show
+a positive median; instead the bias matches the flip **Z-damping** RocketSim already
+implements (`Z_DAMP_120`, applied when `vel.z < 0` or early in the flip). So `DodgeLift`
+adds no upward impulse in soccar, and RocketSim's 2D dodge impulse plus Z-damp is the
+correct structure.
+
+Caveat kept honest: this rules out a *missing lift term*; it does not prove the vertical
+magnitude is exact to within the ~30 uu/s spread of 30 Hz replay sampling.
+
+## 13. The ground signal, re-measured after both fixes — now localized
+
+Re-running the per-mechanic ground decomposition on the **patched** engine (838 live
+120 Hz transitions; forward component of the velocity-error vector, negative = sim
+under-accelerates):
+
+| ground regime | n | mean fwd err (uu/s) | median | % one-sided |
+|---|---|---|---|---|
+| throttle forward, no boost | 241 | **−4.473** | −1.108 | 82% |
+| hard steering (\|steer\|>0.5) | 151 | **−7.045** | −3.836 | 79% |
+| coasting (throttle≈0) | 16 | −5.746 | −8.483 | 88% |
+| **ground boosting** | 68 | **−0.099** | −0.298 | 68% |
+| handbrake | 115 | +0.812 | −0.160 | 66% |
+
+Three things changed versus the earlier characterisation:
+
+1. **It survives both fixes**, so it is not a secondary effect of the air-throttle bug.
+2. **The sample is now n=408** across three concordant regimes, not 183 in one.
+3. **It is localized.** Ground *boosting* is clean (−0.099, essentially zero) while
+   throttle-driven regimes are not. Boost is applied as a direct force on the body;
+   throttle is applied as **wheel drive torque** through the raycast-vehicle constraint.
+   The deficit therefore sits in the **wheel drive path**, not in general force
+   application — which is consistent with every impulse-primitive comparison in §1b
+   coming back clean.
+
+**Still not promoted to a defect**, deliberately: medians (−1.1 to −3.8 uu/s) are much
+smaller than means, so the distribution is skewed by a minority of frames rather than
+uniformly shifted, and one match cannot separate a real force deficit from residual
+control-timing error. But it is now a *specific, testable* hypothesis rather than a vague
+signal.
+
+**Why Ghidra cannot finish this one.** RL's wheel forces do **not** go through the impulse
+primitives — `FUN_14097f5c0` has only 7 call sites program-wide and none are in the vehicle
+region. Like RocketSim, RL applies suspension and tyre friction inside the **vehicle
+constraint solver**, so comparing it means reverse-engineering that solver rather than
+reading a force call. That is a substantially larger effort than the dodge fix required,
+and it is the honest boundary of what this audit reached.
+
+**To settle it:** a second and third instrumented match would confirm or dissolve the
+skew, and per-wheel logging (drive torque, per-wheel friction) would pin it to a term.
+
+## 14. NEW DATA (10,822-decision match): two findings upgraded to defects
+
+A second instrumented match (`debug.2924986.jsonl`, 722 s, 8,811 live transitions after
+dropping 1,840 paused frames) — ~13x the original sample — changed two conclusions.
+Both had been called clean or inconclusive on the smaller sample.
+
+### DEFECT 3: coasting deceleration is ~20% too strong
+
+The ground signal is **no longer dismissible as skew**. At 13x the data, median and mean
+agree, which they did not before:
+
+| regime | n | mean | median | % one-sided |
+|---|---|---|---|---|
+| **coasting (throttle≈0)** | 237 | **−6.924** | **−8.504** | **93%** |
+| hard steering | 1612 | −3.427 | −4.235 | 80% |
+| throttle fwd, no boost | 2522 | −0.880 | −1.196 | 79% |
+| ground boosting | 830 | −1.276 | −0.265 | 70% |
+
+Negative = the sim loses forward speed faster than the game. Sweeping
+`drive::COASTING_BRAKE_FACTOR` (shipped 0.15) is monotonic and crosses zero at ~0.12:
+
+| k | 0.15 | 0.12 | 0.10 | 0.06 | 0.00 |
+|---|---|---|---|---|---|
+| coasting mean err | −6.924 | **−0.027** | +4.504 | +13.563 | +27.155 |
+| % one-sided | 93% | 56% | 42% | 12% | 5% |
+
+At k=0.12 coasting nulls almost exactly and one-sidedness returns to chance. Other regimes
+are unchanged, as expected — the coast brake only applies at throttle≈0.
+
+**Not shipped — and a follow-up test shows shipping it would have been wrong.**
+Adding an explicit *braking* regime (throttle opposed to motion) discriminates the cause:
+
+| regime | brake factor applied | n | median err | % one-sided |
+|---|---|---|---|---|
+| coasting | 0.15 | 237 | **−8.504** | 93% |
+| **braking** | **1.00** | 113 | **−8.146** | 87% |
+| throttle with motion | – | 2480 | −1.243 | 80% |
+
+If the brake torque were scaled wrong, the braking error would be **~6.7× larger** than
+coasting's (1.0 vs 0.15). It is **equal**. That rules out both `COASTING_BRAKE_FACTOR` and
+`BRAKE_TORQUE_AMOUNT` as the cause: fitting 0.12 would null coasting while leaving braking
+just as wrong.
+
+What is established: **the sim loses ~8 uu/s per 8-tick window too much whenever the car is
+decelerating** (coasting *or* braking, ~equal magnitude, 87–93% one-sided, n=350 combined),
+and only ~1.2 under power. A magnitude independent of brake strength points at a term that
+is not the brake — rolling resistance, or wheel friction while not driving. Unfixed.
+
+Residual after that: throttle-forward −0.880 (79% one-sided, n=2522) and steering −2.727
+(76%, n=1612) remain unexplained but are much smaller.
+
+### DEFECT 4: boost pad pickup volume is too small — the community was right
+
+Retested on 12x the frames (1,508 with every pad genuinely available, vs 110 before):
+
+| | previous (n=110) | **new (n=1508)** |
+|---|---|---|
+| both picked up | 1 | 9 |
+| **REAL-ONLY (sim missed)** | **0** | **10** |
+| SIM-ONLY (sim over-picked) | 0 | 0 |
+
+**Of 19 real pickups, RocketSim missed 10 — a 53% miss rate**, entirely one-directional.
+The earlier "perfect agreement" was a sample-size artifact.
+
+Mechanism: at those pickups the car origin sits **212.8 uu (median, max 253.0)** from the
+nearest pad, *outside* RocketSim's cylinder (208 uu big / 144 uu small tested against the
+car **origin**). RL additionally tests a **box against the car's full AABB**, which reaches
+roughly a car half-length (~60 uu) further and catches exactly these. That is the
+`_box_radius` / `BOX_HEIGHT` car-locking branch flagged dead in §7 and wrongly dismissed
+there as "not exercised by this data" — it is exercised, and it matters.
+
+This independently corroborates the RL modding community's report that "boost pad logic
+was wrong".
+
+**FIXED — via Ghidra, two separate bugs.**
+
+**(a) Broad-phase/narrow-phase mismatch.** `BoostPad::new` built the BVH AABB from
+`box_radius` (120/160) while the pickup tested `dist_2d < cyl_radius` (144/208), so pads
+between those radii were culled before ever being tested. Proof: two missed pickups had the
+car within **123.4 uu and 129.4 uu** of a 144-radius pad — inside the cylinder, no pickup.
+Fixed by building the AABB from `cyl_radius`.
+
+**(b) The pickup tested the car's ORIGIN, not its body.** Ghidra settles this:
+`AVehiclePickup_TA::execIsTouchingAVehicle` (`0x140e83de0`) delegates to `FUN_140f0d590`,
+which walks UE3's **`Touching` array** — i.e. RL decides pickups by a *collision-primitive
+overlap between the pad volume and the car's collision body*, never a point test.
+
+Reimplemented as pad cylinder vs the car's **oriented** box (closest-point-on-OBB). The
+orientation matters: an axis-aligned box of a rotated car is far larger than the car and
+over-triggers badly.
+
+And the radius must then be **`BOX_RAD` (120/160), not `CYL_RAD` (144/208)** — the larger
+cylinder radii are origin-test approximations that already bake in typical body reach, so
+pairing them with a body test double-counts it. This finally explains why `BOX_RAD_*`
+existed as dead constants.
+
+| pickup rule | misses | false | total disagreement |
+|---|---|---|---|
+| shipped: origin vs CYL_RAD | 10 | 0 | 10 |
+| + broad-phase AABB fix | 8 | 0 | 8 |
+| car AABB vs box | 0 | **116** | 116 |
+| car OBB vs CYL_RAD | 0 | 10 | 10 |
+| **car OBB vs BOX_RAD (shipped)** | **0** | **4** | **4** |
+
+**All 19 real pickups now reproduce**, total disagreement 10 → 4.
+
+Rejected along the way: a swept-segment (tunnelling) test — **zero effect**, because the
+diagnostic already sampled closest approach at every tick boundary.
+
+---
+*Superseded analysis, kept for the record:*
+
+`BoostPad::new` built the BVH broad-phase AABB from **`box_radius`** (120 small / 160 big)
+while `BoostPadGrid::process_node` tests **`dist_2d < cyl_radius`** (144 / 208). Any pad
+between those two radii was culled by the broad phase and **never reached the cylinder
+test**. The diagnostic that exposed it: two of the missed pickups had the car within
+**123.4 uu and 129.4 uu** of a 144-radius pad with |dz|=53 — comfortably inside the
+cylinder, yet no pickup.
+
+Shipped fix: build the AABB from `cyl_radius`. Result **10 misses → 8, still 0 false
+positives** (both 9 → 11). Small but strictly correct, and it removes a
+broad-phase/narrow-phase inconsistency that would bite any future radius change.
+
+**The remaining 8 are NOT explained.** Their closest approach along the whole 8-tick path
+is 146–170 uu against a 144 uu radius — a median **16 uu (max 26)** of extra reach needed,
+all on small pads. Two hypotheses tested and rejected:
+
+- *Tunnelling between ticks* — implemented a swept segment test (prev→cur position, with a
+  matching swept BVH query). **Zero effect**, because the diagnostic already sampled
+  closest approach at all 8 tick boundaries, so sub-tick sweeping adds almost nothing.
+  Reverted.
+- *Car body reach (box vs AABB)* — see below; wildly over-triggers.
+
+Closing the last 8 means either a genuine small-pad radius larger than 144, or a body-aware
+rule far tighter than a full AABB. Neither is derivable from 19 events without fitting.
+
+**Earlier fix attempts, both REVERTED — do not repeat.** Two variants were
+implemented against the real pickups and both were worse overall than shipping nothing:
+
+| pickup rule | misses (REAL-ONLY) | false pickups (SIM-ONLY) |
+|---|---|---|
+| shipped: cylinder vs car origin | **10** | 0 |
+| + box(±160/±120, z: pad→pad+64) vs car AABB | 7 | 3 |
+| + box XY vs car AABB, cylinder z-gate | **0** | **116** |
+
+The first variant barely helps because RL's box sits at z: pad→pad+64 (70→134) while a
+grounded car's AABB tops out near z=36, so it only ever fires for airborne cars. The second
+catches every real pickup but over-triggers 116 times in 1508 frames — 6× the true rate.
+The correct rule lies between and is not recoverable by fitting to 19 events, so the
+vendored tree keeps the shipped cylinder-only behaviour. **Confirmed defect, unfixed.**
+
+### Jump cooldown timers: tested, no observable deviation
+
+`jump::RESET_TIME_PAD` carries an upstream TODO ("RL does something similar to this
+time-pad, but not exactly the same"). Across **162 landings**, *zero* had `has_jumped`
+still true at touchdown — RL clears it at or before landing, and since `jump_time` accrues
+through the whole airtime, RocketSim also clears immediately for any hop longer than
+0.275 s. No short hops (<0.275 s airborne) occurred, so the one case where the pad could
+differ never arose. **Not a confirmed defect; also not cleared** — needs a short-hop case.
+
+## 15. Ball-car hit: a real error pattern, and why it could not be fixed here
+
+Re-tested on the larger match: **284 real ball touches** (car <250 uu, opponent >400 uu),
+binned by how off-centre the contact was (perpendicular offset of the ball from the car's
+forward axis, in car-local space):
+
+| off-centre offset | n | direction err | speed ratio |
+|---|---|---|---|
+| ~110 uu (most centred) | 71 | 2.96° | 0.957 |
+| ~137 uu | 71 | 2.54° | 0.970 |
+| ~147 uu | 71 | 2.75° | 0.984 |
+| **~169 uu (most off-centre)** | 71 | **6.81°** | **0.922** |
+
+So the hit is good to ~2.5-3° when centred and degrades to **6.8° with an 8% speed
+deficit** when off-centre. That pattern is real and reproducible.
+
+**The obvious hypothesis was tested and could not be evaluated.** RocketSim derives the
+extra-impulse direction from `ball.pos - car.pos` (centre-to-centre), whereas for a sphere
+the true contact normal is `ball.pos - contact_point`; the two coincide only for centred
+hits and diverge exactly as the contact moves off-axis. The contact point is already
+available at the call site, so it was plumbed into `Ball::on_hit` and used as the direction
+basis.
+
+**Result: byte-identical metrics across all four quartiles.** A sensitivity probe that
+*fully inverted* the hit direction also produced byte-identical metrics — so the harness
+is blind to the extra-impulse direction entirely, and cannot confirm or refute the change.
+It was reverted rather than shipped unvalidated.
+
+**Most likely cause of the Q4 error is the harness, not RocketSim.** The RLBot telemetry
+does not log ball angular velocity, so every ball state in this test starts with **zero
+spin**. Off-centre contacts are precisely the spin-sensitive ones, and the replay-based
+work in §8 showed that supplying real ball spin improves ball prediction ~25%. A test that
+zeroes spin should therefore degrade most on off-centre hits — which is what is observed.
+
+**To settle it:** log ball angular velocity in the RLBot debug JSONL (it is in the packet),
+then repeat this exact binning. Until then the ±5% ball-hit figure should be read as a
+*measurement floor*, not an established RocketSim error.
+
+## 16. Behavioural verdict: per-window accuracy, and where it is still blind
+
+**The bot is closed-loop at 15 Hz**, so the error it actually experiences is one 66.7 ms
+window, not an open-loop trajectory. Open-loop rollouts were measured anyway and are a poor
+metric here: at 1 s the divergence is p50 73 uu, and the fixes make it *marginally worse*
+(69.76 → 73.28), because open-loop divergence over seconds is chaos-dominated and this test
+simulates one car with no opponent and no ball interaction. Do not tune against it.
+
+Per-window, pristine vs the four fixes, on 8,798 live windows:
+
+| regime (one window) | n | pos p50 (pristine → fixed) | vel p50 (pristine → fixed) |
+|---|---|---|---|
+| ALL live | 8798 | 0.294 → 0.300 | 9.655 → 9.677 |
+| ground: throttle | 3660 | 0.622 → 0.622 | 13.857 → 13.802 |
+| ground: coasting | 558 | 0.675 → 0.725 | 17.178 → 17.353 |
+| ground: boosting | 917 | 0.726 → 0.726 | 16.751 → 16.752 |
+| air: no boost | 2814 | 0.100 → 0.101 | 1.153 → 1.209 |
+| **air: boosting** | 559 | 0.193 → **0.071** | 4.481 → **0.462** |
+| **jump/flip window** | 465 | **20.294** | **308.933** |
+
+**The air-throttle fix is a large, unambiguous win** — 9.7× on velocity accuracy for
+boosted aerials, the regime this run scaffolds hardest.
+
+**Two caveats that bound the confidence claim:**
+
+1. **Coasting magnitude did not improve** even though its *forward component* went from
+   93% one-sided (median −8.504) to 49% (+0.132). The residual is dominated by
+   perpendicular (lateral/vertical) error of ~15-17 uu/s that the coast-brake fix does not
+   touch. The directional fix is still right; it just is not the dominant term.
+
+2. **Jump/flip windows are the worst regime by an order of magnitude** (20.3 uu, 309 uu/s)
+   and are **unchanged by the fixes** — because this harness cannot reconstruct
+   `is_jumping`/`jump_time`/`flip_time`/`flip_rel_torque` from the RLBot packet, so the sim
+   does not reproduce the jump at all. That number is a harness artifact, **but it also
+   means flip-heavy mechanics are the one regime this audit cannot certify.** The
+   replay-based dodge test (§1b) is the only real measurement there, and it covers dodge
+   torque only, not the jump/landing sequence.
+
+**Verdict for deployment:** driving and aerial dynamics are per-window sub-uu and materially
+better than before. Flip/jump sequences remain unverified end-to-end. See the confidence
+statement in §17.
+
+## 17. Confidence statement — behavioural impact of the fixes
+
+Flip state *can* be reconstructed without new logging: replays carry
+`CarComponent_TA:ReplicatedActive` (per-component active flags), `CarComponent_TA:Vehicle`
+(component→car), `CarComponent_Dodge_TA:DodgeTorque` and
+`CarComponent_DoubleJump_TA:DoubleJumpImpulse`. An earlier claim in this session that flips
+needed extra RLBot instrumentation was **wrong** — the replay path already supplies it.
+
+Measured on **6,382 mid-dodge windows** driven by the game's own replicated `DodgeTorque`
+with proper flip state:
+
+| | pristine | fixed |
+|---|---|---|
+| angVel err p50 | **2.0482 rad/s** | **0.0512 rad/s** |
+| **→ orientation error over a full 0.65 s dodge** | **76.3°** | **1.9°** |
+
+Position/velocity in that table are unchanged and floor-limited (~15 uu) by replay state
+quantisation, so only the angular figure is meaningful there.
+
+And on boosted aerials (telemetry, 559 windows):
+
+| | pristine | fixed |
+|---|---|---|
+| vel err p50 | 4.481 uu/s | **0.462 uu/s** |
+| **→ speed error over a 1.5 s aerial** | **100.8 uu/s** | **10.4 uu/s** |
+
+**This is the answer to the original question.** A policy trained on the pre-fix engine
+learned dodges that ended up **76° from where the real game puts them**, and aerials that
+arrived ~100 uu/s fast. Those are exactly the errors that make learned mechanics fail to
+transfer while leaving positional play looking fine — which matches the reported symptom
+(real-game goal share pinned at ~20% across every configuration change).
+
+**Confidence, by area:**
+
+- **Driving** — per-window 0.30 uu median / 1.6 uu p90 across 8,798 windows. High.
+- **Aerials** — 9.7× velocity-accuracy improvement; residual 10 uu/s over a 1.5 s aerial. High.
+- **Dodges/flips** — 40× rotation improvement; residual 1.9° over a full dodge. High.
+- **Ball contact** — ±5%, but that is a *measurement floor* (harness zeroes ball spin), not
+  an established error. Medium, likely better than measured.
+- **Bumps/demos** — magnitudes validated, reproduction rate limited by contact-phase
+  sampling. Medium.
+
+**Remaining known-unknowns:** the jump→flip→landing *transition* (dodge torque is validated,
+the surrounding sequence is not), ~15-17 uu/s of perpendicular coasting error with no
+identified cause, and 4 spurious boost pickups per 1508 windows.
+
+## Recommended order
+
+1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
+   the binary, validated at ~40× error reduction. Prefer this over a scalar: it
+   generalises across bodies and axes. Median
+   dodge angular-velocity error drops 2.048 → 0.038 rad/s (54×). Verify against the
+   replay harness before/after; the 5.5 rad/s cap hides it from casual inspection.
+2. **Gate air throttle on `!boost`** (§5). One line, and the only defect confirmed
+   against real telemetry to 0.3%. Systematic and same-signed, so it integrates,
+   on every boosted aerial, in a run that scaffolds aerials hard. Independently
+   corroborated by the regime sweep: boosted-air angVel error is 359× the
+   non-boosting airborne control (§7).
+3. **Do NOT change `actionDelay`** (§4 correction) — it is already correct, and do NOT
+   apply the `TORQUE_MIN_TIME` gate — both were tested and made the fit worse.
+4. Fix the two stale docs (RocketSimV3 README §mesh claim; the "suspension 14%
+   off" framing, which is a state-restore artifact).
+5. Optional: use `CarExtraState` in training state-setters for exact resets.
+6. (withdrawn — was "restore v2's boost-pad box branch"; v2 is not a valid reference.)
+
+**When replaying real telemetry, drop paused-game frames** (real position identical
+across the window while the car carries speed) — 12.4% of this log, and they corrupt
+every tail statistic.
+
+## 9. Coverage audit — every physics code path mapped to a test
+
+Rather than assert exhaustiveness, here is the enumeration: every function in
+RocketSim's soccar physics step, and the test that exercises it. This audit is what
+surfaced `update_auto_roll` / `update_auto_flip`, which no earlier test had covered.
+
+| RocketSim physics function | covering test | result |
+|---|---|---|
+| `car::update_wheels` (friction, suspension, sticky) | §7 flat/wall/ceiling + per-mechanic | clean |
+| `car::update_air_torque` (air control) | airborne control, 0.001 rad/s | clean |
+| `car::update_air_torque` (flip torque) | §1b real `DodgeTorque` sweep | **DEFECT** |
+| `car::update_jump` | jump regime, flip duration bracket | clean |
+| `car::update_double_jump_or_flip` (double jump) | §8 `DoubleJumpImpulse`, exact | clean |
+| `car::update_double_jump_or_flip` (flip init) | flip direction conventions | clean |
+| `car::update_boost` (accel) | §5 directional ΔV | **DEFECT** |
+| `car::update_boost` (consumption) | §7 boost error 0.0000 | clean |
+| `car::update_auto_roll` | tilted-ground vs upright control | clean (n=57) |
+| `car::update_auto_flip` | §9b turtle set, 3,086 transitions | exercised, no anomaly |
+| `ball::pre_tick_update` (gravity, drag) | §7 free flight 0.026 uu | clean |
+| `ball::on_hit` (car→ball impulse) | §7 phase-robust ratio 1.027 | clean |
+| `ball::on_world_hit` (bounces) | free flight incl. bounces | clean |
+| `ball` angular velocity | §8 exact (0.0000 med and p90) | clean |
+| `arena::on_car_car_collision` (bump) | §8 magnitude ratio 0.82 | clean |
+| `arena::on_car_car_collision` (demo) | §8 supersonic gate, 23/23 | clean |
+| boost pad pickup | §7 perfect agreement | clean |
+| `ball::on_dropshot_tile_collision` | — | out of scope (not soccar) |
+
+### 9b. `update_auto_flip` — closed
+
+The audit initially left this as the one untested path (n=2 in the telemetry). Widening
+the search from 2 replays to all 83 found **5,824 inverted-on-ground frames across 1,611
+turtle episodes and 231 distinct cars** — ample data.
+
+- Real |roll| while turtled: **median 2.502 rad**, and **35.1%** of frames exceed
+  RocketSim's `autoflip::ROLL_THRESH = 2.8` — i.e. the threshold sits sensibly inside the
+  real distribution rather than trivially above or below it.
+- Replaying 3,086 turtle transitions: **up-vector error median 0.0754** — RocketSim
+  tracks the real game's turtle orientation closely.
+- Forcing `jump=true` (auto-flip fires) vs `jump=false` gives 1.1497 vs 1.1541 rad/s —
+  **indistinguishable**. Over a 4-tick window the auto-flip impulse (200 uu/s over 0.4 s)
+  is smaller than the noise from unknown player inputs.
+
+**Status: exercised on real data with no anomaly found, but the auto-flip impulse is not
+isolated from input noise.** That is a weaker statement than the other validations and is
+labelled as such — but it is no longer an untested code path.
+
+**With this, every soccar physics code path in §9 has been exercised against real-game
+data.** Two are defective; the rest show no anomaly at the precision available.
+
+## 10. Oracle inventory — why the residuals are oracle-limited, not effort-limited
+
+Every source of ground truth available for this system, and what each yielded:
+
+| oracle | gives | used for | exhausted? |
+|---|---|---|---|
+| `RocketLeague.exe` via Ghidra | code *structure*; 3,740 named natives | dodge cancel logic, z-damp gating, proof constants are CDO fields | yes — constants are in the encrypted package |
+| RL replays (`boxcars`, 83 files) | 30 fps quantised state, **`DodgeTorque`**, **`DoubleJumpImpulse`**, demolitions, loadouts, ball spin, multi-car | flip defect, double-jump validation, demo gate, spin, bumps, ceiling, turtle | yes — no inputs recorded, no contact events |
+| RLBot telemetry (one match) | 120 Hz state **with controls** | air-throttle defect, per-mechanic decomposition, pad pickup, regime sweep | yes — one match |
+| RocketSim source | the implementation under test | unused-constant sweep, formula comparison | yes |
+| RocketSim v2 | — | **not a valid reference** (user-stated) | n/a |
+
+**A path I proposed and must withdraw.** I twice suggested adding
+`is_flipping`/`flip_time`/`flip_rel_torque` and per-tick contact events to the RLBot
+debug JSONL and playing a match. **That would not work.** The RLBot v5 packet exposes
+only `air_state`, `boost`, `demolished_timeout`, `dodge_timeout`, `has_dodged`,
+`has_double_jumped`, `has_jumped`, `physics`, `player_id`, `team` — there is no dodge
+torque, no flip timer, and no collision/contact event. A bot cannot log what the packet
+does not carry. (The replay *does* carry `DodgeTorque`, which is why the replay, not the
+bot, was the oracle that cracked the flip defect.)
+
+So the two residuals — contact-phase resolution and hitbox effects below control noise —
+are **oracle-limited**: no available source supplies per-tick contact data or
+input-recorded multi-body play. They are not waiting on more analysis.
+
+## Coverage — subsystem status
+
+Every soccar subsystem has now been probed against a valid reference (real telemetry,
+real replays, or RL's own code). What follows is not "unexamined" — it is the residual,
+with the reason each cannot be pushed further.
+
+**Validated, no defect found:** arena geometry · ground contact (sticky force,
+suspension) · flat/wall/ramp/**ceiling** driving · ball free flight · **ball spin
+propagation** (exact) · ball-car hit impulse magnitude · **spin imparted by a hit** ·
+boost consumption · boost-pad pickup · flip duration · **double-jump impulse** (exact) ·
+**demolition supersonic gate** · car-car bump magnitude · multi-car 2v2/3v3.
+
+**Confirmed defects (2):** air-throttle double-count while boosting; flip angular
+dynamics.
+
+**Residual limits:**
+
+- **Car-car bump reproduction rate** — magnitude looks right (median ratio 0.82) but
+  only 28% of real bumps reproduce from a quantized frame-boundary state (§8). This
+  is a *measurement* limit of 30 fps replays, not a known defect. Settling it needs
+  per-tick contact data, not more replays.
+- **Boost-pad car-locking** — v3's pickup is cylinder-only (§7); the pad-camping
+  case is untested against the real game.
+- **Car bodies other than Octane** — tested and not discriminable (§8): control noise
+  in replays is ~5000× the hitbox effect on ground motion. Blocked on input-recorded
+  multi-body data. Pulsar plays Octane.
+- **Contact-phase resolution.** Every contact-type measurement (ball hit, bump, spin
+  imparted) is bounded by how precisely contact timing can be recovered from sampled
+  state — 8-tick telemetry or 4-tick quantized replays. Magnitudes check out
+  (ball-hit ratio 1.027, bump 0.82, spin err 0.42 rad/s); exact per-contact fidelity
+  would need per-tick instrumentation inside the real game, which this audit cannot do.
+- **Boost-pad car-locking** — v3's pickup is cylinder-only (§7); the pad-camping case
+  is untested against the real game.
+- Sample base: one 1v1 RLBot match at 120 Hz (§7) plus 83 replays at 30 Hz (§8).

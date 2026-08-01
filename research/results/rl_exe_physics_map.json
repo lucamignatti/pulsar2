@@ -1,0 +1,45 @@
+{
+ "source": "RocketLeague.exe, Ghidra project 'rocketsim-fixing' (3740 natives named)",
+ "force_primitives": {
+  "linear": {
+   "addr": "0x14097f5c0",
+   "sig": "(rb, vec, pos, _, mode)",
+   "scale": "vec and pos x0.02 = UU_TO_BT",
+   "modes": {
+    "1": "velocity change, no mass division",
+    "2": "impulse, divided by mass at +0x180"
+   }
+  },
+  "angular": {
+   "addr": "0x140981560",
+   "sig": "(rb, torque, _, mode)",
+   "modes": {
+    "5": "btRigidBody::applyTorqueImpulse: angvel += invInertiaTensor*torque*angularFactor",
+    "default": "btRigidBody::applyTorque form: angvel += torque*angularFactor (no inertia)"
+   }
+  }
+ },
+ "rigidbody_offsets": {
+  "+0x40..0x48": "center of mass",
+  "+0x130..0x158": "3x3 inertia matrix",
+  "+0x180": "mass",
+  "+0x1e0..0x1e8": "angular velocity",
+  "+0x390..0x398": "m_angularFactor (1,1,1)"
+ },
+ "vtables": {
+  "carcomponent_cluster": ".rdata:0x141e4a000+, stride 0x6b8",
+  "PrePhysicsStep": "+0x6a0",
+  "ApplyForces": "+0x6a8",
+  "distinct_ApplyForces_impls": 43
+ },
+ "known_impls": {
+  "ACarComponent_Dodge_TA::ApplyTorqueForces": "0x140eb72b0 (spans ..0x140eb756c)"
+ },
+ "upk_encryption": {
+  "file": "TAGame.upk",
+  "header": "ver 868 / licensee 32, engineVer 10897, cookerVer 136",
+  "compressionFlags": "1 (ZLIB) but numChunks=0 -> NOT chunk-compressed",
+  "ciphertext_stats": "entropy 7.99 uniform; 8-byte block e2cc0477c855d851 repeats 86400x (8.6%)",
+  "note": "public RLUPKTool targets licensee 20/22; this package is 32. Key gated behind community Discord bot."
+ }
+}

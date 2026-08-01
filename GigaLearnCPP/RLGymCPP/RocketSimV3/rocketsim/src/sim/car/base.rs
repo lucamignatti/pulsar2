@@ -402,9 +402,21 @@ impl Car {
                     * Vec3A::new(car_consts::flip::TORQUE_X, car_consts::flip::TORQUE_Y, 0.0)
                     * TICK_TIME;
 
+                // VENDOR PATCH (pulsar 2026-08-01): apply the dodge torque through the
+                // INVERSE INERTIA TENSOR, as the real game does.
+                // RocketLeague.exe applies angular forces via FUN_140981560; the dodge
+                // uses MODE 5, which takes the cofactor inverse of the car's 3x3 inertia
+                // matrix (+0x130..+0x158) and applies it to the torque before adding to
+                // angular velocity. RocketSim added the torque straight to ang_vel with
+                // no inertia division (and `Impulse::Angular` + massed=true divides by
+                // MASS, which is dimensionally wrong for a torque), making dodges ~1/I
+                // too strong. Octane 1/I_y = 0.01041 vs an independently fitted 0.0100.
+                // Measured on 6382 real mid-dodge replay frames: angular-velocity error
+                // 2.048 -> 0.051 rad/s (~40x). See research/reports/SIM2REAL_AUDIT.md S1b.
+                let world_dodge_torque = rb.get_world_trans().matrix3 * dodge_torque;
                 rb.add_impulse(
                     None,
-                    Impulse::Angular(rb.get_world_trans().matrix3 * dodge_torque),
+                    Impulse::Angular(rb.inv_inertia_tensor_world * world_dodge_torque),
                     false,
                     true,
                 );
@@ -460,8 +472,14 @@ impl Car {
             rb.add_impulse(None, Impulse::Angular(rb_torque), false, true);
         }
 
-        if self.state.controls.throttle != 0.0 {
-            // TODO: Fix air-throttle not respecting boost
+        // VENDOR PATCH (pulsar 2026-08-01): do not apply air throttle while boosting.
+        // RocketSim added THROTTLE_AIR_ACCEL (66.67 uu/s^2) on top of boost whenever
+        // throttle != 0, and `DefaultAction` sets throttle = boost on every aerial
+        // action, so it applied on EVERY boosted aerial. Verified against real match
+        // telemetry: predicted excess forward dV +4.444 uu/s per 8-tick window,
+        // measured +4.459 (0.3%). Was upstream's "TODO: Fix air-throttle not
+        // respecting boost". See research/reports/SIM2REAL_AUDIT.md S5.
+        if self.state.controls.throttle != 0.0 && !self.state.controls.boost {
             let throttle_force = forward_dir
                 * self.state.controls.throttle
                 * const { car_consts::drive::THROTTLE_AIR_ACCEL * UU_TO_BT * TICK_TIME };
