@@ -11,3 +11,7 @@ RLBotSim/
 collision_meshes
 nexto/nexto-model.pt
 pulsar-bot/checkpoint/
+pulsar-bot/checkpoint_*/
+
+# Per-decision debug JSONL from the bot (GGL_DEBUG_JSONL; a few MB per match)
+pulsar-bot/debug.*.jsonl

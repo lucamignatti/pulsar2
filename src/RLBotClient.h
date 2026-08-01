@@ -11,6 +11,7 @@
 #include <RLGymCPP/ActionParsers/ActionParser.h>
 #include <GigaLearnCPP/Util/InferUnit.h>
 
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -31,6 +32,13 @@ public:
 	RLBotBot(std::unordered_set<unsigned> indices, unsigned team, std::string name) noexcept;
 	~RLBotBot() noexcept override;
 
+	// Called once with FieldInfo (valid for the bot's lifetime): builds the boost pad
+	// index map below.
+	void initialize(
+		rlbot::flat::ControllableTeamInfo const* controllableTeamInfo,
+		rlbot::flat::FieldInfo const* fieldInfo,
+		rlbot::flat::MatchConfiguration const* matchConfiguration) noexcept override;
+
 	// Called by the BotManager on every received GamePacket.
 	void update(
 		rlbot::flat::GamePacket const* packet,
@@ -38,6 +46,12 @@ public:
 
 private:
 	RLBotParams params;
+
+	// padMap[i] = index into the packet's boost_pads for CommonValues::BOOST_LOCATIONS[i],
+	// matched by position from FieldInfo (the v5 packet orders pads y-then-x, which is NOT
+	// CommonValues order - assuming identity misattributed the whole midfield cluster).
+	// Empty until initialize(); ToGameState falls back to all-pads-available without it.
+	std::vector<int> padMap;
 
 	// Per-controlled-car state (keyed by index into packet->players()). With
 	// hivemind = false this holds a single entry, but keying by index keeps it correct
@@ -47,10 +61,23 @@ private:
 		RLGC::Action controls = {}; // Action currently being applied
 		bool updateAction = true;
 		int ticks = -1;
+		// Scripted kickoff state (Nexto's state machine, ported): -1 = kickoff not yet
+		// evaluated, -2 = evaluated and we are not the taker, >= 0 = tape position in
+		// ticks. Reset to -1 whenever the match phase leaves Kickoff.
+		int kickoffIndex = -1;
+		// Previous packet's air_state for this car, for transition logging (255 = unseen).
+		uint8_t prevAirState = 255;
 	};
 	std::unordered_map<unsigned, CarCtx> ctxByIndex;
 
 	float prevTime = 0; // secondsElapsed of the previous packet (shared across this bot's cars)
+
+	// GGL_DEBUG_JSONL: per-decision debug log (exact obs/mask/action the policy saw,
+	// plus the raw packet fields and their reconstruction) + air-state transition
+	// lines. One file per bot process in the cwd; opened lazily on first use.
+	std::ofstream debugLog;
+	bool debugLogTried = false;
+	void DebugLogLine(const std::string& line);
 };
 
 namespace RLBotClient {

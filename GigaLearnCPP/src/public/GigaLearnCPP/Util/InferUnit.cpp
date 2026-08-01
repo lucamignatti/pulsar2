@@ -43,11 +43,16 @@ GGL::InferUnit::InferUnit(
 	}
 }
 
-RLGC::Action GGL::InferUnit::InferAction(const RLGC::Player& player, const RLGC::GameState& state, bool deterministic, float temperature) {
-	return BatchInferActions({ player }, { state }, deterministic, temperature)[0];
+RLGC::Action GGL::InferUnit::InferAction(const RLGC::Player& player, const RLGC::GameState& state, bool deterministic, float temperature, InferDebug* debugOut) {
+	std::vector<InferDebug> debugRows;
+	auto result = BatchInferActions({ player }, { state }, deterministic, temperature,
+		debugOut ? &debugRows : nullptr)[0];
+	if (debugOut && !debugRows.empty())
+		*debugOut = std::move(debugRows[0]);
+	return result;
 }
 
-std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RLGC::Player>& players, const std::vector<RLGC::GameState>& states, bool deterministic, float temperature) {
+std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RLGC::Player>& players, const std::vector<RLGC::GameState>& states, bool deterministic, float temperature, std::vector<InferDebug>* debugOut) {
 	RG_ASSERT(players.size() > 0 && states.size() > 0);
 	RG_ASSERT(players.size() == states.size());
 
@@ -85,9 +90,22 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 		PPOLearner::InferActionsFromModels(*models, tObs, tActionMasks, deterministic, temperature, false, &tActions, &tLogProbs);
 
 		auto actionIndices = TENSOR_TO_VEC<int>(tActions);
-		
-		for (int i = 0; i < batchSize; i++) 
+
+		for (int i = 0; i < batchSize; i++)
 			results.push_back(actionParser->ParseAction(actionIndices[i], players[i], states[i]));
+
+		if (debugOut) {
+			debugOut->resize(batchSize);
+			const int maskWidth = actionParser->GetActionAmount();
+			for (int i = 0; i < batchSize; i++) {
+				auto& dbg = (*debugOut)[i];
+				dbg.obs.assign(allObs.begin() + (size_t)i * obsSize,
+					allObs.begin() + (size_t)(i + 1) * obsSize);
+				dbg.actionMask.assign(allActionMasks.begin() + (size_t)i * maskWidth,
+					allActionMasks.begin() + (size_t)(i + 1) * maskWidth);
+				dbg.actionIndex = actionIndices[i];
+			}
+		}
 
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("InferUnit: Exception when inferring model: " << e.what());

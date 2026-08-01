@@ -64,6 +64,35 @@ eac_active() { # true iff a REAL anti-cheat process is running (not the installe
 	done
 	return 1
 }
+# The trainer saturates all 24 cores (1024 env threads) and 10-13 GB of the 16 GB GPU.
+# A match run underneath it corrupts BOTH sides:
+#   * Python agents starve far harder than ours. Nexto rebuilds its obs and runs a
+#     37-entity attention forward per packet on ONE thread, and warns at boot that it
+#     needs a stable 120fps; Pulsar's bot is a C++ MLP. The match then measures
+#     scheduler priority, not skill - this is what produced the bogus "62-38 vs Nexto"
+#     on 2026-07-31.
+#   * Rocket League itself holds ~1.5 GB of the same GPU and OOM-crashed the trainer
+#     TWICE that day (18:31, 19:26) - the game appears by PID in the trainer's OOM dump.
+# CLAUDE.md: never look for the trainer with `pgrep -f` (it matches its own command
+# line); resolve /proc/<pid>/exe instead.
+trainer_active() {
+	TRAINER_MATCH=""
+	local e t
+	for e in /proc/[0-9]*/exe; do
+		t=$(readlink "$e" 2>/dev/null) || continue
+		# Rebuilding build/ under a live trainer is the DOCUMENTED-SAFE workflow
+		# (trainerctl update does it), and it replaces the inode - so the running
+		# process's exe link reads ".../GigaLearnBot (deleted)". Strip that suffix
+		# before matching or this guard silently misses the most common case, which
+		# is exactly what it did on first write.
+		t=${t% (deleted)}
+		case "$t" in
+			*build/GigaLearnBot)
+				TRAINER_MATCH="pid $(basename "$(dirname "$e")"): $t"; return 0 ;;
+		esac
+	done
+	return 1
+}
 rl_connected() { grep -q "Connected to Rocket League" core_play.log 2>/dev/null; }
 # Each Pulsar2 car runs run.sh, which logs to pulsar-bot/bot.<pid>.log (one per car).
 bot_spawned()  { grep -qs "Created RLBot bot" pulsar-bot/bot.*.log 2>/dev/null; }
@@ -114,9 +143,26 @@ trap 'echo; echo "Ending session..."; save_replay_if_eval; kill_all; exit 0' INT
 
 pkill -f RLBotServer 2>/dev/null
 sleep 1
-: > core_play.log; : > watchdog.log; : > procs.log; rm -f pulsar-bot/bot.*.log 2>/dev/null
+: > core_play.log; : > watchdog.log; : > procs.log; rm -f pulsar-bot/bot.*.log pulsar-bot/debug.*.jsonl 2>/dev/null
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"
 if eac_active; then log "Refusing to start: EAC already running ($EAC_MATCH)"; abort_eac; fi
+if trainer_active && [ "${ALLOW_TRAINER:-0}" != "1" ]; then
+	log "############################################################"
+	log "#  TRAINER IS LIVE - $TRAINER_MATCH"
+	log "#  Refusing to start. A match under the trainer measures scheduler"
+	log "#  priority, not skill: Python agents (Nexto) starve far harder than"
+	log "#  our C++ bot, and the game's GPU use has OOM-crashed the trainer."
+	log "#"
+	log "#    tools/trainerctl stop      # then re-run this; restart when done"
+	log "#    ALLOW_TRAINER=1 ./play.sh ...   # override (result is NOT a measurement)"
+	log "############################################################"
+	exit 1
+fi
+if trainer_active; then
+	log "WARNING: ALLOW_TRAINER=1 with the trainer live ($TRAINER_MATCH)."
+	log "WARNING: both sides are starved and the game may OOM-crash the trainer."
+	log "WARNING: whatever this match shows is NOT a valid measurement."
+fi
 
 # --- background process logger: snapshot RL/EAC procs every 1s (pure diagnostics) ----
 (

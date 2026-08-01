@@ -283,7 +283,17 @@ void GGL::NextoOpponent::Act(const std::vector<RLGC::GameState>& states,
 				R[F_BOOSTAMT] = p.boost / 100.f;
 				R[F_DEMO] = p.isDemoed ? 1.f : 0.f;
 				R[F_GROUND] = p.isOnGround ? 1.f : 0.f;
-				R[F_FLIP] = p.HasFlipOrJump() ? 1.f : 0.f;
+				// NOT HasFlipOrJump(). The reference this obs reproduces is rlgym_compat
+				// v1/player_data.py, which defines has_flip as exactly
+				//     not has_flipped and not has_double_jumped
+				//     and air_time_since_jump < DOUBLEJUMP_MAX_DELAY
+				// with NO on-ground disjunct. HasFlipOrJump() ORs in isOnGround, so a car
+				// mid-ground-flip (hasFlipped already set while the wheels are still down)
+				// reports "flip available" where the reference reports spent. Nexto's net was
+				// trained against the reference meaning, so feeding it ours puts that feature
+				// off-distribution. Compute the reference expression directly.
+				R[F_FLIP] = (!p.hasFlipped && !p.hasDoubleJumped
+					&& p.airTimeSinceJump < RLConst::DOUBLEJUMP_MAX_DELAY) ? 1.f : 0.f;
 			}
 
 			// Ball row

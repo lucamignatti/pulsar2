@@ -6,6 +6,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="/home/luca/Projects/pulsar2-3.0"
 # GigaLearnRLBot is dynamically linked against libGigaLearnCPP, libRLBotCPP and libtorch.
 export LD_LIBRARY_PATH="$REPO/build:$REPO/GigaLearnCPP/libtorch/lib:$LD_LIBRARY_PATH"
+# Per-decision debug JSONL (exact obs/mask/action + raw packet jump fields + air-state
+# transitions) -> debug.<pid>.jsonl next to this script. A few MB per match; used to
+# compare real-game inputs against sim. Set to 0 to disable.
+export GGL_DEBUG_JSONL="${GGL_DEBUG_JSONL:-1}"
 # Capture each car's stdout+stderr + exit code to bot.<pid>.log (one file per Pulsar2 car,
 # so 2v2/3v3 instances don't clobber each other). Segfault leaves exit 139; an uncaught
 # C++ exception leaves its what() text here.

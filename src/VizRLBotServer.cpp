@@ -554,7 +554,23 @@ void VizRLBotServer::SendGamePacket(BotClient& client, const RLGC::GameState& st
 		info->air_state = player.isOnGround ? flat::AirState::OnGround : flat::AirState::InAir;
 		// Negative means "not applicable" in RLBot's timeout convention.
 		info->demolished_timeout = player.isDemoed ? player.demoRespawnTimer : -1.f;
-		info->dodge_timeout = player.HasFlipOrJump() ? 1.f : -1.f;
+		// SECONDS OF DODGE WINDOW REMAINING, not a boolean sentinel. This used to send a
+		// constant 1.0 whenever HasFlipOrJump() was true and -1 otherwise, which broke
+		// rlgym_compat-based agents (Nexto): it reconstructs
+		//     air_time_since_jump = DOUBLEJUMP_MAX_DELAY - dodge_timeout
+		// and, on the -1 branch, leaves whatever it had. So a car that jumped and let the
+		// 1.25s window lapse WITHOUT dodging sent -1, rlgym_compat kept the stale 0.25 from
+		// the previous frame, and its has_flip
+		//     (not has_flipped and not has_double_jumped and air_time_since_jump < 1.25)
+		// stayed TRUE forever — telling the agent it still had a dodge it had already lost,
+		// so it planned flips and aerial recoveries it could not execute.
+		// Send the real remaining window while airborne after a jump (it may go negative once
+		// the window has lapsed, which is what makes the reconstruction come out right), and
+		// -1 only on the ground / before any jump, where rlgym_compat's own
+		// `not has_jumped` clause zeroes air_time_since_jump correctly anyway.
+		info->dodge_timeout = (player.hasJumped && !player.isOnGround)
+			? (RLConst::DOUBLEJUMP_MAX_DELAY - player.airTimeSinceJump)
+			: -1.f;
 		info->has_dodged = player.hasFlipped;
 		info->has_jumped = player.hasJumped;
 		info->has_double_jumped = player.hasDoubleJumped;
