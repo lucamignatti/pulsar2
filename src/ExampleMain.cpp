@@ -938,12 +938,22 @@ int main(int argc, char* argv[]) {
 		// pause/rewind/editing keep working against it. Built only with
 		// -DGGL_VIZ_RLBOT=ON; the trainer links none of this.
 		{
-			// Relative to the build dir the viewer runs from (build-viz/), which is where
-			// the rest of this file's relative paths are anchored too.
-			static const std::string botRoot = std::filesystem::absolute("../rlbot-run").string();
+			// Harness roots to scan, most-preferred first. The first is relative to the
+			// build dir the viewer runs from (build-viz/), which is where the rest of this
+			// file's relative paths are anchored too.
+			//
+			// The second is the SIBLING checkout, and it is not an accident: Element lives
+			// there with the Python venv both it and Nexto are already launched from
+			// (see nexto/bot.toml's run_command_linux), so copying it into this tree would
+			// fork a working install to no purpose. A root that doesn't exist is skipped,
+			// so this stays harmless on a machine that only has one checkout.
+			static const std::vector<std::string> botRoots = {
+				std::filesystem::absolute("../rlbot-run").string(),
+				"/home/luca/Projects/pulsar2/rlbot-run",
+			};
 			static GGL::VizRLBotServer rlbotServer;
 
-			cfg.vizBotFinder = []() { return GGL::VizRLBotServer::FindBotConfigs(botRoot); };
+			cfg.vizBotFinder = []() { return GGL::VizRLBotServer::FindBotConfigs(botRoots); };
 
 			cfg.externalControlSource = [](
 				const std::string& spec, Team team, const RLGC::GameState& state,
@@ -951,10 +961,13 @@ int main(int argc, char* argv[]) {
 				std::vector<uint8_t>& outValid,
 				LearnerConfig::ExternalControlStatus& status) -> bool {
 
+				// The spec already carries an absolute path — VizControl accepted it only
+				// because it exactly matched one the finder produced, so there is nothing
+				// left to join and no browser-composed path fragment to trust.
 				const std::string prefix = "rlbot:";
 				std::string wantConfig;
 				if (spec.rfind(prefix, 0) == 0)
-					wantConfig = botRoot + "/" + spec.substr(prefix.size());
+					wantConfig = spec.substr(prefix.size());
 
 				// What is actually running, so a change of bot, side, or car count
 				// relaunches, and deselecting shuts the bot down rather than leaving it

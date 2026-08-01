@@ -191,31 +191,86 @@ static std::string ReadTomlString(const std::string& path, const std::string& ke
 	return "";
 }
 
-std::vector<std::string> VizRLBotServer::FindBotConfigs(const std::string& searchRoot) {
-	std::vector<std::string> found;
-	std::error_code ec;
-	if (!std::filesystem::exists(searchRoot, ec))
-		return found;
+std::vector<VizBotEntry> VizRLBotServer::FindBotConfigs(const std::vector<std::string>& searchRoots) {
+	std::vector<VizBotEntry> found;
+	// Which root each entry came from, kept only long enough to disambiguate names below.
+	std::vector<std::string> entryRoot;
 
-	// Shallow: bots live a directory or two under the harness root, and recursing the
-	// whole tree would sweep in vendored copies nobody wants to play against.
-	for (auto it = std::filesystem::recursive_directory_iterator(
-			searchRoot, std::filesystem::directory_options::skip_permission_denied, ec);
-		it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-		if (ec)
-			break;
-		if (it.depth() > 2) {
-			it.disable_recursion_pending();
-			continue;
+	for (const std::string& rawRoot : searchRoots) {
+		std::error_code ec;
+		// Normalized up front, because the label below names the root's PARENT directory to
+		// say which checkout an entry came from — and callers pass roots like
+		// `absolute("../rlbot-run")`, whose parent is the literal "..".  A trailing
+		// separator would hide the real leaf the same way, so drop that too.
+		std::filesystem::path searchRoot =
+			std::filesystem::absolute(rawRoot, ec).lexically_normal();
+		if (searchRoot.filename().empty())
+			searchRoot = searchRoot.parent_path();
+		if (!std::filesystem::exists(searchRoot, ec))
+			continue; // a checkout that isn't on this machine is not an error
+
+		// Shallow: bots live a directory or two under the harness root, and recursing the
+		// whole tree would sweep in vendored copies nobody wants to play against. Depth 2
+		// is load-bearing, not slack — Element's config is at `Elementv5/src/bot.toml`.
+		for (auto it = std::filesystem::recursive_directory_iterator(
+				searchRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+			it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+			if (ec)
+				break;
+			if (it.depth() > 2) {
+				it.disable_recursion_pending();
+				continue;
+			}
+			if (!it->is_regular_file(ec))
+				continue;
+			if (it->path().extension() != ".toml")
+				continue;
+
+			// The content sniff. An agent config is the file that says how to launch an
+			// agent, so a run command is both necessary and sufficient — and it is what
+			// separates a real config from the other .toml files lying around a harness
+			// root (loadout.toml, match*.toml, RLBotSim's Cargo.toml), none of which
+			// carry one.
+			std::string path = std::filesystem::absolute(it->path(), ec).lexically_normal().string();
+			if (ReadTomlString(path, "run_command_linux").empty()
+				&& ReadTomlString(path, "run_command").empty())
+				continue;
+
+			// Roots may overlap or be listed twice; the same file must not appear twice in
+			// a dropdown where selecting it launches a process.
+			if (std::any_of(found.begin(), found.end(),
+					[&](const VizBotEntry& e) { return e.path == path; }))
+				continue;
+
+			std::string name = ReadTomlString(path, "name");
+			if (name.empty())
+				name = it->path().parent_path().filename().string();
+			found.push_back({ path, name });
+			entryRoot.push_back(searchRoot.string());
 		}
-		if (!it->is_regular_file(ec))
-			continue;
-		std::string name = it->path().filename().string();
-		if (name != "bot.toml")
-			continue;
-		found.push_back(std::filesystem::relative(it->path(), searchRoot, ec).string());
 	}
-	std::sort(found.begin(), found.end());
+
+	// Two checkouts can hold configs calling themselves the same thing (both harness roots
+	// have a "Pulsar2"), and a dropdown with two identical rows is a dropdown you cannot
+	// use. The distinguishing fact is which checkout it came from, so say that.
+	// Flag first, rename second: renaming in one pass would make the first of a pair stop
+	// matching the second, and only one of the two would get disambiguated.
+	std::vector<bool> ambiguous(found.size(), false);
+	for (size_t i = 0; i < found.size(); i++)
+		for (size_t k = i + 1; k < found.size(); k++)
+			if (found[k].name == found[i].name)
+				ambiguous[i] = ambiguous[k] = true;
+	for (size_t i = 0; i < found.size(); i++) {
+		if (!ambiguous[i])
+			continue;
+		std::string where = std::filesystem::path(entryRoot[i]).parent_path().filename().string();
+		if (!where.empty())
+			found[i].name += " (" + where + ")";
+	}
+
+	std::sort(found.begin(), found.end(), [](const VizBotEntry& a, const VizBotEntry& b) {
+		return a.name != b.name ? a.name < b.name : a.path < b.path;
+	});
 	return found;
 }
 

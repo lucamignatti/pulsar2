@@ -3,7 +3,10 @@
 name = "Nexto (Toxic!)"
 loadout_file = "loadout.toml"
 run_command = "..\\..\\venv\\Scripts\\python toxic.py"
-run_command_linux = "../../venv/bin/python toxic.py"
+# Same fix bot.toml already carries: the upstream relative path points at a `venv/` this
+# checkout does not have. The interpreter with torch/rlgym_compat/rlbot in it is the
+# sibling project's.
+run_command_linux = "/home/luca/Projects/pulsar2/rlbot-run/.venv312/bin/python toxic.py"
 logo_file = "nexto_logo.png"
 agent_id = "rlgym/nexto-toxic"
 

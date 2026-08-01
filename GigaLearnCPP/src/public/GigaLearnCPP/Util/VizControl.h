@@ -8,6 +8,15 @@
 
 namespace GGL {
 
+	// One external RLBot agent the viewer may offer as an opponent. Declared out here
+	// rather than inside VizControl because it is also the return type of the finder
+	// callback in LearnerConfig — whoever can serve an agent is the only thing that knows
+	// how to find one, and both ends need to agree on what a found agent looks like.
+	struct VizBotEntry {
+		std::string path; // absolute path to the agent's .toml
+		std::string name; // display name from that config's [settings] name
+	};
+
 	// The per-car payload of a snapshot.
 	//
 	// Under v3 this is the ENGINE'S OWN state struct, captured through the FFI rather
@@ -196,8 +205,13 @@ namespace GGL {
 			return false;
 		}
 
-		// RLBot bot.toml paths the panel offers, relative to the harness root.
-		std::vector<std::string> availableBots;
+		// RLBot agent configs the panel offers. ABSOLUTE paths: bots are discovered across
+		// several harness roots (this checkout's and the sibling one Element lives in), so
+		// there is no single root left to be relative to — and an absolute path is also the
+		// safer thing to hand back, since nothing downstream has to join browser-supplied
+		// text onto a directory. `name` is what the config calls itself ("Nexto (Toxic!)"),
+		// which is the only label that separates two configs sharing a directory.
+		std::vector<VizBotEntry> availableBots;
 		// Live status for the panel: is the agent up and has it connected.
 		bool rlbotRunning = false;
 		bool rlbotConnected = false;

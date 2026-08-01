@@ -716,8 +716,14 @@ void GGL::Learner::RefreshVizOpponentList() {
 
 	// RLBot configs are discovered by the executable (it owns the RLBot integration and
 	// knows where the harness lives); this only publishes what it found.
-	if (config.vizBotFinder && vizControl->availableBots.empty())
+	if (config.vizBotFinder && vizControl->availableBots.empty()) {
 		vizControl->availableBots = config.vizBotFinder();
+		// Logged once, because "the bot I expected isn't in the dropdown" is otherwise
+		// indistinguishable from "the dropdown is broken" — and discovery reaches across
+		// checkouts now, so where each one came from is worth having in the log.
+		for (const VizBotEntry& e : vizControl->availableBots)
+			RG_LOG("[viz] bot: " << e.name << " <- " << e.path);
+	}
 }
 
 bool GGL::Learner::ReloadNewestCheckpointForRender(int64_t& loadedTimesteps) {

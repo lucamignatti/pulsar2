@@ -295,7 +295,11 @@ void VizControl::HandleCommand(const std::string& text) {
 		// (and, for a bot, handed to fork/exec). Accept only the shapes the panel offers.
 		if (IsRLBot(want)) {
 			std::string cfg = RLBotConfig(want);
-			if (std::find(availableBots.begin(), availableBots.end(), cfg) == availableBots.end()) {
+			// Exact match against a path WE discovered, never a path the browser composed:
+			// this string is about to reach fork/exec, and the panel only ever echoes back
+			// an entry it was handed.
+			if (std::none_of(availableBots.begin(), availableBots.end(),
+					[&](const VizBotEntry& e) { return e.path == cfg; })) {
 				RG_LOG("[viz] refusing unknown bot config: " << cfg);
 				opponentError = "unknown bot config";
 				return;
@@ -554,7 +558,13 @@ std::string VizControl::StatusJSON() const {
 	j["blueAgent"] = blueAgent;
 	j["orangeAgent"] = orangeAgent;
 	j["opponents"] = availableOpponents;
-	j["bots"] = availableBots;
+	// Objects, not bare paths: the panel labels by name, because two configs can share a
+	// directory (nexto/bot.toml and nexto/toxic.bot.toml) and a path-derived label cannot
+	// tell them apart.
+	nlohmann::json bots = nlohmann::json::array();
+	for (const VizBotEntry& e : availableBots)
+		bots.push_back({ { "path", e.path }, { "name", e.name } });
+	j["bots"] = bots;
 	j["opponentError"] = opponentError;
 	j["rlbotRunning"] = rlbotRunning;
 	j["rlbotConnected"] = rlbotConnected;

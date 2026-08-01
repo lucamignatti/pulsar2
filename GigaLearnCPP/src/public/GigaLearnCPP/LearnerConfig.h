@@ -3,6 +3,7 @@
 #include <RLGymCPP/StateSetters/AirDrillState.h>
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
+#include "Util/VizControl.h" // VizBotEntry, the finder callback's return type
 
 #include <memory>
 
@@ -125,7 +126,7 @@ namespace GGL {
 		// Render only: lists the external agents the panel may offer as opponents. Kept
 		// alongside externalControlSource because whoever can serve an agent is also the
 		// only thing that knows how to find one.
-		std::function<std::vector<std::string>()> vizBotFinder = nullptr;
+		std::function<std::vector<VizBotEntry>()> vizBotFinder = nullptr;
 
 		// If renderMode, the UDP port the viewer's control panel sends commands to
 		// (bound on loopback only). See Util/VizControl.h.

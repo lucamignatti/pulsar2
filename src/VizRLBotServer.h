@@ -1,6 +1,7 @@
 #pragma once
 #include <RLGymCPP/Gamestates/GameState.h>
 #include <RLGymCPP/BasicTypes/Action.h>
+#include <GigaLearnCPP/Util/VizControl.h> // VizBotEntry
 
 #include <cstdint>
 #include <memory>
@@ -71,9 +72,18 @@ namespace GGL {
 		const std::string& LastError() const { return lastError; }
 		const std::string& BotName() const { return botName; }
 
-		// bot.toml files discoverable under `searchRoot`, as paths relative to it, so the
-		// panel can offer a dropdown instead of asking for a filesystem path.
-		static std::vector<std::string> FindBotConfigs(const std::string& searchRoot);
+		// RLBot agent configs discoverable under any of `searchRoots`, as absolute paths
+		// plus display names, so the panel can offer a dropdown instead of asking for a
+		// filesystem path.
+		//
+		// Several roots because the bots on this box are not in one place: Element lives in
+		// the sibling pulsar2 checkout with its own venv, and copying it here would fork a
+		// working install. Recognition is by CONTENT, not by the filename `bot.toml` — that
+		// convention misses sibling configs like `nexto/toxic.bot.toml`, which is a real
+		// selectable agent, while a name-based rule would still have to special-case
+		// `loadout.toml`, `match*.toml` and `Cargo.toml`. An agent config is the thing that
+		// says how to run an agent, so that is what we look for.
+		static std::vector<VizBotEntry> FindBotConfigs(const std::vector<std::string>& searchRoots);
 
 	private:
 		struct Impl;
