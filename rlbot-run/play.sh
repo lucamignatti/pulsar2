@@ -25,10 +25,10 @@ cd "$(dirname "$0")"
 #                 SESSION (Ctrl-C): the holder sends StopMatch, RL flushes the .replay,
 #                 THEN the server is torn down. Watch as long as you like; stop to save.
 #   team_size and eval may appear in either order after the config.
-# Examples:  ./play.sh                          -> 1v1, you vs Pulsar2
+# Examples:  ./play.sh                          -> 1v1, you vs Pulsar2 (syncs to newest ckpt)
 #            ./play.sh match_vs_element 3        -> 3v3, Pulsar2 vs Element (you spectate)
 #            ./play.sh match_vs_nexto 1 eval     -> 1v1 vs Nexto, save a replay
-#            ./play.sh match_vs_nexto eval       -> same (team_size defaults to 1)
+#            ./play.sh match_vs_nexto 1 nosync  -> keep the staged checkpoint, do not sync
 CONFIG="${1:-match_vs_human.toml}"
 [ -f "$CONFIG" ] || CONFIG="$CONFIG.toml"
 [ -f "$CONFIG" ] || { echo "Match config not found: ${1:-match_vs_human.toml}"; exit 1; }
@@ -36,6 +36,7 @@ CONFIG="${1:-match_vs_human.toml}"
 TEAM_SIZE=1
 REPLAY=0
 MODE=""
+SYNC=1
 for a in "$@"; do
 	case "$a" in
 		1|2|3)                 TEAM_SIZE="$a" ;;
@@ -51,7 +52,9 @@ for a in "$@"; do
 		#   sample: ONE lever - Pulsar samples from the policy like every sim evaluation
 		#           does, instead of the client's argmax default. Nexto untouched.
 		bugnexto|simparity|sample) MODE="$a" ;;
-		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
+		# Keep the bot on whatever checkpoint is already staged (see sync_checkpoint).
+		nosync|--nosync)       SYNC=0 ;;
+		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'nosync', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
 	esac
 done
 export REPLAY
@@ -105,6 +108,80 @@ trainer_active() {
 	done
 	return 1
 }
+# --- live checkpoint sync -----------------------------------------------------
+# pulsar-bot/checkpoint is a STATIC COPY. The viz hot-swaps to the newest save; this
+# does not, so without a sync every real-game eval silently benchmarks an old bot -
+# measured 2026-07-31, a 6.50B copy against a 9.15B live run, i.e. 2.65B of training
+# invisible to every match played that night. Default ON; `nosync` to pin.
+#
+# CKPT_ROOT default is the LIVE LINEAGE and it drifts: the folder has been
+# checkpoints_6M -> _resid -> _5.1 -> _5.2 -> _5.3, and every rename has silently
+# broken something downstream (see the cold-start checklist). So a missing root is a
+# LOUD failure listing candidates, never a quiet fallback to a dead lineage.
+sync_checkpoint() {
+	local root="${GGL_CKPT_ROOT:-../build/checkpoints_5.3}"
+	local dest="pulsar-bot/checkpoint"
+
+	if [ ! -d "$root" ]; then
+		log "SYNC FAILED: checkpoint root '$root' does not exist."
+		log "SYNC: candidates -"
+		for d in ../build/checkpoints_*/; do [ -d "$d" ] && log "SYNC:   $d"; done
+		log "SYNC: set GGL_CKPT_ROOT=<dir> (the live lineage folder has changed 5x)."
+		return 1
+	fi
+
+	local have=""
+	[ -f "$dest/STEPS.txt" ] && have=$(cat "$dest/STEPS.txt" 2>/dev/null)
+
+	# Numbered dirs only: skips best_r*<ts> golden entries, policy_versions/ and any
+	# in-flight *.tmp. Saves are atomic (write to .tmp then rename), so a dir that
+	# exists under its final name is complete - but ROTATION (8 kept, ~10min window)
+	# can delete it mid-copy, which is why we walk several candidates newest-first
+	# instead of trusting the first one.
+	local cands
+	cands=$(ls "$root" 2>/dev/null | grep -E '^[0-9]+$' | sort -rn | head -5)
+	if [ -z "$cands" ]; then
+		log "SYNC FAILED: no numbered checkpoints in $root"
+		return 1
+	fi
+
+	local ts
+	for ts in $cands; do
+		if [ "$ts" = "$have" ]; then
+			log "SYNC: already current at $ts steps ($(echo "scale=2; $ts/1000000000" | bc 2>/dev/null || echo "?")B)"
+			return 0
+		fi
+		local src="$root/$ts"
+		local stage="pulsar-bot/.ckpt_stage.$$"
+		rm -rf "$stage"; mkdir -p "$stage" || return 1
+
+		# Only what InferUnit actually loads. RUNNING_STATS is optional (this lineage
+		# trains on raw obs, standardizeObs=false) but copied when present so the dir
+		# stays a faithful subset of one checkpoint.
+		if cp "$src/POLICY.lt" "$stage/" 2>/dev/null \
+			&& cp "$src/SHARED_HEAD.lt" "$stage/" 2>/dev/null \
+			&& [ -s "$stage/POLICY.lt" ] && [ -s "$stage/SHARED_HEAD.lt" ]; then
+			cp "$src/RUNNING_STATS.json" "$stage/" 2>/dev/null || true
+			echo "$ts" > "$stage/STEPS.txt"
+			mkdir -p "$dest"
+			# Clear stale .lt first: the destination accumulated a full checkpoint's
+			# worth of files (critics, optims) from an old copy, and leaving 6.5B
+			# criticsnext to a 9.7B policy makes the dir lie about what it holds.
+			rm -f "$dest"/*.lt "$dest"/RUNNING_STATS.json 2>/dev/null
+			mv "$stage"/* "$dest"/ && rmdir "$stage"
+			log "SYNC: ${have:-<none>} -> $ts steps ($(echo "scale=2; $ts/1000000000" | bc 2>/dev/null || echo "?")B)"
+			log "SYNC: if the bot aborts with a size mismatch, RLBotMain.cpp's hardcoded"
+			log "SYNC: net config no longer matches the trainer's (the standing hazard)."
+			return 0
+		fi
+		rm -rf "$stage"
+		log "SYNC: $ts vanished mid-copy (rotation), trying next-newest..."
+	done
+
+	log "SYNC FAILED: every candidate rotated away mid-copy; keeping ${have:-existing} checkpoint"
+	return 1
+}
+
 rl_connected() { grep -q "Connected to Rocket League" core_play.log 2>/dev/null; }
 # Each Pulsar2 car runs run.sh, which logs to pulsar-bot/bot.<pid>.log (one per car).
 bot_spawned()  { grep -qs "Created RLBot bot" pulsar-bot/bot.*.log 2>/dev/null; }
@@ -175,6 +252,15 @@ if [ "$MODE" = "sample" ]; then
 	log "MODE sample: Pulsar samples from the policy (every sim evaluation samples; the client's argmax default has never been evaluated anywhere else)"
 fi
 [ -n "$MODE" ] && log "RECEIPTS: check core_play.log for 'Nexto HANDICAPS' and pulsar-bot/bot.*.log for 'RLBot flags' - a missing receipt means the flag did NOT land"
+
+# Before the server launches the bot, so the car spawns on the checkpoint we just staged.
+# A failed sync is NOT fatal: playing the previous checkpoint beats refusing to play,
+# and the log says loudly which one it is.
+if [ "$SYNC" = 1 ]; then
+	sync_checkpoint || log "SYNC: continuing on the previously staged checkpoint"
+else
+	log "SYNC: skipped (nosync); bot stays on $(cat pulsar-bot/checkpoint/STEPS.txt 2>/dev/null || echo '<unknown>') steps"
+fi
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"
 if eac_active; then log "Refusing to start: EAC already running ($EAC_MATCH)"; abort_eac; fi
 if trainer_active && [ "${ALLOW_TRAINER:-0}" != "1" ]; then
