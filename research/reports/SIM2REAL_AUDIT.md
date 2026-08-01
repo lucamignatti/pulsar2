@@ -1047,6 +1047,32 @@ transfer while leaving positional play looking fine — which matches the report
 the surrounding sequence is not), ~15-17 uu/s of perpendicular coasting error with no
 identified cause, and 4 spurious boost pickups per 1508 windows.
 
+## 17. Ball contact: spin RULED OUT as the cause (correction)
+
+§15 speculated that the off-centre ball-hit error was an artifact of the RLBot telemetry
+not logging ball angular velocity, and that the true margin was therefore better than the
+measured +/-5%. **That was wrong.** Replays *do* carry ball angular velocity, so the test
+was run both ways on the same 294 reproduced contacts:
+
+| ball spin fed to the sim | dir err p50 | speed ratio p50 | outgoing spin err p50 |
+|---|---|---|---|
+| zeroed | 19.25° | 0.659 | 3.198 rad/s |
+| **real** | 19.53° | 0.669 | **0.747 rad/s** |
+
+Supplying real spin changes direction and speed by **under 2%** — it is not the cause.
+It does improve the *outgoing* spin 4.3x, so RocketSim's spin handling at contact is sound
+when given correct input; incoming spin simply is not what drives the direction error.
+
+(The absolute numbers here are far worse than the telemetry test's 2.5-6.8° / 0.92-0.98
+because replays are 30 fps, so contact phase is quantised to 4-tick steps and only ~28% of
+contacts reproduce at all. The telemetry figures remain the better estimate; this test is
+only valid as a *controlled comparison* of spin-on vs spin-off.)
+
+**Consequence: the ball-contact tolerance is real, not a measurement floor.** Direction
+2.5-3° centred / 6.8° off-centre and speed +/-5% stand as genuine sim-vs-game differences,
+and remain the thinnest margin in the system. The claim in §15 that logging ball spin would
+tighten it is withdrawn — it would not.
+
 ## Recommended order
 
 1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
