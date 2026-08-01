@@ -83,7 +83,7 @@ def collect(policy):
 
     n = TARGET_ROWS
     out = {
-        "h2": np.empty((n, 512), np.float32),
+        "h2": np.empty((n, getattr(policy, "h2_width", 512)), np.float32),
         "mask": np.empty((n, 90), np.uint8),
         "goal_car": np.empty((n, 6), np.float32),
         "goal_ball": np.empty((n, 6), np.float32),
@@ -267,6 +267,9 @@ def main():
     rs.init(str(HERE.parents[1] / "build" / "collision_meshes"))
     policy, ckpt = load_latest()
     print(f"checkpoint {ckpt.name}")
+    # padded-lineage (230-obs) checkpoints need the env obs builder switched over
+    import collect_dataset as _cd
+    _cd.set_obs_size(policy.obs_size)
 
     t0 = time.time()
     data = collect(policy)

@@ -352,7 +352,8 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
         "kickoff": np.zeros(n_rows, bool),
     }
     if want_h2:
-        rec["h2"] = np.empty((n_rows, 512), np.float16)
+        _p0 = policies[0] if isinstance(policies, (tuple, list)) else policies
+        rec["h2"] = np.empty((n_rows, getattr(_p0, "h2_width", 512)), np.float16)
     if want_masks:
         rec["masks"] = np.empty((n_rows, 90), np.uint8)
     if want_goals:
@@ -404,7 +405,7 @@ def rollout_team(policies, ppt, n_rows, seed, num_arenas=12, want_h2=False,
             rec["obs"] = np.empty((n_rows, obs_b.shape[1]), np.float16)
         if per_team:
             slots = torch.arange(obs_b.shape[0]) % npl
-            h2 = torch.empty(obs_b.shape[0], 512)
+            h2 = torch.empty(obs_b.shape[0], getattr(policies[0], "h2_width", 512))
             actions = torch.empty(obs_b.shape[0], dtype=torch.long)
             for t, pol in enumerate(policies):
                 sel = torch.nonzero(slots % 2 == t).flatten()

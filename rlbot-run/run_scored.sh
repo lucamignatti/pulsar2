@@ -32,6 +32,23 @@ done
 
 : > core.log; : > rlbotsim.log; : > scored.log
 
+# The real game STEALS the backend slot. RocketLeague launched with `-rlbot` connects
+# out to port 23233 the moment a server opens it - before rlbot_sim can - and the
+# "Connected to Rocket League" readiness check cannot tell the two apart. The match
+# then spawns into a game sitting at a menu: zero cars forever (diagnosed 2026-07-31
+# from exactly those logs). It is also physics contamination for the sim-vs-real
+# isolation experiment this harness exists for. Refuse until it is closed.
+for c in /proc/[0-9]*/cmdline; do
+	line=$(cat "$c" 2>/dev/null | tr '\0' ' ') || continue
+	case "$line" in *RocketLeague.exe*)
+		echo "[driver] REFUSING: real Rocket League is running (pid $(basename "$(dirname "$c")"))."
+		echo "[driver] It will steal the sim's backend port (23233). Quit the game first."
+		exit 1 ;;
+	esac
+done
+# A leftover RLBotServer from play.sh holds the ports; ours would fail to bind.
+pkill -f RLBotServer 2>/dev/null; sleep 1
+
 nice -n 19 ./RLBotServer > core.log 2>&1 &
 CORE=$!
 for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':23234' && break; sleep 0.5; done

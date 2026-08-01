@@ -1,0 +1,17 @@
+{
+ "checkpoint": 9750127919,
+ "rows": 600000,
+ "high_ball_step_frac": 0.28024333333333334,
+ "per_100k_steps": {
+  "wavedash_like": 143.16666666666666,
+  "flip_cancel_ish": 1500.5,
+  "proto_dribble_touches": 537.3333333333333,
+  "grounded_jump_at_high_ball": 176.33333333333331
+ },
+ "raw": {
+  "wavedash_like": 859,
+  "flip_cancel_ish": 9003,
+  "proto_dribble_touches": 3224,
+  "grounded_jump_at_high_ball": 1058
+ }
+}

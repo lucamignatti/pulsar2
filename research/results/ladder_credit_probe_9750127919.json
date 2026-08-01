@@ -1,0 +1,50 @@
+{
+ "checkpoint": 9750127919,
+ "rows": 900000,
+ "n_matched_per_class": 1724,
+ "n_best_placed": 4216,
+ "n_readings": 8414,
+ "pursue_rate_best_placed": 0.5056925996204934,
+ "pricing_v_real": {
+  "pursue_minus_decline": 0.11673945933580399,
+  "se": 0.015880299732089043,
+  "pursue_minus_decline_z": 0.32338157296180725
+ },
+ "pricing_v_exp": {
+  "pursue_minus_decline": 0.10899832844734192,
+  "se": 0.015422014519572258,
+  "pursue_minus_decline_z": 0.29620569944381714
+ },
+ "pricing_vdag_min": {
+  "pursue_minus_decline": 0.04390406608581543,
+  "se": 0.010488239116966724,
+  "pursue_minus_decline_z": 0.14594168961048126
+ },
+ "pricing_v_goal": {
+  "pursue_minus_decline": 0.048578184098005295,
+  "se": 0.014237536117434502,
+  "pursue_minus_decline_z": 0.17293497920036316
+ },
+ "pricing_v_geo": {
+  "pursue_minus_decline": 0.0048980712890625,
+  "se": 0.0028630231972783804,
+  "pursue_minus_decline_z": 0.06337255984544754
+ },
+ "pricing_H": {
+  "pursue_minus_decline": -0.07283568382263184,
+  "se": 0.01700935885310173,
+  "pursue_minus_decline_z": -0.198689803481102
+ },
+ "horizon_v_exp": {
+  "dz_pursue_minus_decline": -0.027175839990377426,
+  "se": 0.014406342059373856
+ },
+ "horizon_vdag_min": {
+  "dz_pursue_minus_decline": -0.177439883351326,
+  "se": 0.05065084248781204
+ },
+ "horizon_v_goal": {
+  "dz_pursue_minus_decline": -0.1504465937614441,
+  "se": 0.03550656512379646
+ }
+}

@@ -29,6 +29,7 @@ Status vocabulary:
 
 | Report | Date | Run | Topic | Status |
 |---|---|---|---|---|
+| [INTERP_53.md](INTERP_53.md) | 08-01 | 5.3 @ 9.75B | **The interpretability battery rerun** against the four-rung ladder: whiff tax reversed, rho calibrated, knowing-doing knowledge-graded, V† ZPD structure real, **V◇ degenerate (flat r̂ binding; solution routes through prevAction Σ)** | **RESULT** |
 | [COMPOSITION_CRITIC.md](COMPOSITION_CRITIC.md) | 07-25 | testbed + resid | **The paper.** Composition critic: exploration by seeking realizable headroom | **CANONICAL** |
 | [GEOMETRIC_CRITIC.md](GEOMETRIC_CRITIC.md) | 07-30 | testbed + 5.3 | **The ladder paper.** 4th rung: value read from environment geometry (HJB), permanent constant mix beside V-dagger. Live from step 0 of 5.3 | **CANONICAL** |
 | [H2_TRUNCATION.md](H2_TRUNCATION.md) | 07-19 | cross-run | Offline loader bug, fix + oracle verification | **CANONICAL** |
