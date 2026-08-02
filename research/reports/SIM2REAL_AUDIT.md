@@ -1432,3 +1432,55 @@ differs in DIRECTION, not just magnitude.
 `supersonic_run`, `into_net`, `transition_curve_dash`, `transition_wall_dash`,
 `transition_flip_off`, `transition_supersonic_into`. `supersonic_run` has now failed to
 capture twice. Cause unknown -- do not claim full coverage until this is explained.
+
+## §22 — Full coverage (77/77) + a real-vs-real control (2026-08-02)
+
+The runner's fixed 25uu state-set gate was silently skipping every high-speed segment
+(§21.4 cause found: the gate is checked one 60Hz packet after a state set that carries
+velocity, so a 2200uu/s spawn is 36.7uu away before it can ever pass). Fixed; 77/77 now
+capture, including the wall dash and both supersonic segments.
+
+### 22.1 CONTROL: the real game is deterministic
+
+Two real captures of the same script diff at **0.00 uu median on nearly every segment**.
+The measurement floor is therefore ~0, and any sim-vs-real error is a real model defect.
+TWO EXCEPTIONS, and they matter:
+
+- `transition_flip_into` real-vs-real **78.0 uu** -- LARGER than its 41.0 uu sim-vs-real
+  error. RETRACT it as a finding; it is not distinguishable from run-to-run variation.
+- `transition_flip_early` real-vs-real **30.8 uu** vs 152.4 uu sim-vs-real. Still a real
+  defect, but the fillet contact is genuinely chaotic and the effect is smaller than §21
+  claimed. §21's 122.9 uu figure also drifted to 152.4 uu across runs for this reason.
+
+Fillet contact is sensitive to initial conditions in BOTH venues. Quote per-segment
+real-vs-real alongside any fillet number from now on.
+
+### 22.2 Flip cancels are a bigger defect than the fillet
+
+| segment | sim-vs-real p50 | real-vs-real | note |
+|---|---|---|---|
+| `speed_flip` | **583.5** (up err **94.6 deg**) | ~0 | worst defect in the sim |
+| `stall` | **249.9** | ~0 | |
+| `transition_flip_off` | 200.7 (fwd err 88.8 deg, 73 gnd mism) | n/a | |
+| `transition_flip_early` | 152.4 | 30.8 | fillet, partly chaotic |
+| `transition_supersonic_into` | 94.3 | n/a | |
+| `transition_curve_dash` | 63.1 | n/a | |
+| `flip_into_wall` | 30.1 | ~0 | |
+| `transition_wall_dash` | 29.9 | ~0 | |
+| `powerslide_recover` | 23.3 | ~0 | |
+
+`speed_flip` ending 94.6 degrees off in ORIENTATION with a ~0 noise floor is the single
+largest confirmed sim-to-real defect found so far, and it is the standard kickoff mechanic.
+Note `dodge_then_cancel` is only 5.3 uu, so the plain cancel is fine -- the defect needs the
+cancel COMBINED with air roll and boost. Diagnose before touching anything.
+
+### 22.3 The boost-pad fixes are validated
+
+First test coverage since they shipped 2026-08-01: `boostpad_big` 10.9, `boostpad_small`
+10.8, `boostpad_clip` (edge of a big pad) 5.0 uu -- all at the noise floor. Ceiling drive/
+drop, tornado spin and supersonic_run are also clean.
+
+### 22.4 Still untested
+
+Car-ball contact of any kind (the ball is parked at (-3500,4800) by design), and bumps/
+demos (needs a second car). Both need runner work, not more segments.
