@@ -1175,6 +1175,32 @@ Two consequences:
    in §8). This test is only valid as a *controlled A/B on the spin variable*, which is
    exactly what it was used for.
 
+## 19. Post-impulse trajectory: no evidence of a defect, but noise-limited
+
+The remaining jump gap was the *trajectory* after the impulse. That is measurable without
+grounding the car: start from the first follow-frame (already airborne) and roll forward.
+
+| sequence | n | err after ~66 ms | after ~166 ms |
+|---|---|---|---|
+| DODGE | 880 | 21.35 uu | 54.47 uu |
+| JUMP | 134 | 20.10 uu | 58.85 uu |
+| DBLJUMP | 283 | **11.48 uu** | 29.88 uu |
+
+**These are at the replay noise floor, not above it.** Two limits apply equally to all rows:
+replays are 30 Hz and quantized (the ~15 uu floor established in §8), and they do not record
+car *inputs*, so the rollout uses zero controls while the real car was air-rolling.
+
+The comparison that matters is against ordinary airborne flight measured the same way:
+**14.76 uu over 4 ticks** (§8's airborne regime). DBLJUMP over *8* ticks is **11.48 uu** —
+better than free flight over half the horizon. DODGE at 21.35 uu over 8 ticks is the same
+order.
+
+So: **post-impulse trajectories are indistinguishable from ordinary airborne flight at this
+resolution.** That is not a positive validation — it is "no evidence of a defect, and the
+instrument cannot see smaller than this". Combined with §17 (impulse correct to ~4%) and
+§1b (dodge rotation 1.9° per dodge post-fix), the jump/flip path has no remaining measured
+discrepancy, but the landing itself is still unexercised.
+
 ## Recommended order
 
 1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
