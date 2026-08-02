@@ -159,6 +159,33 @@ pub mod car {
         pub const MAX_TIME: f32 = 0.2;
         /// Can be at most 1.25 seconds after the jump is finished
         pub const DOUBLEJUMP_MAX_DELAY: f32 = 1.25;
+        /// Minimum time after a jump before a dodge/double jump may fire.
+        ///
+        /// RocketSim had no such gate: with a 1-tick jump tap `is_jumping` clears at
+        /// MIN_TIME and a dodge could fire ~3 ticks after the jump. The real game refuses
+        /// it there. Measured (research/maneuvers vs a real capture): `speed_flip` presses
+        /// the dodge 6 ticks after the jump and the real car does NOT dodge -- its roll
+        /// rate stays flat at 0.00 rad/s while the sim reached 7.2 -- yet
+        /// `wavedash_forward` dodges 18 ticks after the jump and matches to 5.9 uu.
+        ///
+        /// Swept against the capture: the window is [0.0167, 0.0333]. Below it speed_flip
+        /// breaks (583.3 uu), above it half_flip breaks (3.3 -> 347.2 uu). MIN_TIME sits
+        /// dead centre and is an existing RL constant, so use it rather than a fitted
+        /// number. See SIM2REAL_AUDIT.md S24.
+        /// Minimum time after a jump before a dodge/double jump may fire.
+        ///
+        /// RocketSim had no such gate: with a 1-tick jump tap `is_jumping` clears at
+        /// MIN_TIME and a dodge could fire ~3 ticks after the jump. The real game refuses
+        /// it there. Measured (research/maneuvers vs a real capture): `speed_flip` presses
+        /// the dodge 6 ticks after the jump and the real car does NOT dodge -- its roll
+        /// rate stays flat at 0.00 rad/s while the sim reached 7.2 -- yet
+        /// `wavedash_forward` dodges 18 ticks after the jump and matches to 5.9 uu.
+        ///
+        /// Swept against the capture: the window is [0.0167, 0.0333]. Below it speed_flip
+        /// breaks (583.3 uu), above it half_flip breaks (3.3 -> 347.2 uu). MIN_TIME sits
+        /// dead centre and is an existing RL constant, so use it rather than a fitted
+        /// number. See SIM2REAL_AUDIT.md S24.
+        pub const FLIP_MIN_DELAY: f32 = MIN_TIME;
     }
 
     pub mod flip {

@@ -609,7 +609,18 @@ impl Car {
             self.state.air_time_since_jump = 0.0;
         }
 
-        if jump_pressed && self.state.air_time_since_jump < car_consts::jump::DOUBLEJUMP_MAX_DELAY {
+        // The post-jump lockout only means anything if a jump actually happened:
+        // air_time_since_jump is pinned at 0 for a car that never jumped, so gating on it
+        // unconditionally re-imposes the has_jumped block that the capture already
+        // disproved (corner_flip_into shows the real car taking a +280.8 uu/s jump impulse
+        // in mid-air having never grounded). Measured: without this guard stall regresses
+        // 9.3 -> 240.6 uu and corner_flip_into 11.1 -> 106.5 uu.
+        let flip_delay_ok = !self.state.has_jumped
+            || self.state.air_time_since_jump >= car_consts::jump::FLIP_MIN_DELAY;
+        if jump_pressed
+            && flip_delay_ok
+            && self.state.air_time_since_jump < car_consts::jump::DOUBLEJUMP_MAX_DELAY
+        {
             let input_magnitude = self.state.controls.yaw.abs()
                 + self.state.controls.pitch.abs()
                 + self.state.controls.roll.abs();
