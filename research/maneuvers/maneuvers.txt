@@ -126,41 +126,43 @@ ACT 28   1 0 0 0 1  0 0 0        # air-roll through the descent -> lands off-axi
 # A dodge cannot produce a mid-rotation landing (see above), so these set the attitude
 # directly and drop the car. This is the family that actually tests landing response:
 # suspension compression, the auto-right torque, and whether a wheel/nose/roof contact
+# (named tilt_* -- four of these collided with the older land_* family and silently merged
+# in compare.py, which groups by segment name; keep every SEG name globally unique)
 # resolves the same way in both venues. No jump is used, so nothing here can silently no-op.
 
-SEG land_nose_down 180
+SEG tilt_nose_down 180
 STATE 0 -1200 300  -0.9 1.5708 0   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_nose_up 180
+SEG tilt_nose_up 180
 STATE 0 -1200 300  0.9 1.5708 0   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_roll_left 180
+SEG tilt_roll_left 180
 STATE 0 -1200 300  0 1.5708 -1.0   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_roll_right 180
+SEG tilt_roll_right 180
 STATE 0 -1200 300  0 1.5708 1.0   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_on_side 180
+SEG tilt_on_side 180
 STATE 0 -1200 300  0 1.5708 1.5708   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_inverted 200
+SEG tilt_inverted 200
 STATE 0 -1200 320  0 1.5708 3.1416   0 800 -800   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_corner_first 180
+SEG tilt_corner_first 180
 STATE 0 -1200 300  -0.7 1.5708 0.8   0 900 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_spinning 220
+SEG tilt_spinning 220
 STATE 0 -1200 400  0 1.5708 0   0 900 -700   0 4 2   100
 ACT 0   0 0 0 0 0  0 0 0
 
-SEG land_tilted_with_airroll 200
+SEG tilt_with_airroll 200
 STATE 0 -1200 350  -0.6 1.5708 0.6   0 900 -800   0 0 0   100
 ACT 0   0 0 0 0 1  0 0 0        # fighting it with air roll on the way down
 
@@ -327,3 +329,89 @@ ACT 24   1 0 -1 0 0  0 0 0
 SEG backwall_land 200
 STATE 0 4600 700  0 1.5708 0   0 900 -300   0 0 0   100
 ACT 0   1 0 0 0 0  0 0 0
+
+# ------------------------------------- FLOOR-TO-WALL TRANSITION (the curved fillet)
+# Where the floor meets the side/back wall RL does not use a hard edge: there is a curved
+# fillet of radius 256uu, centred at |x|=3840 (side) / |y|=4864 (back) at z=256. Flips taken
+# into and along that curve are the basis of real mechanic exploits (curve dash, wall dash,
+# recoveries that ride the fillet back to the floor), and a curved contact is exactly where a
+# convex-hull or normal approximation in the sim is most likely to diverge from the game.
+# Nothing else in this script touches the fillet: wall_* start already ON the flat wall and
+# corner_* use the big 1152uu side/back corner, not the floor join.
+#
+# Side wall is +x=4096, so yaw 0 faces it. Fillet begins at x=3840; at 1400uu/s that is
+# ~38 ticks from x=3400, so the dodge ticks below straddle contact with the curve.
+
+SEG transition_flip_into 200
+STATE 3400 0 17  0 0 0   1400 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 30   1 0 -1 0 0  1 0 0      # flip into the curve as it starts to rise
+ACT 34   1 0 0 0 0  0 0 0
+
+SEG transition_flip_early 200
+STATE 3400 0 17  0 0 0   1400 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 14   1 0 -1 0 0  1 0 0      # flip before the curve, land on it mid-flight
+ACT 18   1 0 0 0 0  0 0 0
+
+SEG transition_curve_dash 220
+STATE 3300 0 17  0 0 0   1900 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0
+ACT 26   1 0 0 0 0  1 0 0       # jump off the curve itself
+ACT 27   1 0 0 0 0  0 1 0
+ACT 40   1 0 -1 0 0  1 0 0      # then dodge -- the curve dash
+ACT 44   1 0 0 0 0  0 1 0
+
+SEG transition_wall_dash 220
+STATE 3300 -600 17  0 0.4 0   1500 700 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 34   1 0 0 -1 0  1 0 0      # side dodge into the curve at an angle
+ACT 38   1 0 0 0 0  0 0 0
+
+SEG transition_drive_along 220
+STATE 3900 -1500 40  0 1.5708 0   0 1500 0   0 0 0   100
+ACT 0   1 -0.35 0 0 0  0 1 0    # ride along the fillet, steering into it
+
+SEG transition_land_on 200
+STATE 3700 0 500  0 0 0   500 0 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0        # drop straight onto the curve
+
+SEG transition_land_tilted 200
+STATE 3700 0 500  0 0 -0.8   500 0 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0        # rolled toward the wall as it lands on the curve
+
+SEG transition_flip_off 240
+STATE 4050 0 200  0 0 -1.5708   0 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0       # start on the wall just above the fillet, drive down it
+ACT 40   1 0 0 0 0  1 0 0
+ACT 41   1 0 0 0 0  0 0 0
+ACT 50   1 0 -1 0 0  1 0 0      # flip off the curve back toward the floor
+ACT 54   1 0 0 0 0  0 0 0
+
+SEG transition_backwall_flip 200
+STATE 0 4400 17  0 1.5708 0   0 1400 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 30   1 0 -1 0 0  1 0 0      # same thing at the back-wall fillet (|y|=4864)
+ACT 34   1 0 0 0 0  0 0 0
+
+SEG transition_backflip_into 200
+STATE 3400 0 17  0 0 0   1400 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 30   1 0 1 0 0  1 0 0       # back dodge into the curve
+ACT 34   1 0 0 0 0  0 0 0
+
+SEG transition_diag_flip 200
+STATE 3400 -400 17  0 0.25 0   1400 350 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 30   1 0 -0.7 -0.7 0  1 0 0
+ACT 34   1 0 0 0 0  0 0 0
+
+SEG transition_supersonic_into 220
+STATE 2800 0 17  0 0 0   2200 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0       # hit the curve at supersonic, no flip
