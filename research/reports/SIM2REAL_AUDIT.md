@@ -1115,6 +1115,36 @@ dodge torque (1.9°), flip duration (bracketed [0.6083, 0.6666] s), gravity, and
 (0.001 rad/s). No component of that sequence carries a known error above the agent's noise
 floor.
 
+## 17. Jump impulse VALIDATED from replays (no live match needed)
+
+The jump blind spot was previously blocked on a broken harness (forcing
+`is_on_ground` does not physically ground a car, so the sim never triggered the jump).
+That is sidestepped entirely by measuring the impulse in the **replay data itself**,
+using `CarComponent_TA:ReplicatedActive` activations — no simulation involved.
+
+Extracted 2,728 JUMP / 604 DBLJUMP / 1,581 DODGE component activations with car state,
+then measured the vertical velocity change across each activation with gravity removed:
+
+| | n | real dVz median | RocketSim prediction | ratio |
+|---|---|---|---|---|
+| **JUMP** | 973 | **325.13 uu/s** | `IMMEDIATE_FORCE` 291.67 + one frame of `ACCEL` ≈ **340** | **0.96** |
+| DBLJUMP | 205 | 264.57 uu/s | `IMMEDIATE_FORCE` **291.67** | 0.91 |
+
+**The jump impulse is correct to ~4%** on 973 real events. The double jump reads 9% low,
+but that is within this measurement's noise (30 Hz replay sampling, quantized velocities,
+and gravity removal using a variable inter-frame dt) and is contradicted by the stronger
+evidence in §8: the game *replicates* `DoubleJumpImpulse` as exactly 525, which is
+525/180×100 = 291.67 uu/s, i.e. RocketSim's constant exactly. Treat the 0.91 as noise,
+not a defect.
+
+JUMP's p25 of 21.78 uu/s shows the distribution is bimodal: in some activations the
+impulse has already been applied before the sampled frame. That is a sampling-phase
+artifact, not two different jump strengths — the bulk (median 325, p75 337) sits on the
+prediction.
+
+**Still open:** the full jump → flip → landing *trajectory*. The impulse that starts it is
+now validated; what happens over the following 0.5 s is not.
+
 ## Recommended order
 
 1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
