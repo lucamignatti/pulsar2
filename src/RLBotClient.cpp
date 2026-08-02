@@ -132,6 +132,11 @@ static Player ToPlayer(const rlbot::flat::PlayerInfo* p) {
 void RLBotBot::LoadScriptIfRequested() {
 	if (const char* sp = std::getenv("GGL_SCRIPT")) {
 		script = LoadScript(sp);
+		// Never fall back to the policy on a bad script: a silent revert here looks
+		// exactly like "the scripted test ran" while actually measuring the policy.
+		if (script.empty())
+			RG_ERR_CLOSE("GGL_SCRIPT=\"" << sp << "\" parsed 0 segments; refusing to "
+				"fall back to policy inference.");
 		RG_LOG("GGL_SCRIPT: scripted maneuver mode, " << script.size()
 			<< " segments from \"" << sp << "\" (policy bypassed)");
 	}
@@ -384,7 +389,9 @@ static const float SCRIPT_BALL_PARK[3] = { -3500.0f, 4800.0f, 93.0f };
 static std::vector<ScriptSeg> LoadScript(const std::string& path) {
 	std::vector<ScriptSeg> segs;
 	std::ifstream f(path);
-	if (!f) { RG_LOG("GGL_SCRIPT: cannot open \"" << path << "\""); return segs; }
+	if (!f)
+		RG_ERR_CLOSE("GGL_SCRIPT: cannot open \"" << path << "\". NOTE: the bot's working "
+			"directory is pulsar-bot/, not rlbot-run/ -- use an ABSOLUTE path.");
 	std::string line;
 	while (std::getline(f, line)) {
 		auto hash = line.find('#');
@@ -468,7 +475,22 @@ void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index
 		float dx = ph->location().x() - sg.st[0];
 		float dy = ph->location().y() - sg.st[1];
 		float dz = ph->location().z() - sg.st[2];
-		bool there = (dx*dx + dy*dy + dz*dz) < 25.0f * 25.0f;
+		// The state set carries VELOCITY, so the car is already moving when the next packet
+		// arrives. The game delivers ~60 packets/s, so a spawn at 2200 uu/s has travelled
+		// 36.7 uu before we can look -- a fixed 25 uu gate can never pass and the segment is
+		// silently skipped. That is exactly why supersonic_run, into_net, transition_curve_dash,
+		// transition_wall_dash and transition_supersonic_into never appeared in any capture,
+		// while several more sat at 23-25 uu and survived only by luck. Scale the gate with
+		// the requested speed (~4 packets of travel) and confirm the VELOCITY took as well,
+		// which is what actually distinguishes "state set landed" from "state set refused".
+		const float svx = sg.st[6], svy = sg.st[7], svz = sg.st[8];
+		const float speed = std::sqrt(svx * svx + svy * svy + svz * svz);
+		const float tol = 25.0f + speed * 0.07f;
+		float dvx = ph->velocity().x() - svx;
+		float dvy = ph->velocity().y() - svy;
+		float dvz = ph->velocity().z() - svz;
+		bool there = (dx * dx + dy * dy + dz * dz) < tol * tol
+		          && (dvx * dvx + dvy * dvy + dvz * dvz) < 300.0f * 300.0f;
 		scriptSettle++;
 		if (!there) {
 			if (scriptSettle > 40) {  // state set refused/ignored -- do not log garbage

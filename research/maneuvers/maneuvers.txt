@@ -384,7 +384,7 @@ STATE 3700 0 500  0 0 -0.8   500 0 -900   0 0 0   100
 ACT 0   0 0 0 0 0  0 0 0        # rolled toward the wall as it lands on the curve
 
 SEG transition_flip_off 240
-STATE 4050 0 200  0 0 -1.5708   0 0 0   0 0 0   100
+STATE 4060 0 420  0 0 -1.5708   0 0 0   0 0 0   100
 ACT 0    1 0 0 0 0  0 1 0       # start on the wall just above the fillet, drive down it
 ACT 40   1 0 0 0 0  1 0 0
 ACT 41   1 0 0 0 0  0 0 0
@@ -415,3 +415,67 @@ ACT 34   1 0 0 0 0  0 0 0
 SEG transition_supersonic_into 220
 STATE 2800 0 17  0 0 0   2200 0 0   0 0 0   100
 ACT 0    1 0 0 0 0  0 1 0       # hit the curve at supersonic, no flip
+
+# ----------------------------------------------------- MECHANICS NOT OTHERWISE COVERED
+# Coverage audit. Everything above tests surfaces and landings; these are the named
+# mechanics a player would actually use, several of which ride the fillet or the wall and
+# so probe the same suspect geometry from a different direction.
+
+SEG half_flip 220
+STATE 0 -1000 17  0 1.5708 0   0 -900 0   0 0 0   100
+ACT 0    -1 0 0 0 0  1 0 0
+ACT 1    -1 0 0 0 0  0 0 0
+ACT 8    -1 0 1 0 0  1 0 0      # backflip...
+ACT 12   -1 0 -1 0 0  0 0 0     # ...then reverse pitch to cancel it: the half flip
+ACT 40   -1 0 -1 0 1  0 0 0     # air roll upright
+
+SEG speed_flip 220
+STATE 0 -2000 17  0 1.5708 0   0 1200 0   0 0 0   100
+ACT 0    1 0.2 0 0 0  1 0 1
+ACT 1    1 0.2 0 0 0  0 1 1
+ACT 6    1 0 -0.4 -0.9 0  1 1 0  # diagonal dodge...
+ACT 10   1 0 1 0 0  0 1 0        # ...cancelled forward: the speed flip
+ACT 30   1 0 0 0 1  0 1 0
+
+SEG stall 200
+STATE 0 -1000 900  0 1.5708 0   0 700 0   0 0 0   100
+ACT 0    0 0 0 0 0  1 0 0
+ACT 1    0 0 0 0 0  0 0 0
+ACT 8    0 0 0 -1 0  1 0 0      # yaw dodge held into a stall
+ACT 12   0 0 0 -1 1  0 0 0
+
+SEG tornado_spin 220
+STATE 0 -1000 1100  0.5 1.5708 0.5   0 600 0   0 0 0   100
+ACT 0   0 0 -1 0 1  0 1 0       # pitch + air roll together
+
+SEG ceiling_drive 240
+STATE 0 -1000 2027  0 1.5708 3.1416   0 900 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0        # drive along the ceiling inverted
+
+SEG ceiling_drop 200
+STATE 0 -1000 2027  0 1.5708 3.1416   0 300 0   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0        # fall off the ceiling and recover
+
+SEG boostpad_big 200
+STATE 3072 -4096 17  0 1.5708 0   0 1400 0   0 0 0   0
+ACT 0   1 0 0 0 0  0 0 0        # drive over a BIG pad at (3072,-4096): 100 boost
+
+SEG boostpad_small 200
+STATE 0 -2816 17  0 1.5708 0   0 1400 0   0 0 0   0
+ACT 0   1 0 0 0 0  0 0 0        # drive over a SMALL pad at (0,-2816): 12 boost
+
+SEG boostpad_clip 200
+STATE 3072 -4300 17  0 1.2 0   500 1400 0   0 0 0   0
+ACT 0   1 0 0 0 0  0 0 0        # clip the EDGE of a big pad: tests the pickup radius
+
+SEG powerslide_recover 220
+STATE 0 -1500 17  0 1.5708 0   600 1300 0   0 0 0   100
+ACT 0   1 -1 0 0 0  0 0 1
+ACT 60  1 1 0 0 0  0 0 0        # slide then catch it
+
+SEG flip_into_wall 200
+STATE 3300 0 17  0 0 0   1500 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 44   1 0 -1 0 0  1 0 0      # flip that arrives ABOVE the fillet, on the flat wall
+ACT 48   1 0 0 0 0  0 0 0

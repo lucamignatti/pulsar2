@@ -27,10 +27,12 @@ using namespace GGL; // GigaLearn
 using namespace RLGC; // RLGymCPP
 
 // Discount factor, shared by the learner's GAE and every PBRS reward (they MUST match or the
-// potential terms stop telescoping against GAE). 5.0: tickSkip 8 => 15 actions/sec, so 0.9969
-// keeps the ~15s half-life (225 steps). If you change tickSkip, re-derive:
+// potential terms stop telescoping against GAE). If you change tickSkip, re-derive:
 // half-life_s = ln2 / (-ln gamma) / (120/tickSkip).
-static constexpr float TRAIN_GAMMA = 0.9969f;
+// 5.0 (tickSkip 8, 15 Hz): 0.9969 = ~14.88s half-life (223 steps).
+// 6.0 (tickSkip 1, 120 Hz, user-directed 2026-08-01): the SAME 14.88s wall-clock horizon
+// re-timed to the 8x finer decision rate => gamma_new = 0.9969^(1/8) = 0.99961197 (1786 steps).
+static constexpr float TRAIN_GAMMA = 0.99961197f;
 
 // ---- 4.0: one net for 1v1/2v2/3v3 (team-play program) ------------------------------------
 // The 4.0 lineage trains a SINGLE policy across team sizes via a padded obs
@@ -229,7 +231,9 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// ESCALATE-1 (2026-07-16, user-directed): small time cost - urgency vs the
 		// measured stall/hover pathology. 0.01 -> ~4.5 per 30s episode (15Hz steps
 		// at tickSkip 8), 3% of a goal.
-		{ new TimeCostReward(), 0.01f },
+		// 6.0 ts1: PER-STEP term, so its weight is a per-SECOND density divided by the
+		// decision rate. 0.01 / 8 = 0.00125 keeps the same ~4.5 per 30s episode at 120 Hz.
+		{ new TimeCostReward(), 0.00125f },
 
 		// TEAM PRESSURE (2026-07-19, user-directed; RLGym-PPO-guide item): someone
 		// must be on the ball. -0.15/step (~ -2.25/s; a 5s collective lapse costs
@@ -239,7 +243,9 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// Zero-sum: charged relative to the opponent's own pressure state; mutual
 		// passivity cancels (accepted - TimeCost still taxes it). Watch
 		// Rewards/TeamPressureReward and the next aerial-census conversion read.
-		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.15f },
+		// 6.0 ts1: PER-STEP term, /8 for the 120 Hz rate — 0.15 -> 0.01875 preserves the
+		// documented -2.25/s pressure density (a 5s collective lapse still costs ~7% of a goal).
+		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.01875f },
 
 		// KICKOFF RACE (2026-07-20, user-directed: net losses come from conceded
 		// kickoff goals). Zero-sum, time-decayed first-touch reward, GATED on the
@@ -474,18 +480,82 @@ int main(int argc, char* argv[]) {
 		else                                     cfg.deviceType = LearnerDeviceType::GPU_CUDA;
 	}
 
-	// 5.0: tickSkip 8, actionDelay 0 (from 4.0's tickSkip 4 + delay 3). The 4.0 choice
-	// optimized the CONTROL CEILING; the 4.0 record settled that the binding constraint
-	// is LEARNABILITY: ts8 halves every action chain in decision-space and doubles
-	// per-decision consequence mass (MECHANICS.md sample-economics — wavedash stuck at
-	// 11% for billions of steps at ts4, per-instance SNR ~0.18), and Nexto-class bots
-	// developed wavedashes/speedflips AT ts8. Zero delay = max action-effect
-	// correlation for precision mechanics (revisit only if RLBot sim-to-real matters).
-	// Gamma re-derived above; fresh run required (obs prevAction + dynamics semantics).
-	cfg.tickSkip = 8;
+	// 6.0 (2026-08-01, USER-DIRECTED): tickSkip 1, actionDelay 0 => a decision on EVERY
+	// physics tick, 120 Hz. This is an 8x finer decision rate than 5.0's ts8/15 Hz.
+	//
+	// History this overrides: 4.0 ran ts4 + actionDelay 3 and the 4.0 record read that as
+	// LEARNABILITY-bound, not control-bound (wavedash stuck at 11% for billions of steps,
+	// per-instance SNR ~0.18), which is why 5.0 went the other way to ts8. ts1 is the
+	// opposite bet: maximum control resolution, accepting ~8x more decisions per game-second
+	// (so ~8x less game time per timestep, and inference — already 2/3 of collection at ts8 —
+	// becomes the throughput wall).
+	//
+	// actionDelay stays 0. Today's sim-to-real probe fit real match data at lags 0/1/2/3 with
+	// median position error 0.679 / 0.708 / 0.851 / 0.916 uu: lag 0 fits best, because the
+	// game's 2-tick send->applied delay is cancelled by the ~2-tick staleness of the packet
+	// the policy acts on. See research/reports/SIM2REAL_AUDIT.md S4.
+	//
+	// EVERYTHING RATE-DERIVED WAS RE-DERIVED WITH THIS (each is marked "6.0 ts1"):
+	//   TRAIN_GAMMA 0.9969 -> 0.99961197      gaeLambda 0.95 -> 0.993767
+	//   goalCritic.gamma 0.9994 -> 0.99992498  TimeCost / TeamPressure  /8 (per-step terms)
+	//   reachability HER + gate windows  x8 (they are real-TIME windows expressed in steps)
+	// NOT rescaled, deliberately: PBRS terms (telescoping makes them rate-invariant), event
+	// terms (Goal/Demo/TouchAccel/AerialTouch/OpposedSave/KickoffRace/PickupBoost — they fire
+	// on events, not per step), and NoTouchCondition (already in SECONDS, uses deltaTime).
+	cfg.tickSkip = 1;
 	cfg.actionDelay = 0;
 
-	cfg.numGames = 1024;
+	// 6.0 ts1: 1024 -> 128. This is NOT a throughput cut — it is the tickSkip change applied to
+	// the fleet. Each arena now yields 8x more decisions per game-second, so 1024 arenas at ts1
+	// produce the timestep rate that 8192 would have at ts8; the fleet was oversized by exactly
+	// the rate change.
+	//
+	// It is also the fix for the OOM that killed three 6.0 launches, which no amount of model
+	// shrinking touched. Episodes are appended WHOLE to combinedTraj at finalize, and the
+	// collection loop's exit test is `combinedTrajNext.Length() < tsPerItr` — a test on
+	// FINALIZED rows only. A newborn policy never touches the ball, so every episode runs the
+	// full NoTouchCondition(20s) and, because all arenas reset together, every player finalizes
+	// on the SAME step. That clump is numPlayers x episodeSteps, independent of tsPerItr:
+	//     ts8:  2048 players x  300 steps =  0.6M rows  (3x over tsPerItr - survivable)
+	//     ts1:  2048 players x 2400 steps =  4.9M rows  (24x over - OOM)
+	// Measured on the third launch: the failing torch::cat asked for 11.60 GiB =
+	// 3.47M rows x 896 (trunk width) x 4B, i.e. 1,697 steps/player = 14.1s, just under the cap.
+	// 128 arenas cuts the clump 8x back to ts8's proportions. It decays on its own once the
+	// policy starts touching the ball, but the run has to survive birth first.
+	//
+	// 128 -> 256 -> 512 (2026-08-01, each step measured). The birth clump DECAYS: by ~100M
+	// steps the policy touches the ball, episodes end on goals/touches instead of all hitting
+	// the 20s NoTouch cap in lockstep, and 128->256 cost only +160 MiB rather than the +1.6 GB
+	// the birth arithmetic predicts. So the clump bounds the fleet only at step 0; a run that
+	// RESUMES from a checkpoint never re-pays it.
+	//
+	// 512 is a THROUGHPUT change, and the target is inference. Measured at 256: collection
+	// 3.9s vs consumption 2.9s, so with pipelinedCollection the iteration is collection-bound,
+	// and inference is 2.08s of that 3.9s. Each forward batches only numPlayers rows (512 at
+	// 256 arenas) which badly underuses the GPU. Doubling the fleet HALVES the number of
+	// forward passes needed to fill tsPerItr while doubling each batch - strictly better GPU
+	// efficiency for identical total env work. Env/Prep/Record are CPU-side and roughly
+	// constant per timestep, so they do not benefit (the box is already at load ~26 on 24 cores).
+	// 512 REVERTED -> 128 (2026-08-01, measured). 512 was a REGRESSION and the metric that
+	// said otherwise is a trap: `Overall Steps/Second` and `Total Timesteps` count
+	// collectSteps (simulated player-steps), but the LEARN pass consumes combinedTraj, which
+	// the collection loop caps at tsPerItr — `Headroom/Rows N` reads ~200k at every fleet size.
+	// So learning per iteration is CONSTANT and the only thing that matters is wall-clock per
+	// iteration. Measured: 512 -> collection 4.3-5.2s (SPS 185k), 256 -> 3.2-3.9s (SPS 91k).
+	// The bigger fleet bought a 2x higher SPS counter and a 25% SLOWER iteration.
+	// With pipelinedCollection the iteration floor is consumption (~2.8s), so the optimum is
+	// the smallest fleet whose collection still fills tsPerItr in ~2.8s.
+	//
+	// MEASURED SWEEP (2026-08-02, collection time per iteration, consumption ~2.7-2.8s):
+	//     128 arenas -> 5.4-8.4s   (inference 3.1-5.5s)
+	//     256 arenas -> 3.2-3.9s   (inference ~1.8-2.1s)   <-- optimum
+	//     512 arenas -> 4.3-5.2s   (inference 2.3-2.5s)
+	// It is a real optimum, not monotone. Below 256 the per-forward batch (2 x numGames rows)
+	// is too small to use the GPU and inference latency dominates; above 256 the whole-episode
+	// collection overshoot makes the loop simulate far more player-steps than the 200k it
+	// needs. Do not "tune" this by reading Overall Steps/Second - that counter tracks
+	// simulated steps and rises with fleet size even as the iteration gets slower.
+	cfg.numGames = 256;
 
 	// Pipelined collection: collect iteration N+1 (worker, frozen policy snapshot) while N
 	// processes+learns. Collection and consumption are near-equal (~0.6s each at ts8) and fully
@@ -547,6 +617,12 @@ int main(int argc, char* argv[]) {
 	// changes ago (see the 200k->100k->50k->20k ladder above, each step forced by a capacity
 	// increase). At this width 100k is ~10x the per-minibatch activation peak of a config that
 	// already measured ~12GB of 16.3GB - it OOMs on the first learn pass.
+	// 6.0 (2026-08-01): 25k -> 12.5k for the ~8 GB VRAM budget, then BACK to 25k once the
+	// card stopped being shared. 200k/25k = 8 accumulation chunks (an exact divisor, same
+	// constraint that rules out 32k/30k above). Gradient accumulation makes minibatch size
+	// MATHEMATICALLY IDENTICAL for the update — it trades activation peak against GEMM
+	// efficiency — so this is a pure throughput knob. It targets PPO Learn (2.28s of the
+	// 2.9s consumption half). Give it back first (12.5k) if VRAM bites.
 	cfg.ppo.miniBatchSize = 25'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
@@ -581,7 +657,19 @@ int main(int argc, char* argv[]) {
 	}
 
 	cfg.ppo.epochs = 2;
-	cfg.ppo.entropyScale = 0.035f;
+	// 6.0 ts1: 0.035 -> 0.004375 (= 0.035/8), the same /8 the other rate-derived per-step
+	// quantities took. Entropy regularization is a RATE — nats per unit time, not per
+	// decision — so a coefficient tuned at 15 Hz applies 8x more entropy pressure per
+	// game-second at 120 Hz. Symptom that convicted it: the viewer showed cars flipping
+	// continuously. At ts8 the env granted 8 ticks of free action persistence per decision;
+	// ts1 removed it, so a stochastic policy re-rolls its jump/dodge bits 120x/s and
+	// exploration becomes dithering rather than committed behaviour. Measured Policy Entropy
+	// 0.73 on 6.0 vs 0.58-0.60 on 5.3 at the same coefficient.
+	// WATCH `Policy Entropy`: target is a drift back toward ~0.60. This is the aggressive end
+	// of the defensible range — if entropy instead COLLAPSES (say under ~0.35) that is
+	// premature convergence, and the revert is this one number (0.035, or a middle rung
+	// like 0.0175).
+	cfg.ppo.entropyScale = 0.004375f;
 
 	// ADVANTAGE FILTERING (2026-07-29, user-directed): the policy trains only on the top 50% of
 	// rows by post-injection advantage; the threshold is a buffer-wide quantile taken after GAE
@@ -614,6 +702,18 @@ int main(int argc, char* argv[]) {
 	// still feed the InfoNCE trunk aux + Reach/* plasticity canaries.
 	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = false;
+
+	// 6.0 ts1: the HER goal-sampling offsets and the gate's delta windows are REAL-TIME
+	// windows that happen to be expressed in STEPS — PPOLearnerConfig.h says so inline and
+	// tells you to re-derive them when tickSkip changes (they already went 90->45 / 20->10
+	// on the ts4->ts8 move). At 120 Hz they are 8x too short in wall-clock unless scaled.
+	// Held deliberately: carStateHerMaxOffset (see the block below — it is an EMPIRICAL
+	// calibration choice, not a real-time design, and its calibration is already void).
+	cfg.ppo.reachability.ballHerMaxOffset = 360; // was 45  (~3.0s preserved)
+	cfg.ppo.reachability.carHerMaxOffset  = 80;  // was 10  (~0.67s preserved)
+	cfg.ppo.reachability.deltaWindow      = 64;  // was 8   (~0.53s preserved)
+	cfg.ppo.reachability.deltaSmooth      = 32;  // was 4   (~0.27s preserved)
+	cfg.ppo.reachability.touchPredHorizon = 360; // was 45  (~3.0s preserved)
 	// Third goal-space head (2026-07-14): canonical CAR pos+vel - the movement-capability
 	// frontier for META steering. Offline (conservative frozen-phi test): calibration
 	// DECISIVELY monotone (~7x the ball head's margin; window 45 chosen by margin across
@@ -643,20 +743,28 @@ int main(int argc, char* argv[]) {
 	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
 	cfg.ppo.rewardClipRange = 50;
 
-	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~15s half-life at 15Hz (5.0 tickSkip 8); MUST match the PBRS reward gammas above
+	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~14.9s half-life at 120Hz (6.0 tickSkip 1); MUST match the PBRS reward gammas above
+
+	// 6.0 ts1: gaeLambda MUST be re-derived with gamma, or GAE silently goes myopic.
+	// The TD credit window is ~1/(1 - gamma*lambda) steps. At ts8 that was
+	// 1/(1 - 0.9969*0.95) = 18.9 steps = 1.26s. Leaving lambda at 0.95 under the ts1 gamma
+	// gives 19.9 steps = 0.165s — a 7.6x SHORTER real-time window, i.e. the bias/variance
+	// tradeoff would move drastically without anyone touching lambda.
+	// Preserving the 1.26s window at 120 Hz needs 151 steps => lambda = 0.993767.
+	cfg.ppo.gaeLambda = 0.993767f;
 
 	// Secondary goal-only critic: long-horizon credit on the one unfarmable signal. Independent net,
 	// raw obs in; advantages blended at beta = 25% of dense-advantage scale (std-matched, centered).
 	// VALIDATION: GoalCritic/Value-Outcome Corr and Adv-Outcome Corr must be POSITIVE once goals flow;
 	// negative = channel/sign bug -> set beta = 0 (critic still trains, no blend) and investigate.
 	cfg.ppo.goalCritic.enabled = true;
-	cfg.ppo.goalCritic.gamma = 0.9994f;   // ~77s half-life at 15Hz (5.0 tickSkip 8; re-derived)
+	cfg.ppo.goalCritic.gamma = 0.99992498f; // ~77s half-life at 120Hz (6.0 tickSkip 1: 0.9994^(1/8))
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
 	// Private head on top of critic_trunk (2026-07-29): 5x1280 on raw obs -> 2x1280 on the shared
 	// value body, 6.87M -> 3.29M. This is the change that gives up its gradient isolation - see
 	// the criticTrunk block below and PPOLearnerConfig::criticTrunk.
-	cfg.ppo.goalCritic.model.layerSizes = { 1280, 1280 };
+	cfg.ppo.goalCritic.model.layerSizes = { 1024, 1024 }; // 6.0: 1280 -> 1024 (VRAM budget)
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
@@ -711,8 +819,14 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.psi.addResiduals = addResiduals;
 
 
-	cfg.ppo.sharedHead.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
-	cfg.ppo.policy.layerSizes = { 768, 768, 768 };         // SHRUNK: stem + 1 block
+	// 6.0 VRAM BUDGET (2026-08-01, user-directed): the whole trainer must fit in ~8 GB so the
+	// card can be shared with other jobs. 5.3's widths peaked at 10.33 GiB and OOM'd three
+	// times at 6.0's birth. Widths scaled ~0.8x here; the accompanying miniBatchSize cut is
+	// the other half of the budget (see it below). Activation peak is LINEAR in both, so
+	// 0.8 x 0.5 ~= 0.4x on the dominant term. Depth and head-count are unchanged — see the
+	// critic_trunk block below for why two layers per value head is a floor, not a knob.
+	cfg.ppo.sharedHead.layerSizes = { 896, 896, 896 };  // was 1152; stem + 1 residual block
+	cfg.ppo.policy.layerSizes = { 640, 640, 640 };      // was 768; stem + 1 block
 
 	// SECOND SHARED TRUNK, VALUE-SIDE ONLY (2026-07-29, user-directed). The four value heads used
 	// to be four independent 5x1280 stacks reading the main trunk (critic + vdag1 + vdag2, which
@@ -731,9 +845,12 @@ int main(int argc, char* argv[]) {
 	// each on a shared body and they collapse toward the same function, disarming the guard that
 	// COMPOSITION_CRITIC.md section 4.4 measured (H inflating 0.3 -> 11.8 with nothing behind it).
 	// If params must come down further, take them from critic_trunk's depth, not the heads'.
-	cfg.ppo.criticTrunk.layerSizes = { 1280, 1280, 1280 };
+	// 6.0: 1280 -> 1024 on the whole value side (the VRAM budget above). Depth is untouched,
+	// which is what the floor rule below demands; only width moved. vdag1/vdag2 follow the
+	// critic's config automatically, so this one line resizes three of the four heads.
+	cfg.ppo.criticTrunk.layerSizes = { 1024, 1024, 1024 };
 	cfg.ppo.criticTrunk.addOutputLayer = false;  // it is a body; MakeModels asserts this
-	cfg.ppo.critic.layerSizes = { 1280, 1280 };  // private head on top of critic_trunk
+	cfg.ppo.critic.layerSizes = { 1024, 1024 };  // private head on top of critic_trunk
 	// Reachability phi/psi are CONTRASTIVE/regression heads, not value
 	// heads: the critic-scaling evidence above does not cover them, and over-parameterized
 	// InfoNCE embeddings can overfit the contrastive task. Grown only modestly (256x2 ->
@@ -746,6 +863,18 @@ int main(int argc, char* argv[]) {
 	// Speed knob kept from the post-good-era "speed 2" commit (2211cce): larger rho-read chunks
 	// fill the GPU better. This only changes CHUNKING of the gate's rho reads, never their values,
 	// so it's a pure throughput win with zero behavioral effect on the gate.
+	// 16384 -> 4096 (2026-08-01): this is the trainer's largest transient allocation and it was
+	// the exact site of three CUDA OOM crashes at 6.0's birth. The failing malloc was 72.00 MiB =
+	// 16384 x 1152 x 4B — one LayerNorm activation of the chunked shared-trunk forward
+	// (Learner.cpp, the "computed ONCE and reused" FP32 trunk pass), where 1152 is
+	// sharedHead's width. The trunk is stem + 1 residual block, so several such tensors are
+	// live per chunk; quartering the chunk quarters that whole transient (~0.4 GB of relief)
+	// and is BEHAVIOR-NEUTRAL by the same argument as the comment above — chunking a forward
+	// pass cannot change its result. Cost is a modest throughput loss from smaller GEMMs.
+	// Raise it back once the card is not shared with other jobs.
+	// Back to 16384 (2026-08-01): 4096 was an anti-OOM measure during the 6.0 birth crisis and
+	// it bought only ~0.1 GiB of peak — the real cause was the birth episode clump, not this
+	// chunk. With the card no longer shared, restore the throughput default.
 	cfg.ppo.reachability.scoreChunkSize = 16384;
 
 	// Muon for the dense nets (RMS-matched, Adam LRs transfer). Reachability heads stay Adam:
@@ -884,8 +1013,18 @@ int main(int argc, char* argv[]) {
 	// the HJB field needs to solve before its gap term means anything (Geo/Residual is the gate).
 	// checkpoints_5.2 stays fully intact (2.3 GB, ~175M steps) as the restore point: revert =
 	// put this line back and set cfg.ppo.geoEnabled = false, rebuild, restart.
-	cfg.checkpointFolder = "checkpoints_5.3";
-	cfg.metricsRunName = "5.3-geo";
+	// 6.0 (2026-08-01, user-directed): tickSkip 8 -> 1 (15 Hz -> 120 Hz), actionDelay 0.
+	// The fresh folder is MANDATORY here, and for a sharper reason than 5.2's shape break.
+	// ts1 changes NO tensor shapes — obs is still 230-dim, the action table is still 90 — so
+	// every checkpoint in checkpoints_5.3 would LOAD CLEANLY into this binary and silently
+	// resume a 16.4B-step policy into an 8x different decision rate, a different gamma, a
+	// different lambda and re-scaled per-step rewards. That is the one failure mode the
+	// loader cannot catch: it only rejects checkpoints it cannot deserialize. checkpoints_5.3
+	// (16.4B steps) stays fully intact as the restore point — revert = put this line, the
+	// tickSkip/actionDelay block, TRAIN_GAMMA, gaeLambda, goalCritic.gamma, the two per-step
+	// reward weights and the reachability windows back, rebuild, restart.
+	cfg.checkpointFolder = "checkpoints_6.0";
+	cfg.metricsRunName = "6.0-ts1";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
