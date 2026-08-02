@@ -479,3 +479,33 @@ ACT 0    1 0 0 0 0  1 0 0
 ACT 1    1 0 0 0 0  0 0 0
 ACT 44   1 0 -1 0 0  1 0 0      # flip that arrives ABOVE the fillet, on the flat wall
 ACT 48   1 0 0 0 0  0 0 0
+
+# ----------------------------------- JUMP STATE AFTER BECOMING AIRBORNE WITHOUT JUMPING
+# Settles whether a car that reached the air WITHOUT jumping still has a jump/flip.
+# RocketSim's can_use gate checks has_double_jumped and has_flipped but NOT has_jumped,
+# and air_time_since_jump is reset to 0 every tick while has_jumped is false, so the
+# DOUBLEJUMP_MAX_DELAY window is vacuous -- such a car can double jump or flip freely.
+#
+# These must NOT teleport at the moment of interest: a state-set car might be flagged by
+# the game as having already used its jump, which would confound the answer. So the car is
+# placed ON A SURFACE and drives off it naturally, then presses jump well into the flight.
+
+SEG jump_after_wall_launch 260
+STATE 2800 0 17  0 0 0   2200 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0      # supersonic into the fillet -> launched up the wall
+ACT 90   1 0 0 0 0  1 0 0      # airborne, never jumped: does this lift us?
+ACT 96   1 0 0 0 0  0 0 0
+ACT 110  1 0 -1 0 0  1 0 0     # and does this flip us?
+ACT 116  1 0 0 0 0  0 0 0
+
+SEG jump_after_ramp_launch 240
+STATE 3000 -3000 17  0 0.7854 0   1400 1400 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0      # into the corner, carried airborne without jumping
+ACT 100  1 0 0 0 0  1 0 0
+ACT 106  1 0 0 0 0  0 0 0
+ACT 120  1 0 -1 0 0  1 0 0
+ACT 126  1 0 0 0 0  0 0 0
+
+SEG no_jump_control 260
+STATE 2800 0 17  0 0 0   2200 0 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 1 0      # identical, but never presses jump: the paired control

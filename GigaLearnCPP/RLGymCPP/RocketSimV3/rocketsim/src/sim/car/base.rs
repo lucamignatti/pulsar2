@@ -615,6 +615,22 @@ impl Car {
                 + self.state.controls.roll.abs();
             let is_flip_input = input_magnitude >= self.config.dodge_deadzone;
 
+            // NOT PATCHED. It is tempting to add `self.state.has_jumped &&` here: the
+            // gate checks has_double_jumped and has_flipped but not has_jumped, and
+            // air_time_since_jump is reset to 0 every tick while has_jumped is false, so
+            // the DOUBLEJUMP_MAX_DELAY window is vacuous. Adding it made `stall` go
+            // 249.9 -> 8.1 uu against the real game and looked like a clear win.
+            //
+            // It was measurement error. The real game CARRIES jump/flip state across a
+            // state set; the maneuver runner reset the car every segment. `stall` follows
+            // `speed_flip`, which ends mid-flip, so the real car had already spent its
+            // flip -- nothing to do with has_jumped. The paired segment `corner_flip_into`
+            // (which follows a segment ending on the ground) shows the real car taking a
+            // +280.8 uu/s jump impulse while airborne and never grounded, i.e. RL DOES
+            // allow it there, and the patch regressed that segment 20.3 -> 103.5 uu.
+            //
+            // Decide this only from segments whose jump state is controlled. See
+            // SIM2REAL_AUDIT.md S23.
             let can_use = !self.state.is_auto_flipping
                 && !self.state.has_double_jumped
                 && !self.state.has_flipped

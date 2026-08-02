@@ -446,6 +446,19 @@ void RLBotBot::SendSegmentState(const ScriptSeg& sg, unsigned index) {
 	sendDesiredGameState(std::move(state));
 }
 
+// Park the car flat on the floor with no velocity. Held for SCRIPT_RESET_TICKS packets
+// before every segment so ground contact clears has_jumped/has_flipped and each segment
+// starts from an identical jump state regardless of what the previous one left behind.
+void RLBotBot::SendGroundReset(unsigned index) {
+	ScriptSeg rst{};
+	rst.st[0] = 0.0f; rst.st[1] = -4600.0f; rst.st[2] = 17.0f;   // empty corner of our half
+	rst.st[3] = 0.0f; rst.st[4] = 1.5708f;  rst.st[5] = 0.0f;    // upright, facing +y
+	rst.st[6] = rst.st[7] = rst.st[8] = 0.0f;
+	rst.st[9] = rst.st[10] = rst.st[11] = 0.0f;
+	rst.st[12] = 100.0f;
+	SendSegmentState(rst, index);
+}
+
 void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index, int ticksElapsed) {
 	auto players = packet->players();
 	if (!players || index >= players->size()) { setOutput(index, {}); return; }
@@ -459,10 +472,30 @@ void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index
 		scriptLog.open(out, std::ios::trunc);
 		scriptLog << "seg\ttick\tx\ty\tz\tvx\tvy\tvz\tfx\tfy\tfz\tux\tuy\tuz\tavx\tavy\tavz\tground\tboost\n";
 		RG_LOG("GGL_SCRIPT: " << script.size() << " segments -> " << out);
-		scriptSeg = 0; scriptStateSent = false; scriptSettle = 0; scriptTick = 0;
+		scriptSeg = 0; scriptStateSent = false; scriptSettle = 0; scriptTick = 0; scriptGrounded = -1;
 	}
 	if (scriptSeg >= (int)script.size()) { setOutput(index, {}); return; }
 	const ScriptSeg& sg = script[scriptSeg];
+
+	// --- phase 0: park on the ground so jump/flip state is identical for every segment
+	static constexpr int SCRIPT_RESET_TICKS = 12;
+	if (scriptGrounded < SCRIPT_RESET_TICKS) {
+		if (scriptGrounded < 0) {
+			SendGroundReset(index); scriptGrounded = 0; scriptSettle = 0;
+			setOutput(index, {}); return;
+		}
+		if (p->air_state() == rlbot::flat::AirState::OnGround) scriptGrounded++;
+		else if (scriptSettle % 8 == 0) SendGroundReset(index);   // retry; does not count
+		// Never hang the whole run on one stubborn reset -- say so and carry on, so the
+		// segment is visibly suspect rather than silently missing.
+		if (++scriptSettle > 240) {
+			RG_LOG("GGL_SCRIPT: ground reset before \"" << script[scriptSeg].name
+				<< "\" never grounded; segment starts with UNCONTROLLED jump state");
+			scriptGrounded = SCRIPT_RESET_TICKS;
+		}
+		setOutput(index, {});
+		return;
+	}
 
 	// --- phase 1: state set, then wait until the game reports we are actually there
 	if (!scriptStateSent) {
@@ -496,7 +529,7 @@ void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index
 			if (scriptSettle > 40) {  // state set refused/ignored -- do not log garbage
 				RG_LOG("GGL_SCRIPT: segment \"" << sg.name << "\" state set did not take ("
 					<< dx << "," << dy << "," << dz << "); skipping");
-				scriptSeg++; scriptStateSent = false; scriptTick = 0;
+				scriptSeg++; scriptStateSent = false; scriptTick = 0; scriptGrounded = -1;
 			} else if (scriptSettle % 8 == 0) {
 				SendSegmentState(sg, index);  // retry
 			}
@@ -531,7 +564,7 @@ void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index
 	if (scriptTick >= sg.dur) {
 		RG_LOG("GGL_SCRIPT: segment " << (scriptSeg + 1) << "/" << script.size()
 			<< " \"" << sg.name << "\" done");
-		scriptSeg++; scriptStateSent = false; scriptTick = 0;
+		scriptSeg++; scriptStateSent = false; scriptTick = 0; scriptGrounded = -1;
 		if (scriptSeg >= (int)script.size()) {
 			scriptLog.flush();
 			RG_LOG("GGL_SCRIPT: ALL SEGMENTS COMPLETE -- you can stop the match");

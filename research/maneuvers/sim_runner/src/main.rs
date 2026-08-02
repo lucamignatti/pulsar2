@@ -74,17 +74,35 @@ fn main() {
     let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
     let mut out = String::from("seg\ttick\tx\ty\tz\tvx\tvy\tvz\tfx\tfy\tfz\tux\tuy\tuz\tavx\tavy\tavz\tground\tboost\n");
     for s in &segs {
+        // GROUND-PARK RESET, and it must be PHYSICAL, not a flag poke.
+        //
+        // This used to zero has_jumped/has_flipped/... directly. The real game cannot do
+        // that: a state set CARRIES jump/flip state, so over there a segment inherited
+        // whatever the previous one left. `stall` followed `speed_flip` and inherited a
+        // spent flip (real car could not jump at all); `corner_flip_into` followed a
+        // segment ending on the ground and took a +280.8 uu/s jump impulse in mid-air.
+        // The sim's free reset hid that entirely and nearly justified a bogus has_jumped
+        // patch to RocketSim. Park on the floor and let GROUND CONTACT clear the flags,
+        // exactly as the real runner now does, then carry the result through the teleport.
+        {
+            let mut park = *arena.get_car_state(car);
+            park.phys.pos = Vec3A::new(0.0, -4600.0, 17.0);
+            park.phys.rot_mat = rot_from_euler(0.0, 1.5708, 0.0);
+            park.phys.vel = Vec3A::ZERO;
+            park.phys.ang_vel = Vec3A::ZERO;
+            park.boost = 100.0;
+            arena.set_car_state(car, park);
+            arena.set_car_controls(car, CarControls::default());
+            for _ in 0..12 { arena.step_tick(); }
+        }
+        // Preserve the flags the park produced; override only the physical state.
         let mut cs = *arena.get_car_state(car);
         cs.phys.pos = Vec3A::new(s.st[0], s.st[1], s.st[2]);
         cs.phys.rot_mat = rot_from_euler(s.st[3], s.st[4], s.st[5]);
         cs.phys.vel = Vec3A::new(s.st[6], s.st[7], s.st[8]);
         cs.phys.ang_vel = Vec3A::new(s.st[9], s.st[10], s.st[11]);
         cs.boost = s.st[12];
-        // clear carried-over flags so each segment is independent
         cs.is_on_ground = s.st[2] < 30.0;
-        cs.has_jumped = false; cs.has_double_jumped = false; cs.has_flipped = false;
-        cs.is_jumping = false; cs.is_flipping = false; cs.flip_time = 0.0; cs.jump_time = 0.0;
-        cs.air_time_since_jump = 0.0; cs.flip_rel_torque = Vec3A::ZERO;
         arena.set_car_state(car, cs);
         // Park the ball in a far corner every segment. The default arena puts it at
         // kickoff (0,0,93) with radius 91, so its TOP is z~184 -- the drop segments were
