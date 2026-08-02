@@ -1737,3 +1737,71 @@ measured real re-attachment distance in transition_flip_off) while ride height a
 flat-driving response stay exactly as they are. That is a change in the Bullet vehicle layer
 (`bullet/dynamics/vehicle.rs` wheel raycast), not a constant, and it should be swept against
 BOTH captures with drive_throttle/coast_decel as hard guards.
+
+## §29 — Wall adhesion decomposed: two mechanisms on one constant (2026-08-02)
+
+S28 proposed decoupling the wheel raycast's ground-DETECTION reach from ride height, so a
+car could re-acquire a wall it drifted off without disturbing flat driving. Implemented and
+swept (`SUSPENSION_DETECT_EXTRA`, added only to `real_ray_length`).
+
+**The decoupling itself works perfectly.** Across extra = 0/8/16/30/50 uu the guards never
+move at all: `drive_throttle` 7.39, `coast_decel` 3.97, `wall_drive` 2.32, identical to four
+significant figures. Ride height and flat driving are genuinely untouched.
+
+And the wall family improves a lot at extra = 8:
+
+    transition_flip_off        183.35 -> 114.55      ceiling_drive   22.53 -> 10.14
+    transition_supersonic_into  35.01 ->   8.91      ceiling_drop    14.92 ->  5.45
+    corner_drive_up             34.41 ->  12.76      speed_flip      15.51 ->  9.46
+
+18 segments improve and the MEDIAN improves (5.96 -> 5.71). But the total worsens
+(1187.6 -> 1487.3) on essentially one segment: `half_flip` 6.16 -> **334.64**.
+
+### 29.1 Correction to S28's reasoning: the suspension cannot pull
+
+S28 assumed the suspension force goes negative past the rest length and provides a bounded
+pull toward the surface. It does not. `update_suspension` ends with:
+
+    if wheels_suspension_force <= 0.0 { return; }
+
+so a negative force is discarded outright. Extending the raycast therefore creates no
+suspension pull whatsoever. What it actually extends is the range over which
+`is_in_contact_with_world` is true, and that flag gates three different things.
+
+### 29.2 The decomposition (measured, not assumed)
+
+Re-ran extra = 8 with the sticky force disabled to separate the effects:
+
+| segment | extra 0 | extra 8 | extra 8, no sticky |
+|---|---|---|---|
+| `transition_flip_off` | 183.35 | **114.55** | 235.84 |
+| `half_flip` | 6.16 | 334.64 | **335.09** |
+
+- The wall-adhesion GAIN needs the sticky force (without it flip_off is 235.8, worse than
+  baseline). So adhesion in RocketSim is entirely `StickyForce`, gated on
+  `wheels_have_world_contact` -- extending reach extends adhesion. This is the sim's stand-in
+  for RL's `WheelSuspension`, which is RL's only candidate (S28: four wheel forces, no
+  sticky force of any name).
+- The `half_flip` LOSS is unrelated to sticky (335.09 without it). It comes from wheels being
+  classified in-contact while genuinely airborne, so wheel FRICTION and DRIVE apply to a car
+  that has left the ground.
+
+One constant currently drives both, which is why the sweep cannot win: any reach long enough
+to hold a wall is also long enough to make a jumping car think it is still on the floor.
+
+NOT ADOPTED, and reverted; baseline stands at total 1187.6, median 5.96.
+
+### 29.3 The actual fix
+
+Separate ADHESION reach from CONTACT CLASSIFICATION. `wheels_have_world_contact` (which
+gates only the sticky force, car/base.rs) should use the extended probe, while the wheel's
+friction/drive/suspension path keeps the current reach -- i.e. a wheel within the extended
+band adheres but does not drive, brake or generate lateral friction.
+
+Guards for that change, all currently near the floor and all held exactly by the reach
+decoupling: `drive_throttle` 7.39, `coast_decel` 3.97, `wall_drive` 2.32, and now
+`half_flip` 6.16 as the specific regression sentinel. Sweep against BOTH captures.
+
+Expected prize if it lands cleanly: roughly -180 uu of total error (the extra-8 gains
+without the half_flip loss), taking the script to about 1000 uu total and a median near
+5.2 uu.
