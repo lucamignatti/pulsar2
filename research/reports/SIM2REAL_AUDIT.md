@@ -1384,3 +1384,51 @@ dynamics.
 - **Boost-pad car-locking** — v3's pickup is cylinder-only (§7); the pad-camping case
   is untested against the real game.
 - Sample base: one 1v1 RLBot match at 120 Hz (§7) plus 83 replays at 30 Hz (§8).
+
+## §21 — The floor-to-wall fillet: three confirmed divergences (2026-08-02)
+
+66-segment scripted capture, real game vs sim. The duplicate-SEG-name artefact from the
+previous capture is confirmed dead (land_nose_down 707.9 -> 1.94 uu etc.), so the numbers
+below are physics.
+
+Flat geometry is at the noise floor (floor/wall/air all 5-12 uu median). Every one of the
+worst segments is a CURVED or attitude-resolution contact:
+
+| segment | p50 | max | what diverges |
+|---|---|---|---|
+| `transition_flip_early` | **122.9** | 413.8 | flip landing on the 256uu fillet |
+| `corner_drive_up` | 45.6 | 184.9 | big 1152uu corner |
+| `crossbar_land` | 28.4 | 56.2 | goal frame |
+| `tilt_on_side` | 27.7 | 115.3 | on-side landing recovery |
+| `transition_drive_along` | 21.0 | 96.9 | driving up the fillet |
+
+### 21.1 The fillet over-launches (worst defect in the script)
+
+`transition_flip_early` tracks the real game to **0.9 uu at tick 36** -- dead on until the
+car meets the curve. Then:
+
+- sim reports `is_on_ground` at tick **96**, real not until **144** (0.4 s earlier attach)
+- by tick 192 sim z = **773**, real z = **374** -- the sim gets roughly double the climb
+
+So on flip contact with the fillet the sim attaches to the surface far too early and
+converts the contact into far too much up-wall velocity. Prime suspect is the wall-stick /
+surface-attach force being applied on the curved fillet where the game does not yet apply
+it. NOT YET INVESTIGATED against Ghidra -- do that before touching anything.
+
+### 21.2 Wall climb ~4% fast
+
+`transition_drive_along` diverges monotonically (5 -> 95 uu) with both venues attached the
+whole way: z 1770 sim vs 1703 real at tick 216. A steady overspeed climbing the wall, plausibly
+the same root cause as 21.1.
+
+### 21.3 On-side landing resolves the wrong way
+
+`tilt_on_side`: sim plants at tick 72 and slides to x = -25; real stays airborne to tick 120
+and recovers to x = 0. 28 ground-flag mismatches. The flop-to-wheels / auto-right resolution
+differs in DIRECTION, not just magnitude.
+
+### 21.4 Six segments never captured
+
+`supersonic_run`, `into_net`, `transition_curve_dash`, `transition_wall_dash`,
+`transition_flip_off`, `transition_supersonic_into`. `supersonic_run` has now failed to
+capture twice. Cause unknown -- do not claim full coverage until this is explained.
