@@ -1145,6 +1145,36 @@ prediction.
 **Still open:** the full jump → flip → landing *trajectory*. The impulse that starts it is
 now validated; what happens over the following 0.5 s is not.
 
+## 18. Ball spin is NOT the cause of the contact error (hypothesis disproved)
+
+The +/-5% ball-hit figure was repeatedly caveated in this report as "a measurement floor,
+not a proven error", on the theory that the RLBot telemetry does not log ball angular
+velocity, so every contact test started from **zero spin** — and off-centre contacts are the
+spin-sensitive ones.
+
+That theory is now tested and **wrong**. Replays *do* carry ball angular velocity, so the
+same contact test can be run with real spin and with spin zeroed, changing nothing else.
+313 replay ball-touches (a car within 250 uu and real ball dV > 80 uu/s):
+
+| ball spin | n | post-hit speed ratio p25/med/p75 | direction err (median) |
+|---|---|---|---|
+| **zeroed** | 313 | 0.524 / **0.643** / 0.829 | 20.54° |
+| **real** | 312 | 0.528 / **0.654** / 0.830 | 21.23° |
+
+Supplying the real spin moves the speed ratio by **0.011** and the direction error by
+**0.7°** — i.e. nothing. Ball spin does not explain the contact error.
+
+Two consequences:
+
+1. **The caveat should be dropped.** The telemetry-based figure (ratio 1.027, IQR
+   [0.936, 1.037], §7) is not concealing a spin-dependent error, and is the best estimate
+   of ball-hit fidelity. Its residual is contact-phase resolution, as §7 originally said.
+2. **These replay numbers must not be read as the error.** Ratio 0.65 / 20° here is far
+   worse than the telemetry's 1.027 / 2.5-6.8° purely because replays are 30 Hz and
+   quantized, so contact phase is recovered much more coarsely (the ~40x noise factor noted
+   in §8). This test is only valid as a *controlled A/B on the spin variable*, which is
+   exactly what it was used for.
+
 ## Recommended order
 
 1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
