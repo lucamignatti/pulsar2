@@ -402,21 +402,26 @@ impl Car {
                     * Vec3A::new(car_consts::flip::TORQUE_X, car_consts::flip::TORQUE_Y, 0.0)
                     * TICK_TIME;
 
-                // VENDOR PATCH (pulsar 2026-08-01): apply the dodge torque through the
-                // INVERSE INERTIA TENSOR, as the real game does.
-                // RocketLeague.exe applies angular forces via FUN_140981560; the dodge
-                // uses MODE 5, which takes the cofactor inverse of the car's 3x3 inertia
-                // matrix (+0x130..+0x158) and applies it to the torque before adding to
-                // angular velocity. RocketSim added the torque straight to ang_vel with
-                // no inertia division (and `Impulse::Angular` + massed=true divides by
-                // MASS, which is dimensionally wrong for a torque), making dodges ~1/I
-                // too strong. Octane 1/I_y = 0.01041 vs an independently fitted 0.0100.
-                // Measured on 6382 real mid-dodge replay frames: angular-velocity error
-                // 2.048 -> 0.051 rad/s (~40x). See research/reports/SIM2REAL_AUDIT.md S1b.
-                let world_dodge_torque = rb.get_world_trans().matrix3 * dodge_torque;
+                // REVERTED to upstream (pulsar 2026-08-02). A vendor patch here divided
+                // this torque by the inverse inertia tensor, reasoning that RL's angular
+                // primitive (RocketLeague.exe FUN_140981560, mode 5) is Bullet's
+                // applyTorqueImpulse. The Ghidra reading was right about what mode 5 does;
+                // the mistake was assuming RocketSim's TORQUE_X/Y are in the same units as
+                // the torque RL feeds that primitive. They are not.
+                //
+                // The replay validation that appeared to confirm it (angVel error
+                // 2.048 -> 0.051 rad/s) was circular: it fed the sim the game's REPLICATED
+                // DodgeTorque, which carries its own ~1/100 scale factor, so a torque that
+                // was also divided by inertia matched a target that was already small.
+                //
+                // The scripted maneuver test (research/maneuvers) is decisive -- identical
+                // inputs from identical states, dodge orientation error vs the real game:
+                //     WITH the inertia division:  fwd 94.6 / 98.6 / 121.7 / 99.4 deg
+                //     WITHOUT (this code):        fwd  6.0 /  4.4 /   5.1 /  2.5 deg
+                // for dodge forward/backward/side/diagonal. See SIM2REAL_AUDIT.md S21.
                 rb.add_impulse(
                     None,
-                    Impulse::Angular(rb.inv_inertia_tensor_world * world_dodge_torque),
+                    Impulse::Angular(rb.get_world_trans().matrix3 * dodge_torque),
                     false,
                     true,
                 );
