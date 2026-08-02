@@ -1201,6 +1201,58 @@ instrument cannot see smaller than this". Combined with §17 (impulse correct to
 §1b (dodge rotation 1.9° per dodge post-fix), the jump/flip path has no remaining measured
 discrepancy, but the landing itself is still unexercised.
 
+## 20. LIVE ts1 MATCH — landings validated, and a 2x decision-rate deploy gap found
+
+945.7 s real-game match, 6.0 ts1 policy (3.07B steps), 56,733 decisions, 24 MB JSONL.
+The bot self-configured correctly: `trunk { 896, 896, 896 }`, `policy { 640, 640, 640 }`,
+`Decision rate: tickSkip=1 (120 Hz)`.
+
+### The landing phase is validated (last open physics item)
+
+Replayed all 55,956 clean transitions through the patched engine:
+
+| regime | n | pos p50 | pos p90 | pos p99 | vel p50 |
+|---|---|---|---|---|---|
+| all live | 55,956 | **0.151 uu** | 0.322 | 1.00 | 4.100 |
+| on ground | 42,066 | 0.159 | 0.335 | 0.81 | 4.245 |
+| airborne | 13,643 | 0.062 | 0.290 | 8.06 | 0.051 |
+| **LANDING (air→ground)** | **247** | **0.318 uu** | 1.336 | 8.11 | 21.733 |
+
+**Landings are 0.318 uu median** — 2x the all-regime median and a quarter-percent of a car
+length. Velocity error is higher (21.7 vs 4.1 uu/s), which is expected across a
+discontinuous contact event. **No defect.** That closes the last physics item the audit
+could not reach.
+
+(These are tighter than §16's numbers because the window here is 2 ticks, not 8.)
+
+### DEPLOY GAP: the game delivers 60 packets/s, so ts1 runs at HALF its trained rate
+
+The decision timestamps are unambiguous:
+
+- median decision interval **17.000 ms** = **two** physics ticks (one tick = 8.333 ms)
+- 56,733 decisions / 945.7 s = **59.99 Hz**
+- at 120 Hz we would expect **113,487** decisions — we got exactly half
+- all 56,733 timestamps are unique, so the bot is not dropping packets; **the game is not
+  sending them**
+
+Cause: `TASystemSettings.ini` has **`UncappedFramerate=False`** (and
+`UpscaleTargetFramerate=60`). RLBot packets follow the render frame rate, so a 60 fps cap
+hard-limits the decision rate to 60 Hz regardless of `tickSkip`.
+
+**A tickSkip-1 policy therefore cannot run at its trained rate on this machine as
+configured.** Every action is held for 2 ticks instead of 1 — behaviourally identical to
+deploying a ts1 policy at ts2. This is invisible in the sim, invisible in the viz, and
+produces no error anywhere: exactly the class of silent mismatch this audit exists to catch.
+
+**Fix:** set `UncappedFramerate=True` and confirm the game sustains >=120 fps (drop
+resolution if needed — the config also carries a 1280x720 block). Then re-run and check the
+decision interval is 8.333 ms. If 120 fps is not sustainable, the honest alternative is to
+train at **tickSkip 2 (60 Hz)** to match what the venue can actually deliver.
+
+Note the echo lag is unchanged at a median of **2 ticks**, consistent with §4 — that is the
+send→applied delay and is still cancelled by packet staleness; it is a separate thing from
+this rate cap.
+
 ## Recommended order
 
 1. **Apply the inverse inertia tensor to dodge torque** (§1b) — one line, root-caused in
