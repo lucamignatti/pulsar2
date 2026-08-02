@@ -1484,3 +1484,76 @@ drop, tornado spin and supersonic_run are also clean.
 
 Car-ball contact of any kind (the ball is parked at (-3500,4800) by design), and bumps/
 demos (needs a second car). Both need runner work, not more segments.
+
+## §23 — Deterministic jump state; speed_flip survives and is the real defect (2026-08-02)
+
+### 23.1 The harness was inventing a defect
+
+The real game CARRIES jump/flip state across a state set; the sim runner zeroed the flags
+directly. Segments therefore inherited whatever the previous one left, in ONE venue only,
+making results depend on script ORDER.
+
+This produced a fully convincing false positive. RocketSim's `can_use` gate genuinely omits
+`has_jumped` (and `air_time_since_jump` resets every tick while it is false, so the
+DOUBLEJUMP_MAX_DELAY window is vacuous). Adding the check moved `stall` 249.9 -> 8.1 uu.
+But `stall` follows `speed_flip`, which ends mid-flip: the real car had merely spent its
+flip. `corner_flip_into` (following a segment that ends grounded) shows the real car taking
+a **+280.8 uu/s jump impulse** in mid-air, never grounded, then pure gravity -- RL DOES
+allow it there, and the patch regressed that segment 20.3 -> 103.5 uu. NOT PATCHED.
+
+Both runners now park on the floor for 12 ticks and let GROUND CONTACT clear the flags.
+Proof it was artefact: with **no code change**, `stall` went 249.9 -> **9.3 uu** and
+`transition_flip_early` 152.4 -> **81.7 uu**.
+
+### 23.2 CAVEAT: the `ground` column is not comparable between venues
+
+The real game reports `AirState::Jumping` from the instant jump is pressed while the wheels
+are still down; RocketSim keeps `is_on_ground` true through that window (already documented
+at RLBotClient.cpp ToPlayer()). Measuring "liftoff" off that column reads a uniform +2 tick
+difference across 26/27 segments -- that is the observation semantics, NOT physics. Do not
+draw ground-contact conclusions from it, and treat the `gnd mism` column as advisory.
+
+### 23.3 speed_flip is real, and it is the worst defect
+
+583.5 -> **583.3 uu** across the state fix, i.e. entirely unaffected: not an artefact.
+Orientation error **94.5 deg** against a ~0 real-vs-real noise floor.
+
+Localised, and the localisation is the useful part:
+
+| segment | error | verdict |
+|---|---|---|
+| `dodge_diagonal` (diagonal dodge, no cancel) | 13.1 uu | fine |
+| `dodge_then_cancel` (axis dodge + cancel) | 4.5 uu | fine |
+| `speed_flip` (diagonal dodge + cancel) | **583.3 uu** | broken |
+
+So neither ingredient is broken; the COMBINATION is. In the trace the sim reaches
+avx = -1.59 rad/s two ticks after the dodge while the real car is at -0.12 and then rotates
+the OTHER way (+1.67 peak), i.e. the real car appears to respond to the cancel input via air
+control while the sim commits a full dodge rotation.
+
+RULED OUT: `do_air_control = true` in RocketSim's cancel branch (removing it moves the
+error 583.3 -> 585.8, no effect). Also ruled out earlier: the cancel SIGN convention --
+`flip_rel_torque.y = -pitch_at_dodge`, so RocketSim cancels on opposite pitch exactly as
+RL's `CarComponent_Dodge_TA_ApplyTorqueForces` does (which modulates ONLY the Y component,
+by `1 - |pitch clamped toward the opposing sign|`; X is unmodulated in both).
+
+Still open. Next candidates: whether RL fires a dodge at all for this input/timing, and the
+torque magnitude term `C1 / *(*(car+0x438)+0x238)` in the RL native, which has no
+counterpart in RocketSim's `rel_torque * (TORQUE_X, TORQUE_Y, 0) * TICK_TIME`.
+
+### 23.4 Current ranking on trustworthy state (80/80 captured)
+
+| segment | p50 |
+|---|---|
+| `speed_flip` | 583.3 |
+| `jump_after_wall_launch` | 213.0 |
+| `transition_flip_off` | 184.1 |
+| `no_jump_control` | 139.0 |
+| `transition_curve_dash` | 108.9 |
+| `transition_supersonic_into` | 101.9 |
+| `transition_flip_early` | 81.7 |
+| `corner_drive_up` | 41.6 |
+
+`no_jump_control` never presses jump, so its 139 uu is a clean measure of the fillet/wall
+launch divergence alone -- the jump_after_* pair cannot settle the has_jumped question until
+that is fixed, because the launch itself dominates.
