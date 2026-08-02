@@ -131,14 +131,16 @@ pub mod car {
         pub const STOPPING_FORWARD_VEL: f32 = 25.0;
         /// How much the brake is applied when coasting
         ///
-        /// VENDOR PATCH (pulsar 2026-08-01): 0.15 -> 0.11. RocketSim's coasting
-        /// deceleration was ~20% too strong. Measured against real match telemetry
-        /// (8811 live transitions): real coast decel -640.7 uu/s^2 vs sim -768, and the
-        /// forward-velocity error was 93% one-sided (median -8.504 uu/s per 8-tick
-        /// window, n=237). At 0.11 that becomes 49% one-sided, median +0.13.
-        /// Isolated to coasting: explicit braking (brake factor 1.0) is only 3.5% off,
-        /// so this is NOT a brake-torque scaling error -- see SIM2REAL_AUDIT.md S14.
-        pub const COASTING_BRAKE_FACTOR: f32 = 0.11;
+        /// REVERTED to upstream 0.15 (pulsar 2026-08-02). A previous vendor patch set this
+        /// to 0.11 based on the forward-velocity component of match telemetry, which looked
+        /// convincing (93% one-sided) but was measuring a contaminated population: "throttle
+        /// ~= 0" in match play also catches turning, brief airtime and wall contact, and the
+        /// forward projection moves with the car. The scripted maneuver test
+        /// (research/maneuvers) isolates a pure coast from a fixed state and is decisive:
+        ///   real decel 525 uu/s^2   vs   sim 385 at 0.11   and   525 at 0.15
+        ///   coast_decel segment error: 56.01 uu at 0.11, 4.11 uu at 0.15
+        /// 0.15 is correct. Do not "fix" this from match-play aggregates again.
+        pub const COASTING_BRAKE_FACTOR: f32 = 0.15;
         /// If we are braking and moving faster than this, disable throttle
         pub const BRAKING_NO_THROTTLE_SPEED_THRESH: f32 = 0.01;
         /// Throttle input of less than this is ignored
