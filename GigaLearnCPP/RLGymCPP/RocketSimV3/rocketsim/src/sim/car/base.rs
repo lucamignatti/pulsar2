@@ -340,10 +340,11 @@ impl Car {
         }
 
         let wheels_have_world_contact = self.bullet_vehicle.wheels.iter().any(|wheel| {
-            wheel
-                .raycast_info
-                .as_ref()
-                .is_some_and(|info| info.is_in_contact_with_world)
+            wheel.adhesion_contact
+                || wheel
+                    .raycast_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_in_contact_with_world)
         });
         if wheels_have_world_contact {
             let upwards_dir = self.bullet_vehicle.get_upwards_dir_from_wheel_contacts(rb);

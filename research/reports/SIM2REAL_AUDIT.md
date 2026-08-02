@@ -1805,3 +1805,64 @@ decoupling: `drive_throttle` 7.39, `coast_decel` 3.97, `wall_drive` 2.32, and no
 Expected prize if it lands cleanly: roughly -180 uu of total error (the extra-8 gains
 without the half_flip loss), taking the script to about 1000 uu total and a median near
 5.2 uu.
+
+## §30 — Adhesion-only band: ADOPTED (2026-08-02)
+
+S29 identified that one constant drove two mechanisms. Split them: a wheel that finds a
+surface beyond the suspension's working range now sets `adhesion_contact` and feeds ONLY the
+sticky-force gate, producing no friction, drive or suspension force. `SUSPENSION_DETECT_EXTRA`
+sets that extra reach.
+
+This is the sim's stand-in for RL's `WheelSuspension` reach -- RL has four wheel forces and
+no sticky force of any name (S28), so a car out there in RL is held by suspension alone and
+is certainly not driving.
+
+Swept against BOTH captures. **2.0 uu adopted**, and it sits just under a cliff:
+
+| extra | FIT | HOLD | median | <10uu | <5uu | curve_dash | half_flip |
+|---|---|---|---|---|---|---|---|
+| 0 (before) | 1137.6 | 1187.6 | 5.96 | 50 | 34 | 31.5 | 6.16 |
+| **2.0** | **1112.1** | **1161.1** | **4.98** | **54** | **40** | 32.1 | **3.41** |
+| 4.0 | 1178.8 | 1223.8 | 4.88 | 55 | 41 | **120.8** | 3.52 |
+| 8.0 | 1179.4 | 1217.2 | 5.40 | 56 | 36 | 120.1 | 3.73 |
+
+At 4.0 and above the CONCAVE fillet pushes legitimately-driving wheels into the band; they
+stop generating drive and the car loses traction on the curve. 2.0 keeps the gains without
+crossing that line.
+
+Consistent across both captures (16-17 segments improved, the same 6 regressed). Every guard
+held to four significant figures: `drive_throttle` 7.39, `coast_decel` 3.97, `wall_drive`
+2.32, `brake_hard` 15.39, `steer_full` 11.59 -- and `half_flip` improved 6.16 -> 3.41.
+
+Biggest gains: `corner_drive_up` 34.4 -> 12.8, `ceiling_drive` 22.5 -> 12.8, `dodge_forward`
+9.7 -> 4.2, `ceiling_drop` 14.9 -> 9.9, `flip_land_early` 6.7 -> 2.9, `speed_flip` 15.5 ->
+12.2, `dodge_side` 6.0 -> 3.3.
+
+HONEST COST: `transition_flip_early` regresses 28.4 -> 60.3 on both captures, and
+`jump_after_wall_launch` 117.5 -> 127.8. Both are in the wall/fillet-flip family that remains
+the open problem. Taken because total, median and every threshold count improve on two
+independent captures while all guards hold.
+
+### 30.1 Final state of the sim
+
+| metric | session start | now |
+|---|---|---|
+| total | 1729.7 | **1161.1** |
+| median | — | **4.98 uu** |
+| < 15 uu | — | 62/80 |
+| < 10 uu | — | 54/80 |
+| < 5 uu | — | 40/80 |
+| < 2 uu | — | 20/80 |
+
+Against a real-vs-real noise floor of median 0.00 uu (94.9 total).
+
+### 30.2 What is left
+
+`transition_flip_off` (185.4) and `jump_after_wall_launch` (127.8) -- the car detaching from
+a wall after a flip. The adhesion band helps the approach but not this. The remaining
+suspect is that RocketSim's sticky force uses `get_upwards_dir_from_wheel_contacts`, which
+with one or two grazing wheels can yield an "up" that points away from the surface, so the
+force pushes the car off instead of holding it. Worth testing next: derive the sticky
+direction from the CONTACT NORMAL rather than the inferred wheel-contact up.
+
+Plus the irreducible symmetric-tilted-landing chaos of 26.1.

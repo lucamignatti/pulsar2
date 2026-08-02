@@ -413,6 +413,19 @@ pub mod bullet_vehicle {
     pub const WHEELS_DAMPING_RELAXATION: f32 = 40.0;
     pub const MAX_SUSPENSION_TRAVEL: f32 = 12.0;
     pub const SUSPENSION_SUBTRACTION: f32 = 0.05;
+    /// Extra ADHESION probe reach (uu) beyond the suspension's working range.
+    ///
+    /// A wheel that finds a surface out here sets `adhesion_contact` and feeds ONLY the
+    /// sticky-force gate -- it produces no friction, drive or suspension force, because it
+    /// is not really on the ground. RL holds a car to a wall through WheelSuspension and
+    /// has no sticky force of any kind (S28); this is RocketSim's stand-in for that reach.
+    ///
+    /// Swept against two independent captures. 2.0 sits just under a cliff: at 4.0 and
+    /// above the CONCAVE fillet pushes legitimately-driving wheels into the band, they stop
+    /// generating drive, and the car loses traction on the curve (transition_curve_dash
+    /// 31.5 -> 120.8). At 2.0 both captures improve on total, median and every guard.
+    /// See SIM2REAL_AUDIT.md S30.
+    pub const SUSPENSION_DETECT_EXTRA: f32 = 2.0;
 }
 
 pub mod curves {

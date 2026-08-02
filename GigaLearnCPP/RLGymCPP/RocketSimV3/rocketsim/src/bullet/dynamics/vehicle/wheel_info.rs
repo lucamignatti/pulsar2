@@ -27,6 +27,10 @@ pub struct RaycastInfo {
 
 pub struct WheelInfo {
     pub raycast_info: Option<RaycastInfo>,
+    /// A surface is within the EXTENDED probe but outside the suspension's working range.
+    /// Such a wheel feeds the sticky-force gate (adhesion) but gets no `raycast_info`, so
+    /// it generates no friction, drive or suspension force. See SIM2REAL_AUDIT.md S29/S30.
+    pub adhesion_contact: bool,
     pub hard_point: Vec3A,
     pub axle_dir: Vec3A,
     pub chassis_connection_point_cs: Vec3A,
@@ -46,6 +50,7 @@ pub struct WheelInfo {
 impl WheelInfo {
     pub const DEFAULT: Self = Self {
         raycast_info: None,
+        adhesion_contact: false,
         hard_point: Vec3A::ZERO,
         axle_dir: Vec3A::ZERO,
         chassis_connection_point_cs: Vec3A::ZERO,
@@ -77,7 +82,8 @@ impl WheelInfo {
         let suspension_travel = bullet_vehicle::MAX_SUSPENSION_TRAVEL * UU_TO_BT;
         self.real_ray_length =
             self.suspension_rest_length_1 + suspension_travel + self.wheels_radius
-                - bullet_vehicle::SUSPENSION_SUBTRACTION;
+                - bullet_vehicle::SUSPENSION_SUBTRACTION
+                + bullet_vehicle::SUSPENSION_DETECT_EXTRA * UU_TO_BT;
     }
 
     pub fn prepare_for_raycast(&mut self, chassis_trans: &Affine3A) -> (Vec3A, Vec3A) {
@@ -90,6 +96,7 @@ impl WheelInfo {
     pub fn reset_wheel_suspension(&mut self) {
         self.extra_pushback = 0.0;
         self.raycast_info = None;
+        self.adhesion_contact = false;
     }
 
     pub fn apply_ray_cast(
@@ -118,6 +125,20 @@ impl WheelInfo {
         let suspension_travel = bullet_vehicle::MAX_SUSPENSION_TRAVEL * UU_TO_BT;
         let min_suspension_len = self.suspension_rest_length_1 - suspension_travel;
         let max_suspension_len = self.suspension_rest_length_1 + suspension_travel;
+
+        // ADHESION-ONLY BAND. The extended probe reaches past the suspension's working
+        // range so a car can re-acquire a wall it has drifted off (RL holds a car to a wall
+        // with WheelSuspension and has no sticky force at all -- S28). But a wheel out
+        // there is NOT on the ground: letting it generate friction and drive is what made a
+        // jumping car behave as if still on the floor (half_flip 6.2 -> 334.6 uu, and that
+        // regression is independent of the sticky force -- measured at 335.1 with sticky
+        // disabled). So flag it for the sticky gate and take no other force from it.
+        self.adhesion_contact = false;
+        if suspension_length > max_suspension_len {
+            self.adhesion_contact = is_in_contact_with_world;
+            self.raycast_info = None;
+            return;
+        }
         suspension_length = suspension_length.clamp(min_suspension_len, max_suspension_len);
 
         let rel_pos = contact_point - chassis_trans.translation;
