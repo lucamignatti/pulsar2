@@ -1938,3 +1938,44 @@ touches at all -- the ball is parked by design).
 
 Closing those would take source-level branch coverage of the car physics to ~100% with, by
 this count, roughly 6-10 new segments plus a two-car harness.
+
+## §32 — Triage of an external fix list (Moonwatcher), 2026-08-02
+
+A second, independent sim-vs-real effort published 10 fixes. Triaged against our tree:
+
+| # | their fix | applies to us? |
+|---|---|---|
+| 1 | inverted `has_flipped` | **NO** -- ours is consistent (`has_flipped` = "flip spent", set at flip start, cleared on ground). Our own has_flip bug family was on the RLBot bridge side and was fixed 2026-07-31. |
+| 2 | reset boost state every test tick | **NO** -- their harness |
+| 3 | flip-torque units | **ALREADY SETTLED** -- we tried an inertia-scaled torque and it was a 95-122 deg regression; reverted with the reasoning recorded (S21) |
+| 4 | steering applied at force-application time | **NO** -- `steer_angle` is set in `update_wheels` and consumed by `apply_ray_cast` within the same tick |
+| 5 | wheel forces using current velocities | **NO** -- `update_vehicle_first` (raycast) and `update_vehicle_second` (suspension then friction) are called back-to-back with no force application between them |
+| 6 | boost-pad pickup geometry | **ALREADY FIXED** here (BVH `cyl_radius` + OBB pickup); validated at the noise floor (4.96-10.9 uu) |
+| 7 | **supersonic can start only while grounded** | **YES -- REAL GAP, FIXED** |
+| 8 | correct hitbox per recording | **NO** -- their harness |
+| 9 | action/contact diagnostics | **NO** -- their tooling |
+| 10 | bump analysis | **NO** -- their tooling |
+
+### 32.1 #7 adopted, with an explicit evidence caveat
+
+`post_tick_update` set `is_supersonic = true` on speed alone, with no ground check. A car
+merely exceeding the start speed in the air -- a fast aerial, or a fillet launch, which we
+know reaches 2033 uu z at supersonic -- became supersonic, and since demolitions require
+supersonic that manufactures PHANTOM DEMOS on contact.
+
+Their evidence: 3 phantom demos removed, 13/13 demos correct.
+
+**This is NOT validated locally, and cannot be.** `is_supersonic` has no trajectory effect in
+RocketSim -- it only gates demos -- so the maneuver harness structurally cannot observe it
+(no segment contains a second car; §31.4 already lists demos as an untested path). What was
+verified here is that the change is trajectory-NEUTRAL: all 80 segments are bit-identical
+before and after, so it cannot regress anything currently measured.
+
+Re-test properly once a two-car harness exists. This is the first change this session
+adopted on external evidence rather than our own measurement, and it is flagged as such in
+the source.
+
+### 32.2 Worth noting
+
+Two independent efforts converged on the boost-pad pickup geometry (their #6, our earlier
+fix) from different directions. That is mild corroboration for both.
