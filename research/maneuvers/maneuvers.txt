@@ -53,47 +53,116 @@ STATE 0 0 400  0 0 0        0 0 0        0 0 3.5  100
 ACT 0   0 0 0 0 0  0 0 0
 
 # ------------------------------------------------- FLIPS INTERACTING WITH THE GROUND
-# The specific case called out: dodging into / during a landing.
+# The reported weirdness. Two false starts are recorded here so they are not repeated:
+#   1. Spawning these AIRBORNE makes both jump presses no-ops (a jump only registers on the
+#      ground, and without has_jumped the second press is not a dodge). The car merely fell.
+#      Every segment below therefore starts on the floor at z=17.
+#   2. A dodge extends the flight, so the dodge tick and the landing tick move together and
+#      cannot be hand-tuned. The timings below come from a 336-point sweep of dodge tick x
+#      jump-hold (research note: /tmp sweep, reproduced in SIM2REAL_AUDIT.md S21).
+#
+# SWEEP RESULT, and it is the headline: across all 336 timings, tilt at FIRST IMPACT never
+# exceeded 12 degrees. In this sim a dodge ALWAYS completes its rotation and arrives flat --
+# no dodge timing lands the car mid-rotation. Only sustained air-control input after the
+# dodge does (see land_during_flip_rotation, 57d at impact). If the real game lands nose-
+# first or on its side from a plain dodge, that gap is the bug. These segments sit at the
+# sweep maxima so the comparison is taken where the sim is most likely to differ.
+#
+# METRIC WARNING, paid for once: measure tilt at FIRST IMPACT (first arrest of a downward
+# vz), NOT at the is_on_ground flag. is_on_ground needs WHEEL contact, so a car landing on
+# its roof or side does not set it until it has already flopped upright -- scoring that way
+# reports every landing as flat and hides exactly the behaviour under test.
 
 SEG wavedash_forward 200
-STATE 0 -1200 200  0 1.5708 0   0 1300 -150   0 0 0   100
-ACT 0    1 0 0 0 0  0 0 0
-ACT 10   1 0 0 0 0  1 0 0        # jump
-ACT 16   1 0 0 0 0  0 0 0        # release
-ACT 26   1 0 -1 0 0  1 0 0       # dodge forward into the ground
-ACT 32   1 0 -1 0 0  0 0 0
+STATE 0 -1200 17  0 1.5708 0   0 1300 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 18   1 0 -1 0 0  1 0 0       # sweep max for a forward dodge (tilt 8d, land ~156)
+ACT 22   1 0 0 0 0  0 0 0
 
-SEG flip_at_contact 200
-STATE 0 -1200 120  0 1.5708 0   0 1300 -700   0 0 0   100
-ACT 0    1 0 0 0 0  0 0 0
-ACT 4    1 0 0 0 0  1 0 0
-ACT 9    1 0 0 0 0  0 0 0
-ACT 12   1 0 -1 0 0  1 0 0       # dodge timed to fire at touchdown
-ACT 18   1 0 -1 0 0  0 0 0
+SEG flip_land_early 200
+STATE 0 -1200 17  0 1.5708 0   0 1200 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 16   1 0 -1 0 0  1 0 0
+ACT 20   1 0 0 0 0  0 0 0
 
-SEG flip_just_before_land 200
-STATE 0 -1200 320  0 1.5708 0   0 1200 -400   0 0 0   100
-ACT 0    1 0 0 0 0  0 0 0
-ACT 4    1 0 0 0 0  1 0 0
-ACT 9    1 0 0 0 0  0 0 0
-ACT 14   1 0 -1 0 0  1 0 0
-ACT 20   1 0 -1 0 0  0 0 0
+SEG flip_land_late 200
+STATE 0 -1200 17  0 1.5708 0   0 1200 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 58   1 0 -1 0 0  1 0 0       # dodge late in the flight instead
+ACT 62   1 0 0 0 0  0 0 0
 
-SEG sideflip_into_ground 200
-STATE 0 -1200 220  0 1.5708 0   0 1200 -200   0 0 0   100
-ACT 0    1 0 0 0 0  0 0 0
-ACT 8    1 0 0 0 0  1 0 0
-ACT 13   1 0 0 0 0  0 0 0
-ACT 20   1 0 0 -1 0  1 0 0       # side dodge into the ground
-ACT 26   1 0 0 -1 0  0 0 0
+SEG sideflip_land 200
+STATE 0 -1200 17  0 1.5708 0   0 1200 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 34   1 0 0 -1 0  1 0 0       # sweep max for a side dodge (tilt 13d)
+ACT 38   1 0 0 0 0  0 0 0
+
+SEG backflip_land 200
+STATE 0 -1200 17  0 1.5708 0   0 1000 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 32   1 0 1 0 0  1 0 0
+ACT 36   1 0 0 0 0  0 0 0
+
+SEG diagflip_land 200
+STATE 0 -1200 17  0 1.5708 0   0 1200 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 24   1 0 -0.7 -0.7 0  1 0 0  # sweep max for a diagonal dodge (tilt 13d)
+ACT 28   1 0 0 0 0  0 0 0
 
 SEG land_during_flip_rotation 220
-STATE 0 -1200 500  0 1.5708 0   0 1100 -300   0 0 0   100
-ACT 0    1 0 0 0 0  0 0 0
-ACT 4    1 0 0 0 0  1 0 0
-ACT 9    1 0 0 0 0  0 0 0
-ACT 12   1 0 -1 0 0  1 0 0       # dodge high, land mid-rotation
-ACT 18   1 0 -1 0 0  0 0 0
+STATE 0 -1200 17  0 1.5708 0   0 1100 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 1    1 0 0 0 0  0 0 0
+ACT 24   1 0 -1 0 0  1 0 0
+ACT 28   1 0 0 0 1  0 0 0        # air-roll through the descent -> lands off-axis
+
+# --------------------------------------------- TILTED LANDINGS (spawned, no dodge needed)
+# A dodge cannot produce a mid-rotation landing (see above), so these set the attitude
+# directly and drop the car. This is the family that actually tests landing response:
+# suspension compression, the auto-right torque, and whether a wheel/nose/roof contact
+# resolves the same way in both venues. No jump is used, so nothing here can silently no-op.
+
+SEG land_nose_down 180
+STATE 0 -1200 300  -0.9 1.5708 0   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_nose_up 180
+STATE 0 -1200 300  0.9 1.5708 0   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_roll_left 180
+STATE 0 -1200 300  0 1.5708 -1.0   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_roll_right 180
+STATE 0 -1200 300  0 1.5708 1.0   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_on_side 180
+STATE 0 -1200 300  0 1.5708 1.5708   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_inverted 200
+STATE 0 -1200 320  0 1.5708 3.1416   0 800 -800   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_corner_first 180
+STATE 0 -1200 300  -0.7 1.5708 0.8   0 900 -900   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_spinning 220
+STATE 0 -1200 400  0 1.5708 0   0 900 -700   0 4 2   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_tilted_with_airroll 200
+STATE 0 -1200 350  -0.6 1.5708 0.6   0 900 -800   0 0 0   100
+ACT 0   0 0 0 0 1  0 0 0        # fighting it with air roll on the way down
 
 # ---------------------------------------------------------------- FLIPS (free air)
 
@@ -199,4 +268,62 @@ ACT 0   1 0 0 0 0  0 0 0
 
 SEG wall_land 200
 STATE 3600 0 700  0 1.5708 -1.5708   700 400 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+# ---------------------------------------------------------------- CURVED CORNERS
+# Where the side wall curves into the floor/ceiling. Arena is x +-4096, y +-5120, and the
+# corner meshes are the only curved geometry -- a landing there resolves against a sloped
+# triangle mesh rather than a flat plane, which is a different contact path entirely.
+
+SEG corner_drive_up 240
+STATE 3000 3400 30  0 0.7854 0   700 700 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0
+
+SEG corner_land_shallow 200
+STATE 3200 3600 400  0 0.7854 0   400 400 -300   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG corner_land_steep 200
+STATE 3500 3900 600  -0.6 0.7854 0   200 200 -700   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG corner_flip_into 200
+STATE 3200 3600 200  0 0.7854 0   600 600 -200   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 2    1 0 0 0 0  1 0 0
+ACT 8    1 0 0 0 0  0 0 0
+ACT 12   1 0 -1 0 0  1 0 0       # dodge into the curved corner
+ACT 18   1 0 -1 0 0  0 0 0
+
+SEG ceiling_corner 240
+STATE 3600 0 1400  0 1.5708 -1.5708   0 1200 600   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0
+
+# ---------------------------------------------------------------- GOAL / POSTS
+# Goal mouth: y = +-5120, half width 892.755, height 642.775, depth 880.
+# The posts and crossbar are thin colliders and the net interior is a separate volume --
+# all geometry a match-play policy hits constantly and none of it exercised above.
+
+SEG goalpost_glance 200
+STATE 700 3600 17  0 1.5708 0   0 1500 0   0 0 0   100
+ACT 0   1 0.25 0 0 0  0 1 0      # angle into the post
+
+SEG crossbar_land 200
+STATE 0 5000 800  0 1.5708 0   0 300 -400   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG into_net 220
+STATE 0 4200 17  0 1.5708 0   0 1600 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0         # drive into the net and hit the back wall
+
+SEG net_flip_out 220
+STATE 0 5600 17  0 -1.5708 0   0 -1200 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 6    1 0 0 0 0  1 0 0
+ACT 12   1 0 0 0 0  0 0 0
+ACT 18   1 0 -1 0 0  1 0 0       # flip out of the net over the goal line
+ACT 24   1 0 -1 0 0  0 0 0
+
+SEG backwall_land 200
+STATE 0 4600 700  0 1.5708 0   0 900 -300   0 0 0   100
 ACT 0   1 0 0 0 0  0 0 0
