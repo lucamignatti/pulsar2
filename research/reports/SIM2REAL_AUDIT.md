@@ -1622,3 +1622,58 @@ correct, so this is not a mirrored-basis artefact.
 Rejected this session, with evidence: post-integration velocity clamp (total 1729.7 ->
 2269.9, transition_curve_dash 107 -> 684); `do_air_control` in the dodge-cancel branch
 (583.3 -> 585.8, no effect); HIT_WORLD restitution 0.0 and 0.15 (both worse than 0.3).
+
+## §27 — Holdout validation: the fixes generalise (2026-08-02)
+
+The S24/S25 constants were chosen by sweeping against one capture, so they were refit-risk.
+A second independent capture of the same 80 segments settles it.
+
+| | fit capture | holdout capture |
+|---|---|---|
+| total | 1137.6 | **1187.6** |
+| median | 5.69 | **5.96** |
+| < 15 uu | 58/80 | 59/80 |
+| < 10 uu | 51/80 | 50/80 |
+| < 5 uu | 35/80 | 34/80 |
+
+Every segment the fixes targeted is stable to ~1 uu across the two captures:
+
+    speed_flip      15.81 -> 15.51      no_jump_control            12.53 -> 12.20
+    half_flip        6.20 ->  6.16      transition_supersonic_into 34.04 -> 35.01
+    stall            2.33 ->  2.31      corner_land_steep          26.68 -> 27.55
+    dodge_forward    9.56 ->  9.74      flip_into_wall             16.54 -> 16.54
+    wavedash_forward 5.25 ->  5.17      corner_drive_up            33.35 -> 34.41
+
+NOT overfit. `jump::MIN_TIME` for the dodge lockout and `>= 3` wheels for the friction gate
+were both already-existing constants that the sweep happened to land on, which is the
+reason to trust them over a fitted value.
+
+### 27.1 The real game's own repeatability, capture vs capture
+
+Total 94.9 uu, median **0.00** -- deterministic almost everywhere. The exceptions are the
+whole story of the fit->holdout drift:
+
+| segment | real-vs-real | sim error fit -> holdout |
+|---|---|---|
+| `transition_flip_into` | **63.1** | 38.5 -> 72.3 |
+| `jump_after_wall_launch` | 17.1 | 109.8 -> 117.5 |
+| `dodge_backward` | 10.6 | 4.1 -> 11.0 |
+
+All three of the largest fit->holdout moves are the three least repeatable segments. The
+drift is real-game variance, not refit.
+
+**RETRACT `transition_flip_into` as a finding, for the second time.** Its real-vs-real noise
+(63.1 uu) exceeds its sim error, exactly as in S22.1. Quote per-segment real-vs-real
+alongside any number from the flip/fillet family before treating it as signal.
+
+### 27.2 Where the sim stands
+
+Median 5.96 uu against a ~0 uu noise floor, 59/80 segments inside 15 uu. Flat-surface
+driving, coasting, braking, air control, boost, boost pads, jumps, dodges, dodge cancels,
+half flips, wavedashes, ceiling driving and free-fall landings are all at or near the floor.
+
+What is left is one family -- the car detaching from a wall or the fillet after a flip
+(`transition_flip_off` 183.4, `jump_after_wall_launch` 117.5) -- plus the irreducible
+symmetric-tilted-landing chaos of 26.1. Progress on the first needs RL's wheel/suspension
+physics from `Vehicle_TA`; there are no `Sticky*` symbols in the binary, so RocketSim's
+sticky force is a modelling construct with no directly comparable ground truth.
