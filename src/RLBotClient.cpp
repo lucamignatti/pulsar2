@@ -24,6 +24,9 @@ RLBotBot::RLBotBot(std::unordered_set<unsigned> indices, unsigned team, std::str
 
 RLBotBot::~RLBotBot() noexcept = default;
 
+// GGL_SCRIPT=<file> switches this bot from policy inference to scripted maneuver replay.
+static std::vector<ScriptSeg> LoadScript(const std::string& path);
+
 // ---- flat -> RLGymCPP conversions (v5 schema) -------------------------------
 
 static Vec ToVec(const rlbot::flat::Vector3& v) {
@@ -126,11 +129,20 @@ static Player ToPlayer(const rlbot::flat::PlayerInfo* p) {
 // identity assumption misattributed state/timers across the whole midfield cluster.
 // Match by position from FieldInfo once, at initialize().
 
+void RLBotBot::LoadScriptIfRequested() {
+	if (const char* sp = std::getenv("GGL_SCRIPT")) {
+		script = LoadScript(sp);
+		RG_LOG("GGL_SCRIPT: scripted maneuver mode, " << script.size()
+			<< " segments from \"" << sp << "\" (policy bypassed)");
+	}
+}
+
 void RLBotBot::initialize(
 	rlbot::flat::ControllableTeamInfo const* controllableTeamInfo,
 	rlbot::flat::FieldInfo const* fieldInfo,
 	rlbot::flat::MatchConfiguration const* matchConfiguration) noexcept {
 	rlbot::Bot::initialize(controllableTeamInfo, fieldInfo, matchConfiguration);
+	LoadScriptIfRequested();
 
 	padMap.clear();
 
@@ -362,6 +374,149 @@ static std::string MaskToHex(const std::vector<uint8_t>& mask) {
 
 // ---- per-tick control -------------------------------------------------------
 
+
+// ================= scripted maneuver mode =========================================
+// See RLBotClient.h. Ball is parked in a far corner to match the sim runner exactly --
+// the default kickoff ball sits at (0,0,93) with radius 91, i.e. its top is z~184, and
+// the drop segments would land on IT instead of the floor.
+static const float SCRIPT_BALL_PARK[3] = { -3500.0f, 4800.0f, 93.0f };
+
+static std::vector<ScriptSeg> LoadScript(const std::string& path) {
+	std::vector<ScriptSeg> segs;
+	std::ifstream f(path);
+	if (!f) { RG_LOG("GGL_SCRIPT: cannot open \"" << path << "\""); return segs; }
+	std::string line;
+	while (std::getline(f, line)) {
+		auto hash = line.find('#');
+		if (hash != std::string::npos) line = line.substr(0, hash);
+		std::istringstream ss(line);
+		std::string kw; if (!(ss >> kw)) continue;
+		if (kw == "SEG") { ScriptSeg sg; ss >> sg.name >> sg.dur; segs.push_back(sg); }
+		else if (kw == "STATE" && !segs.empty()) { for (int i = 0; i < 13; i++) ss >> segs.back().st[i]; }
+		else if (kw == "ACT" && !segs.empty()) {
+			ScriptAct a{}; float j, b, h;
+			ss >> a.at >> a.t >> a.s >> a.p >> a.y >> a.r >> j >> b >> h;
+			a.jump = j > 0.5f; a.boost = b > 0.5f; a.hb = h > 0.5f;
+			segs.back().acts.push_back(a);
+		}
+	}
+	return segs;
+}
+
+void RLBotBot::SendSegmentState(const ScriptSeg& sg, unsigned index) {
+	auto mkv = [](float x, float y, float z) {
+		auto v = std::make_unique<rlbot::flat::Vector3PartialT>();
+		v->x = std::make_unique<rlbot::flat::Float>(x);
+		v->y = std::make_unique<rlbot::flat::Float>(y);
+		v->z = std::make_unique<rlbot::flat::Float>(z);
+		return v;
+	};
+	rlbot::flat::DesiredGameStateT state;
+
+	auto carState = std::make_unique<rlbot::flat::DesiredCarStateT>();
+	carState->physics = std::make_unique<rlbot::flat::DesiredPhysicsT>();
+	carState->physics->location = mkv(sg.st[0], sg.st[1], sg.st[2]);
+	carState->physics->velocity = mkv(sg.st[6], sg.st[7], sg.st[8]);
+	carState->physics->angular_velocity = mkv(sg.st[9], sg.st[10], sg.st[11]);
+	auto rot = std::make_unique<rlbot::flat::RotatorPartialT>();
+	rot->pitch = std::make_unique<rlbot::flat::Float>(sg.st[3]);
+	rot->yaw   = std::make_unique<rlbot::flat::Float>(sg.st[4]);
+	rot->roll  = std::make_unique<rlbot::flat::Float>(sg.st[5]);
+	carState->physics->rotation = std::move(rot);
+	carState->boost_amount = std::make_unique<rlbot::flat::Float>(sg.st[12]);
+	// cars are indexed by slot; fill up to ours so ours lands in the right position
+	for (unsigned i = 0; i < index; i++)
+		state.car_states.emplace_back(std::make_unique<rlbot::flat::DesiredCarStateT>());
+	state.car_states.emplace_back(std::move(carState));
+
+	auto ballState = std::make_unique<rlbot::flat::DesiredBallStateT>();
+	ballState->physics = std::make_unique<rlbot::flat::DesiredPhysicsT>();
+	ballState->physics->location = mkv(SCRIPT_BALL_PARK[0], SCRIPT_BALL_PARK[1], SCRIPT_BALL_PARK[2]);
+	ballState->physics->velocity = mkv(0, 0, 0);
+	ballState->physics->angular_velocity = mkv(0, 0, 0);
+	state.ball_states.emplace_back(std::move(ballState));
+
+	sendDesiredGameState(std::move(state));
+}
+
+void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index, int ticksElapsed) {
+	auto players = packet->players();
+	if (!players || index >= players->size()) { setOutput(index, {}); return; }
+	auto p = players->Get(index);
+	auto ph = p->physics();
+	if (!ph) { setOutput(index, {}); return; }
+
+	if (scriptSeg < 0) {  // first packet: open the log and start segment 0
+		std::string out = std::getenv("GGL_SCRIPT_OUT") ? std::getenv("GGL_SCRIPT_OUT")
+		                                                : "real_maneuvers.tsv";
+		scriptLog.open(out, std::ios::trunc);
+		scriptLog << "seg\ttick\tx\ty\tz\tvx\tvy\tvz\tfx\tfy\tfz\tux\tuy\tuz\tavx\tavy\tavz\tground\tboost\n";
+		RG_LOG("GGL_SCRIPT: " << script.size() << " segments -> " << out);
+		scriptSeg = 0; scriptStateSent = false; scriptSettle = 0; scriptTick = 0;
+	}
+	if (scriptSeg >= (int)script.size()) { setOutput(index, {}); return; }
+	const ScriptSeg& sg = script[scriptSeg];
+
+	// --- phase 1: state set, then wait until the game reports we are actually there
+	if (!scriptStateSent) {
+		SendSegmentState(sg, index);
+		scriptStateSent = true; scriptSettle = 0;
+		setOutput(index, {});
+		return;
+	}
+	if (scriptTick == 0) {
+		float dx = ph->location().x() - sg.st[0];
+		float dy = ph->location().y() - sg.st[1];
+		float dz = ph->location().z() - sg.st[2];
+		bool there = (dx*dx + dy*dy + dz*dz) < 25.0f * 25.0f;
+		scriptSettle++;
+		if (!there) {
+			if (scriptSettle > 40) {  // state set refused/ignored -- do not log garbage
+				RG_LOG("GGL_SCRIPT: segment \"" << sg.name << "\" state set did not take ("
+					<< dx << "," << dy << "," << dz << "); skipping");
+				scriptSeg++; scriptStateSent = false; scriptTick = 0;
+			} else if (scriptSettle % 8 == 0) {
+				SendSegmentState(sg, index);  // retry
+			}
+			setOutput(index, {});
+			return;
+		}
+	}
+
+	// --- phase 2: play the scripted controls and log
+	ScriptAct cur{}; cur.at = -1;
+	for (const auto& a : sg.acts) if (a.at <= scriptTick && a.at > cur.at) cur = a;
+	if (cur.at >= 0)
+		setOutput(index, { cur.t, cur.s, cur.p, cur.y, cur.r,
+		                   cur.jump, cur.boost, cur.hb, false /* use_item */ });
+	else
+		setOutput(index, {});
+
+	Angle ang(ph->rotation().yaw(), ph->rotation().pitch(), ph->rotation().roll());
+	RotMat m = ang.ToRotMat();
+	Vec fwd = m.forward, up = m.up;
+	scriptLog << sg.name << '\t' << scriptTick << '\t'
+		<< ph->location().x() << '\t' << ph->location().y() << '\t' << ph->location().z() << '\t'
+		<< ph->velocity().x() << '\t' << ph->velocity().y() << '\t' << ph->velocity().z() << '\t'
+		<< fwd.x << '\t' << fwd.y << '\t' << fwd.z << '\t'
+		<< up.x << '\t' << up.y << '\t' << up.z << '\t'
+		<< ph->angular_velocity().x() << '\t' << ph->angular_velocity().y() << '\t'
+		<< ph->angular_velocity().z() << '\t'
+		<< (p->air_state() == rlbot::flat::AirState::OnGround ? 1 : 0)
+		<< '\t' << p->boost() << '\n';
+
+	scriptTick += ticksElapsed > 0 ? ticksElapsed : 1;
+	if (scriptTick >= sg.dur) {
+		RG_LOG("GGL_SCRIPT: segment " << (scriptSeg + 1) << "/" << script.size()
+			<< " \"" << sg.name << "\" done");
+		scriptSeg++; scriptStateSent = false; scriptTick = 0;
+		if (scriptSeg >= (int)script.size()) {
+			scriptLog.flush();
+			RG_LOG("GGL_SCRIPT: ALL SEGMENTS COMPLETE -- you can stop the match");
+		}
+	}
+}
+
 void RLBotBot::update(
 	rlbot::flat::GamePacket const* packet,
 	rlbot::flat::BallPrediction const* ballPrediction) noexcept {
@@ -380,6 +535,8 @@ void RLBotBot::update(
 	GameState gs = ToGameState(packet, padMap);
 
 	for (unsigned index : this->indices) {
+		if (!script.empty()) { RunScripted(packet, index, ticksElapsed); continue; }
+
 		// Default-constructs the ctx (updateAction = true, ticks = -1) on first sight.
 		CarCtx& ctx = ctxByIndex[index];
 

@@ -1,0 +1,202 @@
+# Scripted sim-vs-real maneuver test.
+#
+# WHY: match-play comparison can only measure what the policy happens to do, and it can
+# never repeat a situation. This runs a FIXED action sequence from a FIXED state in both
+# venues, so any divergence is pure physics. Segments are independent (each begins with a
+# state set), so errors cannot compound across maneuvers and each is scored on its own.
+#
+# FORMAT (whitespace-separated, '#' comments):
+#   SEG   <name> <duration_ticks>
+#   STATE <x> <y> <z> <pitch> <yaw> <roll> <vx> <vy> <vz> <avx> <avy> <avz> <boost>
+#           position/velocity in uu, rotation in RADIANS (RLBot rotator), angvel in rad/s
+#   ACT   <at_tick> <throttle> <steer> <pitch> <yaw> <roll> <jump> <boost> <handbrake>
+#           applies from that tick until the next ACT in the segment
+#
+# Tick 0 is AFTER the state set has been confirmed applied, so both venues start identical.
+# 120 ticks = 1 second.
+#
+# Ground rest height is z=17. Segments stay near midfield unless testing walls.
+
+# ---------------------------------------------------------------- LANDINGS
+# The reported problem area. Vary approach speed, attitude and contact geometry.
+
+SEG land_flat_drop 150
+STATE 0 0 300  0 0 0        0 0 0        0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_fast_drop 150
+STATE 0 0 900  0 0 0        0 0 -900     0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_nose_down 150
+STATE 0 0 320  -0.45 0 0    0 0 0        0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_nose_up 150
+STATE 0 0 320  0.45 0 0     0 0 0        0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_rolled 150
+STATE 0 0 320  0 0 0.9      0 0 0        0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_inverted 220
+STATE 0 0 320  0 0 3.14159  0 0 0        0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG land_moving_fast 160
+STATE 0 -1500 300  0 1.5708 0   0 1400 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG land_spinning 180
+STATE 0 0 400  0 0 0        0 0 0        0 0 3.5  100
+ACT 0   0 0 0 0 0  0 0 0
+
+# ------------------------------------------------- FLIPS INTERACTING WITH THE GROUND
+# The specific case called out: dodging into / during a landing.
+
+SEG wavedash_forward 200
+STATE 0 -1200 200  0 1.5708 0   0 1300 -150   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 10   1 0 0 0 0  1 0 0        # jump
+ACT 16   1 0 0 0 0  0 0 0        # release
+ACT 26   1 0 -1 0 0  1 0 0       # dodge forward into the ground
+ACT 32   1 0 -1 0 0  0 0 0
+
+SEG flip_at_contact 200
+STATE 0 -1200 120  0 1.5708 0   0 1300 -700   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 4    1 0 0 0 0  1 0 0
+ACT 9    1 0 0 0 0  0 0 0
+ACT 12   1 0 -1 0 0  1 0 0       # dodge timed to fire at touchdown
+ACT 18   1 0 -1 0 0  0 0 0
+
+SEG flip_just_before_land 200
+STATE 0 -1200 320  0 1.5708 0   0 1200 -400   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 4    1 0 0 0 0  1 0 0
+ACT 9    1 0 0 0 0  0 0 0
+ACT 14   1 0 -1 0 0  1 0 0
+ACT 20   1 0 -1 0 0  0 0 0
+
+SEG sideflip_into_ground 200
+STATE 0 -1200 220  0 1.5708 0   0 1200 -200   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 8    1 0 0 0 0  1 0 0
+ACT 13   1 0 0 0 0  0 0 0
+ACT 20   1 0 0 -1 0  1 0 0       # side dodge into the ground
+ACT 26   1 0 0 -1 0  0 0 0
+
+SEG land_during_flip_rotation 220
+STATE 0 -1200 500  0 1.5708 0   0 1100 -300   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 4    1 0 0 0 0  1 0 0
+ACT 9    1 0 0 0 0  0 0 0
+ACT 12   1 0 -1 0 0  1 0 0       # dodge high, land mid-rotation
+ACT 18   1 0 -1 0 0  0 0 0
+
+# ---------------------------------------------------------------- FLIPS (free air)
+
+SEG dodge_forward 140
+STATE 0 0 17  0 1.5708 0    0 900 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 6    1 0 0 0 0  0 0 0
+ACT 12   1 0 -1 0 0  1 0 0
+ACT 18   1 0 -1 0 0  0 0 0
+
+SEG dodge_backward 140
+STATE 0 0 17  0 1.5708 0    0 900 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 6    1 0 0 0 0  0 0 0
+ACT 12   1 0 1 0 0  1 0 0
+ACT 18   1 0 1 0 0  0 0 0
+
+SEG dodge_side 140
+STATE 0 0 17  0 1.5708 0    0 900 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 6    1 0 0 0 0  0 0 0
+ACT 12   1 0 0 -1 0  1 0 0
+ACT 18   1 0 0 -1 0  0 0 0
+
+SEG dodge_diagonal 140
+STATE 0 0 17  0 1.5708 0    0 900 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 6    1 0 0 0 0  0 0 0
+ACT 12   1 0 -0.7 -0.7 0  1 0 0
+ACT 18   1 0 -0.7 -0.7 0  0 0 0
+
+SEG dodge_then_cancel 140
+STATE 0 0 17  0 1.5708 0    0 900 0   0 0 0   100
+ACT 0    1 0 0 0 0  1 0 0
+ACT 6    1 0 0 0 0  0 0 0
+ACT 12   1 0 -1 0 0  1 0 0
+ACT 18   1 0 1 0 0  0 0 0        # immediately reverse pitch (cancel attempt)
+
+SEG double_jump 140
+STATE 0 0 17  0 1.5708 0    0 700 0   0 0 0   100
+ACT 0    0 0 0 0 0  1 0 0
+ACT 8    0 0 0 0 0  0 0 0
+ACT 20   0 0 0 0 0  1 0 0        # no directional input -> double jump, not a dodge
+ACT 26   0 0 0 0 0  0 0 0
+
+# ---------------------------------------------------------------- GROUND DRIVING
+
+SEG drive_throttle 200
+STATE 0 -2000 17  0 1.5708 0   0 0 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG drive_boost 200
+STATE 0 -2000 17  0 1.5708 0   0 0 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0
+
+SEG coast_decel 220
+STATE 0 -2000 17  0 1.5708 0   0 1400 0   0 0 0   100
+ACT 0   0 0 0 0 0  0 0 0
+
+SEG brake_hard 180
+STATE 0 -2000 17  0 1.5708 0   0 1400 0   0 0 0   100
+ACT 0   -1 0 0 0 0  0 0 0
+
+SEG steer_full 200
+STATE 0 -1000 17  0 1.5708 0   0 1100 0   0 0 0   100
+ACT 0   1 1 0 0 0  0 0 0
+
+SEG handbrake_turn 200
+STATE 0 -1000 17  0 1.5708 0   0 1100 0   0 0 0   100
+ACT 0   1 1 0 0 0  0 0 1
+
+SEG supersonic_run 240
+STATE 0 -3000 17  0 1.5708 0   0 2200 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0
+
+# ---------------------------------------------------------------- AIR CONTROL
+
+SEG air_roll 160
+STATE 0 0 800  0 1.5708 0   0 500 0   0 0 0   100
+ACT 0   0 0 0 0 1  0 0 0
+
+SEG air_pitch 160
+STATE 0 0 800  0 1.5708 0   0 500 0   0 0 0   100
+ACT 0   0 0 1 0 0  0 0 0
+
+SEG air_yaw 160
+STATE 0 0 800  0 1.5708 0   0 500 0   0 0 0   100
+ACT 0   0 0 0 1 0  0 0 0
+
+SEG aerial_boost 220
+STATE 0 -1000 500  0.6 1.5708 0   0 600 300   0 0 0   100
+ACT 0   1 0 0 0 0  0 1 0
+
+SEG air_throttle_no_boost 200
+STATE 0 -1000 700  0 1.5708 0   0 800 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+# ---------------------------------------------------------------- WALLS
+
+SEG wall_drive 220
+STATE 3900 0 600  0 1.5708 -1.5708   0 900 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0
+
+SEG wall_land 200
+STATE 3600 0 700  0 1.5708 -1.5708   700 400 0   0 0 0   100
+ACT 0   1 0 0 0 0  0 0 0

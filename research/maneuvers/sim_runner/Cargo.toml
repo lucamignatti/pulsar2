@@ -1,0 +1,7 @@
+[package]
+name = "sim_runner"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+rocketsim = { path = "../../../GigaLearnCPP/RLGymCPP/RocketSimV3/rocketsim" }
+glam = "0.33"

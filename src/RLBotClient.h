@@ -14,6 +14,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <string>
 
 struct RLBotParams {
@@ -27,10 +28,29 @@ struct RLBotParams {
 // InferUnit/config is handed to spawned bots through this global.
 extern RLBotParams g_RLBotParams;
 
+// ---- scripted maneuver mode (GGL_SCRIPT=<file>) -----------------------------------
+// Replays research/maneuvers/maneuvers.txt in the REAL game: state-sets the car at the
+// start of each segment, applies the scripted controls by tick, and logs per-packet state
+// in the same TSV the sim runner emits. The policy is bypassed entirely, so sim and game
+// see identical inputs from identical states and any divergence is pure physics.
+struct ScriptAct { int at; float t, s, p, y, r; bool jump, boost, hb; };
+struct ScriptSeg { std::string name; int dur; float st[13]; std::vector<ScriptAct> acts; };
+
 class RLBotBot final : public rlbot::Bot {
 public:
 	RLBotBot(std::unordered_set<unsigned> indices, unsigned team, std::string name) noexcept;
 	~RLBotBot() noexcept override;
+
+	// --- scripted mode state ---
+	std::vector<ScriptSeg> script;      // empty => normal policy mode
+	int scriptSeg = -1;                 // current segment (-1 = not started)
+	int scriptTick = 0;                 // ticks since this segment's state set landed
+	int scriptSettle = 0;               // packets spent waiting for the state set to apply
+	bool scriptStateSent = false;
+	std::ofstream scriptLog;
+	void LoadScriptIfRequested();
+	void RunScripted(rlbot::flat::GamePacket const* packet, unsigned index, int ticksElapsed);
+	void SendSegmentState(const ScriptSeg& seg, unsigned index);
 
 	// Called once with FieldInfo (valid for the bot's lifetime): builds the boost pad
 	// index map below.
