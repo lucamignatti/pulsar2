@@ -867,6 +867,15 @@ impl Car {
 
         // TODO: Refactor and move
         let num_wheels_in_contact = self.state.num_wheels_in_contact();
+        // Tell the contact layer the wheels are carrying the car this tick, so chassis
+        // friction against world geometry is suppressed (see arena_contact_tracker.rs).
+        //
+        // >= 3 is RocketSim's own "on the ground" threshold (see update_wheels), and the
+        // capture agrees: >=1 and >=2 also fix the fillet but wrongly suppress friction
+        // for tilted landings, which touch one or two wheels AND the shell
+        // (tilt_nose_down 12.0 -> 63.9 uu, tilt_roll_right 6.5 -> 55.4 uu). >=3 fixes the
+        // fillet with those intact; >=4 is marginally worse overall.
+        rb.wheels_grounded = num_wheels_in_contact >= 3;
 
         self.update_wheels(rb, num_wheels_in_contact, forward_speed_uu);
 

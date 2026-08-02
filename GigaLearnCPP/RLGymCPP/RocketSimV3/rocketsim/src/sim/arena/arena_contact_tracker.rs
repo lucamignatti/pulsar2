@@ -76,6 +76,21 @@ impl ContactAddedCallback for ArenaContactTracker {
             let hit_coefs = match user_idx_b {
                 UserInfoTypes::Ball => consts::car::HIT_BALL_COEFS,
                 UserInfoTypes::Car => consts::car::HIT_CAR_COEFS,
+                // CHASSIS-vs-world friction is suppressed while the wheels carry the car.
+                //
+                // The floor/wall fillet is CONCAVE, so a long box hitbox digs into it and
+                // the chassis scrapes even though the car is driving normally on its
+                // wheels. Measured against the real capture: the sim bled ~257 uu/s
+                // crossing the fillet at supersonic that the real game does not, and the
+                // deficit then stayed pinned at exactly -248.8 uu/s forever after -- i.e.
+                // a one-off energy loss in the curve, not a force error (boost, gravity
+                // and drive all track afterwards).
+                //
+                // Zeroing this friction outright fixed the whole fillet cluster but
+                // wrecked every tilted-landing segment (tilt_inverted 3.4 -> 171.2 uu),
+                // because a car sliding on its shell genuinely needs it. Gating on wheel
+                // contact separates the two cases. See SIM2REAL_AUDIT.md S25.
+                _ if body_a.wheels_grounded => consts::car::HIT_WORLD_WHEELS_DOWN_COEFS,
                 _ => consts::car::HIT_WORLD_COEFS,
             };
             manifold_point.combined_friction = hit_coefs.friction;

@@ -92,6 +92,13 @@ pub mod car {
         restitution: 0.3,
     };
 
+    /// Chassis-vs-world contact while the wheels are carrying the car. Value swept against
+    /// the real capture; see SIM2REAL_AUDIT.md S25.
+    pub const HIT_WORLD_WHEELS_DOWN_COEFS: PhysicsCoefs = PhysicsCoefs {
+        friction: 0.0,
+        restitution: 0.3,
+    };
+
     pub const HIT_CAR_COEFS: PhysicsCoefs = PhysicsCoefs {
         friction: 0.09,
         restitution: 0.1,

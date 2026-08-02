@@ -141,6 +141,11 @@ pub struct RigidBody {
     pub companion_id: Option<usize>,
     /// The index of this object in `CollisionWorld`
     pub world_array_idx: usize,
+    /// Set each tick for cars: are any wheels carrying load this tick?
+    ///
+    /// Used to suppress CHASSIS-vs-world friction while the car is riding on its wheels.
+    /// See arena_contact_tracker.rs and SIM2REAL_AUDIT.md S25.
+    pub wheels_grounded: bool,
     pub deactivation_time: f32,
     pub friction: f32,
     pub restitution: f32,
@@ -200,6 +205,7 @@ impl RigidBody {
             collision_flags,
             companion_id: None,
             world_array_idx: 0,
+            wheels_grounded: false,
             activation: ActivationState::Active,
             deactivation_time: 0.0,
             friction: info.friction,
