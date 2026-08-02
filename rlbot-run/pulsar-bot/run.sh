@@ -18,6 +18,12 @@ fi
 # Capture each car's stdout+stderr + exit code to bot.<pid>.log (one file per Pulsar2 car,
 # so 2v2/3v3 instances don't clobber each other). Segfault leaves exit 139; an uncaught
 # C++ exception leaves its what() text here.
+# Decision rate travels with the staged checkpoint (written by play.sh's sync_checkpoint).
+# Without this the bot silently runs at its 15 Hz default on a 120 Hz (ts1) policy.
+if [ -z "$GGL_TICK_SKIP" ] && [ -f "$HERE/checkpoint/TICKSKIP" ]; then
+	export GGL_TICK_SKIP="$(cat "$HERE/checkpoint/TICKSKIP")"
+fi
+
 LOG="$HERE/bot.$$.log"
 "$REPO/build/GigaLearnRLBot" "$HERE/checkpoint" > "$LOG" 2>&1
 echo "=== GigaLearnRLBot exited with code $? ===" >> "$LOG"

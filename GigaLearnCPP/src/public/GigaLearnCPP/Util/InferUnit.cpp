@@ -3,6 +3,7 @@
 #include <GigaLearnCPP/Util/Models.h>
 #include <GigaLearnCPP/PPO/PPOLearner.h>
 
+#include <torch/script.h>
 #include <torch/cuda.h>
 #include <torch/mps.h>
 
@@ -112,4 +113,16 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 	}
 
 	return results;
+}
+
+std::vector<int> GGL::ReadLayerSizesFromModule(const std::string& ltPath, bool dropOutput) {
+	std::vector<int> sizes;
+	torch::jit::script::Module m = torch::jit::load(ltPath, torch::kCPU);
+	for (const auto& p : m.named_parameters()) {
+		if (p.value.dim() == 2)
+			sizes.push_back((int)p.value.size(0));
+	}
+	if (dropOutput && !sizes.empty())
+		sizes.pop_back();
+	return sizes;
 }

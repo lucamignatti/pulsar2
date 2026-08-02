@@ -10,10 +10,12 @@
 #include <RLGymCPP/ObsBuilders/AdvancedObsPadded.h>
 #include <RLGymCPP/ActionParsers/DefaultAction.h>
 #include <RLGymCPP/Gamestates/GameState.h>
+#include <GigaLearnCPP/Util/InferUnit.h>
 
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace RLGC;
 using namespace GGL;
@@ -31,6 +33,12 @@ static int ComputeObsSize(ObsBuilder* obs) {
 	Player b = {}; b.carId = 2; b.team = Team::ORANGE; b.index = 1;
 	gs.players = { a, b };
 	return (int)obs->BuildObs(gs.players[0], gs).size();
+}
+
+static std::string JoinSizes(const std::vector<int>& v) {
+	std::string s;
+	for (size_t i = 0; i < v.size(); i++) s += (i ? ", " : "") + std::to_string(v[i]);
+	return s;
 }
 
 static bool EnvFlag(const char* name) {
@@ -72,8 +80,24 @@ int main(int argc, char** argv) {
 	// mismatch here produces no error at all - only a bot that looks lobotomized.
 	bool addResiduals = true;
 
+	// Derived from the checkpoint's own weights (see ReadLayerSizesFromModule). The shared
+	// head has no output projection; the policy head's last 2-D weight IS its output layer,
+	// so drop it -- addOutputLayer re-adds it.
+	std::vector<int> sharedSizes, policySizes;
+	try {
+		sharedSizes = ReadLayerSizesFromModule(checkpoint + "/SHARED_HEAD.lt", false);
+		policySizes = ReadLayerSizesFromModule(checkpoint + "/POLICY.lt", true);
+	} catch (const std::exception& e) {
+		RG_ERR_CLOSE("Could not read layer sizes from checkpoint \"" << checkpoint
+			<< "\": " << e.what());
+	}
+	if (sharedSizes.empty() || policySizes.empty())
+		RG_ERR_CLOSE("Checkpoint \"" << checkpoint << "\" has no 2-D weights to size from");
+	RG_LOG("Architecture derived from checkpoint: trunk { " << JoinSizes(sharedSizes)
+		<< " }, policy { " << JoinSizes(policySizes) << " }");
+
 	PartialModelConfig sharedHeadConfig;
-	sharedHeadConfig.layerSizes = { 1152, 1152, 1152 };  // stem + 1 residual block
+	sharedHeadConfig.layerSizes = sharedSizes;
 	sharedHeadConfig.addResiduals = addResiduals;
 	sharedHeadConfig.activationType = ModelActivationType::LEAKY_RELU;
 	sharedHeadConfig.addLayerNorm = true;
@@ -83,7 +107,7 @@ int main(int argc, char** argv) {
 	sharedHeadConfig.addOutputLayer = false;
 
 	PartialModelConfig policyConfig;
-	policyConfig.layerSizes = { 768, 768, 768 };         // stem + 1 residual block
+	policyConfig.layerSizes = policySizes;
 	policyConfig.addResiduals = addResiduals;
 	policyConfig.activationType = ModelActivationType::LEAKY_RELU;
 	policyConfig.addLayerNorm = true;
@@ -100,9 +124,23 @@ int main(int argc, char** argv) {
 		sharedHeadConfig, policyConfig,
 		checkpoint, useGPU);
 
+	// tickSkip MUST match the lineage the checkpoint was trained at, and unlike the layer
+	// sizes a mismatch is SILENT: the bot simply decides at the wrong rate and plays badly
+	// with no error. 5.x lineages are ts8 (15 Hz); 6.0 is ts1 (120 Hz). It is not recorded
+	// in the checkpoint, so it is an explicit env knob and is always logged.
 	RLBotParams params = {};
-	params.tickSkip = 8;      // matches cfg.tickSkip in ExampleMain.cpp
-	params.actionDelay = 0;   // matches cfg.actionDelay (5.0v3: zero actuation latency)
+	params.tickSkip = 8;
+	if (const char* ts = std::getenv("GGL_TICK_SKIP")) {
+		int v = std::atoi(ts);
+		if (v >= 1 && v <= 120) params.tickSkip = v;
+		else RG_ERR_CLOSE("GGL_TICK_SKIP=\"" << ts << "\" is out of range (1..120)");
+	}
+	params.actionDelay = 0;   // 0 on every current lineage: the game's ~2-tick send->applied
+	                          // delay is cancelled by the ~2-tick staleness of the packet the
+	                          // policy acts on (SIM2REAL_AUDIT.md S4).
+	RG_LOG("Decision rate: tickSkip=" << params.tickSkip << " ("
+		<< (120.0 / params.tickSkip) << " Hz), actionDelay=" << params.actionDelay
+		<< "  [override with GGL_TICK_SKIP]");
 	params.inferUnit = inferUnit;
 
 	RLBotClient::Run(params);

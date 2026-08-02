@@ -3,6 +3,14 @@
 #include "ModelConfig.h"
 
 namespace GGL {
+	// Hidden-layer widths read straight out of a saved .lt module's 2-D (Linear) weights.
+	//
+	// The RLBot bot and the viz both used to hand-copy these from ExampleMain.cpp, which
+	// broke silently on every lineage that resized the net (1152/768 on 5.3, 896/640 on
+	// 6.0 ts1). The weights already carry the answer. Set dropOutput for a head whose last
+	// 2-D weight is its output projection (addOutputLayer re-adds it).
+	RG_IMEXPORT std::vector<int> ReadLayerSizesFromModule(const std::string& ltPath, bool dropOutput);
+
 	struct RG_IMEXPORT InferUnit {
 		int obsSize;
 		RLGC::ObsBuilder* obsBuilder;

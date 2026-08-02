@@ -118,8 +118,19 @@ trainer_active() {
 # checkpoints_6M -> _resid -> _5.1 -> _5.2 -> _5.3, and every rename has silently
 # broken something downstream (see the cold-start checklist). So a missing root is a
 # LOUD failure listing candidates, never a quiet fallback to a dead lineage.
+# tickSkip is NOT stored in a checkpoint, and unlike the layer sizes (which the bot now
+# derives from the weights) a mismatch is SILENT - the bot just decides at the wrong rate.
+# 5.x lineages are ts8 (15 Hz); 6.0 is ts1 (120 Hz). Derive it from the lineage folder and
+# stage it NEXT TO the checkpoint so the copy carries its own decision rate.
+tick_skip_for_root() {
+	case "$1" in
+		*checkpoints_6.0*) echo 1 ;;
+		*)                 echo 8 ;;
+	esac
+}
+
 sync_checkpoint() {
-	local root="${GGL_CKPT_ROOT:-../build/checkpoints_5.3}"
+	local root="${GGL_CKPT_ROOT:-../build/checkpoints_6.0}"
 	local dest="pulsar-bot/checkpoint"
 
 	if [ ! -d "$root" ]; then
@@ -129,6 +140,14 @@ sync_checkpoint() {
 		log "SYNC: set GGL_CKPT_ROOT=<dir> (the live lineage folder has changed 5x)."
 		return 1
 	fi
+
+	# Always (re)stamp the decision rate for this lineage, even on a nosync/no-op sync,
+	# so a stale marker from a previous lineage can never outlive its checkpoint.
+	local ts_for_root
+	ts_for_root="${GGL_TICK_SKIP:-$(tick_skip_for_root "$root")}"
+	mkdir -p "$dest" 2>/dev/null
+	echo "$ts_for_root" > "$dest/TICKSKIP"
+	log "SYNC: lineage '$root' -> tickSkip $ts_for_root ($(awk -v t="$ts_for_root" 'BEGIN{printf "%.0f", 120/t}') Hz)"
 
 	local have=""
 	[ -f "$dest/STEPS.txt" ] && have=$(cat "$dest/STEPS.txt" 2>/dev/null)
