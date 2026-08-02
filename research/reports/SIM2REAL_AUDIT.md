@@ -1979,3 +1979,36 @@ the source.
 
 Two independent efforts converged on the boost-pad pickup geometry (their #6, our earlier
 fix) from different directions. That is mild corroboration for both.
+
+## §33 — The static tree walk is BOUNDED by the binary (2026-08-02)
+
+S31 said node-level correspondence was easy and only the numeric leaves were blocked by the
+.upk packages. Walking it further found a harder, earlier blocker.
+
+**RocketLeague.exe carries no MSVC RTTI.** Searched for `.?AVCarComponent_Jump_TA@@` and the
+equivalent descriptor for DoubleJump, AirControl, FlipCar, Boost and Dodge -- none present.
+So class vtables cannot be located by the standard type-descriptor -> complete-object-locator
+-> vtable chain.
+
+That matters because UE3 reaches most component natives through SHARED exec thunks:
+`ACarComponent_DoubleJump_TAexecApplyForces`, `_Jump_TAexecApplyForces` and
+`_AirControl_TAexecApplyForces` all resolve to the SAME thunk
+(`ACarComponent_TA_execApplyForces__shared21` @140e78d80), which dispatches on a vtable slot
+(`+0x698` CanActivate, `+0x6a0` PrePhysicsStep, `+0x6b0`/`+0x6b8` dodge impulse). With no
+RTTI the concrete override cannot be identified statically.
+
+Recoverable only where a class-SPECIFIC thunk exists:
+
+| function | thunk | native |
+|---|---|---|
+| `Dodge_TA::ApplyTorqueForces` | 140e81650 | **140eb72b0, decompiled in full (S24)** |
+| `AirControl_TA::GetInputForRotationAxis` | 140e84250 | 140ef0fc0, decompiled (a rotate-toward-target helper, not the player air-control torque) |
+| `Boost_TA::IsBoostRestricted` | 140e7f4e0 | resolvable |
+
+So: **the static leaf-by-leaf diff cannot be completed on this binary.** It is not a matter of
+effort. Finishing it would need either a runtime vtable dump (attach and read the object's
+vptr) or the .upk/reflection route -- both larger undertakings than the behavioural route.
+
+**The behavioural route stands and is 91.4% done** (S31.3) with a finite named gap list. That
+remains the way to "verify every leaf": exercise each branch and diff against a real capture
+whose noise floor is median 0.00 uu.
