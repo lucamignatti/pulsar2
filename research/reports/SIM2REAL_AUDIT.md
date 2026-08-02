@@ -1677,3 +1677,63 @@ What is left is one family -- the car detaching from a wall or the fillet after 
 symmetric-tilted-landing chaos of 26.1. Progress on the first needs RL's wheel/suspension
 physics from `Vehicle_TA`; there are no `Sticky*` symbols in the binary, so RocketSim's
 sticky force is a modelling construct with no directly comparable ground truth.
+
+## §28 — RL has no sticky force: it is all suspension (2026-08-02)
+
+S26.2 claimed the wall-detach family had "no directly comparable ground truth" because the
+binary has no `Sticky*` symbols. That was the wrong search, not the wrong question -- the
+behaviour exists in the game, so the code exists under a different name.
+
+**Found it.** RL keeps a per-force name table at `0x141a4f8b0`, 40-byte records of the form
+`Impulse` / `<name>` / `AddForce`. There are exactly FOUR wheel forces:
+
+    141a4f8b8  WheelSuspension
+    141a4f8e0  WheelFriction
+    141a4f908  WheelDrive
+    141a4f930  WheelBrake
+
+There is no sticky/magnet/adhesion force anywhere. A car holds a wall in RL purely through
+`WheelSuspension` acting over its travel range. (Also confirmed present: a `Wheel_TA` class
+with `GetSuspensionDistance` / `GetSuspensionOffset` / `GetLocalWheelLocation`, and
+`Vehicle_TA::GetNumWheelContacts` / `GetWheelWorldContacts`. The `Suspension travel/spring/
+damper` strings at 1420403e1 are PhysX's `NpWheelShape`, not RL's own vehicle sim -- do not
+mistake them for RL parameters.)
+
+Locating the force code itself needs more than a name: the strings are inline char buffers
+inside a struct array, so there is no 8-byte pointer and no RIP-relative LEA to them (both
+searched, and a full 27 MB `.text` scan for the LEA found nothing).
+
+### 28.1 But RocketSim's sticky force cannot simply be deleted
+
+Removing it is strictly worse across the board (holdout total 1187.6 -> **1481.7**,
+transition_flip_off 183.4 -> 265.6, jump_after_wall_launch 117.5 -> 199.8), at every
+suspension travel from 12 to 32. So RocketSim's `StickyForce` is compensating for a real
+structural difference in how its Bullet raycast suspension behaves versus RL's
+`WheelSuspension`. It is an approximation that earns its place; it is not a stray hack.
+
+### 28.2 Suspension travel is coupled to ride height, so it cannot be tuned alone
+
+With the sticky force kept, sweeping `MAX_SUSPENSION_TRAVEL` (holdout totals):
+
+| travel | total | flip_off | jump_wall | drive_throttle | coast_decel |
+|---|---|---|---|---|---|
+| 12 (current) | 1187.6 | 183.4 | 117.5 | 7.4 | 4.0 |
+| 16 | 1176.7 | 181.2 | **27.9** | 8.4 | 5.6 |
+| 20 | 1200.9 | 167.1 | 26.4 | 10.9 | 8.9 |
+| 26 | 1485.3 | **59.2** | 73.4 | 15.9 | 14.6 |
+
+More travel buys wall re-attachment and pays for it in flat driving, because
+`Car::new` derives `suspension_rest_length = wheel_config.suspension_rest_length -
+MAX_SUSPENSION_TRAVEL`, so the same constant sets BOTH the ground-detection reach and the
+ride height. NOT ADOPTED: travel 16 is only 0.9% better overall, degrades the two
+best-validated segments in the whole script (drive_throttle, coast_decel), and is a fitted
+number with no counterpart in RL.
+
+### 28.3 The concrete next step
+
+Decouple the two roles: extend the wheel raycast's ground-detection length WITHOUT reducing
+`suspension_rest_length`, so a car can re-acquire a surface it has drifted ~17 uu from (the
+measured real re-attachment distance in transition_flip_off) while ride height and the
+flat-driving response stay exactly as they are. That is a change in the Bullet vehicle layer
+(`bullet/dynamics/vehicle.rs` wheel raycast), not a constant, and it should be swept against
+BOTH captures with drive_throttle/coast_decel as hard guards.
