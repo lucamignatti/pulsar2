@@ -1557,3 +1557,68 @@ counterpart in RocketSim's `rel_torque * (TORQUE_X, TORQUE_Y, 0) * TICK_TIME`.
 `no_jump_control` never presses jump, so its 139 uu is a clean measure of the fillet/wall
 launch divergence alone -- the jump_after_* pair cannot settle the has_jumped question until
 that is fixed, because the launch itself dominates.
+
+## §24-26 — Two physics fixes and two harness fixes (2026-08-02)
+
+Whole-script median position error, summed over 80 segments:
+
+| state | total | note |
+|---|---|---|
+| start of session | 1729.7 | |
+| + post-jump dodge lockout (S24) | — | speed_flip 583.3 -> 19.0 |
+| + wheel-gated chassis friction (S25) | 1322.5 | fillet cluster |
+| + harness offsets removed (S26) | **1137.6** | measurement only, not a physics change |
+
+Now: median **5.69 uu**, 58/80 under 15 uu, 51/80 under 10 uu, 35/80 under 5 uu.
+
+### S24 — post-jump dodge lockout
+
+RocketSim let a dodge fire as soon as `is_jumping` cleared (~3 ticks after a 1-tick jump
+tap). The real game refuses it there: `speed_flip` dodges 6 ticks after the jump and the
+real car does NOT dodge (roll rate flat at 0.00 rad/s while the sim reached 7.2), yet
+`wavedash_forward` dodges at 18 ticks and matches to 5.9 uu. Swept window [0.0167, 0.0333];
+`jump::MIN_TIME` = 0.025 sits dead centre. Gated on `has_jumped`, since
+`air_time_since_jump` is pinned at 0 for a car that never jumped and gating unconditionally
+re-imposes the block disproved in S23.
+
+### S25 — chassis friction while the wheels carry the car
+
+The fillet is CONCAVE, so a long box hitbox digs in and the chassis scrapes while the car
+drives normally. The sim bled ~257 uu/s crossing it at supersonic, after which the deficit
+stayed pinned at exactly -248.8 uu/s -- a one-off energy loss in the curve, not a force
+error. Suppressed when `num_wheels_in_contact >= 3` (RocketSim's own on-ground threshold);
+>=1/>=2 also fix the fillet but wrongly catch tilted landings, which touch one or two
+wheels AND the shell.
+
+### S26 — the metric was charging the sim for harness offsets
+
+(1) The sim runner stepped then logged, so every sim row was one tick ahead of the real
+runner, which logs the packet before setting controls -- 18.3 uu of offset per sample at
+supersonic. (2) The sim started exactly on the scripted state while the real car started
+wherever the state set landed (up to ~179 uu at 2200 uu/s). Runner now logs at the start of
+each tick and accepts a real capture as a 4th arg to seed each segment's t=0 state
+(orientation from the captured forward/up basis, not round-tripped Euler). Alignment scan
+minimum moved to shift 0, confirming the fix.
+
+### 26.1 KNOWN IRREDUCIBLE: symmetric tilted landings are chaotic
+
+`tilt_nose_down` (62.1 uu) and `transition_land_tilted` (62.1 uu) land almost perfectly --
+z and up.z match to three decimals -- then accumulate error purely from a LATERAL kick whose
+SIGN differs (sim vx +88 vs real -95). The setup is symmetric about x=0, so that kick is
+symmetry-breaking from contact ordering and its sign is arbitrary. `coast_decel` is exact
+(vy identical), so ground physics is sound. Not fixable by any constant; do not chase it.
+Seeding handedness was checked against `rot_from_euler` (identity and roll=180) and is
+correct, so this is not a mirrored-basis artefact.
+
+### 26.2 Still open, in priority order
+
+| segment | uu | what |
+|---|---|---|
+| `transition_flip_off` | 178.9 | after flipping off the wall the real car RE-ATTACHES and drives up it (x pinned 4079, z 400->739) while the sim detaches and accelerates away (vx -84 -> -330 with no thrust). Restitution swept and rejected (0.3 is optimal; 0.0 is worse overall). Suspect sticky-force / suspension raycast range. |
+| `jump_after_wall_launch` | 109.8 | same family |
+| `crossbar_land` | 37.3 | goal frame geometry |
+| `corner_drive_up` | 33.4 | big 1152uu corner, same class as the fillet but not fixed by the S25 gate |
+
+Rejected this session, with evidence: post-integration velocity clamp (total 1729.7 ->
+2269.9, transition_curve_dash 107 -> 684); `do_air_control` in the dodge-cancel branch
+(583.3 -> 585.8, no effect); HIT_WORLD restitution 0.0 and 0.15 (both worse than 0.3).
