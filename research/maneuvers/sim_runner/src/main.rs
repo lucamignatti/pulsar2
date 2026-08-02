@@ -44,7 +44,7 @@ fn selftest() {
 pub const BALL_PARK: [f32; 3] = [-3500.0, 4800.0, 93.0];
 
 struct Act { at: i32, c: CarControls }
-struct Seg { name: String, dur: i32, st: [f32; 13], acts: Vec<Act> }
+struct Seg { name: String, dur: i32, st: [f32; 13], rot: Option<Mat3A>, acts: Vec<Act> }
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -58,7 +58,7 @@ fn main() {
         if l.is_empty() { continue }
         let p: Vec<&str> = l.split_whitespace().collect();
         match p[0] {
-            "SEG" => segs.push(Seg{ name: p[1].into(), dur: p[2].parse().unwrap(), st: [0.0;13], acts: vec![] }),
+            "SEG" => segs.push(Seg{ name: p[1].into(), dur: p[2].parse().unwrap(), st: [0.0;13], rot: None, acts: vec![] }),
             "STATE" => { let s = segs.last_mut().unwrap();
                 for i in 0..13 { s.st[i] = p[1+i].parse().unwrap(); } }
             "ACT" => { let s = segs.last_mut().unwrap();
@@ -68,6 +68,35 @@ fn main() {
                     jump:f[5]>0.5, boost:f[6]>0.5, handbrake:f[7]>0.5 } }); }
             _ => {}
         }
+    }
+    // Optional 4th arg: a real capture TSV. The game's state set lands within a
+    // speed-scaled tolerance (up to ~179uu for a 2200uu/s spawn), so the real car starts
+    // somewhere near the scripted state while the sim starts exactly on it -- a constant
+    // offset that is counted as physics error for the whole segment (no_jump_control
+    // opened 18.2uu off and held ~16.4uu through its entire ground phase). Seeding from
+    // the real t=0 row removes it and isolates dynamics. See SIM2REAL_AUDIT.md S26.
+    let mut seed: std::collections::HashMap<String, ([f32; 13], Mat3A)> =
+        std::collections::HashMap::new();
+    if let Some(path) = a.get(4) {
+        let rt = std::fs::read_to_string(path).expect("real capture");
+        for line in rt.lines().skip(1) {
+            let c: Vec<&str> = line.split('\t').collect();
+            if c.len() < 19 || c[1] != "0" { continue }
+            let g = |i: usize| c[i].parse::<f32>().unwrap_or(0.0);
+            // Take the captured basis directly rather than round-tripping through Euler
+            // angles: x_axis = forward, z_axis = up, y_axis = up x forward (see selftest).
+            let fwd = Vec3A::new(g(8), g(9), g(10)).normalize_or_zero();
+            let up = Vec3A::new(g(11), g(12), g(13)).normalize_or_zero();
+            let right = up.cross(fwd);
+            let rot = Mat3A::from_cols(fwd, right, up);
+            seed.insert(c[0].to_string(),
+                ([g(2), g(3), g(4), 0.0, 0.0, 0.0, g(5), g(6), g(7),
+                  g(14), g(15), g(16), g(18)], rot));
+        }
+        eprintln!("seeded {} segments from {}", seed.len(), path);
+    }
+    for sg in segs.iter_mut() {
+        if let Some((v, rot)) = seed.get(&sg.name) { sg.st = *v; sg.rot = Some(*rot); }
     }
     eprintln!("parsed {} segments", segs.len());
     let mut arena = Arena::new(GameMode::Soccar);
@@ -98,7 +127,7 @@ fn main() {
         // Preserve the flags the park produced; override only the physical state.
         let mut cs = *arena.get_car_state(car);
         cs.phys.pos = Vec3A::new(s.st[0], s.st[1], s.st[2]);
-        cs.phys.rot_mat = rot_from_euler(s.st[3], s.st[4], s.st[5]);
+        cs.phys.rot_mat = s.rot.unwrap_or_else(|| rot_from_euler(s.st[3], s.st[4], s.st[5]));
         cs.phys.vel = Vec3A::new(s.st[6], s.st[7], s.st[8]);
         cs.phys.ang_vel = Vec3A::new(s.st[9], s.st[10], s.st[11]);
         cs.boost = s.st[12];
@@ -117,9 +146,14 @@ fn main() {
         let mut cur = CarControls::default();
         for t in 0..s.dur {
             for act in &s.acts { if act.at == t { cur = act.c; } }
-            arena.set_car_controls(car, cur);
-            arena.step_tick();
-            let g = arena.get_car_state(car);
+            // LOG BEFORE STEPPING. The real runner logs the packet it received and only
+            // then sets controls, so its row for tick t is the state at the START of t.
+            // This loop used to step first, so every sim row was one tick ahead -- at
+            // supersonic that is 18.3 uu of pure offset counted as physics error on every
+            // sample. Confirmed by scanning the alignment: seeded sim[t] vs real[t+1]
+            // scored 1161.4 against 1451.0 at t+0. See SIM2REAL_AUDIT.md S26.
+            let g = *arena.get_car_state(car);
+            let g = &g;
             let (p, v, m, av) = (g.phys.pos, g.phys.vel, g.phys.rot_mat, g.phys.ang_vel);
             out.push_str(&format!(
                 "{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{:.5}\t{}\t{:.2}\n",
@@ -132,6 +166,8 @@ fn main() {
                     g.jump_time, g.air_time_since_jump, g.has_flipped as u8, g.is_flipping as u8,
                     g.flip_time, cur.jump as u8);
             }
+            arena.set_car_controls(car, cur);
+            arena.step_tick();
         }
     }
     let path = a.get(3).cloned().unwrap_or_else(|| "sim_maneuvers.tsv".into());
