@@ -1866,3 +1866,75 @@ force pushes the car off instead of holding it. Worth testing next: derive the s
 direction from the CONTACT NORMAL rather than the inferred wheel-contact up.
 
 Plus the irreducible symmetric-tilted-landing chaos of 26.1.
+
+## §31 — Is leaf-by-leaf equivalence feasible? Measured, not guessed (2026-08-02)
+
+Question: treat both physics implementations as trees and verify every leaf matches.
+
+### 31.1 The node level maps almost 1:1 — this part is easy
+
+RocketSim's car per-tick tree is 8 nodes and **47 decision points** (`update_wheels` 11,
+`update_double_jump_or_flip` 13, `update_air_torque` 7, `update_jump` 6, `update_auto_flip` 4,
+`pre_tick_update` 4, `update_boost` 2, `update_auto_roll` 0). Small enough to enumerate by hand.
+
+RL's is enumerable too, because UE3 names its components:
+
+| RocketSim | RL |
+|---|---|
+| `update_wheels` | `WheelSuspension` / `WheelFriction` / `WheelDrive` / `WheelBrake` (S28) |
+| `update_jump` | `CarComponent_Jump_TA` |
+| `update_double_jump_or_flip` | `CarComponent_DoubleJump_TA` + `CarComponent_Dodge_TA` |
+| `update_air_torque` | `CarComponent_AirControl_TA` + `Dodge_TA::ApplyTorqueForces` |
+| `update_auto_flip` | `CarComponent_FlipCar_TA` |
+| `update_boost` | `CarComponent_Boost_TA` |
+| (demos) | `CarComponent_TerritoryDemolish_TA` |
+
+Per-component logic IS recoverable: `CarComponent_Dodge_TA_ApplyTorqueForces` was decompiled
+in full and its pitch-modulation rule read off directly.
+
+### 31.2 The leaves are the blocker — but only for a STATIC diff
+
+Leaves are numeric constants, and in UE3 those live in the CDO inside the .upk packages, not
+in the exe. The exe carries property NAMES only. So a static value-by-value diff needs the
+package/reflection route, and several nodes are virtual dispatches that need vtable
+resolution first.
+
+**But static equivalence is not what we need.** RocketSim is Bullet-derived and RL is not, so
+the code will never correspond line-for-line even where behaviour is identical. What matters
+is behavioural equivalence at each leaf, and we already have an oracle for that: the maneuver
+harness, with a real-vs-real noise floor of median 0.00 uu.
+
+### 31.3 So the tractable form is BRANCH-COVERAGE testing, and it is already 91% done
+
+Built the sim runner with `-C instrument-coverage` and ran the 80 segments:
+
+| file | region coverage |
+|---|---|
+| `sim/car/base.rs` | **91.38%** (68/789 regions missed) |
+| `bullet/dynamics/vehicle/wheel_info.rs` | **94.98%** |
+| `bullet/dynamics/vehicle/vehicle_rl.rs` | **92.50%** |
+
+So the answer to "is it feasible" is yes, and most of it is done. The remaining work is a
+finite, named list rather than an open-ended audit.
+
+### 31.4 The measured gap list
+
+Physics paths NEVER executed by any of the 80 segments:
+
+| path | lines | note |
+|---|---|---|
+| `update_auto_flip` | 18 | **the biggest hole.** Jump while upside-down on the ground to right the car -- a real mechanic, entirely untested |
+| `pre_tick_update` demo/respawn + `demolish` | 11 | demos, known gap (needs a second car) |
+| `update_double_jump_or_flip` deadzone | 3 | input below `dodge_deadzone` -> double jump instead of flip; and the backward-dodge sign branch |
+| `post_tick_update` supersonic grace expiry | 3 | dropping out of supersonic |
+| `update_air_torque` L388 | 2 | air control while flipping with `flip_rel_torque == ZERO` (double jump, not dodge) |
+| `finish_physics_tick` vel_impulse_cache | 3 | bump/demo impulse path |
+| `update_boost` recharge | 2 | recharge mutator, not used in soccar |
+| three-wheel curves | 3 | only for 3-wheel hitboxes, N/A for Octane |
+
+Genuinely actionable: **auto-flip, the dodge deadzone, supersonic grace expiry, the
+double-jump air-control branch**, plus bumps/demos and car-ball contact (which no segment
+touches at all -- the ball is parked by design).
+
+Closing those would take source-level branch coverage of the car physics to ~100% with, by
+this count, roughly 6-10 new segments plus a two-car harness.
