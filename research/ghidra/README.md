@@ -42,3 +42,36 @@ Do not patch physics off aggregates or plausibility. Two "fixes" (COASTING_BRAKE
 0.15->0.11 and dividing dodge torque by the inverse inertia tensor) were both regressions
 that looked right and were caught only by the scripted maneuver test. Every patch goes
 through research/maneuvers/ and a real-game capture before it is believed.
+
+## Runtime UObject dump — the way past the RTTI wall (planned)
+
+S33 established the static tree walk is blocked: no MSVC RTTI, and most CarComponent natives
+sit behind SHARED exec thunks that dispatch on a vtable. The way through is UE3's own
+reflection, read from the LIVE process:
+
+- `GObjects` (TArray<UObject*>) -> every UClass / UFunction / UProperty as a live object
+- **`UFunction::Func`** = the native function pointer. Vtable resolution WITHOUT RTTI.
+- **`UClass::Defaults`** = the CDO in memory, holding real property VALUES. The .upk
+  constants without touching packages or decryption.
+
+One technique clears both blockers at once (S31 constants, S33 vtables).
+
+### Do NOT bother scanning the exe for GNames statically
+
+Tried it. `GNames` is populated at RUNTIME, so it is not statically initialised and the scan
+only finds lookalikes. The specific decoy: an Oodle compressor-name table at
+`0x14233a320`, whose entries are "None", "SuperFast", "Optimal1", "Kraken", "Mermaid",
+"LZNA", "LZH", "LZNIB". Its `"None"` is Oodle's null compressor, NOT FName index 0 -- the
+tell is that the entry-header int32 decodes to ASCII garbage (1701869896 = "HHHf") rather
+than a small index.
+
+### The actual route
+
+Find `GObjects`/`GNames` by their ACCESSORS, not their contents: locate a function that
+dereferences them (FName construction, `UObject::StaticFindObject`, class registration) and
+read the global it references. Then attach read-only to a running instance and walk the
+arrays. Read-only, offline, single-player.
+
+Cross-check available for free: `research/maneuvers` already pins behaviour to a real capture
+with a median 0.00 uu noise floor, so any constant recovered this way can be validated
+against it immediately rather than trusted on sight.
