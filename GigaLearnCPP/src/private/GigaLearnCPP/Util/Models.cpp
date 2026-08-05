@@ -241,6 +241,14 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 			RG_LOG("WARNING: No optimizer found at " << optimPath << ", optimizer will be reset");
 		}
 	}
+
+	// The bf16 inference mirror must be rebuilt from the weights just loaded. StepOptim sets this
+	// and so does the collect-snapshot sync — but Load did NOT, so any Model that had already
+	// served one half-precision forward kept serving its PRE-LOAD weights forever, silently.
+	// Boot resume is unaffected (load precedes the first forward). The live victim is render
+	// mode's checkpoint hot-swap, which loads into already-used models: the viewer would keep
+	// showing the OLD policy while logging the new checkpoint's timestep.
+	_seqHalfOutdated = true;
 }
 
 torch::Tensor GGL::Model::CopyParams() const {

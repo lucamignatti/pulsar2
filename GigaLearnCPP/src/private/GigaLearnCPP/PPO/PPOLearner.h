@@ -102,6 +102,13 @@ namespace GGL {
 		torch::Tensor InferRhatMax(torch::Tensor obs);
 		// GEOMETRY (4th rung): V_geo, the HJB fixed point. No-grad read for the field.
 		torch::Tensor InferGeoV(torch::Tensor obs);
+		// FUSED consumption-path read: ONE upload and ONE shared_head+critic_trunk forward
+		// feeding critic / goal critic / V-dagger min, plus geo_v off the same upload. Pass
+		// nullptr for any head you do not need. Prefer this over calling the singles in
+		// separate loops — that forwards the trunk once PER CALL (see the note on the impl).
+		void InferValueFamily(
+			torch::Tensor obs, torch::Tensor* outCritic, torch::Tensor* outGoalCritic,
+			torch::Tensor* outVdagMin, torch::Tensor* outGeoV);
 		// Reservoir over (obs, nextObs, scaledReward) for the STATIONARY world-facing fits
 		// (r_hat, Sigma). Reward and one-step displacement spread are properties of the
 		// environment; only where we sample them moves as the policy changes. Fitting them on
@@ -134,13 +141,19 @@ namespace GGL {
 		// Bad rows are sanitized to uniform (sampling stays safe) and the per-row finite flags
 		// are returned for a DEFERRED verdict at the caller's existing sync point. When null,
 		// the original synchronous check-and-die with full forensics runs in place.
+		// precomputedTrunk (optional): an already-forwarded shared_head output for these exact
+		// rows. Pass it from the learn pass, where the value family forwards the trunk anyway —
+		// otherwise this function runs shared_head itself and the main trunk is built AND
+		// backpropped twice per minibatch. Leave undefined on collection/eval paths, which have
+		// no other consumer to share with.
 		static torch::Tensor InferPolicyProbsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
 			float temperature,
 			bool halfPrec,
 			torch::Tensor steerDelta = {},
-			torch::Tensor* outRowOk = nullptr);
+			torch::Tensor* outRowOk = nullptr,
+			torch::Tensor precomputedTrunk = {});
 		static void InferActionsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,

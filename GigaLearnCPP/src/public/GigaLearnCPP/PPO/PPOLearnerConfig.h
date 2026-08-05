@@ -198,6 +198,87 @@ namespace GGL {
 		// This is much faster on GPU, not so much for CPU
 		bool useHalfPrecision = false;
 
+		// BF16 AUTOCAST FOR THE LEARN PASS (2026-08-04, user-directed "more sps").
+		// useHalfPrecision above covers only INFERENCE; the learn pass ran strict fp32, and
+		// profiling made it the system bottleneck: the GPU sits at 92-98% and the collect
+		// worker's small forwards queue behind it, so learn-pass cost sets BOTH halves of the
+		// iteration (collection 5.3s / consumption 3.9s under pipelining). Weights and the
+		// optimizer stay fp32 — autocast only runs the matmuls in bf16 and keeps reductions
+		// and loss functions in fp32, so no gradient scaler is needed (that is an fp16
+		// requirement; bf16 has fp32's exponent range).
+		//
+		// SCOPE IS DELIBERATE, not blanket. Autocast covers the policy / critic / goal-critic /
+		// V-dagger forwards — the 1536-wide value family that dominates the pass — and is
+		// PAUSED for two paths that are numerically delicate and cheap anyway:
+		//   * the geo HJB residual, which takes an input-gradient with create_graph and then
+		//     backprops through it (double-backward under autocast is fragile, and the field
+		//     is already conditioning-sensitive — see geoGamma).
+		//   * the reachability InfoNCE, which this file's own comment keeps in fp32 because
+		//     contrastive embeddings train poorly at reduced precision.
+		// Backward always runs outside the autocast region, per the standard recipe.
+		//
+		// REVERT = this flag. Watch for non-finite losses, a Policy Entropy discontinuity, or
+		// Headroom/Vdag Update Magnitude changing scale.
+		bool learnAutocastBF16 = false;
+
+		// ADVANTAGE FILTERING AS A TRUE ROW SUBSET (2026-08-04, user-directed).
+		// advFilterFrac/advFilterMode above select rows, but they only MASK the policy loss
+		// (`ppoPerRow * advKeep`) — every row still runs the full forward and backward, so the
+		// filter costs full compute and the policy head is only ~10% of the pass anyway. With
+		// this ON, the selected rows become an actual subset of the learn pass: the whole
+		// update (policy AND all value heads) runs on them, so the learn pass shrinks with
+		// advFilterFrac.
+		//
+		// THE PPO SURROGATE TERM IS UNCHANGED BY THIS FLAG, and that is verified algebraically:
+		// excluded rows already contribute exactly zero to the clipped policy loss and the kept
+		// rows are already renormalized by their own count, so mask-at-f and subset-at-f give
+		// an identical policy gradient. The VALUE heads (critic, V-dagger twins, goal critic)
+		// and the aux heads seeing the subset is the intended change — the thing the literature
+		// is split on, which is why this is a flag and why 0.5 is the fraction to try first.
+		//
+		// *** CORRECTION (2026-08-04, found in audit the same night this shipped). "The policy
+		// term is unchanged" is TRUE of the surrogate and FALSE of the objective, because the
+		// ENTROPY BONUS is part of the policy objective and it does change population: with a
+		// subset, `entRows` is computed over the kept (high-|A|) rows only, so entropy is
+		// regularized over the rows that scored well rather than over the whole visited state
+		// distribution — which is exactly what the loss comment in PPOLearner::Learn claims it
+		// does NOT do. The direction is unfavourable: narrowing entropy pressure onto the
+		// extreme-advantage tail is the mechanism arXiv:2505.22617 identifies as driving
+		// entropy collapse, and 6.1 died of entropy collapse.
+		// Measured after 40 iterations: median entropy 0.4989 vs 0.4929-0.4996 before, stdev
+		// 0.0252 vs 0.0255-0.0277 — no detectable damage YET. (An audit claim of a 10x variance
+		// jump did not survive checking; it compared mismatched windows.)
+		// ALSO: `Policy Entropy`, `Mean KL Divergence` and `SB3 Clip Fraction` are now SUBSET
+		// statistics and are not comparable to pre-2026-08-04 history. The guard thresholds
+		// were set against the old population.
+		// The clean fix is to keep the entropy term on the full row set (costs back the trunk +
+		// policy forward on dropped rows, ~13% of the pass, leaving ~37% of the 50% saving).
+		// Not taken unilaterally on a live run — it is a real throughput/safety trade. ***
+		//
+		// PRECEDENT (all on-policy self-play at scale, all ranking by |A| with both tails kept,
+		// all filtering the critic too): GigaFlow arXiv:2502.03349 (ICML'25) drops ~80% on an
+		// adaptive threshold for 2.3x throughput "without sacrificing sample efficiency", and
+		// predicts the win lands "especially where data collection is cheaper than gradient
+		// calculation" — this run exactly; Stratego arXiv:2511.07312 keeps top 25% for ~2.5x
+		// wall-clock per iteration with sample efficiency going UP; Generals.io arXiv:2606.23348
+		// keeps top 25% (`top_k(|adv|)` in its code) and swept 25/50/75/100 with 25% winning.
+		// PufferLib 3.0 ships the soft version (segment-level priority by summed |A|).
+		// AGAINST, and the reason this is not simply turned on at 25%: VSOP arXiv:2306.01460
+		// filters the ACTOR only and has a lower-bound proof for doing so, and PPG
+		// arXiv:2009.04416 finds the value function tolerates MORE sample reuse than the policy,
+		// not less. No published work runs the controlled comparison. Also note every paper
+		// above uses SEPARATE actor/critic networks; this run shares one trunk across policy,
+		// critic_trunk, both V-dagger twins, goal critic, reach and geo, so a row subset shrinks
+		// gradient coverage into shared parameters in a way none of them measured.
+		//
+		// ORDERING IS SAFE HERE: the mask is built in Learner.cpp AFTER GAE, after the
+		// injections and after advantage normalization, which is what the papers that got this
+		// wrong ("damaged credit assignment") violated.
+		// WATCH, in order: Policy Entropy and Mean KL (reward is consistently the LAST metric to
+		// break under over-filtering), then Geo/Residual — the HJB residual is now evaluated on
+		// the kept rows rather than all of them. REVERT = this flag.
+		bool advFilterSubset = false;
+
 		PartialModelConfig policy, critic, sharedHead;
 
 		// CRITIC TRUNK (2026-07-29, user-directed): a SECOND shared body stacked on top of
@@ -351,6 +432,23 @@ namespace GGL {
 		// the sense that no mid-run insertion has been tested.
 		bool geoEnabled = false;      // OFF by default: fresh-run mechanism, see above
 		float geoLR = 1e-3f;
+		// HJB gamma, DECOUPLED from gaeGamma (2026-08-03, 6.1). The residual
+		//     resid = (1-g)*V - r_hat - g*|Sigma grad V|
+		// is tickSkip-FRAGILE in its CONDITIONING, not its constants: (1-g) is the only
+		// coefficient anchoring V's LEVEL, while the gradient-shaping gnorm path carries ~g, so
+		// the level-anchoring weight is (1-g)/g — 0.0031 at the validated ts8 gamma, 0.000388 at
+		// ts1's gaeGamma. Measured on 6.0: Geo/V Mean 2.9-3.0 against the ~39 dimensional
+		// analysis predicts (r_hat and Sigma both scale ~1/8 at ts1, so V* is rate-invariant),
+		// creeping ~0.1/20 iters — an unsolved field injected at geoMixW while every Geo/* panel
+		// looked healthy, because the injector standardizes twice and discards the level.
+		// Rescaling the residual (dividing by 1-g) is NOT a fix: it is a constant loss rescale,
+		// and the geo nets train under Adam, which is scale-invariant — the RELATIVE term
+		// weighting is what must be restored, i.e. gamma itself. Set this to the gamma the rung
+		// was validated at (0.9969, ts8) regardless of tickSkip: the loss geometry is then
+		// exactly the validated one, and V's level lands at ~1/8 of rate-invariant (harmless —
+		// only the field's SHAPE reaches the policy). This gamma defines the FIELD only; the
+		// PBRS injection of H_geo telescopes on gaeGamma downstream as it must. <0 => gaeGamma.
+		float geoGamma = -1.f;
 		// Shrinks the feasible-displacement ellipsoid. rho(V*) is flat at 0.697-0.698 across
 		// {0.5, 1, 2}, but 0.5 is the only setting that also keeps rho(V*) > rho(V_pi).
 		float geoSigmaScale = 0.5f;

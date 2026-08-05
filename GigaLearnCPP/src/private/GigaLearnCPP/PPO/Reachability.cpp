@@ -79,7 +79,9 @@ GGL::ReachabilityModule::InfoNCEResult GGL::ReachabilityModule::ComputeInfoNCELo
 		Tensor rowCorrect = logits.argmax(1).eq(labels).to(kFloat);
 		Tensor columnCorrect = logits.argmax(0).eq(labels).to(kFloat);
 		result.categoricalAccuracy = (0.5f * (rowCorrect.mean() + columnCorrect.mean())).cpu().item<float>();
-		result.rawLoss = (rowLoss + columnLoss).detach().cpu().item<float>();
+		// rawLoss REMOVED (2026-08-04): it had ZERO readers anywhere in the tree, and computing
+		// it cost a blocking device sync right here — 3 heads x 18 minibatches = 54 dead syncs
+		// per iteration, each draining a stream the collection worker is queued behind.
 	}
 
 	return result;

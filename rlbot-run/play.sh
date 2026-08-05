@@ -124,13 +124,13 @@ trainer_active() {
 # stage it NEXT TO the checkpoint so the copy carries its own decision rate.
 tick_skip_for_root() {
 	case "$1" in
-		*checkpoints_6.0*) echo 1 ;;
-		*)                 echo 8 ;;
+		*checkpoints_6.*) echo 1 ;;   # every 6.x lineage (6.0, 6.1, 6.1b) is ts1
+		*)                echo 8 ;;
 	esac
 }
 
 sync_checkpoint() {
-	local root="${GGL_CKPT_ROOT:-../build/checkpoints_6.0}"
+	local root="${GGL_CKPT_ROOT:-../build/checkpoints_6.1b}"
 	local dest="pulsar-bot/checkpoint"
 
 	if [ ! -d "$root" ]; then

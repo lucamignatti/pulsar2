@@ -4,11 +4,40 @@
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/autograd/autograd.h>   // torch::autograd::grad — the input-gradient the HJB residual needs
 #include <torch/csrc/api/include/torch/serialize.h>
+#include <ATen/autocast_mode.h>             // bf16 autocast for the learn pass (config.learnAutocastBF16)
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <RLGymCPP/CommonValues.h>
 #include "../Util/Plasticity.h"
 
 using namespace torch;
+
+// RAII bf16 autocast for the learn pass; see PPOLearnerConfig::learnAutocastBF16.
+// Restores the previous state on scope exit (including on a thrown exception) and clears
+// autocast's weight-cast cache, which MUST NOT outlive an optimizer step or the next
+// minibatch would matmul against stale casts of the pre-step weights.
+namespace {
+	struct AutocastScope {
+		bool active;
+		bool prev = false;
+		explicit AutocastScope(bool enable) : active(enable) {
+			if (!active)
+				return;
+			prev = at::autocast::is_autocast_enabled(at::kCUDA);
+			at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+			at::autocast::set_autocast_enabled(at::kCUDA, true);
+		}
+		// End the region early and idempotently. Everything after the call — the geo HJB
+		// double-backward, the InfoNCE heads, and backward() itself — runs in fp32.
+		void End() {
+			if (!active)
+				return;
+			at::autocast::set_autocast_enabled(at::kCUDA, prev);
+			at::autocast::clear_cache();
+			active = false;
+		}
+		~AutocastScope() { End(); }
+	};
+}
 
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
 
@@ -175,7 +204,8 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
 	float temperature, bool halfPrec,
-	torch::Tensor steerDelta, torch::Tensor* outRowOk) {
+	torch::Tensor steerDelta, torch::Tensor* outRowOk,
+	torch::Tensor precomputedTrunk) {
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -183,7 +213,13 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	constexpr float ACTION_DISABLED_LOGIT = -1e10f;
 
 	torch::Tensor rawObs = obs; // kept for the non-finite diagnostic below
-	if (models["shared_head"])
+	if (precomputedTrunk.defined())
+		// The learn pass already forwarded shared_head for the value family; reusing that
+		// tensor keeps the graph single-trunk, so autograd accumulates the policy's and the
+		// value heads' gradients at one node and traverses the trunk ONCE (see the note by
+		// fnValueTrunk in Learn). Header contract: same rows, same model, same order.
+		obs = precomputedTrunk;
+	else if (models["shared_head"])
 		obs = models["shared_head"]->Forward(obs, halfPrec);
 
 	// Steered-practice collection: shift the trunk output along the commitment direction for
@@ -194,7 +230,13 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 		obs = obs + steerDelta.to(obs.device());
 	}
 
-	auto logits = models["policy"]->Forward(obs, halfPrec) / temperature;
+	// temperature == 1 is the live setting and `/ 1.0f` is a full [rows x 90] elementwise kernel
+	// launched every collection step for nothing. Inference here is DISPATCH-bound, not
+	// arithmetic-bound (the 21-op network was issuing ~55 GPU ops), so an op that computes an
+	// identity is a real cost.
+	auto logits = models["policy"]->Forward(obs, halfPrec);
+	if (temperature != 1.f)
+		logits = logits / temperature;
 
 	// A non-finite logit row would crash multinomial downstream with a device-side assert that
 	// poisons the CUDA context - identify the SOURCE here instead. The reduction is cheap; the
@@ -207,6 +249,13 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	auto rowOk = logits.isfinite().all(-1, /*keepdim=*/true);
 	if (outRowOk) {
 		*outRowOk = rowOk;
+		// REVERTED to torch::where (2026-08-04). Replacing this with
+		// `logits.masked_fill_(rowOk.logical_not(), 0.f)` looked like a strict op-count win —
+		// two ops instead of two, one of them in place — and MEASURED as part of a 40%
+		// inference regression (1.790s -> 2.504s median). Op counting is not cost: `where` with
+		// a [rows,1] condition against [rows,90] is a well-optimized broadcast ternary, whereas
+		// broadcasting a mask through in-place masked_fill_ is not. Do not "optimize" this
+		// again without measuring it alone.
 		logits = torch::where(rowOk, logits, torch::zeros_like(logits));
 	} else if (!rowOk.all().item<bool>()) {
 		bool trunkOutFinite = obs.isfinite().all().item<bool>(); // post-trunk (+delta)
@@ -302,6 +351,50 @@ torch::Tensor GGL::PPOLearner::InferVdagMin(torch::Tensor obs) {
 	auto a = models["vdag1"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	auto b = models["vdag2"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 	return torch::minimum(a, b);
+}
+
+// ONE trunk + critic_trunk forward serving EVERY value head, for the consumption path.
+// The Infer* helpers above each rebuild ValueTrunk internally, so calling InferCritic +
+// InferGoalCritic + InferVdagMin over the same buffer — which Learner.cpp did, in three
+// separate chunk loops — forwarded shared_head 3x and critic_trunk 3x over every row, and
+// uploaded the same states 3x. That is 10.26M of 14.97M MAC/row paid three times for one
+// result. This is the same duplication that was found on the LEARN side on 2026-08-04
+// (fnTrunkVR/fnValueTrunk memoize it there); this is the consumption-side twin.
+// Any output tensor may be left undefined to skip that head. geo_v is included because it
+// shares the chunk's HOST->DEVICE upload even though it reads raw obs, not the trunk.
+void GGL::PPOLearner::InferValueFamily(
+	torch::Tensor obs, torch::Tensor* outCritic, torch::Tensor* outGoalCritic,
+	torch::Tensor* outVdagMin, torch::Tensor* outGeoV) {
+
+	RG_NO_GRAD;
+	bool hp = config.useHalfPrecision;
+	auto obsDev = obs.to(device, true, true);          // the single upload for this chunk
+
+	if (outGeoV && models["geo_v"])                    // independent net, raw obs
+		*outGeoV = models["geo_v"]->Forward(obsDev, hp).flatten().to(torch::kFloat32);
+
+	bool needTrunk = (outCritic && models["critic"])
+		|| (outGoalCritic && models["goal_critic"])
+		|| (outVdagMin && models["vdag1"] && models["vdag2"]);
+	if (!needTrunk)
+		return;
+
+	auto vt = ValueTrunk(obsDev, hp);                  // THE one trunk + critic_trunk forward
+
+	if (outCritic && models["critic"])
+		*outCritic = models["critic"]->Forward(vt, hp).flatten().to(torch::kFloat32);
+	if (outGoalCritic && models["goal_critic"]) {
+		// InferGoalCritic reads the critic trunk only when one exists; without it the head
+		// takes raw obs, so preserve that branch exactly.
+		*outGoalCritic = models["critic_trunk"]
+			? models["goal_critic"]->Forward(vt, hp).flatten().to(torch::kFloat32)
+			: models["goal_critic"]->Forward(obsDev, hp).flatten().to(torch::kFloat32);
+	}
+	if (outVdagMin && models["vdag1"] && models["vdag2"]) {
+		auto a = models["vdag1"]->Forward(vt, hp).flatten().to(torch::kFloat32);
+		auto b = models["vdag2"]->Forward(vt, hp).flatten().to(torch::kFloat32);
+		*outVdagMin = torch::minimum(a, b);
+	}
 }
 
 torch::Tensor GGL::PPOLearner::InferRhatMax(torch::Tensor obs) {
@@ -654,12 +747,41 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor geoResidAcc, geoMeanAcc;
 	int geoMbCount = 0;
 
+	// ADVANTAGE FILTERING AS A ROW SUBSET (config.advFilterSubset). Materialize the kept rows
+	// ONCE for the whole Learn call, then run every epoch on them. Built with the buffer's own
+	// _GetSamples, which zips fields POSITIONALLY over ExperienceTensors::begin()/end() — so a
+	// field added later is carried automatically and cannot be silently left at full length,
+	// which is the failure mode a hand-written index_select per field would invite.
+	ExperienceBuffer* learnExp = &experience;
+	ExperienceBuffer filteredExp((int)experience.rng(), device);
+	int64_t learnBatchSize = config.batchSize;
+	float dbgSubsetRows = -1.f;
+	if (config.advFilterSubset && experience.data.advFilterMask.defined()) {
+		auto keepCpu = experience.data.advFilterMask.to(torch::kCPU).flatten();
+		auto keptIdx = torch::nonzero(keepCpu > 0.5f).flatten().to(torch::kLong).contiguous();
+		int64_t nKept = keptIdx.numel();
+		// Guard the degenerate end: a subset smaller than one minibatch would make the batch
+		// loop below produce nothing and the iteration would silently not train.
+		if (nKept >= (int64_t)config.miniBatchSize) {
+			filteredExp.data = experience._GetSamples(keptIdx.data_ptr<int64_t>(), (size_t)nKept);
+			learnExp = &filteredExp;
+			// One batch holding every kept row; the minibatch loop below splits it by
+			// miniBatchSize exactly as it does the full buffer. Passing config.batchSize here
+			// instead would yield ZERO batches whenever nKept < batchSize.
+			learnBatchSize = nKept;
+			dbgSubsetRows = (float)nKept;
+		} else {
+			RG_LOG("AdvFilterSubset: only " << nKept << " kept rows (< miniBatchSize "
+				<< config.miniBatchSize << ") - training on the FULL buffer this iteration");
+		}
+	}
+
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
 		dbgVdagRows = experience.data.vdagTargets.defined() ? (float)experience.data.vdagTargets.numel() : -2.f;
 		dbgRhatEntry = experience.data.rhatTargets.defined() ? (float)experience.data.rhatTargets.numel() : -2.f;
-		auto batches = experience.GetAllBatchesShuffled(config.batchSize, config.overbatching);
+		auto batches = learnExp->GetAllBatchesShuffled(learnBatchSize, config.overbatching);
 		if (dbgVdagRows > 0 && !batches.empty())
 			dbgRhatRows = batches[0].vdagTargets.defined() ? (float)batches[0].vdagTargets.numel() : -3.f;
 
@@ -715,13 +837,30 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					advKeep = keepCpu.to(device, true, true);
 				}
 
+				// bf16 autocast covers the dense forwards below (policy, critic, goal critic,
+				// V-dagger twins). It is paused around the geo HJB and the InfoNCE heads, and
+				// ends before totalLoss.backward(). See PPOLearnerConfig::learnAutocastBF16.
+				AutocastScope autocast(config.learnAutocastBF16 && device.is_cuda());
+
+				// THE one main-trunk forward for this minibatch, shared by the policy head and
+				// the whole value family (see the note above fnValueTrunk below for why it is
+				// declared up here rather than next to its value-side users).
+				torch::Tensor trunkVR, valueTrunkVR;
+				auto fnTrunkVR = [&]() -> torch::Tensor& {
+					if (!trunkVR.defined())
+						trunkVR = models["shared_head"]
+							? models["shared_head"]->Forward(obs, false) : obs;
+					return trunkVR;
+				};
+
 				torch::Tensor probs, logProbs, entropy, ratio, clipped, policyLoss, ppoLoss;
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy
 					float curEntropy;
 					{
-						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false);
+						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false,
+							{}, nullptr, fnTrunkVR());
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						auto entRows = ComputeEntropyRows(probs, actionMasks, config.maskEntropy);
 						// Report the UNWEIGHTED mean so the panel stays comparable to runs
@@ -826,13 +965,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// Before this, InferCritic re-forwarded the main trunk on its own while the
 				// V-dagger family used its own copy, so the trunk was materialized twice per
 				// minibatch for nothing.
-				torch::Tensor trunkVR, valueTrunkVR;
-				auto fnTrunkVR = [&]() -> torch::Tensor& {
-					if (!trunkVR.defined())
-						trunkVR = models["shared_head"]
-							? models["shared_head"]->Forward(obs, false) : obs;
-					return trunkVR;
-				};
+				// 2026-08-04: the SAME duplication survived on the POLICY side and was missed by
+				// that pass — InferPolicyProbsFromModels takes RAW obs and runs shared_head
+				// itself, so the main trunk was still forwarded (and backpropped) TWICE per
+				// minibatch: once for the policy, once for the value family. The policy call
+				// above now passes fnTrunkVR() in, so there is exactly one trunk forward and,
+				// because autograd accumulates both consumers' gradients at that one tensor
+				// before traversing it, exactly one trunk BACKWARD. Worth ~14% of the learn
+				// pass (trunk = 3.57M of 25.5M MAC/row when double-counted) and it is
+				// mathematically identical — same weights, same input, same graph, just not
+				// built twice.
 				auto fnValueTrunk = [&]() -> torch::Tensor& {
 					if (!valueTrunkVR.defined()) {
 						torch::Tensor& t = fnTrunkVR();
@@ -945,6 +1087,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// (1 - gamma) V(s) = r_hat(s) + gamma * || grad_s V(s) ||_Sigma(s)
 				//
 				// The gradient here is w.r.t. the INPUT, not the parameters — that is the whole
+				// END OF THE BF16 REGION. Everything below — the geo HJB double-backward, the
+				// InfoNCE heads, the loss assembly and backward() — runs in fp32 by design.
+				autocast.End();
+
 				// cost of this rung: one extra backward through geo_v per minibatch. create_graph
 				// is required so the residual stays differentiable in the parameters.
 				//
@@ -970,7 +1116,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// re-imports the habit this rung exists to see past (measured: drift-on
 					// loses the beats-habit property at every sigma).
 					auto gnorm = (gx.pow(2) * sig.pow(2)).sum(-1).clamp_min(1e-12f).sqrt();
-					auto resid = (1.f - config.gaeGamma) * vg - rh - config.gaeGamma * gnorm;
+					// geoGamma, not gaeGamma: the residual's conditioning is tickSkip-fragile
+					// and this gamma defines only the field's fixed point, never a PBRS
+					// potential — see PPOLearnerConfig::geoGamma.
+					float geoG = (config.geoGamma > 0.f) ? config.geoGamma : config.gaeGamma;
+					auto resid = (1.f - geoG) * vg - rh - geoG * gnorm;
 					auto hjb = resid.pow(2).mean() * batchSizeRatio;
 
 					geoLoss = hjb;
@@ -1198,6 +1348,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["Headroom/Vdag Twin Spread"] = avgVdagTwinSpread.Get();
 		// Row counts: -1 means the targets never reached the batch (broken plumbing),
 		// which is indistinguishable from "loss is small" on the loss panel alone.
+		// -1 = subset filtering off (or it declined to fire this iteration); otherwise the row
+		// count the WHOLE update actually ran on. This is the panel that proves the compute
+		// lever engaged — AdvFilter/Kept Frac only reports what was selected, not what was fed.
+		report["AdvFilter/Subset Rows"] = dbgSubsetRows;
 		report["Headroom/Vdag Rows"] = dbgVdagRows;
 		report["Headroom/Rhat Rows"] = dbgRhatRows;
 		if (dbgEntGate >= 0.f)
@@ -1255,15 +1409,26 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// batch, so it is cheap enough to run every iteration. Effective-rank decay is the
 		// measurement that justified the residual architecture (45a59d5); keeping it means the
 		// project can still check whether that change did what it was chosen to do.
+		// ^ That "cheap enough to run every iteration" claim was wrong, and measurably so.
+		// EffectiveRank is an SVD, and the trunk's last Linear is 1280x1280 — on CUDA that
+		// dispatches to the iterative Jacobi driver, estimated 40-150ms PER ITERATION, inside
+		// PPO Learn Time, for a panel whose value moves ~0.02 per iteration (897.157 ->
+		// 897.171 -> 897.179 on three consecutive iterations). It is a slow-moving structural
+		// canary, not a per-step signal, so it runs on a cadence now. Dead Units is a cheap
+		// column-norm count and stays every iteration.
 		{
-			auto lins = Plasticity::LinearLayers(models["policy"]);
-			if (!lins.empty())
-				report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);
 			report["Plasticity/Policy Dead Units"] = Plasticity::DeadUnitFraction(models["policy"]);
-			if (models["shared_head"]) {
-				auto tl = Plasticity::LinearLayers(models["shared_head"]);
-				if (!tl.empty())
-					report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
+			constexpr uint64_t EFFRANK_EVERY = 32;
+			static uint64_t effRankTick = 0;   // telemetry cadence only; Learn() has no counter
+			if ((effRankTick++ % EFFRANK_EVERY) == 0) {
+				auto lins = Plasticity::LinearLayers(models["policy"]);
+				if (!lins.empty())
+					report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);
+				if (models["shared_head"]) {
+					auto tl = Plasticity::LinearLayers(models["shared_head"]);
+					if (!tl.empty())
+						report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
+				}
 			}
 		}
 	}

@@ -2095,6 +2095,9 @@ void GGL::Learner::Start() {
 					Timer valPredTimer = {};
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
+					// Filled by the fused GPU loop below alongside tValPreds — see the note
+					// there. Undefined on the CPU path and on a goal-critic-off run.
+					torch::Tensor tGoalValPredsFused;
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
@@ -2102,16 +2105,32 @@ void GGL::Learner::Start() {
 						if (tNextTruncStates.defined())
 							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
 					} else {
-						// Predict values using minibatching
+						// Predict values using minibatching.
+						// FUSED (2026-08-04): the critic and the goal critic are read from ONE
+						// upload and ONE shared_head+critic_trunk forward per chunk. They used to
+						// run as two separate chunk loops, each calling an Infer* helper that
+						// rebuilds ValueTrunk internally — so the trunk (3.57M MAC/row) and
+						// critic_trunk (6.68M MAC/row) were each computed twice over every row,
+						// and the same ~186 MB of states was uploaded twice, to produce two
+						// scalars that read off the identical body. Same duplication the learn
+						// pass had until the policy/value trunk share landed earlier today.
+						// (The V-dagger and geo reads further down are still separate loops and
+						// still re-forward the trunk a third time — a further ~10.3M MAC/row.)
 						tValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
+						if (goalCriticOn)
+							tGoalValPredsFused = torch::zeros({ (int64_t)combinedTraj.Length() });
 						for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
 							int start = i;
 							int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
 							torch::Tensor tStatesPart = tStates.slice(0, start, end);
 
-							auto valPredsPart = ppo->InferCritic(tStatesPart.to(ppo->device, true, true)).cpu();
-							RG_ASSERT(valPredsPart.size(0) == (end - start));
-							tValPreds.slice(0, start, end).copy_(valPredsPart, true);
+							torch::Tensor vCrit, vGoal;
+							ppo->InferValueFamily(tStatesPart, &vCrit,
+								goalCriticOn ? &vGoal : nullptr, nullptr, nullptr);
+							RG_ASSERT(vCrit.size(0) == (end - start));
+							tValPreds.slice(0, start, end).copy_(vCrit.cpu(), true);
+							if (vGoal.defined())
+								tGoalValPredsFused.slice(0, start, end).copy_(vGoal.cpu(), true);
 						}
 
 						if (tNextTruncStates.defined()) {
@@ -2129,13 +2148,11 @@ void GGL::Learner::Start() {
 						if (ppo->device.is_cpu()) {
 							tGoalValPreds = ppo->InferGoalCritic(tStates.to(ppo->device, true, true)).cpu();
 						} else {
-							tGoalValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
-							for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
-								int start = i;
-								int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
-								auto part = ppo->InferGoalCritic(tStates.slice(0, start, end).to(ppo->device, true, true)).cpu();
-								tGoalValPreds.slice(0, start, end).copy_(part, true);
-							}
+							// Already computed, off the critic's trunk forward, in the fused loop
+							// above. RG_ASSERT rather than a silent recompute: if the fusion ever
+							// stops filling this, I want the loud failure, not the slow one.
+							RG_ASSERT(tGoalValPredsFused.defined());
+							tGoalValPreds = tGoalValPredsFused;
 						}
 						if (tNextTruncStates.defined())
 							tGoalTruncValPreds = ppo->InferGoalCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
@@ -2165,12 +2182,38 @@ void GGL::Learner::Start() {
 						(reachCfg.gateEnabled ||
 						 (totalIterations % (uint64_t)RS_MAX(1, reachCfg.diagEveryIters)) == 0);
 
+					// DIAGNOSTIC ROW CAP (2026-08-04). Everything from here to the end of the rho
+					// block is MEASUREMENT: with gateEnabled=false these reads feed only the
+					// Reach/* panels. Two allocations here scale with the buffer and are NOT
+					// chunked-and-consumed like the rest of the loop: the cat below, which is the
+					// only place anything materializes a rows x trunkWidth FP32 tensor, and
+					// EvalRho's internal trunk pass over the opponent states. Every mega-batch CUDA
+					// OOM this lineage has taken landed here — 11.60 GiB at 6.0's birth, 4.85 GiB
+					// on 2026-08-04 (= 947k rows x 1280 x 4B). Every pass that feeds TRAINING
+					// (value preds, goal critic, vdag, geo, PPO itself) is already chunked.
+					//
+					// Buffer length is BURSTY because episodes are appended whole: it normally sits
+					// at ~tsPerItr (202k measured at 256 arenas) but a synchronization event — all
+					// arenas resetting together, then finalizing in lockstep — spikes it to 850-950k.
+					// Fleet size does NOT drive this: 128 arenas produced BIGGER spikes than 256,
+					// because fewer players finalize in coarser lumps.
+					//
+					// The panels are aggregate statistics, so computing them over a bounded PREFIX
+					// of whole episodes is the same measurement at a bounded cost. Cap at 1.25x
+					// tsPerItr: a normal iteration is untouched, only bursts truncate, and the
+					// truncation is logged rather than silent.
+					const int64_t nDiag = RS_MIN((int64_t)combinedTraj.Length(),
+						(int64_t)config.ppo.tsPerItr * 5 / 4);
+					if (reachReadsThisIter && nDiag < (int64_t)combinedTraj.Length())
+						RG_LOG("Reach diag: capped to " << nDiag << " of " << combinedTraj.Length()
+							<< " rows (burst buffer; panels use the prefix)");
+
 					Timer reachReadTimer = {};
 					torch::Tensor tTrunkFeatures;
 					if (reachReadsThisIter && combinedTraj.Length() > 0) {
 						Model* trunkModel = ppo->models["shared_head"];
 						if (trunkModel) {
-							int64_t nRows = (int64_t)combinedTraj.Length();
+							int64_t nRows = nDiag;
 							int64_t chunk = (int64_t)reachCfg.scoreChunkSize;
 							if (chunk <= 0)
 								chunk = nRows;
@@ -2188,10 +2231,12 @@ void GGL::Learner::Start() {
 					// The gate scales REWARDS only (never advantages/values); with beta=0 or
 					// gateEnabled=false the rewards are untouched.
 					if (reachReadsThisIter && combinedTraj.Length() > 0) {
-						int64_t n = (int64_t)combinedTraj.Length();
+						int64_t n = nDiag;  // see the DIAGNOSTIC ROW CAP note above
 
-						torch::Tensor tOppStates = torch::tensor(combinedTraj.oppStates).reshape({ -1, obsSize });
-						torch::Tensor tOppMasks = torch::tensor(combinedTraj.oppActionMasks).reshape({ -1, numActions });
+						torch::Tensor tOppStates = torch::tensor(combinedTraj.oppStates)
+							.reshape({ -1, obsSize }).slice(0, 0, n);
+						torch::Tensor tOppMasks = torch::tensor(combinedTraj.oppActionMasks)
+							.reshape({ -1, numActions }).slice(0, 0, n);
 
 						// Fixed query goals, normalized like the HER goals (canonical frame)
 						torch::Tensor contactGoal = torch::zeros({ 6 });
@@ -2209,7 +2254,7 @@ void GGL::Learner::Start() {
 						Model* sharedHead = ppo->models["shared_head"];
 						auto rhoOwn = ppo->reach->EvalRho(sharedHead,
 							{ { ppo->reach->psiCar, contactGoal }, { ppo->reach->psiBall, scoringGoal } },
-							tStates, tActionMasks, tTrunkFeatures);
+							tStates.slice(0, 0, n), tActionMasks.slice(0, 0, n), tTrunkFeatures);
 						auto rhoOpp = ppo->reach->EvalRho(sharedHead,
 							{ { ppo->reach->psiCar, contactGoal } },
 							tOppStates, tOppMasks);

@@ -555,6 +555,62 @@ int main(int argc, char* argv[]) {
 	// collection overshoot makes the loop simulate far more player-steps than the 200k it
 	// needs. Do not "tune" this by reading Overall Steps/Second - that counter tracks
 	// simulated steps and rises with fleet size even as the iteration gets slower.
+	// 6.1 (2026-08-03): 128 FOR BIRTH ONLY. A fresh cold start pays the full birth clump again —
+	// at the 6.1 widths the full-batch FP32 trunk cat is clump_rows x 1280 x 4B, which at 256
+	// arenas (512 players x ~2400 NoTouch-capped steps = 1.23M rows) is a ~6.3 GB single
+	// transient on top of everything else. 128 arenas halves it to the proportions 6.0's birth
+	// measurably survived — and it worked: birth iteration was exactly 614,656 rows, no OOM,
+	// 9.6 GiB peak. NOTE the clump outlives "first touch" by a lot: at 100M steps iterations
+	// still batched ~580k rows (arenas that reset together stay near-synchronized until touches
+	// desync their episode lengths); deltas only settled into the ~100-320k band by ~300M.
+	// FLIPPED to 256 at 300M (2026-08-04, measured deltas, not the 100M guess): 256 is the
+	// measured throughput optimum, and a resumed run never re-pays the clump. If this lineage
+	// ever cold-starts again, set 128 first, and flip on MEASURED iteration deltas ~<350k,
+	// not on a step count.
+	// 6.1b (2026-08-04): back to 128 — the entropy-collapse restart IS a fresh cold start, so
+	// the birth clump is re-paid, per the rule just above. Flip to 256 on measured deltas.
+	// FLIPPED to 256 at 794M: 12 consecutive iteration deltas < 350k (the measured decay
+	// condition). Note the healthy-entropy policy took ~2.6x LONGER to desync its arenas than
+	// collapsed 6.1 did (794M vs ~300M) — exploration keeps more arenas on the NoTouch cap in
+	// lockstep for longer, so the flip point moves with entropy, another reason it must be
+	// measured rather than scheduled.
+	// BACK TO 128 at 1.92B (2026-08-04 13:13 OOM, systematic): the birth clump has a GROWN-UP
+	// SIBLING with no cap. Episodes end only on goals or a 20s touch drought, so once the
+	// policy rallies competently episode length is UNBOUNDED, and at ts1 every rally-second is
+	// 120 rows/player. Batches of 1.0-1.3M rows (5-6.5 GiB fp32 trunk cats) occurred 121 times
+	// in the 256-arena log, fattening as skill grew, until one 4.85 GiB alloc failed. 128
+	// halves the coincidence size at TODAY'S episode lengths (~2000 steps avg) but does NOT
+	// bound it — lengths grow with skill. The durable fix is chunking the Learner's full-batch
+	// FP32 trunk cat (semantics-free, same class as the existing chunked forwards); an episode
+	// timeout bounds it only weakly (batch ~ players x episode_len, and a cap loose enough to
+	// spare real rallies barely lowers the worst case).
+	// BACK TO 256 (2026-08-04 evening, USER DECISION): "the time lost to the occasional crash
+	// is worth the extra sps, and we handle the crashes gracefully anyways." Measured at 128
+	// the iteration was collection-bound (5.7-14s vs consumption ~4.8s) — the fleet, not the
+	// minibatch, is the SPS lever.
+	//
+	// 512 (2026-08-04, "get me more sps"), and the OOM reasoning above is now KNOWN WRONG.
+	// Profiling at 256 put INFERENCE at 3.86s of the 5.13s collection (env step: 0.32s) — the
+	// loop is bound by forward-pass OVERHEAD at a small batch, not by physics. Each forward
+	// batches 2 x numGames rows, so doubling the fleet halves the NUMBER of forwards while
+	// doubling each one: strictly better on a latency-bound GPU, for identical env work.
+	// Two corrections that license this:
+	//   * The mega-batch OOM does not live in the training path at all — it was the every-16-
+	//     iterations Reach diagnostic, now row-capped in Learner.cpp. Fleet size never drove it.
+	//   * MORE arenas make the buffer SMALLER, not bigger: measured Headroom/Rows N is a tight
+	//     202k at 256 but spiked to 857k at 128, because more players finalize in finer lumps.
+	//     The old "512 is a regression" note below was measured at 6.0's BIRTH, when every
+	//     episode ran the full NoTouch cap in lockstep — a regime a competent policy has left.
+	// MEASURED AND REVERTED to 256 (2026-08-04, same evening). 512 made collection WORSE:
+	// 6.7-9.0s vs 256's 5.13s, with inference 4.6-6.7s vs 3.86s — so the "halve the forward
+	// count" reasoning above is WRONG, and the 6.0-era verdict was right for a better reason
+	// than it gave. Inference is NOT latency-bound at 512 rows/forward: doubling the batch
+	// bought nothing and the extra 512 arenas' CPU-side work (obs build, action parse, record)
+	// contends with the env thread pool on an already-saturated 24-core box. Rows N stays ~200k
+	// at every fleet size, so the bigger fleet adds cost without adding learning.
+	// 256 is a genuine optimum, now confirmed twice on two different net sizes. The remaining
+	// collection cost is inference itself, which is the standing price of ts1 (120 Hz = 8x the
+	// forwards of ts8) and needs a code-level fix, not a knob.
 	cfg.numGames = 256;
 
 	// Pipelined collection: collect iteration N+1 (worker, frozen policy snapshot) while N
@@ -623,11 +679,37 @@ int main(int argc, char* argv[]) {
 	// MATHEMATICALLY IDENTICAL for the update — it trades activation peak against GEMM
 	// efficiency — so this is a pure throughput knob. It targets PPO Learn (2.28s of the
 	// 2.9s consumption half). Give it back first (12.5k) if VRAM bites.
+	// 6.1 (2026-08-04): 25k -> 12.5k, the "give it back first if VRAM bites" lever above,
+	// pulled on evidence: at the 6.1 widths + 256 arenas the steady watermark reached
+	// ~12.7 GiB and the run took a real OOM at 1.0B (148 MiB request, 297 MiB free) — the
+	// same watermark regime that produced 8 crash-restarts in 8h on 2026-07-28. 200k/12.5k
+	// = 16 accumulation chunks (exact divisor). Identical update math; costs only GEMM
+	// efficiency in PPO Learn. Do NOT raise back toward 25k without watching a full learn
+	// pass's actual peak with the desktop loaded.
+	// 6.1b (2026-08-04): 12.5k -> 25k, now that it actually buys something. Measured at 256
+	// arenas: consumption 4.01s of which PPO Learn is 3.35s, against collection 5.13s. Under
+	// pipelinedCollection the iteration is max(collection, consumption), so cutting ONLY
+	// collection (the 512-arena change above) just moves the wall to consumption — both halves
+	// have to come down together, which is why the same bump measured worthless at 128 arenas
+	// and is worth doing here. Gradient accumulation keeps the update mathematically identical;
+	// this is purely activation-peak traded for GEMM efficiency. 200k/25k = 8 exact chunks.
+	// The learn-pass peak this re-spends is affordable because the Reach diagnostic — the
+	// actual site of every mega-batch OOM — is now row-capped.
 	cfg.ppo.miniBatchSize = 25'000;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
 	cfg.ppo.useHalfPrecision = true;
+
+	// 6.1b (2026-08-04, user-directed): bf16 autocast for the LEARN pass, the one throughput
+	// lever that does not trade against the experiment (the alternatives were epochs 2->1,
+	// which halves sample reuse, and shrinking the net the user asked to be full-size).
+	// Profiling: GPU 92-98% busy, iteration = max(collection 5.3s, consumption 3.9s), and
+	// collection is slow because the collect worker's forwards QUEUE BEHIND the learn pass —
+	// so learn-pass cost sets both halves. Weights/optimizer stay fp32; see
+	// PPOLearnerConfig::learnAutocastBF16 for the deliberately partial scope (geo HJB and
+	// InfoNCE stay fp32) and the revert.
+	cfg.ppo.learnAutocastBF16 = true;
 
 	// GGL_SMOKE=1: shrink the fleet + iteration so an offline sandbox (Mac CPU, resuming a
 	// COPY of the real checkpoints with WANDB_MODE=offline) can complete iterations in
@@ -669,7 +751,19 @@ int main(int argc, char* argv[]) {
 	// of the defensible range — if entropy instead COLLAPSES (say under ~0.35) that is
 	// premature convergence, and the revert is this one number (0.035, or a middle rung
 	// like 0.0175).
-	cfg.ppo.entropyScale = 0.004375f;
+	// 6.1b (2026-08-04): 0.004375 -> 0.0175, the "middle rung" the paragraph above names, after
+	// the collapse it warns about HAPPENED on 6.1: entropy fell 0.74 -> 0.05 by 245M steps and
+	// ~6e-4 by 1.1B, a smooth exponential from birth (no event cliff). Discriminated against
+	// everything else that changed: 6.0 ran THIS SAME 0.004375 (and the same advFilter, ts1,
+	// birth fleet) for 3.07B steps holding 0.71-0.76 — the only relevant 6.1 diffs are the
+	// full-size widths. More capacity fits the argmax faster, so the coefficient that was
+	// merely "aggressive" at 896/640 is insufficient at 1280/768. The optimism injections are
+	// exonerated by dose (Inj Std Ratio pinned 0.04). WATCH on 6.1b: entropy should hold a
+	// 0.4-0.7 band; if instead the viewer shows the continuous-flipping dithering that forced
+	// the original /8 cut, step DOWN to ~0.00875, not back to 0.004375. If it collapses under
+	// ~0.35 again at 0.0175, suspect the advFilter interaction next (its own pre-registration
+	// names entropy collapse; revert = TOP_SIGNED), not a further coefficient bump.
+	cfg.ppo.entropyScale = 0.0175f;
 
 	// ADVANTAGE FILTERING (2026-07-29, user-directed): the policy trains only on the top 50% of
 	// rows by post-injection advantage; the threshold is a buffer-wide quantile taken after GAE
@@ -694,6 +788,17 @@ int main(int argc, char* argv[]) {
 	// really are the low-information ones). Success = Nexto/* goal slope at or above its current
 	// trend over the next ~1B steps; Policy Entropy must not collapse. Revert = TOP_SIGNED.
 	cfg.ppo.advFilterMode = AdvFilterMode::MAGNITUDE;
+	// 6.1b (2026-08-04, user-directed): make the filter a real ROW SUBSET of the learn pass
+	// rather than a mask on the policy loss. Until now it selected rows and then ran the full
+	// forward+backward on all of them anyway, so it cost full compute; the policy head is only
+	// ~10% of the pass, so masking it could never save anything. See
+	// PPOLearnerConfig::advFilterSubset for the precedent (GigaFlow / Stratego / Generals.io all
+	// filter the critic too and report 2.3-2.5x) and for the counter-evidence (VSOP, PPG).
+	// HELD AT advFilterFrac 0.5, deliberately, even though the papers above use 0.20-0.25: at
+	// 0.5 this flag leaves the POLICY gradient bit-identical to yesterday's run and changes ONLY
+	// which rows the value heads see, so it isolates the one variable the literature disagrees
+	// about. Move to 0.25 only after entropy and KL hold here.
+	cfg.ppo.advFilterSubset = true;
 
 	// Reachability: aux InfoNCE heads on the shared trunk. gateEnabled = false under FRONTIER-9:
 	// every reward component is now zero-sum/antisymmetric and ungated by design (gating breaks ZS
@@ -764,7 +869,7 @@ int main(int argc, char* argv[]) {
 	// Private head on top of critic_trunk (2026-07-29): 5x1280 on raw obs -> 2x1280 on the shared
 	// value body, 6.87M -> 3.29M. This is the change that gives up its gradient isolation - see
 	// the criticTrunk block below and PPOLearnerConfig::criticTrunk.
-	cfg.ppo.goalCritic.model.layerSizes = { 1024, 1024 }; // 6.0: 1280 -> 1024 (VRAM budget)
+	cfg.ppo.goalCritic.model.layerSizes = { 1536, 1536 }; // 6.1: 1024 -> 1536 (FULL SIZE block below)
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
@@ -825,8 +930,23 @@ int main(int argc, char* argv[]) {
 	// the other half of the budget (see it below). Activation peak is LINEAR in both, so
 	// 0.8 x 0.5 ~= 0.4x on the dominant term. Depth and head-count are unchanged — see the
 	// critic_trunk block below for why two layers per value head is a floor, not a knob.
-	cfg.ppo.sharedHead.layerSizes = { 896, 896, 896 };  // was 1152; stem + 1 residual block
-	cfg.ppo.policy.layerSizes = { 640, 640, 640 };      // was 768; stem + 1 block
+	// 6.1 FULL SIZE (2026-08-03, user-directed "use all the VRAM"): the card is no longer
+	// shared (the possibility sweep finished), so the ~8 GB budget above is retired. Widths go
+	// one rung PAST 5.3's, not just back to them: trunk 1152 -> 1280, value side 1280 -> 1536
+	// (the critic-scaling-pays evidence in the resid block below), policy back to its designed
+	// 768 and deliberately NO further — SimBa/BRO actor-scaling says wider actors buy ~nothing,
+	// so VRAM spent there is wasted. reach phi/psi and geoModel are HELD at their sizes: each
+	// carries its own written warning (InfoNCE overfits when over-parameterized; geo width buys
+	// little and costs learn-pass peak). All widths stay 128-aligned for tensor cores
+	// (1280 = 10x128, 1536 = 12x128). Depth untouched everywhere — the two-layer head floor
+	// below is load-bearing for the vdag min() anti-ratchet.
+	// Estimated learn-pass activation growth vs 6.0 widths is ~1.45x per row on the dominant
+	// term; 6.0 measured ~5.5 GB peak, so expect ~7-8.5 GB with ~13 GB free. The remaining
+	// headroom is deliberately banked for the post-birth throughput levers (miniBatchSize
+	// 25k -> 50k is the next rung, numGames 128 -> 256): those are shape-safe to move mid-run,
+	// widths are not — size the net high once at birth, tune the batch after measuring.
+	cfg.ppo.sharedHead.layerSizes = { 1280, 1280, 1280 }; // 6.1: 896 -> 1280; stem + 1 residual block
+	cfg.ppo.policy.layerSizes = { 768, 768, 768 };        // 6.1: 640 -> 768 (designed size); stem + 1 block
 
 	// SECOND SHARED TRUNK, VALUE-SIDE ONLY (2026-07-29, user-directed). The four value heads used
 	// to be four independent 5x1280 stacks reading the main trunk (critic + vdag1 + vdag2, which
@@ -848,9 +968,10 @@ int main(int argc, char* argv[]) {
 	// 6.0: 1280 -> 1024 on the whole value side (the VRAM budget above). Depth is untouched,
 	// which is what the floor rule below demands; only width moved. vdag1/vdag2 follow the
 	// critic's config automatically, so this one line resizes three of the four heads.
-	cfg.ppo.criticTrunk.layerSizes = { 1024, 1024, 1024 };
+	// 6.1: 1024 -> 1536 (the FULL SIZE block above) — past 5.3's 1280, same depth rules.
+	cfg.ppo.criticTrunk.layerSizes = { 1536, 1536, 1536 };
 	cfg.ppo.criticTrunk.addOutputLayer = false;  // it is a body; MakeModels asserts this
-	cfg.ppo.critic.layerSizes = { 1024, 1024 };  // private head on top of critic_trunk
+	cfg.ppo.critic.layerSizes = { 1536, 1536 };  // private head on top of critic_trunk
 	// Reachability phi/psi are CONTRASTIVE/regression heads, not value
 	// heads: the critic-scaling evidence above does not cover them, and over-parameterized
 	// InfoNCE embeddings can overfit the contrastive task. Grown only modestly (256x2 ->
@@ -918,6 +1039,16 @@ int main(int argc, char* argv[]) {
 	// constant mix weight, and its largest measured wins are early, so it belongs to a lineage
 	// from step 0 rather than being inserted mid-run. Revert is this flag.
 	cfg.ppo.geoEnabled = true;
+	// 6.1 (2026-08-03): the HJB residual's gamma is DECOUPLED from gaeGamma and pinned to the
+	// value the rung was validated at (ts8's 0.9969). At ts1's gaeGamma the residual is
+	// ill-conditioned — the level-anchoring (1-gamma) path fell 8x relative to the
+	// gradient-shaping path, and 6.0 measured Geo/V Mean 2.9 against the ~39 dimensional
+	// analysis predicts, i.e. an UNSOLVED field silently supplying half the seek potential
+	// (geoMixW 0.5) while every panel looked healthy (the injector discards the level).
+	// Full mechanism + why a residual rescale would NOT fix it (Adam is scale-invariant):
+	// PPOLearnerConfig::geoGamma. WATCH Geo/V Mean: at this gamma the fixed point is ~1/8 of
+	// rate-invariant, so healthy is a climb toward ~5, not ~39.
+	cfg.ppo.geoGamma = 0.9969f;
 	cfg.ppo.geoModel.layerSizes = { 384, 384 };
 	cfg.ppo.geoModel.activationType = activation;
 	cfg.ppo.geoModel.addLayerNorm = addLayerNorm;
@@ -1023,8 +1154,21 @@ int main(int argc, char* argv[]) {
 	// (16.4B steps) stays fully intact as the restore point — revert = put this line, the
 	// tickSkip/actionDelay block, TRAIN_GAMMA, gaeLambda, goalCritic.gamma, the two per-step
 	// reward weights and the reachability windows back, rebuild, restart.
-	cfg.checkpointFolder = "checkpoints_6.0";
-	cfg.metricsRunName = "6.0-ts1";
+	// 6.1 (2026-08-03, user-directed): FULL-SIZE cold start — trunk 1280 / value side 1536 /
+	// policy 768 (the FULL SIZE block above), geoGamma decoupled, still ts1. The width changes
+	// break EVERY dense-net shape, so the fresh folder is load-bearing the same way 5.2's was:
+	// booting this binary against checkpoints_6.0 would have the loader walk newest->oldest
+	// renaming every checkpoint corrupt_<ts>, destroying that lineage (~3.07B steps) instead of
+	// refusing to start. checkpoints_6.0 stays fully intact as the restore point: revert = put
+	// this line, the 6.1 width lines, numGames and geoGamma back, rebuild, restart.
+	// 6.1b (2026-08-04): cold restart of 6.1 with entropyScale 0.0175 (see that block) after
+	// 6.1's from-birth entropy collapse — its policy spent the ENTIRE formative window at
+	// entropy <= 0.05, the exact pathology (formative window without exploration) that
+	// motivated the 5.0/6.0 cold starts. Same architecture, same everything else.
+	// checkpoints_6.1 (1.1B steps, collapsed) is left fully intact for inspection/restore;
+	// a fresh folder rather than a wipe, per the never-delete rule.
+	cfg.checkpointFolder = "checkpoints_6.1b";
+	cfg.metricsRunName = "6.1b-full";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
@@ -1071,6 +1215,27 @@ int main(int argc, char* argv[]) {
 			g_RenderTeamSize = n;
 		}
 		RG_LOG("Render mode: " << g_RenderTeamSize << "v" << g_RenderTeamSize << " arena");
+
+		// DETERMINISTIC (argmax) ACTIONS IN THE VIEWER (2026-08-04, user-directed).
+		// The viewer samples from the policy like training does, and at ts1 that is actively
+		// misleading: a decision every 8.3ms means a stochastic policy re-rolls its jump/dodge
+		// bits 120x/second, so ~0.5 nats of entropy renders as continuous dithering rather than
+		// as the behaviour the policy actually intends. That exact symptom is what convicted the
+		// entropy coefficient earlier in this run ("the viewer showed cars flipping
+		// continuously") — i.e. the viewer has been showing exploration noise, not skill.
+		// Argmax shows what the policy would DO, which is also what the RLBot real-match path
+		// already does, so the viewer and a real game now agree.
+		// SAFE HERE AND ONLY HERE: PPOLearnerConfig warns that a LEARN iteration under
+		// deterministic mode throws — render mode never calls Learn(), and this assignment is
+		// inside the renderMode branch, so it cannot reach the trainer.
+		// GGL_RENDER_SAMPLE=1 restores stochastic actions for watching exploration itself.
+		cfg.ppo.deterministic = true;
+		if (const char* d = std::getenv("GGL_RENDER_SAMPLE"); d && d[0] && std::string(d) != "0") {
+			cfg.ppo.deterministic = false;
+			RG_LOG("Render mode: GGL_RENDER_SAMPLE set - sampling actions (exploration visible)");
+		} else {
+			RG_LOG("Render mode: deterministic (argmax) actions");
+		}
 
 #ifdef GGL_VIZ_RLBOT
 		// Let the viewer hand the other team to a real RLBot bot playing in OUR arena, so
