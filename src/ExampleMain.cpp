@@ -80,6 +80,20 @@ static constexpr float PHASE_B_FRAC_3V3 = 0.3333f;
 // 1200 sits ~1 noise-band below the measured 1v1 plateau (~1250-1300 on the 3.1 lineage);
 // the 3-eval streak filters single-eval noise (band is +-30-50). The marker is
 // lineage-scoped: wiping/branching checkpoints_4.0 resets the curriculum with it.
+// 6.2 (2026-08-05, user-directed): TEAM MODES DISABLED FOR THIS LINEAGE. The run stays 1v1
+// forever — no automatic flip, and a stray marker cannot engage it either (both the trigger
+// below and the marker READ at startup are guarded on this). Reasons it is off here:
+//   * The actuation swap (injection -> SIL + entropy gate) is the ONE variable under test.
+//     Flipping two thirds of the fleet to game modes the lineage has never played, partway
+//     through, confounds it — 6.1b flipped at 41.1Ms game time, right at the boundary of the
+//     band its own frequency comparison was supposed to resolve in, and made that read
+//     ambiguous for good.
+//   * The trigger reads Rating/1v1, which is the INFLATED pool metric (~6x overstatement,
+//     measured). Gating a curriculum change on the one number this project knows not to trust
+//     is how 6.1b flipped without anyone deciding to.
+// Flip it back by setting this true; the trigger constant below is unchanged and still correct
+// if you do.
+static constexpr bool PHASE_B_ENABLED = false;
 static constexpr float PHASE_B_RATING_TRIGGER = 1200.0f;
 static constexpr int PHASE_B_TRIGGER_STREAK = 3;
 static constexpr int PHASE_B_RESTART_EXIT_CODE = 99; // nonzero and outside the wrapper's stop set {0,130,143}
@@ -1459,7 +1473,9 @@ int main(int argc, char* argv[]) {
 	// re-fired forever - the trainer wrote the marker, exited 99, relaunched into PHASE A,
 	// and repeated every ~6 minutes for 70M+ steps (five loops in one log, ts 3.695B-3.768B).
 	// If the marker read ever disappears again the symptom is that exact restart loop.
-	g_PhaseB = std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
+	// PHASE_B_ENABLED guards the READ as well as the trigger, so an inherited or hand-copied
+	// marker cannot engage team modes behind your back.
+	g_PhaseB = PHASE_B_ENABLED && std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
 	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
 	g_NumGames = cfg.numGames;
 	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
@@ -1496,6 +1512,11 @@ int main(int argc, char* argv[]) {
 		learner->iterationCallback = [](Learner* learner, Report& report) {
 			report["Curriculum/Team Phase"] = g_PhaseB ? 1.0f : 0.0f;
 			report["Curriculum/Phase B Streak"] = (float)g_PhaseBStreak;
+			// Team modes disabled for this lineage (PHASE_B_ENABLED) — never arm the streak,
+			// never write the marker, never exit(99). The panels above keep publishing so the
+			// series does not vanish mid-history; they just stay pinned at 0.
+			if (!PHASE_B_ENABLED)
+				return;
 			if (g_PhaseB || !report.Has("Rating/1v1"))
 				return;
 			float rating = (float)report["Rating/1v1"];
