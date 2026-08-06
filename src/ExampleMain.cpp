@@ -1053,13 +1053,36 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.geoModel.activationType = activation;
 	cfg.ppo.geoModel.addLayerNorm = addLayerNorm;
 	cfg.ppo.geoModel.addResiduals = false;   // 2 layers: addResiduals is a no-op at this depth
-	// The implicit-world-model potential and H-gated entropy arrived by merge from a parallel
-	// experiment line (e1b02b9) with enabled-by-default config. EXPLICITLY OFF for the 5.3
-	// lineage: it cold-started 2026-07-30 as the four-rung-ladder run, and adding a second
-	// theorised-value potential mid-lineage would confound the geometry rung's at-scale test.
-	// Enable deliberately, on its own restart, with its own panels watched.
+	// The implicit-world-model potential arrived by merge from a parallel experiment line
+	// (e1b02b9) with enabled-by-default config. EXPLICITLY OFF: adding a second
+	// theorised-value potential mid-lineage would confound the at-scale test.
 	cfg.ppo.vdagWmEnabled = false;
-	cfg.ppo.vdagEntGateEnabled = false;
+
+	// ===== ACTUATION SWAP (2026-08-05, research/testbeds/inject2d + RESULTS.md) =====
+	// The potential-injection channel is REPLACED by headroom-gated self-imitation + the
+	// H-gated entropy multiplier. Measured on the offline injection testbed (8 seeds/arm,
+	// like-for-like ladder): the sigma-matched potential injection ignites conducts FAST
+	// and then CAPS them at ~1/3 of the un-injected baseline's converged rate (the
+	// per-batch unit normalization means the delivered dose never retires -- as headroom
+	// closes, residual field noise is re-amplified to constant dose forever); SIL+entgate
+	// ignite 8/8 seeds AND converge highest, and running SIL ON TOP of the live injection
+	// inherits the injection's cap (1.45 vs 5.15 final conduct rate) -- so this is a swap,
+	// not an addition. At ts1 specifically the per-decision potential difference lost ~8x
+	// SNR vs ts8 while SIL (return-level) and entgate (objective-level) are decision-rate
+	// invariant. All four rungs keep TRAINING exactly as before (measurement, gates, and
+	// representation pressure through the trunk); only the advantage-channel dose is zeroed.
+	// Revert: geoSeekBeta back to 0.04, silEnabled false, vdagEntGateEnabled false.
+	cfg.ppo.geoSeekBeta = 0.0f;   // delivered injection = exactly 0; dose panel confirms
+	cfg.ppo.vdagSeekBeta = 0.0f;  // the pre-geo vdag-only injection too (it is overwritten
+	                              // while geoEnabled, but a later geo toggle must not
+	                              // silently resurrect it)
+	cfg.ppo.silEnabled = true;
+	cfg.ppo.silCoeff = 0.05f;     // toy-validated 0.1, halved for the opposed live game
+	                              // (imitated overcommits are the un-derisked hazard --
+	                              // the steering-v1 ratchet; watch Ref shares + SIL/*)
+	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
+	                                   // at ts1 it also de-risks the global entropy
+	                                   // coefficient fragility that killed 6.1 proper
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.

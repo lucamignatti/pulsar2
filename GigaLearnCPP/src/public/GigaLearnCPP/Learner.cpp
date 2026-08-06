@@ -1414,10 +1414,15 @@ void GGL::Learner::Start() {
 			// log-probs, obs are CPU-built), and the learner joins this thread before
 			// consuming, so no GPU tensor crosses streams. Weight staleness during overlap is
 			// the standing async-PPO one-update lag and is unchanged by the stream split.
+			// RG_CUDA_SUPPORT guard (2026-08-05): CPU/MPS torch ships the c10/cuda headers
+			// without these members, which broke the Mac compile-check build; the runtime
+			// path was already CUDA-only via is_cuda().
+#ifdef RG_CUDA_SUPPORT
 			std::optional<c10::cuda::CUDAStreamGuard> collectStreamGuard;
 			if (ppo->device.is_cuda())
 				collectStreamGuard.emplace(c10::cuda::getStreamFromPool(
 					/*isHighPriority=*/true, ppo->device.index()));
+#endif
 			// This iteration's opponent for the non-self team: Nexto, an archived past self, or
 			// (default) the current self. `oppModels` is the opponent's network (null = mirror
 			// self-play); the player masking, trajectory exclusion, and split inference below are
@@ -2440,7 +2445,7 @@ void GGL::Learner::Start() {
 
 					Timer gaeTimer = {};
 					// Run GAE
-					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights;
+					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights, tSilWeights;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -2584,6 +2589,7 @@ void GGL::Learner::Start() {
 						// w is CONSTANT: in the paired test the permanent mix beat a retiring
 						// crossfade in 6/8 step-bucket cells and collapsed nowhere, so V_geo
 						// stays in the ladder for good rather than expiring into V-dagger.
+						torch::Tensor tHGeo; // hoisted: the SIL gate below reads it too
 						if (config.ppo.geoEnabled && ppo->models["geo_v"]) {
 							float w = RS_CLAMP(config.ppo.geoMixW, 0.f, 1.f);
 
@@ -2598,6 +2604,7 @@ void GGL::Learner::Start() {
 							float vm = vpF.mean().item<float>(), vs = vpF.std().item<float>() + 1e-8f;
 							auto geoScaled = (geoV - gm) / gs * vs + vm;
 							auto hGeo = torch::relu(geoScaled - vpF);
+							tHGeo = hGeo;
 
 							auto unit = [](torch::Tensor x) { return x / (x.std() + 1e-8f); };
 							auto phiMix = (1.f - w) * unit(hGeo) + w * unit(tPhi);
@@ -2658,6 +2665,46 @@ void GGL::Learner::Start() {
 								.clamp(1.f, config.ppo.vdagEntGateCap);
 							report["Headroom/Ent Gate Mean"] = tEntWeights.mean().item<float>();
 							report["Headroom/Ent Gate Max"] = tEntWeights.max().item<float>();
+						}
+						// ===== SELF-IMITATION (headroom-gated; PPOLearnerConfig::silEnabled) =====
+						// Conversion rows: realized return (tTargetVals) beat V_exp -- beyond the
+						// upper tail of typical behavior, so genuine conversion, not routine luck --
+						// in a state the ladder flags as frontier (headroom mix >= silGateQ
+						// quantile). Weight = (R - V)+ capped at silWCapSigma * std(R - V).
+						// PPOLearner adds silCoeff * -log pi(a|s) * w on these rows: success-only
+						// consolidation, the direct attack on below-break-even avoidance. The gate
+						// mixes the SAME two fields the injector reads (unit(hGeo) + unit(tH));
+						// with geo disabled it degrades to unit(tH) alone. V_exp comes from the
+						// gap sensor (one-iteration stale: it trains after this block, which also
+						// means it never measures its own influence within an iteration). Skipped
+						// silently while the sensor is young (< 5 updates) or disabled.
+						if (config.ppo.silEnabled && gapSensor && gapSensor->exp
+							&& gapSensor->updates >= 5) {
+							auto tgtF = tTargetVals.to(torch::kFloat32).flatten();
+							auto vexp = torch::empty({ nR }, torch::kFloat32);
+							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+								int64_t i1 = RS_MIN(i0 + VCH, nR);
+								auto h2c = ppo->models["shared_head"]->Forward(
+									tStates.slice(0, i0, i1).to(ppo->device, true), false);
+								vexp.slice(0, i0, i1).copy_(
+									gapSensor->exp->forward(h2c).flatten()
+										.to(torch::kCPU, torch::kFloat32));
+							}
+							auto unit = [](const torch::Tensor& x) {
+								return x / (x.std() + 1e-8f);
+							};
+							auto hMix = tHGeo.defined()
+								? (0.5f * unit(tHGeo) + 0.5f * unit(tH)) : unit(tH);
+							auto hQ = hMix.quantile((double)config.ppo.silGateQ);
+							auto conv = (tgtF > vexp) & (hMix >= hQ);
+							auto resid = tgtF - vpF;
+							float cap = config.ppo.silWCapSigma
+								* (resid.std().item<float>() + 1e-8f);
+							tSilWeights = resid.clamp(0.f, cap) * conv.to(torch::kFloat32);
+							float nConv = conv.to(torch::kFloat32).sum().item<float>();
+							report["SIL/Frac"] = nConv / (float)nR;
+							report["SIL/Mean W"] = nConv > 0
+								? tSilWeights.sum().item<float>() / nConv : 0.f;
 						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
 						report["Headroom/H Mean"] = tH.mean().item<float>();
@@ -2923,6 +2970,8 @@ void GGL::Learner::Start() {
 					experience.data.advFilterMask = tAdvFilterMask;
 					if (tEntWeights.defined())
 						experience.data.entWeights = tEntWeights;
+					if (tSilWeights.defined())
+						experience.data.silWeights = tSilWeights;
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 

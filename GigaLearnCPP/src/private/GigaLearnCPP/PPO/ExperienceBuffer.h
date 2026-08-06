@@ -34,6 +34,9 @@ namespace GGL {
 			advFilterMask,
 			// HEADROOM: per-row entropy multiplier from H (undefined unless vdagEntGateEnabled)
 			entWeights,
+			// SELF-IMITATION: per-row BC weight, nonzero only on conversion rows -- realized
+			// return beat V_exp in a high-headroom state (undefined unless silEnabled)
+			silWeights,
 			advantages;
 
 		auto begin() { return &states; }

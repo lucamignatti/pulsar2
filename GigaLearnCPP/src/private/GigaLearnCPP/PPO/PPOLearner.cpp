@@ -917,6 +917,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					ppoLoss = policyLoss * policyLossRatio
 						- entropy * config.entropyScale * batchSizeRatio;
 
+					// SELF-IMITATION: positive-only BC on conversion rows (weights computed at
+					// learn-prep; see the silEnabled block in Learner.cpp). Mean over the
+					// minibatch's conversion rows, batchSizeRatio-scaled so gradient
+					// accumulation matches a full-batch pass (the guiding-loss convention).
+					if (batch.silWeights.defined()) {
+						auto sw = batch.silWeights.slice(0, start, stop)
+							.to(device, true, true).view_as(logProbs);
+						float nConv = sw.count_nonzero().item<float>();
+						if (nConv > 0) {
+							auto silLoss = (-(logProbs.flatten()) * sw.flatten()).sum()
+								/ nConv * config.silCoeff * batchSizeRatio;
+							dbgSilLoss = silLoss.detach().cpu().item<float>();
+							ppoLoss = ppoLoss + silLoss;
+						}
+					}
+
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
 						{
@@ -1356,6 +1372,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		report["Headroom/Rhat Rows"] = dbgRhatRows;
 		if (dbgEntGate >= 0.f)
 			report["Headroom/Ent Gate"] = dbgEntGate;
+		if (dbgSilLoss >= 0.f)
+			report["SIL/Loss"] = dbgSilLoss;
 		if (config.vdagWmEnabled) {
 			report["Headroom/WM Dyn Loss"] = dbgWmDyn;
 			report["Headroom/WM VI Loss"] = dbgWmVi;

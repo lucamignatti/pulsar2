@@ -133,6 +133,7 @@ namespace GGL {
 		int numActionsCached = 0, obsSizeCached = 0;
 		float dbgWmDyn = -1.f, dbgWmVi = -1.f, dbgWmTrust = -1.f, dbgImag = -1.f;
 		float dbgEntGate = -1.f;
+		float dbgSilLoss = -1.f;
 
 		// Perhaps they should be somewhere else? Should probably make an inference interface...
 		// steerDelta (optional, [n, trunkOut] or [1, trunkOut]): added to the shared-head output

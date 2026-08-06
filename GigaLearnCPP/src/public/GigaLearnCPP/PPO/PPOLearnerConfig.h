@@ -491,6 +491,26 @@ namespace GGL {
 		float vdagEntGateK = 3.0f;
 		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
 
+		// ===== SELF-IMITATION (headroom-gated) =====
+		// The actuation channel that replaced the potential injection (2026-08-05,
+		// research/testbeds/inject2d). When a trajectory's realized return beat V_exp
+		// (a genuine conversion, not routine luck) in a state the ladder flags as
+		// frontier (headroom-mix >= silGateQ quantile), an extra positive-only BC term
+		// -log pi(a|s) * (R - V)+ clones that behavior before the expectation gradient
+		// washes it out. Success-only by construction: failures get default PPO
+		// treatment, so the below-break-even avoidance loop (the acquisition wall's
+		// mechanism) is attacked directly, and only executed behavior is ever imitated
+		// (the execution principle is satisfied trivially). Measured (8 seeds, toy):
+		// 8/8 ignition vs 5/8, ~5x conduct rate at matched budget vs the potential
+		// channel, and the H gate specifically buys ignition SPEED (0.99M vs 1.65M
+		// ungated). Known un-derisked hazard: imitating lucky overcommits an opponent
+		// punishes (the steering-v1 ratchet) -- silCoeff is halved from the toy's 0.1
+		// for that reason; watch RatingWatch/Ref shares for the signature.
+		bool silEnabled = false;
+		float silCoeff = 0.05f;
+		float silGateQ = 0.70f;        // headroom-mix quantile above which rows may imitate
+		float silWCapSigma = 2.0f;     // weight cap, in units of std(R - V)
+
 		// ===== IMPLICIT WORLD MODEL (theorised-achievable-value field) =====
 		// Twin one-step OBS-space dynamics + optimistic value iteration read out through
 		// the worth theory. No rollout, no search, no buffer: one hop per update, and
