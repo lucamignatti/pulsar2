@@ -33,7 +33,7 @@ VIZ_BUILD_DIR="${TRAINERCTL_VIZ_BUILD_DIR:-$REPO_ROOT/build-viz}"
 # golden checkpoint from a SUPERSEDED lineage has a different policy-head width and is not
 # loadable by the live run - the recovery doctrine's "restore a known-good FULL checkpoint"
 # assumes the same lineage. `trainerctl doctor` now diffs this against ExampleMain.cpp.
-CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_6.1b}"
+CKPT_DIR="${TRAINERCTL_CKPT_DIR:-$BUILD_DIR/checkpoints_6.2}"
 RUN_TRAINER="$SCRIPT_DIR/run_trainer.sh"
 LOG_DIR="${RUN_TRAINER_LOG_DIR:-$REPO_ROOT/run_logs}"
 CONF_DIR="$HOME/.config/pulsar-remote"

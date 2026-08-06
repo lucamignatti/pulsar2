@@ -1190,8 +1190,19 @@ int main(int argc, char* argv[]) {
 	// motivated the 5.0/6.0 cold starts. Same architecture, same everything else.
 	// checkpoints_6.1 (1.1B steps, collapsed) is left fully intact for inspection/restore;
 	// a fresh folder rather than a wipe, per the never-delete rule.
-	cfg.checkpointFolder = "checkpoints_6.1b";
-	cfg.metricsRunName = "6.1b-full";
+	// 6.2 (2026-08-05): the ACTUATION SWAP gets its own lineage, and this is mandatory for the
+	// same reason the ts1 change was — not because anything shape-breaks, but because nothing
+	// does. The swap (potential injection -> headroom-gated SIL + entropy gate) adds and removes
+	// no models, so every checkpoint in checkpoints_6.1b loads CLEANLY into this binary and would
+	// silently resume an 11.7B-step policy onto a completely different actuation channel, with
+	// geoSeekBeta and vdagSeekBeta now 0. That is the one failure mode the loader cannot catch:
+	// it only rejects checkpoints it cannot deserialize.
+	// checkpoints_6.1b (11.7B steps, healthy — Nexto share 31%, entropy 0.55 and rising, 0 dead
+	// units) stays fully intact as the restore point. Revert = put these two lines back.
+	// If a mid-run swap ON TOP of 6.1b was actually intended, that is also these two lines — but
+	// it confounds the actuation comparison with 11.7B steps of injection-trained history.
+	cfg.checkpointFolder = "checkpoints_6.2";
+	cfg.metricsRunName = "6.2-sil";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
