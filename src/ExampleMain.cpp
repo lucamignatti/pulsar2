@@ -1080,6 +1080,29 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.silCoeff = 0.05f;     // toy-validated 0.1, halved for the opposed live game
 	                              // (imitated overcommits are the un-derisked hazard --
 	                              // the steering-v1 ratchet; watch Ref shares + SIL/*)
+
+	// ===== HULL OPERATOR (2026-08-07; canonical: research/reports/EPSILON_CRITIC.md s7) =====
+	// The record-licensed relaxed Bellman operator on the V-dagger targets: the bootstrap is
+	// maxed over the real next state plus hullK candidates built by transplanting eps-scaled
+	// WITNESSED displacement vectors between chart-matched states. This is what prices
+	// never-assembled conducts (toy family F, 0.000% assembly in every record: best of all
+	// estimators, 8/8 seeds) and unvisited-state value (family B: +0.13 rho over plain
+	// V-dagger). OPEN configuration deliberately (no donor gates): the validated TRAINING
+	// seat -- toy ignition 1.02M vs 1.22M, 8/8 -- where thin-record optimism is exploration
+	// pressure bounded by SIL's realized-conversion requirement, not hallucination (the seat
+	// theorem, ibid). Adversarial ledger in the report: resource-laundering, teleports,
+	// illegal transplants, thin-record -- every harm channel measured and closed.
+	// Deployment notes: takes effect at next restart; OLD checkpoints fresh-init the two
+	// chart nets (Model::Load allowNotExist) -- no rotation risk; changing V-dagger's
+	// targets mid-lineage is a LEVER (treat as a new deployment: watch Hull/Uplift Mean
+	// [healthy = small and shrinking per-regime, not monotonically growing], Hull/Chart NLL
+	// [down then flat], Headroom/Vdag Mean [no ratchet], SIL/* and Ref shares as always).
+	// Revert: this flag, restart. The feed-side teleport filter this change adds also
+	// removes the long-flagged respawn pollution from the geo Sigma reservoir.
+	cfg.ppo.hullEnabled = true;
+	cfg.ppo.hullHeadModel.layerSizes = { 64 };
+	cfg.ppo.hullHeadModel.activationType = activation;
+	cfg.ppo.hullHeadModel.addLayerNorm = false;
 	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
 	                                   // at ts1 it also de-risks the global entropy
 	                                   // coefficient fragility that killed 6.1 proper

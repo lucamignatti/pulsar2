@@ -2522,6 +2522,25 @@ void GGL::Learner::Start() {
 								ppo->InferVdagMin(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
 						}
 						auto vdagN = torch::cat({ vdag.slice(0, 1, nR), z1 });
+						// ===== HULL OPERATOR (EPSILON_CRITIC.md s7; PPOLearnerConfig::hullEnabled)
+						// Relax the bootstrap: max over the real next state and hullK candidates
+						// built from eps-scaled WITNESSED displacement vectors donated by
+						// chart-matched states. Row i's next state is row i+1 (episodes are
+						// row-contiguous); boundary rows are irrelevant because cont zeroes their
+						// bootstrap term entirely. Hull/Uplift is the how-much-extra-optimism
+						// panel: relu(hull - plain) averaged over bootstrapped rows.
+						if (config.ppo.hullEnabled) {
+							auto tNxt = torch::cat({ tStates.slice(0, 1, nR),
+								tStates.slice(0, nR - 1, nR) });
+							auto tvHull = ppo->HullBootstrap(tNxt);
+							if (tvHull.defined() && tvHull.numel() == nR) {
+								auto uplift = torch::relu(tvHull - vdagN) * cont;
+								report["Hull/Uplift Mean"] =
+									(uplift.sum() / RS_MAX(cont.sum().item<float>(), 1.f))
+									.item<float>();
+								vdagN = torch::maximum(vdagN, tvHull);
+							}
+						}
 						float vScale = tTargetVals.abs().to(torch::kFloat32).quantile(0.99).item<float>();
 						tVdagTargets = (scaledR + g * cont * vdagN)
 							.clamp(-2.f * RS_MAX(vScale, 1.f), 2.f * RS_MAX(vScale, 1.f));
@@ -2637,14 +2656,21 @@ void GGL::Learner::Start() {
 						// GEOMETRY reservoir: obs, arrival obs, and the SCALED reward that
 						// landed on the arrival state (same reconstruction the theory head uses,
 						// so r_hat is in the critic's units).
-						if (config.ppo.geoEnabled) {
+						if (config.ppo.geoEnabled || config.ppo.hullEnabled) {
 							auto z0g = torch::zeros({ 1 }, scaledR.options());
 							auto arrivalG = torch::cat({ z0g, scaledR.slice(0, 0, nR - 1) });
 							auto contPrevG = torch::cat({ z0g, cont.slice(0, 0, nR - 1) });
+							// keepMask = cont of the DEPARTURE row: pairs whose first row ended an
+							// episode are goal->kickoff teleports, not executed dynamics. Excluding
+							// them (2026-08-07, with the hull operator) also fixes the long-flagged
+							// Sigma pollution: these pairs previously entered with only their
+							// REWARD zeroed, so the geo Sigma learned respawn teleports as
+							// reachable displacement (offline: 4x ball-dim slack inflation).
 							ppo->GeoReservoirAdd(tStates.slice(0, 0, nR - 1),
 								tStates.slice(0, 1, nR),
 								(arrivalG * contPrevG).slice(0, 1, nR),
-								config.ppo.geoReservoir);
+								config.ppo.geoReservoir,
+								cont.slice(0, 0, nR - 1));
 						}
 						if (config.ppo.vdagTheoryEnabled) {
 							auto z0 = torch::zeros({ 1 }, scaledR.options());

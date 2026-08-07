@@ -491,6 +491,32 @@ namespace GGL {
 		float vdagEntGateK = 3.0f;
 		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
 
+		// ===== HULL OPERATOR (record-licensed relaxed Bellman) =====
+		// Canonical: research/reports/EPSILON_CRITIC.md section 7. The V-dagger bootstrap is
+		// maxed over the real next state plus hullK candidates built by transplanting
+		// eps-scaled WITNESSED one-step displacement vectors between states matched in a
+		// LEARNED dynamics chart (L1-sparse projection trained by displacement NLL -- it
+		// discovers the physics' invariances from data; on the toy it kept vz/contact/boost
+		// and pruned position). Generalization bound moves from state support to CHART
+		// support: a dynamics cell witnessed anywhere licenses slack everywhere it recurs,
+		// which is what prices never-assembled conducts (toy family F: 0.000% assembly in
+		// every record, priced above V-dagger on 8/8 seeds). Because donors are real
+		// displacement vectors, asymmetries are preserved: no +boost-in-air can ever be
+		// hallucinated. This is the OPEN (actuation-seat) configuration -- the validated
+		// trainer (toy: fastest ignition of the program, 1.02M vs 1.22M) -- NOT the gated
+		// estimator-grade readout; hallucinated headroom in thin regions directs attempts
+		// and is structurally cheap because SIL consolidates only realized R > V_exp
+		// conversions. Adversarial ledger (5 attacks, all harm channels closed) in the
+		// report. eps=0 (or the flag off) recovers the plain composition critic exactly.
+		bool hullEnabled = false;      // fresh-restart lever; old checkpoints fresh-init the chart
+		float hullEps = 1.0f;          // slack scale on donated displacements (toy-validated)
+		int hullK = 4;                 // donor candidates per bootstrap row
+		int hullChartDim = 8;          // learned dynamics-chart width
+		float hullChartL1 = 1e-3f;     // sparsity pressure on the chart projection
+		float hullChartLR = 1e-3f;     // Adam; chart nets are OFF-trunk world-facing fits
+		int hullBankSub = 2048;        // donor-bank subsample per iteration (cost lever)
+		PartialModelConfig hullHeadModel;  // shape for the chart's (mu, log-sigma) head
+
 		// ===== SELF-IMITATION (headroom-gated) =====
 		// The actuation channel that replaced the potential injection (2026-08-05,
 		// research/testbeds/inject2d). When a trajectory's realized return beat V_exp

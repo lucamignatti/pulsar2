@@ -123,6 +123,29 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		models.Add(new Model("geo_v", gv, device));
 	}
 
+	// HULL OPERATOR chart (EPSILON_CRITIC.md section 7). Two small OFF-trunk nets:
+	//   hull_proj : obs -> chartDim   the learned dynamics chart (near-linear, L1-sparsified
+	//               in the training loss -- it discovers which obs dims CONDITION the local
+	//               physics and prunes the rest; inspect its first-layer weights to audit)
+	//   hull_head : chartDim -> 2*obs (mu, log-sigma) of the one-step displacement given the
+	//               chart cell -- the NLL that trains the chart, and the likelihood reference
+	//               for the (optional, estimator-seat) donor gates.
+	// The donor BANK is the geo reservoir (obs, next) pairs; deltas = next - obs.
+	if (config.hullEnabled) {
+		ModelConfig hp = PartialModelConfig{};
+		hp.layerSizes = { config.hullChartDim };
+		hp.addOutputLayer = false;           // chart coords ARE the layer output
+		hp.addLayerNorm = false;             // distances in chart space must be raw
+		hp.numInputs = obsSize; hp.numOutputs = config.hullChartDim;
+		ModelConfig hh = config.hullHeadModel.IsValid()
+			? ModelConfig(config.hullHeadModel) : ModelConfig(PartialModelConfig{});
+		if (!config.hullHeadModel.IsValid())
+			hh.layerSizes = { 64 };
+		hh.numInputs = config.hullChartDim; hh.numOutputs = obsSize * 2;
+		models.Add(new Model("hull_proj", hp, device));
+		models.Add(new Model("hull_head", hh, device));
+	}
+
 	if (config.reachability.enabled) {
 		int trunkOutSize = config.sharedHead.IsValid() ? config.sharedHead.layerSizes.back() : obsSize;
 		reach = new ReachabilityModule(trunkOutSize, numActions, config.reachability, device, models,
@@ -413,10 +436,67 @@ torch::Tensor GGL::PPOLearner::InferGeoV(torch::Tensor obs) {
 	return models["geo_v"]->Forward(obs, config.useHalfPrecision).flatten().to(torch::kFloat32);
 }
 
-void GGL::PPOLearner::GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap) {
+torch::Tensor GGL::PPOLearner::HullBootstrap(torch::Tensor states) {
+	// The hull candidates for each row of `states` (the NEXT states of the buffer): the
+	// hullK nearest donor states in chart space lend their eps-scaled witnessed
+	// displacement vectors; return max_j InferVdagMin(states + eps * delta_j).
+	// OPEN (actuation-seat) configuration deliberately -- no donor-radius or likelihood
+	// gates: this feeds training optimism, whose thin-record excess is exploration
+	// pressure bounded by SIL's realized-conversion requirement (EPSILON_CRITIC.md s7,
+	// the seat theorem). Cost: hullK extra InferVdagMin passes + one cdist per chunk.
+	RG_NO_GRAD;
+	if (!config.hullEnabled || !models["hull_proj"] || geoResFill < 4096)
+		return {};
+	int64_t nR = states.size(0);
+	int64_t sub = RS_MIN((int64_t)config.hullBankSub, geoResFill);
+	auto bidx = torch::randint(0, geoResFill, { sub }, torch::TensorOptions().dtype(torch::kLong));
+	auto bankObs = geoResObs.index_select(0, bidx).to(device, true);
+	auto bankDelta = (geoResNext.index_select(0, bidx) - geoResObs.index_select(0, bidx))
+		.to(device, true);
+	// residual teleport guard on top of the feed-side mask: drop the extreme tail of
+	// donated displacement norms (a data-driven bound, no domain knowledge)
+	auto dNorm = bankDelta.norm(2, 1);
+	auto normCap = dNorm.quantile(0.995);
+	bankDelta = bankDelta * (dNorm <= normCap).to(torch::kFloat32).unsqueeze(1);
+	auto bankCoords = models["hull_proj"]->Forward(bankObs, false).to(torch::kFloat32);
+
+	auto out = torch::empty({ nR }, torch::kFloat32);
+	constexpr int64_t HCH = 32768;
+	for (int64_t i0 = 0; i0 < nR; i0 += HCH) {
+		int64_t i1 = RS_MIN(i0 + HCH, nR);
+		auto q = states.slice(0, i0, i1).to(device, true).to(torch::kFloat32);
+		auto qc = models["hull_proj"]->Forward(q, false).to(torch::kFloat32);
+		auto nnk = std::get<1>(torch::cdist(qc, bankCoords)
+			.topk(RS_MIN((int64_t)config.hullK, sub), 1, /*largest=*/false));
+		torch::Tensor best;
+		for (int64_t j = 0; j < nnk.size(1); j++) {
+			auto pert = q + config.hullEps * bankDelta.index_select(0, nnk.select(1, j));
+			auto v = InferVdagMin(pert);
+			best = best.defined() ? torch::maximum(best, v) : v;
+		}
+		out.slice(0, i0, i1).copy_(best.to(torch::kCPU, torch::kFloat32));
+	}
+	return out;
+}
+
+void GGL::PPOLearner::GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap,
+	torch::Tensor keepMask) {
 	// Uniform reservoir over the whole run. Vectorised: a per-row loop over a 6144-row buffer
 	// dominated runtime in the offline harness.
+	// keepMask (optional, float 0/1): rows with 0 are EXCLUDED before insertion. The caller
+	// passes the continuation mask so pairs that cross an episode reset (goal -> kickoff
+	// teleports) never enter: they are not executed dynamics, and both Sigma (geo) and the
+	// hull donor bank would otherwise learn teleport displacements as reachable (measured in
+	// the offline testbed: 4x ball-dim slack inflation without the filter).
 	RG_NO_GRAD;
+	if (keepMask.defined()) {
+		auto sel = (keepMask.to(torch::kCPU, torch::kFloat32).flatten() > 0.5f)
+			.nonzero().flatten();
+		if (sel.numel() == 0) return;
+		obs = obs.index_select(0, sel.to(obs.device()));
+		nextObs = nextObs.index_select(0, sel.to(nextObs.device()));
+		rew = rew.flatten().index_select(0, sel.to(rew.device()));
+	}
 	int64_t n = obs.size(0);
 	if (n <= 0 || cap <= 0) return;
 	auto o = obs.to(torch::kCPU, torch::kFloat32);
@@ -740,6 +820,45 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		}
 		// One sync for the panel value, outside the minibatch hot loop.
 		dbgGeoRew = (rewAcc / (float)GEO_FIT_CHUNKS).cpu().item<float>();
+	}
+
+	// HULL chart fits, ONCE per Learn call (same budget logic as the geo fits above: the
+	// chart is a world-facing stationary fit on the reservoir). Loss = displacement NLL
+	// through the chart bottleneck + L1 on the projection weights: the NLL forces the chart
+	// to keep exactly the obs dims that CONDITION the local dynamics; the L1 deletes the
+	// rest. Audit by reading hull_proj's first-layer weights (Hull/Proj L1 panel tracks the
+	// surviving mass).
+	if (config.hullEnabled && models["hull_proj"] && geoResFill > 1024) {
+		torch::Tensor nllAcc;
+		int64_t chunk = RS_MIN((int64_t)config.miniBatchSize, geoResFill);
+		constexpr int HULL_FIT_CHUNKS = 4;
+		for (int k = 0; k < HULL_FIT_CHUNKS; k++) {
+			auto ridx = torch::randint(0, geoResFill, { chunk },
+				torch::TensorOptions().dtype(torch::kLong));
+			auto ro = geoResObs.index_select(0, ridx).to(device, true);
+			auto rn = geoResNext.index_select(0, ridx).to(device, true);
+			int64_t od = ro.size(1);
+			auto coords = models["hull_proj"]->Forward(ro, false).to(torch::kFloat32);
+			auto hOut = models["hull_head"]->Forward(coords, false).to(torch::kFloat32);
+			auto hMu = hOut.slice(1, 0, od);
+			auto hLs = hOut.slice(1, od, 2 * od).clamp(-8.f, 2.f);
+			auto dlt = rn - ro;
+			auto nll = (hLs + 0.5f * ((dlt - hMu) / hLs.exp()).pow(2)).mean();
+			torch::Tensor l1;
+			for (auto& p : models["hull_proj"]->parameters())
+				if (p.dim() == 2)
+					l1 = l1.defined() ? l1 + p.abs().mean() : p.abs().mean();
+			auto loss = l1.defined() ? nll + config.hullChartL1 * l1 : nll;
+			loss.backward();
+			nn::utils::clip_grad_norm_(models["hull_proj"]->parameters(), 1.0f);
+			nn::utils::clip_grad_norm_(models["hull_head"]->parameters(), 1.0f);
+			models["hull_proj"]->StepOptim();
+			models["hull_head"]->StepOptim();
+			nllAcc = nllAcc.defined() ? nllAcc + nll.detach() : nll.detach();
+			if (k == HULL_FIT_CHUNKS - 1 && l1.defined())
+				dbgHullL1 = l1.detach().cpu().item<float>();
+		}
+		dbgHullNLL = (nllAcc / (float)HULL_FIT_CHUNKS).cpu().item<float>();
 	}
 	// HJB debug accumulators: summed as GPU tensors across minibatches, synced ONCE after the
 	// epoch loop. The previous form did three .item() syncs per minibatch (48 per iteration)
@@ -1374,6 +1493,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["Headroom/Ent Gate"] = dbgEntGate;
 		if (dbgSilLoss >= 0.f)
 			report["SIL/Loss"] = dbgSilLoss;
+		if (dbgHullNLL > -900.f)
+			report["Hull/Chart NLL"] = dbgHullNLL;
+		if (dbgHullL1 >= 0.f)
+			report["Hull/Proj L1"] = dbgHullL1;
 		if (config.vdagWmEnabled) {
 			report["Headroom/WM Dyn Loss"] = dbgWmDyn;
 			report["Headroom/WM VI Loss"] = dbgWmVi;
@@ -1516,6 +1639,11 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	for (const char* n : { "wm_dyn1", "wm_dyn2", "wm_v1", "wm_v2" })
 		if (models[n])
 			models[n]->SetOptimLR(criticLR);
+
+	// HULL chart nets: same ctor lr=0 trap. World-facing fits (displacement NLL), own LR.
+	for (const char* n : { "hull_proj", "hull_head" })
+		if (models[n])
+			models[n]->SetOptimLR(config.hullChartLR);
 
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }

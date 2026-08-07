@@ -116,8 +116,19 @@ namespace GGL {
 		// HJB residual run away 100-250x offline.
 		torch::Tensor geoResObs, geoResNext, geoResRew;
 		int64_t geoResFill = 0, geoResSeen = 0;
-		void GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap);
+		void GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap,
+			torch::Tensor keepMask = {});
 		float dbgGeoResid = -1.f, dbgGeoRew = -1.f, dbgGeoMean = -9.f;
+
+		// ===== HULL OPERATOR (record-licensed relaxed Bellman; EPSILON_CRITIC.md s7) =====
+		// For each next-state row: find hullK nearest donor states in the learned dynamics
+		// chart, transplant their eps-scaled witnessed displacement vectors, and return the
+		// elementwise MAX of InferVdagMin over the perturbed candidates. The donor bank is a
+		// per-iteration subsample of the geo reservoir (teleport-filtered at the feed).
+		// Returns a CPU float tensor shaped like `states`' first dim; empty tensor when the
+		// bank is not ready (caller falls back to the plain bootstrap).
+		torch::Tensor HullBootstrap(torch::Tensor states);
+		float dbgHullNLL = -999.f, dbgHullL1 = -1.f;   // NLL can be legitimately negative
 		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
 		float rhatMaxObserved = 0.f;
 		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;   // bound on hypothesis magnitude (never invent)
