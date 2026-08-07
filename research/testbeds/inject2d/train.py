@@ -41,7 +41,7 @@ BETA = 0.04
 GAMMA_INT = 0.95
 
 AUG_ARMS = ("silobs", "silobs_lp")
-SIL_ARMS = ("sil", "sil_nogate", "sil_ent", "sil_pbrs", "silobs", "silobs_lp", "gap_sil")
+SIL_ARMS = ("sil", "sil_eps", "sil_hull", "sil_nogate", "sil_ent", "sil_pbrs", "silobs", "silobs_lp", "gap_sil")
 PBRS_ARMS = ("pbrs", "pbrs_raw", "servo_raw", "kstep", "sparse", "sil_pbrs")
 
 
@@ -60,7 +60,9 @@ class Agent:
         self.v = mlp(self.in_dim, 1)
         self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=LR)
         self.opt_v = torch.optim.Adam(self.v.parameters(), lr=LR)
-        self.ladder = Ladder(OBS_DIM, N_ACT, GAMMA, {"qdag": arm == "aprior"})
+        self.ladder = Ladder(OBS_DIM, N_ACT, GAMMA,
+            {"qdag": arm == "aprior", "eps": 1.0 if arm in ("sil_eps", "sil_hull") else 0.0,
+             "hull": arm == "sil_hull"})
         self.v_int = mlp(OBS_DIM, 1) if arm in ("intr", "align") else None
         if self.v_int is not None:
             self.opt_vint = torch.optim.Adam(self.v_int.parameters(), lr=LR)
@@ -383,19 +385,29 @@ def main():
     ap.add_argument("--shift", type=float, default=0.0,
                     help="fraction of run at which to move the frontier (env phase 2)")
     ap.add_argument("--out", default="runs")
+    ap.add_argument("--save", default="", help="save nets + reservoir here at end")
+    ap.add_argument("--pad", action="store_true", help="boost-pad env variant")
     args = ap.parse_args()
     torch.set_num_threads(2)
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"{args.arm}_s{args.seed}.jsonl")
     agent = Agent(args.arm, args.seed)
+    if args.pad:
+        agent.env.enable_pad()
     iters = args.steps // (N_ENVS * HORIZON)
     shift_iter = int(iters * args.shift) if args.shift > 0 else -1
     t0 = time.time()
+    traj_obs, traj_done = [], []   # trajectory-contiguous windows for --save
     with open(path, "w") as f:
         for it in range(iters):
             if it == shift_iter:
                 agent.env.set_phase(2)
             batch = agent.collect()
+            if args.save:
+                traj_obs.append(batch[0][:, :, :OBS_DIM].clone())
+                traj_done.append(batch[5].clone())
+                if len(traj_obs) > 25:
+                    traj_obs.pop(0); traj_done.pop(0)
             stats = agent.learn(batch)
             stats["iter"] = it
             stats["steps"] = (it + 1) * N_ENVS * HORIZON
@@ -406,6 +418,20 @@ def main():
                 print(f"[{args.arm} s{args.seed}] it {it}/{iters} ph{stats['phase']} "
                       f"touch {stats['touch_1k']:.2f} air {stats['air_1k']:.3f} "
                       f"hi {stats['hi_1k']:.3f} ({(time.time()-t0):.0f}s)", flush=True)
+    if args.save:
+        L = agent.ladder
+        torch.save({
+            "pi": agent.pi.state_dict(), "v": agent.v.state_dict(),
+            "vexp": L.vexp.state_dict(),
+            "vdag1": L.vdag1.state_dict(), "vdag2": L.vdag2.state_dict(),
+            "geo_sigma": L.geo_sigma.state_dict(), "geo_rew": L.geo_rew.state_dict(),
+            "geo_v": L.geo_v.state_dict(),
+            "res_obs": L.res.obs[:L.res.fill], "res_nxt": L.res.nxt[:L.res.fill],
+            "res_rew": L.res.rew[:L.res.fill],
+            "traj_obs": torch.stack(traj_obs), "traj_done": torch.stack(traj_done),
+            "arm": agent.arm, "in_dim": agent.in_dim,
+        }, args.save)
+        print(f"saved {args.save}")
     print(f"done {path} in {time.time()-t0:.0f}s")
 
 

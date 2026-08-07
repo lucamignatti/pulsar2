@@ -1,4 +1,9 @@
+bases/
+bases_pad/
 runs/
 runs_gap/
 runs_meta/
+runs_eps/
+runs_hull/
+runs_hullg/
 smoke/
