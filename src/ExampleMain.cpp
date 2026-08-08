@@ -32,7 +32,9 @@ using namespace RLGC; // RLGymCPP
 // 5.0 (tickSkip 8, 15 Hz): 0.9969 = ~14.88s half-life (223 steps).
 // 6.0 (tickSkip 1, 120 Hz, user-directed 2026-08-01): the SAME 14.88s wall-clock horizon
 // re-timed to the 8x finer decision rate => gamma_new = 0.9969^(1/8) = 0.99961197 (1786 steps).
-static constexpr float TRAIN_GAMMA = 0.99961197f;
+// 7.0b (tickSkip 8 again, user-directed 2026-08-08): back to the 5.0 value. Same 14.88s
+// horizon; see the tickSkip block for why the rate went back.
+static constexpr float TRAIN_GAMMA = 0.9969f;
 
 // ---- 4.0: one net for 1v1/2v2/3v3 (team-play program) ------------------------------------
 // The 4.0 lineage trains a SINGLE policy across team sizes via a padded obs
@@ -233,7 +235,8 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// at tickSkip 8), 3% of a goal.
 		// 6.0 ts1: PER-STEP term, so its weight is a per-SECOND density divided by the
 		// decision rate. 0.01 / 8 = 0.00125 keeps the same ~4.5 per 30s episode at 120 Hz.
-		{ new TimeCostReward(), 0.00125f },
+		// 7.0b ts8: x8 back to the 5.0 value — same per-second density at 15 Hz.
+		{ new TimeCostReward(), 0.01f },
 
 		// TEAM PRESSURE (2026-07-19, user-directed; RLGym-PPO-guide item): someone
 		// must be on the ball. -0.15/step (~ -2.25/s; a 5s collective lapse costs
@@ -245,7 +248,8 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// Rewards/TeamPressureReward and the next aerial-census conversion read.
 		// 6.0 ts1: PER-STEP term, /8 for the 120 Hz rate — 0.15 -> 0.01875 preserves the
 		// documented -2.25/s pressure density (a 5s collective lapse still costs ~7% of a goal).
-		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.01875f },
+		// 7.0b ts8: x8 back to the 5.0 value — same -2.25/s density at 15 Hz.
+		{ new ZeroSumReward(new TeamPressureReward(), TEAM_SPIRIT), 0.15f },
 
 		// KICKOFF RACE (2026-07-20, user-directed: net losses come from conceded
 		// kickoff goals). Zero-sum, time-decayed first-touch reward, GATED on the
@@ -502,7 +506,23 @@ int main(int argc, char* argv[]) {
 	// NOT rescaled, deliberately: PBRS terms (telescoping makes them rate-invariant), event
 	// terms (Goal/Demo/TouchAccel/AerialTouch/OpposedSave/KickoffRace/PickupBoost — they fire
 	// on events, not per step), and NoTouchCondition (already in SECONDS, uses deltaTime).
-	cfg.tickSkip = 1;
+	//
+	// 7.0b (2026-08-08, USER-DIRECTED): BACK TO ts8. The validation seat for the new critic
+	// stack (hull operator + composite V + SIL), chosen on three grounds:
+	//   1. Wall-clock: the learn pass consumes ~200k rows/iteration at ANY tickSkip, so ts8
+	//      learns from 8x more game time per iteration — behavioral milestones land ~8x
+	//      sooner in wall-clock.
+	//   2. Comparability: 5.0v3 is a full known-good lineage AT ts8 (touch/aerial ignition
+	//      curves at matched conditions). At ts1 the only references are collapsed 7.0-vc
+	//      and the confounded 6.x runs.
+	//   3. Conditioning: both ts1-era production failures were rate artifacts (geo HJB
+	//      ill-conditioning at gamma 0.9996; the epi-blend returns-scale collapse, returns
+	//      std ~75). The stack under test is rate-invariant (SIL is return-level) or
+	//      rate-FAVORED at ts8 (hull/aux one-step displacements are 8x larger => better SNR).
+	// The 6.0 control-resolution bet is not refuted, just parked: if ts1 returns it is its
+	// own deployment with the two rate traps above pre-registered. Every "6.0 ts1" marker
+	// below now carries a "7.0b ts8" line with the back-derivation.
+	cfg.tickSkip = 8;
 	cfg.actionDelay = 0;
 
 	// 6.0 ts1: 1024 -> 128. This is NOT a throughput cut — it is the tickSkip change applied to
@@ -611,7 +631,15 @@ int main(int argc, char* argv[]) {
 	// 256 is a genuine optimum, now confirmed twice on two different net sizes. The remaining
 	// collection cost is inference itself, which is the standing price of ts1 (120 Hz = 8x the
 	// forwards of ts8) and needs a code-level fix, not a knob.
-	cfg.numGames = 256;
+	// 7.0b ts8: 256 -> 512. BOTH prior optima are off-seat here: 5.0's 1024 was ts8 but
+	// 512-wide nets; the twice-confirmed 256 was these nets but ts1, where whole-episode
+	// overshoot (episodes ~2000 steps) punished big fleets — at ts8 episodes are 8x shorter
+	// (~300 steps at birth), so overshoot at 512 arenas is a mild ~1.5x. Birth clump: 1024
+	// players x ~300 NoTouch-capped steps = ~0.3M rows, half the 614k that 6.1b measurably
+	// survived at these widths — birth is no longer the constraint. Treat 512 as the START
+	// POINT of the measured-flip rule, not a conclusion: after birth, read collection vs
+	// consumption per iteration and move 512 -> 1024 (or back to 256) on measured deltas.
+	cfg.numGames = 512;
 
 	// Pipelined collection: collect iteration N+1 (worker, frozen policy snapshot) while N
 	// processes+learns. Collection and consumption are near-equal (~0.6s each at ts8) and fully
@@ -763,7 +791,15 @@ int main(int argc, char* argv[]) {
 	// the original /8 cut, step DOWN to ~0.00875, not back to 0.004375. If it collapses under
 	// ~0.35 again at 0.0175, suspect the advFilter interaction next (its own pre-registration
 	// names entropy collapse; revert = TOP_SIGNED), not a further coefficient bump.
-	cfg.ppo.entropyScale = 0.0175f;
+	// 7.0b ts8: x8 back, SAME rate logic in reverse — 0.0175 at 120 Hz and 0.14 at 15 Hz are
+	// the identical nats-per-game-second pressure, and 0.0175 is the only coefficient
+	// measured to hold entropy at the FULL widths (6.1b band 0.4-0.7). Do NOT restore the
+	// old ts8 0.035: that number was tuned at 896/640 and the 6.1 collapse showed it is 4x
+	// under-provisioned for 1280/768. Note 0.14 is UNMEASURED at ts8 + full widths (nobody
+	// has run this cell) — WATCH Policy Entropy from birth: band 0.4-0.7 healthy; sustained
+	// >0.8 or viewer dithering => step down 0.07 then 0.035; collapse under ~0.35 => suspect
+	// the advFilter interaction first, per the 6.1b paragraph above.
+	cfg.ppo.entropyScale = 0.14f;
 
 	// ADVANTAGE FILTERING (2026-07-29, user-directed): the policy trains only on the top 50% of
 	// rows by post-injection advantage; the threshold is a buffer-wide quantile taken after GAE
@@ -814,11 +850,12 @@ int main(int argc, char* argv[]) {
 	// on the ts4->ts8 move). At 120 Hz they are 8x too short in wall-clock unless scaled.
 	// Held deliberately: carStateHerMaxOffset (see the block below — it is an EMPIRICAL
 	// calibration choice, not a real-time design, and its calibration is already void).
-	cfg.ppo.reachability.ballHerMaxOffset = 360; // was 45  (~3.0s preserved)
-	cfg.ppo.reachability.carHerMaxOffset  = 80;  // was 10  (~0.67s preserved)
-	cfg.ppo.reachability.deltaWindow      = 64;  // was 8   (~0.53s preserved)
-	cfg.ppo.reachability.deltaSmooth      = 32;  // was 4   (~0.27s preserved)
-	cfg.ppo.reachability.touchPredHorizon = 360; // was 45  (~3.0s preserved)
+	// 7.0b ts8: /8 back to the 5.0 values — same wall-clock windows at 15 Hz.
+	cfg.ppo.reachability.ballHerMaxOffset = 45;  // ~3.0s preserved
+	cfg.ppo.reachability.carHerMaxOffset  = 10;  // ~0.67s preserved
+	cfg.ppo.reachability.deltaWindow      = 8;   // ~0.53s preserved
+	cfg.ppo.reachability.deltaSmooth      = 4;   // ~0.27s preserved
+	cfg.ppo.reachability.touchPredHorizon = 45;  // ~3.0s preserved
 	// Third goal-space head (2026-07-14): canonical CAR pos+vel - the movement-capability
 	// frontier for META steering. Offline (conservative frozen-phi test): calibration
 	// DECISIVELY monotone (~7x the ball head's margin; window 45 chosen by margin across
@@ -848,7 +885,7 @@ int main(int argc, char* argv[]) {
 	// first goals). 50 releases the full 150 once sigma >= 3 and bounds the tail.
 	cfg.ppo.rewardClipRange = 50;
 
-	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~14.9s half-life at 120Hz (6.0 tickSkip 1); MUST match the PBRS reward gammas above
+	cfg.ppo.gaeGamma = TRAIN_GAMMA; // ~14.9s half-life at 15Hz (7.0b tickSkip 8); MUST match the PBRS reward gammas above
 
 	// 6.0 ts1: gaeLambda MUST be re-derived with gamma, or GAE silently goes myopic.
 	// The TD credit window is ~1/(1 - gamma*lambda) steps. At ts8 that was
@@ -856,14 +893,15 @@ int main(int argc, char* argv[]) {
 	// gives 19.9 steps = 0.165s — a 7.6x SHORTER real-time window, i.e. the bias/variance
 	// tradeoff would move drastically without anyone touching lambda.
 	// Preserving the 1.26s window at 120 Hz needs 151 steps => lambda = 0.993767.
-	cfg.ppo.gaeLambda = 0.993767f;
+	// 7.0b ts8: back to 0.95 — the same 1.26s credit window at 15 Hz.
+	cfg.ppo.gaeLambda = 0.95f;
 
 	// Secondary goal-only critic: long-horizon credit on the one unfarmable signal. Independent net,
 	// raw obs in; advantages blended at beta = 25% of dense-advantage scale (std-matched, centered).
 	// VALIDATION: GoalCritic/Value-Outcome Corr and Adv-Outcome Corr must be POSITIVE once goals flow;
 	// negative = channel/sign bug -> set beta = 0 (critic still trains, no blend) and investigate.
 	cfg.ppo.goalCritic.enabled = true;
-	cfg.ppo.goalCritic.gamma = 0.99992498f; // ~77s half-life at 120Hz (6.0 tickSkip 1: 0.9994^(1/8))
+	cfg.ppo.goalCritic.gamma = 0.9994f; // ~77s half-life at 15Hz (7.0b tickSkip 8, the 5.0 value)
 	cfg.ppo.goalCritic.beta = 0.25f;
 	cfg.ppo.goalCritic.lr = 1.5e-4f;
 	// Private head on top of critic_trunk (2026-07-29): 5x1280 on raw obs -> 2x1280 on the shared
@@ -1268,8 +1306,15 @@ int main(int argc, char* argv[]) {
 	// motivated the 5.0/6.0 cold starts. Same architecture, same everything else.
 	// checkpoints_6.1 (1.1B steps, collapsed) is left fully intact for inspection/restore;
 	// a fresh folder rather than a wipe, per the never-delete rule.
-	cfg.checkpointFolder = "checkpoints_6.1b";
-	cfg.metricsRunName = "6.1b-full";
+	// 7.0b (2026-08-08): FRESH FOLDER, and this one is load-bearing in the NASTIEST way:
+	// the ts1 -> ts8 flip changes NO net shapes, so every checkpoint in the old folder
+	// would LOAD CLEANLY into this binary and silently resume a 120Hz-trained policy at
+	// 15 Hz with wrong-gamma critic history — the corrupt-but-loadable class no structural
+	// check catches (see the 5.3 paragraph above). The old folder stays fully intact per
+	// the never-delete rule. Also the clean cut from 7.0-vc's epi-poisoned baselines
+	// (see epiBlendEnabled): fresh start, not resume, per the recovery doctrine.
+	cfg.checkpointFolder = "checkpoints_7.0b";
+	cfg.metricsRunName = "7.0b-ts8";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
