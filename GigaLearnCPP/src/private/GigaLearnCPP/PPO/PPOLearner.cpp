@@ -1457,6 +1457,18 @@ void GGL::PPOLearner::SaveTo(std::filesystem::path folderPath) {
 	models.Save(folderPath);
 }
 
+bool GGL::PPOLearner::VerifySavedWeights(std::filesystem::path folderPath) {
+	// Behavior-determining nets only — see the call site in Learner::Save for why.
+	// A missing model is not a failure (inference-only sets legitimately lack some);
+	// a PRESENT model whose file disagrees with memory is.
+	for (const char* n : { "shared_head", "policy" }) {
+		Model* m = models[n];
+		if (m && !m->VerifySavedWeights(folderPath))
+			return false;
+	}
+	return true;
+}
+
 void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 	if (!std::filesystem::is_directory(folderPath))
 		RG_ERR_CLOSE("PPOLearner:LoadFrom(): Path " << folderPath << " is not a valid directory");

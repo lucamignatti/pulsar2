@@ -121,6 +121,16 @@ namespace GGL {
 		virtual void Save(std::filesystem::path folder, bool saveOptim = true);
 		virtual void Load(std::filesystem::path folder, bool allowNotExist, bool loadOptim = true);
 
+		// Read the file we just wrote back off disk and compare it to the live weights.
+		// Returns false if ANY parameter differs, is missing, or is the wrong shape.
+		// This exists because the 2026-08-07 corruption produced checkpoints that were
+		// structurally perfect — atomic folder, deserializable, finite, sane-magnitude,
+		// correct claimed rating — and simply held the WRONG VALUES. Nothing in the load
+		// path can detect that; it surfaced only hours later via the boot kickoff probe,
+		// after 8 consecutive saves had already rotated the good ones out.
+		// Never throws: a bug in the verifier must not be able to kill a training run.
+		bool VerifySavedWeights(std::filesystem::path folder) const;
+
 		virtual torch::Tensor CopyParams() const;
 
 		// NOTE: Resets parameters

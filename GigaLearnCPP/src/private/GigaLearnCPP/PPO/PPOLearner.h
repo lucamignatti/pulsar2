@@ -170,6 +170,9 @@ namespace GGL {
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
 
 		void SaveTo(std::filesystem::path folderPath);
+		// Re-read the just-written checkpoint and diff it against the live weights.
+		// False = the file does not hold what we think it holds; do not publish it.
+		bool VerifySavedWeights(std::filesystem::path folderPath);
 		void LoadFrom(std::filesystem::path folderPath);
 		void SetLearningRates(float policyLR, float criticLR);
 

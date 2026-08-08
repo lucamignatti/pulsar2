@@ -709,7 +709,20 @@ int main(int argc, char* argv[]) {
 	// this is purely activation-peak traded for GEMM efficiency. 200k/25k = 8 exact chunks.
 	// The learn-pass peak this re-spends is affordable because the Reach diagnostic — the
 	// actual site of every mega-batch OOM — is now row-capped.
-	cfg.ppo.miniBatchSize = 25'000;
+	// 6.2 (2026-08-07): 25k -> 12.5k. Previously this was held at 25k because the OOMs cost
+	// ~1% of throughput and were judged acceptable. That judgement was correct at the time and
+	// is now void: on 2026-08-07 the run took THREE checkpoint-corruption incidents that
+	// destroyed 32 checkpoints and every golden-archive entry, and the loader eventually
+	// exhausted all of them and started a fresh model on an 11.6B-step lineage. Only an
+	// out-of-band manual backup survived.
+	// The link to memory pressure is CORRELATIONAL, not proven: each corruption window ended in
+	// an OOM, onset was ~40 min before it, and the run sat at ~13.3 GiB of 15.5 with ~250 MiB
+	// free when it died. Allocator exhaustion is a plausible way to perturb the device-to-host
+	// copies a save is made of, and it is the only recurring stressor. Halving the minibatch is
+	// the one lever that touches it, is mathematically identical under gradient accumulation
+	// (200k/12.5k = 16 exact chunks), and costs only GEMM efficiency.
+	// Against losing 1.2B steps and the entire recovery chain, that trade is no longer close.
+	cfg.ppo.miniBatchSize = 12'500;
 
 	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
@@ -1094,9 +1107,31 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.silCoeff = 0.05f;     // toy-validated 0.1, halved for the opposed live game
 	                              // (imitated overcommits are the un-derisked hazard --
 	                              // the steering-v1 ratchet; watch Ref shares + SIL/*)
-	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
-	                                   // at ts1 it also de-risks the global entropy
-	                                   // coefficient fragility that killed 6.1 proper
+	// DISABLED at 3.34B (2026-08-06) — measured, single-lever. Rationale, because the toy
+	// validation above is real and this is NOT a claim it was wrong:
+	//   * The gate reads H, and H INFLATED 175x on this run: 0.0003 (0.4B) -> 0.24 (1.7B) ->
+	//     1.87 (2.05B) -> 3.96 (2.36B), with NO conversion behind it (SIL/Loss flat at ~0.001
+	//     throughout). That is the COMPOSITION_CRITIC.md 4.4 inflation shape. The min(V1,V2)
+	//     anti-ratchet is doing its job — Vdag Twin Spread is stable at 0.013-0.028, not
+	//     collapsing — so this is H inflation, not twin failure.
+	//   * Ent Gate Mean therefore pinned at its 3.0 CAP from ~2.0B onward (1.05 -> 1.55 ->
+	//     2.96). A gate saturated at its cap is not a gate; it is a flat 3x entropy bonus.
+	//   * Consequence: Policy Entropy has not moved in 3.34B steps (0.7597 -> 0.7572), where
+	//     6.1b fell 0.679 -> 0.523 over the same span AND took off in Nexto share exactly as it
+	//     settled (18.8% vs 6.2's 9.8% over 3.00-3.34B). A policy held at 0.755 nats cannot
+	//     commit, and committing is what the inflection looks like.
+	//   * WHY THIS COMPONENT AND NOT SIL: in 6.1b, H fed a PBRS potential, which is
+	//     self-cancelling, so H inflation was harmless. An entropy MULTIPLIER is not
+	//     self-cancelling — an inflating H buys permanent exploration pressure nothing reclaims.
+	//     SIL stays on: cumulative Nexto share is 8.8% vs 6.1b's 8.6% at matched timesteps and
+	//     6.2 LED five of the first six windows, so the swap itself is not the problem.
+	// PRE-REGISTERED: Policy Entropy must start falling within ~500M steps (target band
+	// 0.55-0.65, where 6.1b sat when it inflected). If entropy falls and the Nexto slope
+	// inflects -> the gate was the blocker, SIL+injection-off is validated. If entropy falls and
+	// the slope STILL does not inflect by ~6B -> SIL alone does not reproduce injection's
+	// takeoff, and continuing 6.2 stops being worth it against resuming 6.1b at 12.64B.
+	// Revert = true. Consider vdagEntGateCap 1.5 instead of a full disable if you want it back.
+	cfg.ppo.vdagEntGateEnabled = false;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.

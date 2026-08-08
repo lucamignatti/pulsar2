@@ -509,6 +509,34 @@ void GGL::Learner::Save() {
 	ppo->SaveTo(saveFolder);
 	if (gapSensor && gapSensor->exp)
 		torch::save(gapSensor->exp, (saveFolder / "GAP_EXP.lt").string());
+
+	// VERIFY BEFORE PUBLISHING (2026-08-07). On this date the run wrote 15 checkpoints
+	// across two incidents that were atomic, deserializable, finite, sane-magnitude and
+	// carried a correct claimed rating -- and held the WRONG WEIGHTS. The live policy was
+	// provably healthy throughout (Nexto goal share 68.4% DURING the corrupt window, vs
+	// 65.3% before it), so the fault is in CAPTURING the weights, not in the training
+	// state. Nothing in the load path can see this: it surfaced only at the next boot, via
+	// the kickoff probe, by which time 8 consecutive bad saves had rotated every good
+	// checkpoint out of the window and had begun poisoning the golden archive that is
+	// supposed to be the last resort (best_r2068_10525158912 exists as BOTH a golden entry
+	// and a corrupt_ one).
+	//
+	// Reading the file back and diffing it against the live weights turns a silent,
+	// hours-later, archive-eating failure into a loud one that costs a single save. On
+	// failure we do NOT rename into place, so the previous good checkpoint stays newest --
+	// strictly better than publishing a corrupt one. The .tmp is left for forensics.
+	//
+	// Only the behavior-determining nets are checked (shared trunk + policy): that is what
+	// the boot probe tests and what a corrupt save destroys, and it holds the cost to a
+	// couple hundred MB of read per save (one save per ~4 minutes).
+	if (!ppo->VerifySavedWeights(saveFolder)) {
+		RG_LOG("*** SAVE VERIFY FAILED at " << finalFolder << " - the bytes on disk do not "
+			"match the live weights. NOT publishing; the previous checkpoint stays newest. "
+			"This is the 2026-08-07 corruption signature. If it repeats every save, the run "
+			"is persistently failing to capture weights and should be stopped for triage. ***");
+		return;
+	}
+
 	std::filesystem::remove_all(finalFolder); // paranoia: re-save at an identical timestep
 	std::filesystem::rename(saveFolder, finalFolder);
 
@@ -3051,7 +3079,19 @@ void GGL::Learner::Start() {
 
 				if (!config.checkpointFolder.empty()) {
 					if (totalTimesteps / config.tsPerSave > prevTimesteps / config.tsPerSave) {
-						// Auto-save
+						// Auto-save. JOIN THE COLLECT WORKER FIRST (2026-08-07): this was the
+						// only save path that did not, while the exit path 15 lines above has
+						// always joined with the comment "Never exit with a collection worker
+						// in flight". So every routine checkpoint was serialized out of models
+						// that a live worker thread was concurrently reading and (via the bf16
+						// mirror refresh on _seqHalfOutdated) writing through. That asymmetry
+						// is the only structural difference between the save path that has
+						// never produced a corrupt file and the one that produced 15 of them
+						// on 2026-08-07. Joining costs one iteration of pipelining per save,
+						// i.e. ~3s per ~4 minutes, which is not worth arguing about against
+						// losing 350M steps and half the golden archive.
+						if (collectThread.joinable())
+							collectThread.join();
 						Save();
 					}
 				}

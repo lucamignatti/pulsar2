@@ -159,10 +159,56 @@ void GGL::Model::StepOptim() {
 	_seqHalfOutdated = true;
 }
 
+bool GGL::Model::VerifySavedWeights(std::filesystem::path folder) const {
+	// See the header note. Compares every named parameter in the file against the live
+	// module. Deliberately exact (equal(), not allclose()): serialization is a byte copy,
+	// so any difference at all means the write did not capture the weights we hold.
+	try {
+		std::filesystem::path path = GetSavePath(folder);
+		if (!std::filesystem::exists(path))
+			return false;
+		RG_NO_GRAD;
+		// Load the file exactly the way the real loader will, into a clone of this module,
+		// and diff parameter-by-parameter. Reading the archive by flat named_parameters()
+		// key does NOT work and silently fails everything: torch::save(Sequential) nests
+		// each submodule in its own sub-archive, so "0.weight" does not resolve at the top
+		// level. That mistake made a healthy CPU smoke report every save as corrupt, which
+		// would have stopped checkpointing entirely on the live run.
+		auto clonedImpl = std::dynamic_pointer_cast<torch::nn::SequentialImpl>(seq->clone());
+		if (!clonedImpl)
+			return false;
+		torch::nn::Sequential reloaded(clonedImpl);
+		torch::load(reloaded, path.string());
+
+		auto live = seq->parameters();
+		auto disk = reloaded->parameters();
+		if (live.size() != disk.size() || live.empty())
+			return false;
+		for (size_t i = 0; i < live.size(); i++) {
+			if (live[i].sizes() != disk[i].sizes())
+				return false;
+			if (!torch::equal(live[i].detach().to(torch::kCPU, torch::kFloat32),
+					disk[i].detach().to(torch::kCPU, torch::kFloat32)))
+				return false;
+		}
+		return true;
+	} catch (const std::exception& e) {
+		RG_LOG("VerifySavedWeights: exception during verify: " << e.what());
+		return false;
+	} catch (...) {
+		return false;
+	}
+}
+
 void GGL::Model::Save(std::filesystem::path folder, bool saveOptim) {
 	std::filesystem::path path = GetSavePath(folder);
 	auto streamOut = std::ofstream(path, std::ios::binary);
 	torch::save(seq, streamOut);
+	// Flush and close BEFORE anyone reads this back (the verifier does, immediately).
+	// The stream was previously left to its destructor, so a read-after-write saw a
+	// partially-flushed file.
+	streamOut.flush();
+	streamOut.close();
 
 	if (saveOptim) {
 		torch::serialize::OutputArchive optimArchive;
