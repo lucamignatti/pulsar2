@@ -2520,15 +2520,23 @@ void GGL::Learner::Start() {
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
 
-					// Value explained-variance: the calibration panel, and the signal that
-					// anneals the episodic blend. Computed on the predictions GAE consumed.
+					// Value explained-variance vs the quantity V actually regresses (GAE
+					// target values). The original form compared against discounted RETURNS,
+					// which at ts1's gamma/episode lengths sit at a different scale entirely
+					// (std ~75 vs targets ~0.5-5) -- structurally ~0 regardless of critic
+					// quality, which is what locked the epi blend at max weight for the life
+					// of run 7.0-vc. Target-based EV is the honest fits-its-own-objective
+					// panel; the returns-based number is kept alongside for continuity.
 					{
+						auto tgtF = tTargetVals.to(torch::kFloat32).flatten();
 						auto retF = tReturns.to(torch::kFloat32).flatten();
 						auto vpEv = tValPreds.to(torch::kFloat32).flatten();
-						float ev = 1.f - ((retF - vpEv).var() / (retF.var() + 1e-8f))
+						float ev = 1.f - ((tgtF - vpEv).var() / (tgtF.var() + 1e-8f))
 							.item<float>();
 						ppo->valueEvEma = 0.95f * ppo->valueEvEma + 0.05f * RS_MAX(0.f, ev);
 						report["Value/EV"] = ev;
+						report["Value/EV Returns"] = 1.f
+							- ((retF - vpEv).var() / (retF.var() + 1e-8f)).item<float>();
 					}
 
 					// Raw GAE advantage magnitude, captured BEFORE any injector touches it.

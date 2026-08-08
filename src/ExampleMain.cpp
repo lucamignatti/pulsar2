@@ -1136,7 +1136,16 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.auxDispModel.layerSizes = { 256 };
 	cfg.ppo.auxDispModel.activationType = activation;
 	cfg.ppo.auxDispModel.addLayerNorm = false;
-	cfg.ppo.epiBlendEnabled = true;
+	// EPI BLEND: OFF — 7.0-vc post-mortem (2026-08-08, run ynt5j8np, ~415M steps).
+	// Self-locking failure in prod: the anneal signal (Value/EV vs RETURNS) is
+	// structurally ~0 at ts1 (returns std ~75 vs value-target scale ~0.5-5 over 100k-step
+	// episodes), so Epi W pinned at 0.5 forever, permanently replacing half the GAE
+	// baseline/bootstrap with kNN-over-230-dim-raw-obs noise (~random historical targets)
+	// in a regime where per-step rewards are ~0.001-0.03. Advantages drowned; critic
+	// could never earn the EV to retire the blend. The toy's validation rested on
+	// same-scale returns/targets + 12-dim kNN, which do NOT transfer. Do not re-enable
+	// without (a) a target-scale anneal signal and (b) a learned/low-dim kNN space.
+	cfg.ppo.epiBlendEnabled = false;
 	cfg.ppo.oppCondEnabled = true;
 	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
 	                                   // at ts1 it also de-risks the global entropy
