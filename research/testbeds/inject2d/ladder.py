@@ -31,16 +31,20 @@ class Reservoir:
         self.obs = torch.zeros(cap, obs_dim)
         self.nxt = torch.zeros(cap, obs_dim)
         self.rew = torch.zeros(cap)
+        self.ret = torch.zeros(cap)   # realized GAE return of the departure row
         self.fill = 0
         self.seen = 0
 
-    def add(self, obs, nxt, rew):
+    def add(self, obs, nxt, rew, ret=None):
         n = obs.shape[0]
+        if ret is None:
+            ret = torch.zeros(n)
         take = min(self.cap - self.fill, n)
         if take > 0:
             self.obs[self.fill:self.fill + take] = obs[:take]
             self.nxt[self.fill:self.fill + take] = nxt[:take]
             self.rew[self.fill:self.fill + take] = rew[:take]
+            self.ret[self.fill:self.fill + take] = ret[:take]
             self.fill += take
         rest = n - take
         if rest > 0:
@@ -51,11 +55,16 @@ class Reservoir:
                 self.obs[dst] = obs[take:][idx]
                 self.nxt[dst] = nxt[take:][idx]
                 self.rew[dst] = rew[take:][idx]
+                self.ret[dst] = ret[take:][idx]
         self.seen += n
 
     def sample(self, k):
         idx = torch.randint(0, self.fill, (k,))
         return self.obs[idx], self.nxt[idx], self.rew[idx]
+
+    def sample_ret(self, k):
+        idx = torch.randint(0, self.fill, (k,))
+        return self.obs[idx], self.ret[idx]
 
 
 class Ladder:
@@ -127,7 +136,7 @@ class Ladder:
 
         # reservoir feed: executed pairs only, never across a reset
         keep = done < 0.5
-        self.res.add(obs[keep], nxt[keep], rew[keep])
+        self.res.add(obs[keep], nxt[keep], rew[keep], returns[keep])
 
         # V_exp on realized returns
         for _ in range(epochs):
@@ -139,8 +148,42 @@ class Ladder:
                 self.opt["vexp"].step()
 
         # V-dagger twins: y = r + g*(1-d)*min(tgt1, tgt2)(s')
+        # With eps > 0 this is the EPSILON-INFLATED Bellman operator: the
+        # bootstrap is the max of min-twin over the real next state and K
+        # copies perturbed by eps * sigma_emp (the empirical marginal
+        # displacement scale -- a global vector, nothing to extrapolate).
+        # eps=0 recovers the plain composition critic exactly.
+        eps = self.cfg.get("eps", 0.0)
+        hull = self.cfg.get("hull", False)
+        if hull and self.iter % 25 == 0:
+            self._refresh_chart()
         with torch.no_grad():
             tv = torch.minimum(self.vdag1_t(nxt).flatten(), self.vdag2_t(nxt).flatten())
+            if eps > 0 and hull and getattr(self, "chart", None) is not None:
+                # HULL slack: perturb along eps-scaled WITNESSED displacement
+                # vectors from nearest chart cells (asymmetries preserved --
+                # no unwitnessed direction can be hallucinated)
+                bo, bd = self._hull_bank
+                qc = self.chart.P(nxt)
+                sub = torch.randint(0, bo.shape[0], (min(1024, bo.shape[0]),))
+                nnd, nnk = torch.cdist(qc, self._bank_c[sub]).topk(
+                    self.cfg.get("eps_k", 4), largest=False)
+                mu, ls = self.chart(nxt)
+                for j in range(nnk.shape[1]):
+                    delta = bd[sub[nnk[:, j]]]
+                    # donor radius + likelihood gate (the adversarially-derived pair)
+                    ok = (nnd[:, j] < self._hull_r0) \
+                         & (((delta - mu) / ls.exp()).abs().max(1).values < 3.0)
+                    delta = torch.where(ok.unsqueeze(1), delta, torch.zeros_like(delta))
+                    pert = nxt + eps * delta
+                    tv = torch.maximum(tv, torch.minimum(
+                        self.vdag1_t(pert).flatten(), self.vdag2_t(pert).flatten()))
+            elif eps > 0:
+                sig = (nxt - obs).std(0)
+                for _ in range(self.cfg.get("eps_k", 4)):
+                    pert = nxt + eps * sig * torch.randn_like(nxt)
+                    tv = torch.maximum(tv, torch.minimum(
+                        self.vdag1_t(pert).flatten(), self.vdag2_t(pert).flatten()))
             y = (rew + g * cont * tv).clamp(self.clamp_lo, self.clamp_hi)
         for _ in range(epochs):
             idx = torch.randperm(n)
@@ -206,6 +249,33 @@ class Ladder:
             self.vdag2_t.load_state_dict(self.vdag2.state_dict())
         stats["vdag_mean"] = float(self.vdag_min(obs[:2048]).mean())
         return stats
+
+    def _refresh_chart(self):
+        """Online chart + hull bank from the reservoir (teleport-filtered)."""
+        if self.res.fill < 4096:
+            return
+        from metric6 import ChartSigma, filter_teleports
+        ro = self.res.obs[:self.res.fill]; rn = self.res.nxt[:self.res.fill]
+        keep = filter_teleports(ro, rn)
+        o, nx = ro[keep], rn[keep]
+        if getattr(self, "chart", None) is None:
+            self.chart = ChartSigma(self.obs_dim)
+            self._chart_opt = torch.optim.Adam(self.chart.parameters(), lr=1e-3)
+        for _ in range(300):
+            idx = torch.randint(0, o.shape[0], (512,))
+            mu, ls = self.chart(o[idx])
+            d = nx[idx] - o[idx]
+            nll = (ls + 0.5 * ((d - mu) / ls.exp()) ** 2).mean()
+            loss = nll + 1e-3 * self.chart.P.weight.abs().mean()
+            self._chart_opt.zero_grad(); loss.backward(); self._chart_opt.step()
+        bidx = torch.randint(0, o.shape[0], (min(16384, o.shape[0]),))
+        self._hull_bank = (o[bidx], (nx - o)[bidx])
+        with torch.no_grad():
+            self._bank_c = self.chart.P(self._hull_bank[0])
+            samp = self._bank_c[torch.randint(0, self._bank_c.shape[0], (2048,))]
+            dself = torch.cdist(samp, self._bank_c)
+            dself.scatter_(1, dself.argmin(1, keepdim=True), 1e9)
+            self._hull_r0 = 2.0 * dself.min(1).values.median()
 
     # ---- fields ----------------------------------------------------------
     @torch.no_grad()

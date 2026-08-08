@@ -7,4 +7,6 @@ add_executable(GigaLearnTests ${TEST_SRC})
 set_target_properties(GigaLearnTests PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnTests PROPERTIES CXX_STANDARD 20)
 
-target_link_libraries(GigaLearnTests GigaLearnCPP)
+find_package(Torch REQUIRED)
+target_include_directories(GigaLearnTests PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(GigaLearnTests GigaLearnCPP "${TORCH_LIBRARIES}")

@@ -1107,31 +1107,76 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.silCoeff = 0.05f;     // toy-validated 0.1, halved for the opposed live game
 	                              // (imitated overcommits are the un-derisked hazard --
 	                              // the steering-v1 ratchet; watch Ref shares + SIL/*)
-	// DISABLED at 3.34B (2026-08-06) — measured, single-lever. Rationale, because the toy
-	// validation above is real and this is NOT a claim it was wrong:
-	//   * The gate reads H, and H INFLATED 175x on this run: 0.0003 (0.4B) -> 0.24 (1.7B) ->
-	//     1.87 (2.05B) -> 3.96 (2.36B), with NO conversion behind it (SIL/Loss flat at ~0.001
-	//     throughout). That is the COMPOSITION_CRITIC.md 4.4 inflation shape. The min(V1,V2)
-	//     anti-ratchet is doing its job — Vdag Twin Spread is stable at 0.013-0.028, not
-	//     collapsing — so this is H inflation, not twin failure.
-	//   * Ent Gate Mean therefore pinned at its 3.0 CAP from ~2.0B onward (1.05 -> 1.55 ->
-	//     2.96). A gate saturated at its cap is not a gate; it is a flat 3x entropy bonus.
-	//   * Consequence: Policy Entropy has not moved in 3.34B steps (0.7597 -> 0.7572), where
-	//     6.1b fell 0.679 -> 0.523 over the same span AND took off in Nexto share exactly as it
-	//     settled (18.8% vs 6.2's 9.8% over 3.00-3.34B). A policy held at 0.755 nats cannot
-	//     commit, and committing is what the inflection looks like.
-	//   * WHY THIS COMPONENT AND NOT SIL: in 6.1b, H fed a PBRS potential, which is
-	//     self-cancelling, so H inflation was harmless. An entropy MULTIPLIER is not
-	//     self-cancelling — an inflating H buys permanent exploration pressure nothing reclaims.
-	//     SIL stays on: cumulative Nexto share is 8.8% vs 6.1b's 8.6% at matched timesteps and
-	//     6.2 LED five of the first six windows, so the swap itself is not the problem.
-	// PRE-REGISTERED: Policy Entropy must start falling within ~500M steps (target band
-	// 0.55-0.65, where 6.1b sat when it inflected). If entropy falls and the Nexto slope
-	// inflects -> the gate was the blocker, SIL+injection-off is validated. If entropy falls and
-	// the slope STILL does not inflect by ~6B -> SIL alone does not reproduce injection's
-	// takeoff, and continuing 6.2 stops being worth it against resuming 6.1b at 12.64B.
-	// Revert = true. Consider vdagEntGateCap 1.5 instead of a full disable if you want it back.
+
+	// ===== HULL OPERATOR (2026-08-07; canonical: research/reports/EPSILON_CRITIC.md s7) =====
+	// The record-licensed relaxed Bellman operator on the V-dagger targets: the bootstrap is
+	// maxed over the real next state plus hullK candidates built by transplanting eps-scaled
+	// WITNESSED displacement vectors between chart-matched states. This is what prices
+	// never-assembled conducts (toy family F, 0.000% assembly in every record: best of all
+	// estimators, 8/8 seeds) and unvisited-state value (family B: +0.13 rho over plain
+	// V-dagger). OPEN configuration deliberately (no donor gates): the validated TRAINING
+	// seat -- toy ignition 1.02M vs 1.22M, 8/8 -- where thin-record optimism is exploration
+	// pressure bounded by SIL's realized-conversion requirement, not hallucination (the seat
+	// theorem, ibid). Adversarial ledger in the report: resource-laundering, teleports,
+	// illegal transplants, thin-record -- every harm channel measured and closed.
+	// Deployment notes: takes effect at next restart; OLD checkpoints fresh-init the two
+	// chart nets (Model::Load allowNotExist) -- no rotation risk; changing V-dagger's
+	// targets mid-lineage is a LEVER (treat as a new deployment: watch Hull/Uplift Mean
+	// [healthy = small and shrinking per-regime, not monotonically growing], Hull/Chart NLL
+	// [down then flat], Headroom/Vdag Mean [no ratchet], SIL/* and Ref shares as always).
+	// Revert: this flag, restart. The feed-side teleport filter this change adds also
+	// removes the long-flagged respawn pollution from the geo Sigma reservoir.
+	cfg.ppo.hullEnabled = true;
+	cfg.ppo.hullHeadModel.layerSizes = { 64 };
+	cfg.ppo.hullHeadModel.activationType = activation;
+	cfg.ppo.hullHeadModel.addLayerNorm = false;
+
+	// ===== COMPOSITE VALUE CRITIC (2026-08-07; inject2d RESULTS.md batches 10-11) =====
+	// V is the denominator of the optimism stack (H, SIL weights, GAE, LP); these four
+	// ingredients cut its noise/bias without touching its on-policy semantics. Toy
+	// evidence (8 seeds, sil_hull base): ignition 1.25M -> 0.75-0.84M, finals 4.91 ->
+	// 6.4, worst seed 0.1 -> 6.1; mirror alone cut the hallucinated-headroom floor 9x.
+	// All independently flag-gated; each panel named below is its judge.
+	//   - critic2 twin (Value/Twin Disagree): disjoint-half training, mean readout.
+	//   - mirror pass (25% of rows): exact game symmetry; ObsMirror::Build hard-fails
+	//     on layout drift. Slot-permutation is already trained in via shuffleSlots.
+	//   - aux displacement head on the SHARED trunk (Value/Aux Disp NLL): the toy's
+	//     single largest training lever; deliberately NOT inside the value head (wired
+	//     there it biases V -- measured, ev 0.68 -> 0.49).
+	//   - episodic blend (Value/Epi W, Value/EV): kNN over reservoir returns, weight
+	//     epiWMax*(1-EV_ema) -- memory-backed baseline while V is young, self-retiring.
+	//     Safe because it RETIRES (bank returns rot as the policy improves; the
+	//     non-retiring peer-referee variant failed exactly there, batch 11).
+	//   - privileged opponent conditioning (opp_embed, zero-init = no-op at load):
+	//     the value family sees {isSelf, isOld, isExternal, ringAge}; the policy never
+	//     does. Asymmetric actor-critic: variance reduction, provably unbiased.
+	// Checkpoint compatibility: critic2/aux_disp/opp_embed fresh-init on old
+	// checkpoints (allowNotExist); opp_embed's zero-init makes conditioning an exact
+	// no-op until trained. Watch Value/EV (up), Value/Twin Disagree (down over time),
+	// Headroom/H Mean (floor should DROP as V sharpens -- the compounding).
+	// Goal-critic unification into this treatment is a DEFERRED separate lever.
+	// Revert: these flags, restart.
+	cfg.ppo.valueTwinEnabled = true;
+	cfg.ppo.valueMirrorEnabled = true;
+	cfg.ppo.mirrorMaxPlayersPerTeam = MAX_PLAYERS_PER_TEAM;
+	cfg.ppo.auxDispEnabled = true;
+	cfg.ppo.auxDispModel.layerSizes = { 256 };
+	cfg.ppo.auxDispModel.activationType = activation;
+	cfg.ppo.auxDispModel.addLayerNorm = false;
+	cfg.ppo.epiBlendEnabled = true;
+	cfg.ppo.oppCondEnabled = true;
+	// KEPT DISABLED through the 7.0 merge (2026-08-07). This line reads `true` on the
+	// incoming branch only because that branch predates the 2026-08-06 measurement; it is
+	// not a deliberate re-enable. What was measured on 6.2: the gate reads H, H inflated
+	// 175x (0.0003 -> 3.96) with no conversion behind it, so Ent Gate Mean pinned at its 3.0
+	// CAP from ~2.0B on. A gate saturated at its cap is not a gate, it is a flat 3x entropy
+	// bonus -- and Policy Entropy did not move for 3.34B steps as a result. Disabling it made
+	// entropy fall 0.755 -> 0.49 within 850M steps and Nexto share step 9.8% -> 14.1% -> 58%,
+	// overtaking 6.1b. Re-enable deliberately if the composite critic changes H's behaviour,
+	// but do it as its own lever with Ent Gate Mean watched against the cap.
 	cfg.ppo.vdagEntGateEnabled = false;
+	                                   // at ts1 it also de-risks the global entropy
+	                                   // coefficient fragility that killed 6.1 proper
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.
@@ -1250,8 +1295,19 @@ int main(int argc, char* argv[]) {
 	// units) stays fully intact as the restore point. Revert = put these two lines back.
 	// If a mid-run swap ON TOP of 6.1b was actually intended, that is also these two lines — but
 	// it confounds the actuation comparison with 11.7B steps of injection-trained history.
-	cfg.checkpointFolder = "checkpoints_6.2";
-	cfg.metricsRunName = "6.2-sil";
+	// 7.0 (2026-08-07, user-directed): the composite value critic gets its own lineage.
+	// MANDATORY, and for two reasons this time. The usual one: the incoming branch left this at
+	// checkpoints_6.2, and parts of the new machinery (hull heads, aux displacement head)
+	// FRESH-INIT rather than shape-break on an old checkpoint, so a stale folder could silently
+	// resume old weights into a different critic — the failure the loader cannot catch.
+	// Second: checkpoints_6.2 is not a real lineage any more. It was destroyed on 2026-08-07 by
+	// three checkpoint-corruption incidents that exhausted every numbered checkpoint AND every
+	// golden-archive entry, after which the loader started a fresh model; the folder now holds
+	// only a 6.1b checkpoint staged there by hand to prove the boot probe still worked.
+	// Surviving lineages, both intact and probe-verified: checkpoints_6.1b (12.63B) and
+	// checkpoints_5.3 (16.7B). 6.2 has no recoverable state.
+	cfg.checkpointFolder = "checkpoints_7.0";
+	cfg.metricsRunName = "7.0-vc";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable

@@ -1,0 +1,415 @@
+{
+ "study": "inject2d actuation-channel study",
+ "date": "2026-08-05",
+ "testbed": "research/testbeds/inject2d (Aerial2D, 8 seeds/arm; full writeup in that dir's RESULTS.md)",
+ "batch1_channels_3M": {
+  "metrics": [
+   "ignited/8",
+   "median_ignition_Msteps",
+   "hi_q4_per1k",
+   "final_ep_rew"
+  ],
+  "sil": [
+   8,
+   0.99,
+   5.15,
+   2.83
+  ],
+  "sil_ent": [
+   8,
+   1.25,
+   5.39,
+   2.88
+  ],
+  "entgate": [
+   8,
+   1.41,
+   4.68,
+   2.55
+  ],
+  "sil_nogate": [
+   8,
+   1.65,
+   5.0,
+   2.76
+  ],
+  "align": [
+   8,
+   2.2,
+   4.12,
+   2.28
+  ],
+  "kstep": [
+   6,
+   1.2,
+   3.37,
+   2.03
+  ],
+  "ppo": [
+   6,
+   2.18,
+   2.96,
+   1.78
+  ],
+  "sparse": [
+   4,
+   1.25,
+   3.03,
+   1.86
+  ],
+  "sil_pbrs": [
+   7,
+   1.1,
+   1.45,
+   1.28
+  ],
+  "pbrs_prod_replica": [
+   5,
+   1.11,
+   1.04,
+   1.08
+  ],
+  "servo_raw": [
+   5,
+   null,
+   0.88,
+   0.97
+  ],
+  "intr": [
+   2,
+   null,
+   0.59,
+   0.84
+  ],
+  "pbrs_raw": [
+   3,
+   null,
+   0.58,
+   0.82
+  ],
+  "decay": [
+   4,
+   null,
+   0.46,
+   0.64
+  ],
+  "temp": [
+   0,
+   null,
+   0.14,
+   -0.03
+  ]
+ },
+ "batch2_gap_closure_3M": {
+  "gap_quantity": "relu(Vexp - V)",
+  "sil": [
+   8,
+   1.34,
+   5.54,
+   3.02
+  ],
+  "gap_sil_elevation": [
+   8,
+   1.38,
+   5.03,
+   2.77
+  ],
+  "gap_pre_priced_potential": [
+   6,
+   1.2,
+   4.08,
+   2.67
+  ],
+  "gap_post_advantage_add": [
+   8,
+   1.52,
+   4.02,
+   2.31
+  ],
+  "ppo": [
+   6,
+   1.5,
+   3.85,
+   2.27
+  ],
+  "gap_rew_plain_penalty": [
+   0,
+   null,
+   0.07,
+   -1711.96
+  ]
+ },
+ "batch3_meta_transfer_4M_shift_at_2.4M": {
+  "metrics": [
+   "A_ignition_Msteps",
+   "skill_kept_at_shift",
+   "recover80_iters",
+   "B_air_final",
+   "collapsed_seeds"
+  ],
+  "sil_scaffold_only": [
+   1.13,
+   0.51,
+   71,
+   10.25,
+   0
+  ],
+  "silobs_self_obs": [
+   1.11,
+   0.67,
+   9,
+   10.5,
+   1
+  ],
+  "silobs_lp": [
+   1.44,
+   0.63,
+   21,
+   12.55,
+   0
+  ]
+ },
+ "batch4_foresight_probe_2026-08-06": {
+  "setup": "3 phase-1 sil bases; 600 never-visited phase-2 probes (falling balls); scripted-intercept oracle (13% feasible); geo retrained offline 3 ways from frozen record",
+  "spearman_vs_oracle_mean3seeds": {
+   "Vdag": 0.287,
+   "V": 0.103,
+   "geo_onpolicy": -0.199,
+   "geo_colloc": -0.146,
+   "geo_colloc_sym": -0.151
+  },
+  "finding": "geo field INVERTED on the new conduct (proximity-proxy vs time-to-intercept); collocation/symmetry do not fix it; Sigma cannot represent never-witnessed target dynamics; V-dagger carries the transferable structure -- same phenomenon as batch 3's V-dagger-based self-obs transfer"
+ },
+ "batch4b_unified_critic_2026-08-06": {
+  "design": "twin fields, executed-pair expectile TD anchors + HJB residual at constant 0.3 weight on collocation mix; _r0 zeroes off-manifold r-hat",
+  "spearman_vs_oracle_mean3seeds": {
+   "unified": -0.053,
+   "unified_r0": -0.017,
+   "Vdag_control": 0.287
+  },
+  "verdict": "pre-registered FAILURE: anchoring cures the inversion but the residual destroys anchor foresight; monotone in off-manifold trust (Vdag > unified > geo). Where dynamics are unwitnessed, an explicit reachability constraint with extrapolated coefficients is worse than plain neural generalization from anchors. Reshaped design (untested): trust-gated residual weight (high on-manifold, zero off) -- Vdag absorbing a residual term, not geo absorbing anchors"
+ },
+ "batch5-7_unified_critic_2026-08-06": {
+  "canonical": "research/reports/EPSILON_CRITIC.md",
+  "failed_estimators": {
+   "qrl_quasimetric": "distance collapse",
+   "kernel_expectile_1step": "flat (uncalibrated)",
+   "kernel_kstep_record": 0.19
+  },
+  "epsilon_operator_8seed_probes": {
+   "A_unwitnessed": {
+    "vdag": 0.26,
+    "e1": 0.233
+   },
+   "B_record_gaps": {
+    "vdag": 0.242,
+    "e1": 0.272,
+    "note": "e1 >= vdag on 8/8 seeds"
+   },
+   "C_indist": {
+    "vdag": 0.192,
+    "e1": 0.173
+   },
+   "A_exposed": {
+    "vdag": 0.236,
+    "e1": 0.222
+   }
+  },
+  "pad_3seed": {
+   "D_stitching": {
+    "vdag": 0.173,
+    "e1": 0.197
+   },
+   "E_smooth": {
+    "vdag": 0.458,
+    "e1": 0.426
+   }
+  },
+  "training_8seed": {
+   "sil": {
+    "ign": "8/8",
+    "ign_step_M": 1.25,
+    "hi_q4": 5.37,
+    "rew": 2.92
+   },
+   "sil_eps": {
+    "ign": "8/8",
+    "ign_step_M": 1.11,
+    "hi_q4": 5.45,
+    "rew": 2.98
+   }
+  },
+  "verdict": "unified critic = eps-relaxed Bellman operator; eps=0 IS the composition critic; geometry via empirical-marginal ellipsoid inside the bootstrap; consolidates ladder to V/V_exp/V-ddag(eps); geo trio retired"
+ },
+ "headline_findings": [
+  "sigma-matched potential injection ignites fast then caps at ~1/3 of un-injected baseline; per-batch normalization prevents dose retirement; combos inherit the cap (swap, don't add)",
+  "headroom-gated SIL + entropy gate win batch 1 and compose; the H gate buys ignition speed (0.99M vs 1.65M ungated)",
+  "priced potential-diff self-neutralizes (intr); plain gap penalty is a self-referential doom loop; elevation >> avoidance",
+  "self-obs (tanh(Vdag-Vexp), tanh(Vdag/5) in policy obs) gives 8x faster frontier re-acquisition at no first-frontier cost; 1/8 collapse tail-risk absorbed by LP gating",
+  "LP = relu(H_old - H_now) via net snapshots: self-retiring attention field; zero collapses; expectile noise floor cancels in the difference"
+ ],
+ "production_status": "SIL shipped fe593eb5 (2026-08-05); entropy gate later disabled live by Luca (mean-relative gate + expectile noise floor = structural non-retirement, erratic play once critic bootstrapped); live config = SIL alone; self-obs + LP = deferred 6.x fresh-lineage design",
+ "batch8-9_hull_operator_2026-08-07": {
+  "canonical": "research/reports/EPSILON_CRITIC.md section 7",
+  "mechanism": "record-licensed hull operator: eps-scaled witnessed displacement vectors donated between chart-matched states (L1-sparse learned dynamics chart); teleport filter; optional likelihood+radius gates",
+  "family_F_flick_analogue": {
+   "assembly_in_record": 0.0,
+   "vdag": 0.365,
+   "hull": 0.43,
+   "note": ">= vdag on 8/8 seeds"
+  },
+  "family_B": {
+   "vdag": 0.382,
+   "hull_open": 0.453,
+   "hull_gated": 0.514
+  },
+  "family_C": {
+   "vdag": 0.853,
+   "hull_open": 0.84,
+   "hull_gated": 0.816
+  },
+  "adversarial": {
+   "A1_wind_confound": "graceful (NLL parity in/out zone)",
+   "A2_resource_laundering": {
+    "gaussian": 0.042,
+    "hull": -1.656,
+    "hull_gated_all_seeds_negative": -2.846
+   },
+   "A3_teleports": {
+    "filtered_ball_slack": 0.002,
+    "unfiltered": 0.007
+   },
+   "A4_illegal_transplants": {
+    "rate": 0.096,
+    "optimistic_skew_ungated": 0.047,
+    "skew_gated": -0.002
+   },
+   "thin_record_s1": {
+    "gated_fix": "+1.23 -> -0.23 via donor radius"
+   }
+  },
+  "training_8seed": {
+   "sil": [
+    8,
+    1.22,
+    5.75,
+    3.11
+   ],
+   "hull_open": [
+    8,
+    1.02,
+    5.47,
+    2.97
+   ],
+   "hull_gated": [
+    7,
+    2.16,
+    4.02,
+    2.27
+   ]
+  },
+  "seat_theorem": "thin-record optimism = hallucination in an estimator, exploration pressure in an actuator; open config for the actuation/self-obs seat (SIL consolidates only realized conversions), gates for calibrated readouts"
+ },
+ "batch10_value_critic_2026-08-07": {
+  "base": "sil_hull",
+  "metrics": [
+   "ign/8",
+   "ign_M",
+   "hi_q4",
+   "rew_f",
+   "ev",
+   "h_floor"
+  ],
+  "sil_hull": [
+   7,
+   1.25,
+   4.91,
+   2.72,
+   0.679,
+   0.027
+  ],
+  "vh_aux": [
+   8,
+   0.74,
+   6.41,
+   3.49,
+   0.491,
+   0.0
+  ],
+  "vh_mir": [
+   8,
+   1.1,
+   5.89,
+   3.19,
+   0.671,
+   0.003
+  ],
+  "vh_twin": [
+   8,
+   1.13,
+   5.55,
+   3.0,
+   0.662,
+   0.019
+  ],
+  "vh_td": [
+   8,
+   0.99,
+   5.43,
+   2.99,
+   0.67,
+   0.021
+  ],
+  "vh_dec": [
+   8,
+   1.16,
+   5.46,
+   2.97,
+   0.665,
+   0.016
+  ],
+  "vh_q": [
+   8,
+   1.08,
+   5.02,
+   2.73,
+   0.661,
+   0.035
+  ],
+  "vh_final": [
+   8,
+   0.75,
+   6.36,
+   3.47,
+   0.484,
+   0.0
+  ],
+  "verdict": "composite value critic = trunk aux-NLL + twin mirrored value heads (mean readout), no TD term; mirror confirms the compounding (H-floor 9x down); aux is the largest end-to-end lever but must live on the trunk; prod adds privileged opponent-conditioning"
+ },
+ "batch11_grpo_arms_2026-08-07": {
+  "vh_epi": [
+   8,
+   1.08,
+   6.17,
+   3.36,
+   0.649
+  ],
+  "vh_grp": [
+   8,
+   1.1,
+   4.76,
+   2.64,
+   0.678
+  ],
+  "vh_epifinal": [
+   8,
+   0.84,
+   6.43,
+   3.49,
+   0.506
+  ],
+  "grp_failure": "sil_frac 0.751; stale uniform-history peer returns deflate the conversion threshold",
+  "lesson": "the bank generalizes what is stationary: displacements yes (hull), returns no (peer referee); episodic baseline = cold-start backstop, authority annealed by EV",
+  "final_design": "trunk aux-NLL + twin mirrored value heads + episodic blend (twin-head EV keyed) + opponent conditioning; no TD term"
+ }
+}

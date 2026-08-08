@@ -31,6 +31,7 @@ TOUCH_R = 0.9
 EP_LEN = 200
 
 BALL_Z_LO, BALL_Z_HI = 0.5, 7.5
+PAD_X, PAD_R = -7.0, 1.0   # boost pad (enable_pad mode only)
 HI_Z = 5.0              # ball spawned at/above this counts as a "hi" conduct
 AIR_Z = 1.5             # car above this at touch = airborne touch
 
@@ -68,6 +69,19 @@ class Aerial2D:
     def set_phase(self, p):
         self.phase = p
         self._spawn_ball(np.ones(self.n, bool))
+
+    def enable_wind(self):
+        """Adversarial chart-confound: hidden lateral acceleration in x > 5.
+        Region-dependent dynamics whose region feature the chart may have
+        pruned -- tests whether the invariance claim fails safe."""
+        self.wind_on = True
+
+    def enable_pad(self):
+        """Boost-pad mode: passive regen OFF; the only refill is driving over a
+        fixed ground pad. Makes value DISCONTINUOUS in boost x position (low
+        boost near a high ball is bad; far from ball near the pad is good) --
+        the long-chain, stitching-required regime."""
+        self.pad_on = True
 
     def _spawn_ball(self, m):
         k = int(m.sum())
@@ -122,6 +136,9 @@ class Aerial2D:
     def step(self, a):
         n = self.n
         r = np.full(n, R_TIME)
+        r_cost = np.full(n, R_TIME)   # channel: time + boost + crash costs
+        r_touch = np.zeros(n)         # channel: touch payoff
+        r_appr = np.zeros(n)          # channel: approach shaping
         info = {}
 
         left = (a == 1) | (a == 5)
@@ -148,8 +165,12 @@ class Aerial2D:
         self.boost[boosting] -= BOOST_DRAIN
         np.clip(self.boost, 0.0, 1.0, out=self.boost)
         r[boosting] += R_BOOST_COST
+        r_cost[boosting] += R_BOOST_COST
 
         # integrate
+        if getattr(self, "wind_on", False):
+            self.vx += np.where(self.x > 5.0, 3.0 * DT, 0.0)
+            np.clip(self.vx, -VX_MAX, VX_MAX, out=self.vx)
         self.x += self.vx * DT
         self.z[air] += self.vz[air] * DT
         hit_wall = np.abs(self.x) > X_LIM
@@ -163,11 +184,16 @@ class Aerial2D:
         landed = air & (self.z <= 0.0)
         crash = landed & (self.vz < -CRASH_VZ)
         r[crash] += R_CRASH
+        r_cost[crash] += R_CRASH
         self.z[landed] = 0.0
         self.vz[landed] = 0.0
         self.on_ground[landed] = True
-        regen = self.on_ground
-        self.boost[regen] = np.minimum(1.0, self.boost[regen] + BOOST_REGEN)
+        if getattr(self, "pad_on", False):
+            hit_pad = self.on_ground & (np.abs(self.x - PAD_X) < PAD_R)
+            self.boost[hit_pad] = 1.0
+        else:
+            regen = self.on_ground
+            self.boost[regen] = np.minimum(1.0, self.boost[regen] + BOOST_REGEN)
 
         # ball dynamics (phase 2: falling balls, respawn on ground contact)
         if self.phase == 2:
@@ -181,6 +207,7 @@ class Aerial2D:
         dist = np.hypot(dx, dz)
         touch = dist <= TOUCH_R
         r[touch] += R_TOUCH
+        r_touch[touch] += R_TOUCH
         air_touch = touch & (self.z > AIR_Z)
         hi_touch = touch & (self.bz >= HI_Z)
         info["touch"] = touch.copy()
@@ -190,7 +217,10 @@ class Aerial2D:
         self._spawn_ball(touch)
 
         # approach shaping (recompute dist to the possibly-respawned ball for next step's prev)
-        r += np.clip(R_APPROACH * (self.prev_dist - dist), -0.1, 0.1)
+        appr = np.clip(R_APPROACH * (self.prev_dist - dist), -0.1, 0.1)
+        r += appr
+        r_appr += appr
+        info["r_parts"] = np.stack([r_touch, r_appr, r_cost], axis=1)
         dx = self.bx - self.x; dz = self.bz - self.z
         self.prev_dist = np.hypot(dx, dz)
 

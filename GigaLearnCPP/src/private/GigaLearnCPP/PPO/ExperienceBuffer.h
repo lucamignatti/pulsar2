@@ -37,6 +37,11 @@ namespace GGL {
 			// SELF-IMITATION: per-row BC weight, nonzero only on conversion rows -- realized
 			// return beat V_exp in a high-headroom state (undefined unless silEnabled)
 			silWeights,
+			// COMPOSITE VALUE CRITIC: per-row one-step displacement target (obs-wide) and
+			// its validity mask (0 on boundary rows); undefined unless auxDispEnabled
+			auxDispTargets, auxDispMask,
+			// privileged opponent context, row-expanded (undefined unless oppCondEnabled)
+			oppCtx,
 			advantages;
 
 		auto begin() { return &states; }
