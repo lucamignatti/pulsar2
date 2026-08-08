@@ -1174,7 +1174,22 @@ int main(int argc, char* argv[]) {
 	// entropy fall 0.755 -> 0.49 within 850M steps and Nexto share step 9.8% -> 14.1% -> 58%,
 	// overtaking 6.1b. Re-enable deliberately if the composite critic changes H's behaviour,
 	// but do it as its own lever with Ent Gate Mean watched against the cap.
-	cfg.ppo.vdagEntGateEnabled = false;
+	// RE-ENABLED at 223M with the cap HALVED (2026-08-07). Both failure directions are now
+	// measured, on the same entropyScale 0.0175:
+	//   gate ON, cap 3.0 (6.2): H inflated 175x, Ent Gate Mean pinned AT the cap from ~2.0B,
+	//     and Policy Entropy did not move for 3.34B steps -- a gate at its cap is not a gate,
+	//     it is a flat 3x entropy bonus, and it blocked the takeoff.
+	//   gate OFF (7.0, my call on the merge): entropy fell off a cliff --
+	//     0.718 (50M) -> 0.712 (100M) -> 0.641 (150M) -> 0.456 (200M) -> 0.335 (225M),
+	//     against 6.1b's 0.698 and 6.2's 0.757 at the SAME step with the gate on. That is the
+	//     6.1-proper pathology: the formative window spent without exploration.
+	// So the gate IS load-bearing against collapse, exactly as its original comment claimed;
+	// disabling it outright was the wrong lever. The cap is the right one, and 1.5 is the
+	// middle rung the 6.2 note already named. Watch Headroom/Ent Gate Mean AGAINST the cap: if
+	// it pins at 1.5 the way it pinned at 3.0, the gate has saturated again and the next move
+	// is to bound H rather than to keep trimming the cap.
+	cfg.ppo.vdagEntGateEnabled = true;
+	cfg.ppo.vdagEntGateCap = 1.5f;
 	                                   // at ts1 it also de-risks the global entropy
 	                                   // coefficient fragility that killed 6.1 proper
 
