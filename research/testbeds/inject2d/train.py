@@ -41,7 +41,8 @@ BETA = 0.04
 GAMMA_INT = 0.95
 
 AUG_ARMS = ("silobs", "silobs_lp")
-SIL_ARMS = ("sil", "sil_eps", "sil_hull", "sil_nogate", "sil_ent", "sil_pbrs", "silobs", "silobs_lp", "gap_sil")
+VH_ARMS = ("vh_twin", "vh_q", "vh_mir", "vh_aux", "vh_dec", "vh_td", "vh_best", "vh_bestaux", "vh_final", "vh_epi", "vh_grp", "vh_epifinal")
+SIL_ARMS = ("sil", "sil_eps", "sil_hull", "sil_nogate", "sil_ent", "sil_pbrs", "silobs", "silobs_lp", "gap_sil") + VH_ARMS
 PBRS_ARMS = ("pbrs", "pbrs_raw", "servo_raw", "kstep", "sparse", "sil_pbrs")
 
 
@@ -57,12 +58,20 @@ class Agent:
         self.aug = arm in AUG_ARMS
         self.in_dim = OBS_DIM + (2 if self.aug else 0)
         self.pi = mlp(self.in_dim, N_ACT)
-        self.v = mlp(self.in_dim, 1)
+        self.vvar = arm[3:] if arm.startswith("vh_") else ""
+        vout = {"q": 8, "aux": 1 + 2 * OBS_DIM, "dec": 3,
+                "bestaux": 1 + 2 * OBS_DIM, "final": 1 + 2 * OBS_DIM,
+                "epifinal": 1 + 2 * OBS_DIM}.get(self.vvar, 1)
+        v2out = 1 + 2 * OBS_DIM if self.vvar in ("bestaux", "final", "epifinal") else 1
+        self.v = mlp(self.in_dim, vout)
+        self.v2 = mlp(self.in_dim, v2out) if self.vvar in ("twin", "best", "bestaux", "final", "epifinal") else None
         self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=LR)
-        self.opt_v = torch.optim.Adam(self.v.parameters(), lr=LR)
+        vparams = list(self.v.parameters()) + (list(self.v2.parameters()) if self.v2 else [])
+        self.opt_v = torch.optim.Adam(vparams, lr=LR)
         self.ladder = Ladder(OBS_DIM, N_ACT, GAMMA,
-            {"qdag": arm == "aprior", "eps": 1.0 if arm in ("sil_eps", "sil_hull") else 0.0,
-             "hull": arm == "sil_hull"})
+            {"qdag": arm == "aprior",
+             "eps": 1.0 if arm in ("sil_eps", "sil_hull") or arm in VH_ARMS else 0.0,
+             "hull": arm == "sil_hull" or arm in VH_ARMS})
         self.v_int = mlp(OBS_DIM, 1) if arm in ("intr", "align") else None
         if self.v_int is not None:
             self.opt_vint = torch.optim.Adam(self.v_int.parameters(), lr=LR)
@@ -70,6 +79,98 @@ class Agent:
         self.snap = None            # LP snapshot (silobs_lp)
         self.it = 0
         self.env = Aerial2D(N_ENVS, seed=seed + 1000)
+
+    def val(self, o):
+        """Scalar value readout per critic variant (differentiable)."""
+        out = self.v(o)
+        if self.vvar == "q":
+            return out.mean(1)                      # mean of quantiles
+        if self.vvar == "aux":
+            return out[:, 0]
+        if self.vvar == "dec":
+            return out.sum(1)                       # channel heads sum to V
+        if self.vvar == "twin":
+            return 0.5 * (out.flatten() + self.v2(o).flatten())
+        if self.vvar == "best":
+            return 0.5 * (out.flatten() + self.v2(o).flatten())
+        if self.vvar in ("bestaux", "final", "epifinal"):
+            return 0.5 * (out[:, 0] + self.v2(o)[:, 0])
+        return out.flatten()
+
+    @staticmethod
+    def mirror(o):
+        m = o.clone(); m[:, 0] = -m[:, 0]; m[:, 2] = -m[:, 2]; m[:, 6] = -m[:, 6]
+        return m
+
+    def value_loss(self, o, nx, ret, ret3, d):
+        """Per-variant critic loss (the thing under test)."""
+        vv = self.vvar
+        if vv == "q":
+            # quantile (pinball) regression: 8 quantiles vs the same GAE returns
+            taus = torch.arange(0.5 / 8, 1.0, 1.0 / 8)
+            u = ret.unsqueeze(1) - self.v(o)
+            return (torch.where(u > 0, taus, taus - 1.0) * u).mean() * 2.0
+        if vv == "twin":
+            # differential pair: independent nets on DISJOINT halves of each
+            # minibatch -- uncorrelated sample noise, mean readout cancels it
+            h = o.shape[0] // 2
+            l1 = ((self.v(o[:h]).flatten() - ret[:h]) ** 2).mean()
+            l2 = ((self.v2(o[h:]).flatten() - ret[h:]) ** 2).mean()
+            return l1 + l2
+        if vv == "mir":
+            # exact env symmetry = free doubled value data
+            base = ((self.v(o).flatten() - ret) ** 2).mean()
+            mirr = ((self.v(self.mirror(o)).flatten() - ret) ** 2).mean()
+            return 0.5 * (base + mirr)
+        if vv == "aux":
+            # representation pressure: displacement NLL beside the value output
+            out = self.v(o)
+            base = ((out[:, 0] - ret) ** 2).mean()
+            mu = out[:, 1:1 + OBS_DIM]
+            ls = out[:, 1 + OBS_DIM:].clamp(-7, 2)
+            dlt = (nx - o)[:, :OBS_DIM]
+            keep = (d < 0.5).unsqueeze(1)
+            nll = ((ls + 0.5 * ((dlt - mu) / ls.exp()) ** 2) * keep).mean()
+            return base + 0.1 * nll
+        if vv == "dec":
+            # compositional standard value: channel heads on channel returns
+            return ((self.v(o) - ret3) ** 2).mean()
+        if vv in ("best", "bestaux", "final", "epifinal"):
+            # composites; "final" = twin x mirror x aux, NO record-consistency
+            # (measured: the TD term biases V low -> inflates the H-floor)
+            aux = vv in ("bestaux", "final", "epifinal")
+            h = o.shape[0] // 2
+            loss = 0.0
+            for net, sl in ((self.v, slice(0, h)), (self.v2, slice(h, None))):
+                oo, rr2 = o[sl], ret[sl]
+                for inp in (oo, self.mirror(oo)):
+                    out = net(inp)
+                    vpred = out[:, 0] if aux else out.flatten()
+                    loss = loss + 0.5 * ((vpred - rr2) ** 2).mean()
+                if aux:
+                    out = net(oo)
+                    mu = out[:, 1:1 + OBS_DIM]
+                    ls = out[:, 1 + OBS_DIM:].clamp(-7, 2)
+                    dlt = (nx[sl] - oo)[:, :OBS_DIM]
+                    keep = (d[sl] < 0.5).unsqueeze(1)
+                    loss = loss + 0.1 * ((ls + 0.5 * ((dlt - mu) / ls.exp()) ** 2) * keep).mean()
+            if vv not in ("final", "epifinal") and self.ladder.res.fill > 4096:
+                ro, rn2, rr = self.ladder.res.sample(o.shape[0])
+                with torch.no_grad():
+                    tgt = rr + GAMMA * self.val(rn2)
+                loss = loss + 0.3 * ((self.val(ro) - tgt) ** 2).mean()
+            return loss
+        if vv == "td":
+            # record-composition: Bellman consistency over ALL past data
+            base = ((self.v(o).flatten() - ret) ** 2).mean()
+            if self.ladder.res.fill > 4096:
+                ro, rn, rr = self.ladder.res.sample(o.shape[0])
+                with torch.no_grad():
+                    tgt = rr + GAMMA * self.val(rn)
+                td = ((self.val(ro) - tgt) ** 2).mean()
+                return base + 0.3 * td
+            return base
+        return ((self.v(o).flatten() - ret) ** 2).mean()
 
     @torch.no_grad()
     def _feats(self, o_raw):
@@ -94,6 +195,7 @@ class Agent:
         rews = torch.zeros(T, N)
         dones = torch.zeros(T, N)
         masks = torch.zeros(T, N, N_ACT)
+        parts = torch.zeros(T, N, 3)
         counts = {"touch": 0, "air": 0, "hi": 0, "hi_off": 0}
 
         o = self._aug(torch.from_numpy(env.obs()))
@@ -107,6 +209,7 @@ class Agent:
             obs[t] = o; masks[t] = m; acts[t] = a
             logp[t] = dist.log_prob(a)
             rews[t] = torch.from_numpy(r)
+            parts[t] = torch.from_numpy(info["r_parts"].astype(np.float32))
             dones[t] = torch.from_numpy(d.astype(np.float32))
             o2 = self._aug(torch.from_numpy(env.obs()))
             if d.any():
@@ -119,7 +222,7 @@ class Agent:
             counts["air"] += int(info["air_touch"].sum())
             counts["hi"] += int(info["hi_touch"].sum())
             counts["hi_off"] += int(info["hi_offered"].sum())
-        return obs, nxt, acts, logp, rews, dones, masks, counts
+        return obs, nxt, acts, logp, rews, dones, masks, counts, parts
 
     def act_logits(self, logits, o, m):
         if self.arm == "temp":
@@ -148,7 +251,7 @@ class Agent:
 
     # ---------------- learn ----------------
     def learn(self, batch):
-        obs, nxt, acts, logp0, rews, dones, masks, counts = batch
+        obs, nxt, acts, logp0, rews, dones, masks, counts, parts = batch
         T, N = HORIZON, N_ENVS
         fo = obs.reshape(T * N, -1); fn = nxt.reshape(T * N, -1)
         fo_r = fo[:, :OBS_DIM]; fn_r = fn[:, :OBS_DIM]
@@ -158,8 +261,27 @@ class Agent:
         stats = {}
 
         with torch.no_grad():
-            v = self.v(fo).flatten()
-            v_next = self.v(fn).flatten()
+            v = self.val(fo)
+            v_next = self.val(fn)
+        # EPISODIC BASELINE (vh_epi): kNN-over-bank value read, blended by the
+        # learned critic's own inadequacy (w = 0.5*(1-EV_ema)) -- leans on memory
+        # while V is young, self-anneals as V matures. State-dependent, so the
+        # policy-gradient baseline stays unbiased; bootstrap bias judged empirically.
+        if self.vvar in ("epi", "epifinal") and self.ladder.res.fill > 8192:
+            with torch.no_grad():
+                bo, br = self.ladder.res.sample_ret(2048)
+                for tgt in ("fo", "fn"):
+                    q = fo if tgt == "fo" else fn
+                    dd = torch.cdist(q[:, :OBS_DIM], bo)
+                    nd, ni = dd.topk(8, dim=1, largest=False)
+                    wts = 1.0 / (nd + 1e-2)
+                    epiv = (br[ni] * wts).sum(1) / wts.sum(1)
+                    w = 0.5 * max(0.0, 1.0 - getattr(self, "ev_ema", 0.0))
+                    if tgt == "fo":
+                        v = (1 - w) * v + w * epiv
+                    else:
+                        v_next = (1 - w) * v_next + w * epiv
+                self._epi_w = w
 
         # ---- gap-closure PRE-GAE injections (modify rewards, get priced) ----
         if self.arm in ("gap_rew", "gap_pre"):
@@ -191,13 +313,36 @@ class Agent:
         fadv = adv.reshape(-1)
         fadv = (fadv - fadv.mean()) / (fadv.std() + 1e-8)
 
+        returns3 = None
+        if self.vvar == "dec":
+            with torch.no_grad():
+                v3 = self.v(fo).view(T, N, 3)
+                v3n = self.v(fn).view(T, N, 3)
+            a3 = torch.zeros(T, N, 3); g3 = torch.zeros(N, 3)
+            for t in reversed(range(T)):
+                d3 = parts[t] + GAMMA * v3n[t] - v3[t]
+                g3 = d3 + GAMMA * LAM * (1 - dones[t]).unsqueeze(1) * g3
+                a3[t] = g3
+            returns3 = (a3 + v3).reshape(T * N, 3)
+
         # ladder update on RAW obs, on the agent's actual reward stream
         lstats = self.ladder.update(fo_r, fn_r, fr, fd, fa, returns)
         stats.update(lstats)
+        with torch.no_grad():
+            stats["ev"] = float(1.0 - (returns - v).var() / (returns.var() + 1e-8))
+            self.ev_ema = 0.95 * getattr(self, "ev_ema", 0.0) + 0.05 * max(0.0, stats["ev"])
+            if hasattr(self, "_epi_w"):
+                stats["epi_w"] = self._epi_w
+            sub = torch.randint(0, T * N, (4096,))
+            stats["h_floor"] = float(torch.relu(
+                self.ladder.vdag_min(fo_r[sub]) - v[sub]).mean())
+            if self.vvar == "twin":
+                stats["v_disagree"] = float(
+                    (self.v(fo[sub]).flatten() - self.v2(fo[sub]).flatten()).abs().mean())
 
         # fields in one normalization frame
         with torch.no_grad():
-            v_all = self.v(torch.cat([fo, fn])).flatten()
+            v_all = self.val(torch.cat([fo, fn]))
         phi_all, h_all = self.ladder.fields(torch.cat([fo_r, fn_r]), v_all)
         phi_o, phi_n = phi_all[:T * N], phi_all[T * N:]
         h_o = h_all[:T * N]
@@ -322,6 +467,15 @@ class Agent:
             if self.arm == "gap_sil":
                 gap = torch.relu(vexp - v)
                 sil_mask = (returns > v) & (gap >= torch.quantile(gap, 0.7))
+            elif self.vvar == "grp" and self.ladder.res.fill > 8192:
+                # GROUP-RELATIVE conversion: beat the q75 of 16 nearest peer
+                # HISTORIES (non-parametric referee, immune to V_exp drift)
+                bo, br = self.ladder.res.sample_ret(2048)
+                dd = torch.cdist(fo_r, bo)
+                ni = dd.topk(16, dim=1, largest=False).indices
+                thr = br[ni].quantile(0.75, dim=1)
+                sil_mask = returns > thr
+                stats["grp_thr"] = float(thr.mean())
             else:
                 sil_mask = returns > vexp
                 if self.arm != "sil_nogate":
@@ -348,9 +502,13 @@ class Agent:
                 self.opt_pi.zero_grad(); loss_pi.backward()
                 nn.utils.clip_grad_norm_(self.pi.parameters(), 0.5)
                 self.opt_pi.step()
-                lv = ((self.v(fo[c]).flatten() - returns[c]) ** 2).mean()
+                lv = self.value_loss(fo[c], fn[c], returns[c],
+                                     returns3[c] if returns3 is not None else None,
+                                     fd[c])
                 self.opt_v.zero_grad(); lv.backward()
-                nn.utils.clip_grad_norm_(self.v.parameters(), 0.5)
+                nn.utils.clip_grad_norm_(
+                    list(self.v.parameters())
+                    + (list(self.v2.parameters()) if self.v2 else []), 0.5)
                 self.opt_v.step()
                 with torch.no_grad():
                     kl_acc += float((flp[c] - lp).mean()); ent_acc += float(ent.mean()); nmb += 1

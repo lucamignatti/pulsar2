@@ -309,5 +309,107 @@
    ]
   },
   "seat_theorem": "thin-record optimism = hallucination in an estimator, exploration pressure in an actuator; open config for the actuation/self-obs seat (SIL consolidates only realized conversions), gates for calibrated readouts"
+ },
+ "batch10_value_critic_2026-08-07": {
+  "base": "sil_hull",
+  "metrics": [
+   "ign/8",
+   "ign_M",
+   "hi_q4",
+   "rew_f",
+   "ev",
+   "h_floor"
+  ],
+  "sil_hull": [
+   7,
+   1.25,
+   4.91,
+   2.72,
+   0.679,
+   0.027
+  ],
+  "vh_aux": [
+   8,
+   0.74,
+   6.41,
+   3.49,
+   0.491,
+   0.0
+  ],
+  "vh_mir": [
+   8,
+   1.1,
+   5.89,
+   3.19,
+   0.671,
+   0.003
+  ],
+  "vh_twin": [
+   8,
+   1.13,
+   5.55,
+   3.0,
+   0.662,
+   0.019
+  ],
+  "vh_td": [
+   8,
+   0.99,
+   5.43,
+   2.99,
+   0.67,
+   0.021
+  ],
+  "vh_dec": [
+   8,
+   1.16,
+   5.46,
+   2.97,
+   0.665,
+   0.016
+  ],
+  "vh_q": [
+   8,
+   1.08,
+   5.02,
+   2.73,
+   0.661,
+   0.035
+  ],
+  "vh_final": [
+   8,
+   0.75,
+   6.36,
+   3.47,
+   0.484,
+   0.0
+  ],
+  "verdict": "composite value critic = trunk aux-NLL + twin mirrored value heads (mean readout), no TD term; mirror confirms the compounding (H-floor 9x down); aux is the largest end-to-end lever but must live on the trunk; prod adds privileged opponent-conditioning"
+ },
+ "batch11_grpo_arms_2026-08-07": {
+  "vh_epi": [
+   8,
+   1.08,
+   6.17,
+   3.36,
+   0.649
+  ],
+  "vh_grp": [
+   8,
+   1.1,
+   4.76,
+   2.64,
+   0.678
+  ],
+  "vh_epifinal": [
+   8,
+   0.84,
+   6.43,
+   3.49,
+   0.506
+  ],
+  "grp_failure": "sil_frac 0.751; stale uniform-history peer returns deflate the conversion threshold",
+  "lesson": "the bank generalizes what is stationary: displacements yes (hull), returns no (peer referee); episodic baseline = cold-start backstop, authority annealed by EV",
+  "final_design": "trunk aux-NLL + twin mirrored value heads + episodic blend (twin-head EV keyed) + opponent conditioning; no TD term"
  }
 }

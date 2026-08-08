@@ -136,6 +136,9 @@ class Aerial2D:
     def step(self, a):
         n = self.n
         r = np.full(n, R_TIME)
+        r_cost = np.full(n, R_TIME)   # channel: time + boost + crash costs
+        r_touch = np.zeros(n)         # channel: touch payoff
+        r_appr = np.zeros(n)          # channel: approach shaping
         info = {}
 
         left = (a == 1) | (a == 5)
@@ -162,6 +165,7 @@ class Aerial2D:
         self.boost[boosting] -= BOOST_DRAIN
         np.clip(self.boost, 0.0, 1.0, out=self.boost)
         r[boosting] += R_BOOST_COST
+        r_cost[boosting] += R_BOOST_COST
 
         # integrate
         if getattr(self, "wind_on", False):
@@ -180,6 +184,7 @@ class Aerial2D:
         landed = air & (self.z <= 0.0)
         crash = landed & (self.vz < -CRASH_VZ)
         r[crash] += R_CRASH
+        r_cost[crash] += R_CRASH
         self.z[landed] = 0.0
         self.vz[landed] = 0.0
         self.on_ground[landed] = True
@@ -202,6 +207,7 @@ class Aerial2D:
         dist = np.hypot(dx, dz)
         touch = dist <= TOUCH_R
         r[touch] += R_TOUCH
+        r_touch[touch] += R_TOUCH
         air_touch = touch & (self.z > AIR_Z)
         hi_touch = touch & (self.bz >= HI_Z)
         info["touch"] = touch.copy()
@@ -211,7 +217,10 @@ class Aerial2D:
         self._spawn_ball(touch)
 
         # approach shaping (recompute dist to the possibly-respawned ball for next step's prev)
-        r += np.clip(R_APPROACH * (self.prev_dist - dist), -0.1, 0.1)
+        appr = np.clip(R_APPROACH * (self.prev_dist - dist), -0.1, 0.1)
+        r += appr
+        r_appr += appr
+        info["r_parts"] = np.stack([r_touch, r_appr, r_cost], axis=1)
         dx = self.bx - self.x; dz = self.bz - self.z
         self.prev_dist = np.hypot(dx, dz)
 

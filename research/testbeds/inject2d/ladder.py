@@ -31,16 +31,20 @@ class Reservoir:
         self.obs = torch.zeros(cap, obs_dim)
         self.nxt = torch.zeros(cap, obs_dim)
         self.rew = torch.zeros(cap)
+        self.ret = torch.zeros(cap)   # realized GAE return of the departure row
         self.fill = 0
         self.seen = 0
 
-    def add(self, obs, nxt, rew):
+    def add(self, obs, nxt, rew, ret=None):
         n = obs.shape[0]
+        if ret is None:
+            ret = torch.zeros(n)
         take = min(self.cap - self.fill, n)
         if take > 0:
             self.obs[self.fill:self.fill + take] = obs[:take]
             self.nxt[self.fill:self.fill + take] = nxt[:take]
             self.rew[self.fill:self.fill + take] = rew[:take]
+            self.ret[self.fill:self.fill + take] = ret[:take]
             self.fill += take
         rest = n - take
         if rest > 0:
@@ -51,11 +55,16 @@ class Reservoir:
                 self.obs[dst] = obs[take:][idx]
                 self.nxt[dst] = nxt[take:][idx]
                 self.rew[dst] = rew[take:][idx]
+                self.ret[dst] = ret[take:][idx]
         self.seen += n
 
     def sample(self, k):
         idx = torch.randint(0, self.fill, (k,))
         return self.obs[idx], self.nxt[idx], self.rew[idx]
+
+    def sample_ret(self, k):
+        idx = torch.randint(0, self.fill, (k,))
+        return self.obs[idx], self.ret[idx]
 
 
 class Ladder:
@@ -127,7 +136,7 @@ class Ladder:
 
         # reservoir feed: executed pairs only, never across a reset
         keep = done < 0.5
-        self.res.add(obs[keep], nxt[keep], rew[keep])
+        self.res.add(obs[keep], nxt[keep], rew[keep], returns[keep])
 
         # V_exp on realized returns
         for _ in range(epochs):

@@ -194,3 +194,62 @@ config = best estimator (hallucination negative on all seeds) but a bad
 trainer (2.16M, 7/8) -- thin-record optimism is exploration in the actuation
 seat and hallucination in the estimation seat, and SIL's success-only
 consolidation makes the former safe.
+
+## Batch 10 -- the value-critic study (2026-08-07)
+
+V is the denominator of the whole program (H = V-ddag - V, SIL weights, GAE,
+LP). Seven variants + composites on the sil_hull base, 8 seeds, two new
+metrics: ev (explained variance of V, calibration) and h_floor (mean
+relu(V-ddag - V), hallucinated-headroom floor).
+
+| arm | ign | ign_M | hi_q4 | rew | ev | h_floor |
+|---|---|---|---|---|---|---|
+| sil_hull base | 7/8 | 1.25 | 4.91 | 2.72 | .679 | .027 |
+| vh_aux (displacement-NLL aux) | 8/8 | **0.74** | **6.41** | **3.49** | .491 | .000 |
+| vh_mir (mirror symmetry) | 8/8 | 1.10 | 5.89 | 3.19 | .671 | **.003** |
+| vh_twin (differential pair) | 8/8 | 1.13 | 5.55 | 3.00 | .662 | .019 |
+| vh_td (record Bellman-consistency) | 8/8 | 0.99 | 5.43 | 2.99 | .670 | .021 |
+| vh_dec (channel heads) | 8/8 | 1.16 | 5.46 | 2.97 | .665 | .016 |
+| vh_q (quantile) | 8/8 | 1.08 | 5.02 | 2.73 | .661 | .035 |
+| vh_final (aux+mir+twin, NO td) | 8/8 | 0.75 | 6.36 | 3.47 | .484 | .000 |
+
+Findings: (1) representation pressure (aux) is the largest end-to-end value
+lever ever measured here (-40% ignition, +30% finals, zero laggard seeds) but
+DEGRADES V's calibration when wired inside the value net -- the
+encoder-illusion, live; in prod it belongs on the TRUNK. (2) Mirror symmetry
+is the calibration champion: H-floor 9x down at intact ev -- the compounding
+(sharper V -> deflated hallucinated headroom) confirmed. (3) Twin-differential
+works as designed (noise cancellation, modest). (4) The TD-consistency term
+biases V low and INFLATES the H-floor -- interaction measured, dropped.
+(5) Composites don't stack naively; the final config is aux+mirror+twin.
+
+Prod design ("composite value critic"): trunk-side displacement-NLL aux head
+(clean of V), twin mirrored+slot-permuted value heads with mean readout, no
+TD term, plus the prod-only privileged opponent-conditioning of the value
+family (asymmetric actor-critic; removes opponent-mixture variance -- the
+strategic-value limiter). Parked: quantile head (gap-sensor consolidation,
+architectural), channel decomposition (mild, plumbing-heavy).
+
+## Batch 11 -- GRPO-inspired arms + the closing combo (2026-08-07)
+
+| arm | ign | ign_M | hi_q4 | rew | ev | note |
+|---|---|---|---|---|---|---|
+| vh_epi (episodic baseline) | 8/8 | 1.08 | 6.17 | 3.36 | .649 | near-final perf, calibration INTACT; epi_w self-anneals 0.50->0.15 |
+| vh_grp (peer-group SIL referee) | 8/8 | 1.10 | 4.76 | 2.64 | .678 | REJECTED: sil_frac 0.751 -- stale uniform-history peer returns deflate the threshold, SIL clones mediocrity |
+| vh_epifinal (final + epi) | 8/8 | 0.84 | **6.43** | **3.49** | .506 | best finals + best per-seed floor (6.1) of the whole study |
+
+Lessons: (1) THE BANK GENERALIZES WHAT IS STATIONARY -- displacements are
+physics and stay true forever (hull works); returns are policy-relative and
+rot (peer-group referee fails); V_exp retrained fresh each iteration already
+IS the recency-correct group quantile, amortized. (2) The episodic baseline
+is the memory-backed cold-start backstop: authority handed to the parametric
+critic exactly as fast as it earns it (blend w = 0.5*(1-EV_ema)). (3) In the
+combo the aux-suppressed EV pins epi_w at ~0.25 permanently and it STILL
+helps -- but prod should key the blend on the clean twin-head EV (the
+suppression is a toy-wiring artifact; prod aux lives on the trunk).
+
+FINAL VALUE-CRITIC DESIGN (prod): trunk displacement-NLL aux + twin
+mirrored/slot-permuted value heads (mean readout, |V1-V2| gauge) + episodic
+baseline blend keyed to twin-head EV + privileged opponent conditioning.
+No TD term. Toy evidence: ignition 1.25->0.75-0.84M, finals 4.91->6.4,
+worst seed 0.1->6.1, vs the sil_hull base.
