@@ -5,6 +5,7 @@
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
 
 #include "../Util/Models.h"
+#include "../Util/ObsMirror.h"
 #include "Reachability.h"
 
 #include <torch/optim/adam.h>
@@ -117,7 +118,7 @@ namespace GGL {
 		torch::Tensor geoResObs, geoResNext, geoResRew;
 		int64_t geoResFill = 0, geoResSeen = 0;
 		void GeoReservoirAdd(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor rew, int cap,
-			torch::Tensor keepMask = {});
+			torch::Tensor keepMask = {}, torch::Tensor ret = {});
 		float dbgGeoResid = -1.f, dbgGeoRew = -1.f, dbgGeoMean = -9.f;
 
 		// ===== HULL OPERATOR (record-licensed relaxed Bellman; EPSILON_CRITIC.md s7) =====
@@ -129,6 +130,19 @@ namespace GGL {
 		// bank is not ready (caller falls back to the plain bootstrap).
 		torch::Tensor HullBootstrap(torch::Tensor states);
 		float dbgHullNLL = -999.f, dbgHullL1 = -1.f;   // NLL can be legitimately negative
+
+		// ===== COMPOSITE VALUE CRITIC =====
+		// Mirror map built lazily at first Learn (needs the runtime obs size); the
+		// opponent context is set by the Learner: oppCtxLive for collection-time
+		// inference (the worker knows its iteration's opponent), per-row batch.oppCtx
+		// for the learn pass (pipelining means live != batch iteration).
+		ObsMirror::Map mirrorMap;
+		torch::Tensor oppCtxLive;          // [oppCtxDim] on device; zeros = self-play
+		torch::Tensor oppCtxCollected;     // CPU; written by the collect worker at its draw
+		torch::Tensor oppCtxForLearn;      // CPU; barrier-copied so learn sees ITS iteration
+		float valueEvEma = 0.f;            // explained-variance EMA (drives the epi blend)
+		torch::Tensor geoResRet;           // reservoir returns column (episodic blend)
+		float dbgAuxNLL = -999.f, dbgTwinDisagree = -1.f;
 		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
 		float rhatMaxObserved = 0.f;
 		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;   // bound on hypothesis magnitude (never invent)

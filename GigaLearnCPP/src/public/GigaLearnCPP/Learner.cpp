@@ -1447,6 +1447,7 @@ void GGL::Learner::Start() {
 			if (!render) {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
 				std::uniform_real_distribution<float> oppRoll(0.0f, 1.0f);
+				float oppAgeFrac = 0.f;
 				if (nexto && oppRoll(oppRng) < config.externalOpponent.serveFrac) {
 					oppExternal = true;
 					nexto->BeginServe(numPlayers);
@@ -1457,7 +1458,23 @@ void GGL::Learner::Start() {
 					// never drawn here - it is the measuring stick (Ref/*) and must stay
 					// uncontaminated by being trained against.
 					std::uniform_int_distribution<size_t> pick(0, versionMgr->versions.size() - 1);
-					oppModels = &versionMgr->versions[pick(oppRng)].models;
+					size_t pickIdx = pick(oppRng);
+					oppModels = &versionMgr->versions[pickIdx].models;
+					// 0 = newest ring entry, 1 = oldest: a coarse strength prior for the critic
+					oppAgeFrac = versionMgr->versions.size() > 1
+						? 1.f - (float)pickIdx / (float)(versionMgr->versions.size() - 1) : 0.f;
+				}
+				// PRIVILEGED OPPONENT CONTEXT (composite value critic): the baseline may see
+				// who it is playing; the policy never does. oppCtxLive conditions THIS
+				// iteration's collection-time value inference; oppCtxCollected is handed to
+				// the learn pass at the barrier (pipelining: live != learn iteration).
+				if (config.ppo.oppCondEnabled) {
+					float isSelf = (!oppExternal && !oppModels) ? 1.f : 0.f;
+					float isOld = oppModels ? 1.f : 0.f;
+					float isExt = oppExternal ? 1.f : 0.f;
+					auto ctx = torch::tensor({ isSelf, isOld, isExt, oppAgeFrac }, torch::kFloat32);
+					ppo->oppCtxCollected = ctx;
+					ppo->oppCtxLive = ctx.to(ppo->device);
 				}
 			}
 
@@ -2046,6 +2063,12 @@ void GGL::Learner::Start() {
 			}
 			int stepsCollected = collectSteps;
 			std::swap(combinedTraj, combinedTrajNext);
+			// composite value critic: hand the just-joined collection's opponent context
+			// to the learn pass BEFORE the worker relaunches and overwrites it
+			if (config.ppo.oppCondEnabled)
+				ppo->oppCtxForLearn = ppo->oppCtxCollected.defined()
+					? ppo->oppCtxCollected.clone()
+					: torch::zeros({ config.ppo.oppCtxDim }, torch::kFloat32);
 			collectReport.Finish();
 			for (auto& kv : collectReport.data)
 				report.data[kv.first] = kv.second;
@@ -2443,6 +2466,48 @@ void GGL::Learner::Start() {
 					// writes to them; tPropAInt (if shapingBeta > 0) is the only thing it hands to
 					// GAE's advantages below, and it's centered + explicitly zeroed at terminals.
 
+					// ===== COMPOSITE VALUE CRITIC: learn-prep (PPOLearnerConfig block) =====
+					// Mirror map: built once, hard-fails on layout drift.
+					if (config.ppo.valueMirrorEnabled && !ppo->mirrorMap.IsValid())
+						ppo->mirrorMap = ObsMirror::Build(
+							config.ppo.mirrorMaxPlayersPerTeam, obsSize);
+					// Episodic baseline: kNN over the reservoir's stored returns, blended by
+					// the critic's own inadequacy (w = epiWMax * (1 - EV_ema)). Memory carries
+					// the baseline while V is young; the weight self-retires as V matures.
+					// NOTE bank returns are policy-relative and rot -- this blend is safe
+					// precisely BECAUSE it retires (the stationarity rule, RESULTS.md batch 11).
+					if (config.ppo.epiBlendEnabled && ppo->geoResFill > 16384
+						&& ppo->valueEvEma < 0.95f) {
+						RG_NO_GRAD;
+						float epiW = config.ppo.epiWMax * RS_MAX(0.f, 1.f - ppo->valueEvEma);
+						if (epiW > 1e-3f) {
+							int64_t nAll = (int64_t)combinedTraj.Length();
+							int64_t sub = RS_MIN((int64_t)config.ppo.epiSub, ppo->geoResFill);
+							auto ridx = torch::randint(0, ppo->geoResFill, { sub },
+								torch::TensorOptions().dtype(torch::kLong));
+							auto bObs = ppo->geoResObs.index_select(0, ridx).to(ppo->device, true);
+							auto bRet = ppo->geoResRet.index_select(0, ridx).to(ppo->device, true);
+							auto epiV = torch::empty({ nAll }, torch::kFloat32);
+							constexpr int64_t ECH = 16384;
+							int64_t K = RS_MIN((int64_t)config.ppo.epiK, sub);
+							for (int64_t i0 = 0; i0 < nAll; i0 += ECH) {
+								int64_t i1 = RS_MIN(i0 + ECH, nAll);
+								auto q = tStates.slice(0, i0, i1).to(ppo->device, true)
+									.to(torch::kFloat32);
+								auto dk = torch::cdist(q, bObs).topk(K, 1, /*largest=*/false);
+								auto wts = 1.f / (std::get<0>(dk) + 1e-2f);
+								auto vals = bRet.index_select(0, std::get<1>(dk).flatten())
+									.view({ i1 - i0, K });
+								epiV.slice(0, i0, i1).copy_(
+									((vals * wts).sum(1) / wts.sum(1))
+									.to(torch::kCPU, torch::kFloat32));
+							}
+							tValPreds = ((1.f - epiW) * tValPreds.to(torch::kFloat32).flatten()
+								+ epiW * epiV).view_as(tValPreds).to(tValPreds.scalar_type());
+							report["Value/Epi W"] = epiW;
+						}
+					}
+
 					Timer gaeTimer = {};
 					// Run GAE
 					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights, tSilWeights;
@@ -2454,6 +2519,17 @@ void GGL::Learner::Start() {
 					);
 					report["GAE Time"] = gaeTimer.Elapsed();
 					report["Clipped Reward Portion"] = rewClipPortion;
+
+					// Value explained-variance: the calibration panel, and the signal that
+					// anneals the episodic blend. Computed on the predictions GAE consumed.
+					{
+						auto retF = tReturns.to(torch::kFloat32).flatten();
+						auto vpEv = tValPreds.to(torch::kFloat32).flatten();
+						float ev = 1.f - ((retF - vpEv).var() / (retF.var() + 1e-8f))
+							.item<float>();
+						ppo->valueEvEma = 0.95f * ppo->valueEvEma + 0.05f * RS_MAX(0.f, ev);
+						report["Value/EV"] = ev;
+					}
 
 					// Raw GAE advantage magnitude, captured BEFORE any injector touches it.
 					// GAE/Avg Advantage used to be read after the HEADROOM injection and before
@@ -2656,7 +2732,8 @@ void GGL::Learner::Start() {
 						// GEOMETRY reservoir: obs, arrival obs, and the SCALED reward that
 						// landed on the arrival state (same reconstruction the theory head uses,
 						// so r_hat is in the critic's units).
-						if (config.ppo.geoEnabled || config.ppo.hullEnabled) {
+						if (config.ppo.geoEnabled || config.ppo.hullEnabled
+							|| config.ppo.epiBlendEnabled) {
 							auto z0g = torch::zeros({ 1 }, scaledR.options());
 							auto arrivalG = torch::cat({ z0g, scaledR.slice(0, 0, nR - 1) });
 							auto contPrevG = torch::cat({ z0g, cont.slice(0, 0, nR - 1) });
@@ -2670,7 +2747,9 @@ void GGL::Learner::Start() {
 								tStates.slice(0, 1, nR),
 								(arrivalG * contPrevG).slice(0, 1, nR),
 								config.ppo.geoReservoir,
-								cont.slice(0, 0, nR - 1));
+								cont.slice(0, 0, nR - 1),
+								tTargetVals.to(torch::kFloat32).flatten()
+									.slice(0, 0, nR - 1));
 						}
 						if (config.ppo.vdagTheoryEnabled) {
 							auto z0 = torch::zeros({ 1 }, scaledR.options());
@@ -2998,6 +3077,34 @@ void GGL::Learner::Start() {
 						experience.data.entWeights = tEntWeights;
 					if (tSilWeights.defined())
 						experience.data.silWeights = tSilWeights;
+					// ===== COMPOSITE VALUE CRITIC: per-row learn-pass tensors =====
+					if (config.ppo.auxDispEnabled) {
+						// one-step displacement targets for the trunk aux head; boundary rows
+						// (episode resets) masked -- teleports are not dynamics
+						int64_t nAll = (int64_t)combinedTraj.Length();
+						auto sF = tStates.to(torch::kFloat32);
+						auto termA = tTerminals.to(torch::kFloat32).flatten();
+						auto contA = (termA == 0).to(torch::kFloat32);
+						auto shifted = torch::cat({ sF.slice(0, 1, nAll),
+							sF.slice(0, nAll - 1, nAll) });
+						experience.data.auxDispTargets = (shifted - sF) * contA.unsqueeze(1);
+						experience.data.auxDispMask = contA;
+					}
+					if (config.ppo.oppCondEnabled && ppo->oppCtxForLearn.defined())
+						experience.data.oppCtx = ppo->oppCtxForLearn.unsqueeze(0)
+							.expand({ (int64_t)combinedTraj.Length(), -1 }).contiguous();
+					if (config.ppo.valueTwinEnabled && ppo->models["critic2"]) {
+						// twin disagreement = the per-state noise gauge (panel only)
+						RG_NO_GRAD;
+						int64_t nS = RS_MIN((int64_t)4096, (int64_t)combinedTraj.Length());
+						auto vt = ppo->ValueTrunk(
+							tStates.slice(0, 0, nS).to(ppo->device, true),
+							config.ppo.useHalfPrecision);
+						auto d1 = ppo->models["critic"]->Forward(vt, false).flatten();
+						auto d2 = ppo->models["critic2"]->Forward(vt, false).flatten();
+						ppo->dbgTwinDisagree =
+							(d1 - d2).abs().mean().to(torch::kFloat32).item<float>();
+					}
 					if (goalCriticOn)
 						experience.data.goalTargetValues = tGoalTargetVals;
 

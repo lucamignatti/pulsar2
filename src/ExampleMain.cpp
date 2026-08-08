@@ -1103,6 +1103,41 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.hullHeadModel.layerSizes = { 64 };
 	cfg.ppo.hullHeadModel.activationType = activation;
 	cfg.ppo.hullHeadModel.addLayerNorm = false;
+
+	// ===== COMPOSITE VALUE CRITIC (2026-08-07; inject2d RESULTS.md batches 10-11) =====
+	// V is the denominator of the optimism stack (H, SIL weights, GAE, LP); these four
+	// ingredients cut its noise/bias without touching its on-policy semantics. Toy
+	// evidence (8 seeds, sil_hull base): ignition 1.25M -> 0.75-0.84M, finals 4.91 ->
+	// 6.4, worst seed 0.1 -> 6.1; mirror alone cut the hallucinated-headroom floor 9x.
+	// All independently flag-gated; each panel named below is its judge.
+	//   - critic2 twin (Value/Twin Disagree): disjoint-half training, mean readout.
+	//   - mirror pass (25% of rows): exact game symmetry; ObsMirror::Build hard-fails
+	//     on layout drift. Slot-permutation is already trained in via shuffleSlots.
+	//   - aux displacement head on the SHARED trunk (Value/Aux Disp NLL): the toy's
+	//     single largest training lever; deliberately NOT inside the value head (wired
+	//     there it biases V -- measured, ev 0.68 -> 0.49).
+	//   - episodic blend (Value/Epi W, Value/EV): kNN over reservoir returns, weight
+	//     epiWMax*(1-EV_ema) -- memory-backed baseline while V is young, self-retiring.
+	//     Safe because it RETIRES (bank returns rot as the policy improves; the
+	//     non-retiring peer-referee variant failed exactly there, batch 11).
+	//   - privileged opponent conditioning (opp_embed, zero-init = no-op at load):
+	//     the value family sees {isSelf, isOld, isExternal, ringAge}; the policy never
+	//     does. Asymmetric actor-critic: variance reduction, provably unbiased.
+	// Checkpoint compatibility: critic2/aux_disp/opp_embed fresh-init on old
+	// checkpoints (allowNotExist); opp_embed's zero-init makes conditioning an exact
+	// no-op until trained. Watch Value/EV (up), Value/Twin Disagree (down over time),
+	// Headroom/H Mean (floor should DROP as V sharpens -- the compounding).
+	// Goal-critic unification into this treatment is a DEFERRED separate lever.
+	// Revert: these flags, restart.
+	cfg.ppo.valueTwinEnabled = true;
+	cfg.ppo.valueMirrorEnabled = true;
+	cfg.ppo.mirrorMaxPlayersPerTeam = MAX_PLAYERS_PER_TEAM;
+	cfg.ppo.auxDispEnabled = true;
+	cfg.ppo.auxDispModel.layerSizes = { 256 };
+	cfg.ppo.auxDispModel.activationType = activation;
+	cfg.ppo.auxDispModel.addLayerNorm = false;
+	cfg.ppo.epiBlendEnabled = true;
+	cfg.ppo.oppCondEnabled = true;
 	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
 	                                   // at ts1 it also de-risks the global entropy
 	                                   // coefficient fragility that killed 6.1 proper

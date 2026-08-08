@@ -491,6 +491,50 @@ namespace GGL {
 		float vdagEntGateK = 3.0f;
 		float vdagEntGateCap = 3.0f;   // 5.0 in the toy; kept tighter for a live league
 
+		// ===== COMPOSITE VALUE CRITIC (research/testbeds/inject2d RESULTS.md batches 10-11) =====
+		// V is the denominator of the whole optimism stack (H = Vdag - V, SIL weights,
+		// GAE, LP), so its noise pollutes everything downstream. Four toy-validated
+		// ingredients, individually flag-gated:
+		//
+		//  valueTwinEnabled  : second critic head ("critic2"); each head trains on a
+		//    DISJOINT half of every minibatch (uncorrelated sample noise), readout is the
+		//    mean -- which IS the noise-cancelling operation: V1 - (V1-V2)/2 = mean. The
+		//    signal is common-mode, the independent noise differential. |V1-V2| is a free
+		//    per-state noise gauge (Value/Twin Disagree). Trunks see BOTH halves' grads.
+		//  valueMirrorEnabled: train the value heads on x-mirrored copies (exact game
+		//    symmetry; slot permutation is already trained in by the obs builder's
+		//    shuffleSlots). Toy: hallucinated-headroom floor 9x down at intact EV.
+		//    A wrong mirror is silent corruption -- ObsMirror::Build hard-fails on any
+		//    structural inconsistency, and mirrorMaxPlayersPerTeam must match the obs.
+		//  auxDispEnabled    : one-step displacement (mu, log-sigma) NLL head on the
+		//    SHARED trunk -- representation pressure, the largest single training lever
+		//    measured in the toy (-40% ignition). Deliberately NOT inside the value head:
+		//    wired there it biases V (measured, ev 0.68 -> 0.49). Small weight, own panel.
+		//  epiBlendEnabled   : episodic baseline -- kNN over the reservoir's stored
+		//    returns, blended into the GAE value predictions by the critic's own
+		//    inadequacy (w = epiWMax * (1 - EV_ema)); memory carries the baseline while
+		//    V is young and hands authority back as V matures. NOTE the stationarity
+		//    rule: bank RETURNS rot as the policy improves -- this blend self-retires,
+		//    which is why it is safe where the peer-referee variant (toy vh_grp) failed.
+		//  oppCondEnabled    : privileged opponent conditioning -- a zero-init additive
+		//    embedding of {isSelf, isOldVersion, isExternal, versionAge} into the value
+		//    body. Valid by the asymmetric actor-critic argument (a baseline may use
+		//    privileged inputs; it reduces variance, cannot bias the gradient). The
+		//    POLICY never sees it. Zero-init = exact no-op at load -> checkpoint-safe.
+		bool valueTwinEnabled = false;
+		bool valueMirrorEnabled = false;
+		int mirrorMaxPlayersPerTeam = 3;   // MUST match the obs builder's padding
+		float valueMirrorFrac = 0.25f;     // fraction of each minibatch given a mirrored pass
+		bool auxDispEnabled = false;
+		float auxDispWeight = 0.05f;
+		PartialModelConfig auxDispModel;   // default {256} head on the shared trunk
+		bool epiBlendEnabled = false;
+		int epiK = 8;                      // kNN neighbors
+		int epiSub = 2048;                 // bank subsample per iteration
+		float epiWMax = 0.5f;
+		bool oppCondEnabled = false;
+		int oppCtxDim = 4;
+
 		// ===== HULL OPERATOR (record-licensed relaxed Bellman) =====
 		// Canonical: research/reports/EPSILON_CRITIC.md section 7. The V-dagger bootstrap is
 		// maxed over the real next state plus hullK candidates built by transplanting
