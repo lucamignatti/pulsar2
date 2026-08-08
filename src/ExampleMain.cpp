@@ -1030,15 +1030,19 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
 	cfg.ppo.goalCritic.model.addLayerNorm = addLayerNorm;
 
-	// GEOMETRY (4th rung) — three INDEPENDENT nets on raw obs, no trunk. Deliberately small:
-	// geo_v is a scalar field whose only job is to satisfy a local PDE, and its cost is one
-	// extra input-gradient per minibatch, so width here buys little and costs learn-pass peak
-	// memory (the constraint that forced the r-hat heads off in the first place).
-	// ON as of the 5.3 cold start. This is a FRESH-RUN mechanism (see the config comment and
-	// research/reports/GEOMETRIC_CRITIC.md): it actuates as a PERMANENT 4th potential at a
-	// constant mix weight, and its largest measured wins are early, so it belongs to a lineage
-	// from step 0 rather than being inserted mid-run. Revert is this flag.
-	cfg.ppo.geoEnabled = true;
+	// GEOMETRY (4th rung) — RETIRED 2026-08-08 (audit; research/reports/EPSILON_CRITIC.md).
+	// The eps-critic verdict was "geo trio + Phi-mix retire; everything rides the hull
+	// critic", but only the injection half ever shipped (geoSeekBeta 0 below): the trio kept
+	// training three nets + an HJB input-gradient per minibatch, and the SIL gate kept riding
+	// it (hMix = 0.5 geo + 0.5 vdag). This flag completes the retirement: no geo nets are
+	// built, the SIL gate degrades to unit(tH) alone (documented at its Learner.cpp site),
+	// and the donor bank + hull chart are UNAFFECTED (feed and training gate on hullEnabled
+	// independently). Known cost, accepted: geo's measured edge was the 0-3M cold-start
+	// window (4.7x headroom signal over V-dagger when the policy is worst) — but the hull's
+	// whole claim is pricing what the policy can't yet do; giving it a crutch there would
+	// unfalsify exactly the window it must win. Revert is this flag (geoGamma/geoModel below
+	// stay configured, inert while off).
+	cfg.ppo.geoEnabled = false;
 	// 6.1 (2026-08-03): the HJB residual's gamma is DECOUPLED from gaeGamma and pinned to the
 	// value the rung was validated at (ts8's 0.9969). At ts1's gaeGamma the residual is
 	// ill-conditioned — the level-anchoring (1-gamma) path fell 8x relative to the
@@ -1147,9 +1151,16 @@ int main(int argc, char* argv[]) {
 	// without (a) a target-scale anneal signal and (b) a learned/low-dim kNN space.
 	cfg.ppo.epiBlendEnabled = false;
 	cfg.ppo.oppCondEnabled = true;
-	cfg.ppo.vdagEntGateEnabled = true; // in-house validated (ignition seed-spread 5x -> 0);
-	                                   // at ts1 it also de-risks the global entropy
-	                                   // coefficient fragility that killed 6.1 proper
+	// ENT GATE: OFF — live 7.0 finding (2026-08-06), overriding the toy validation this line
+	// used to cite (ignition seed-spread 5x -> 0). Mechanism: expectile H has a structural
+	// noise floor once the critic bootstraps (V-dagger/V_exp sit above V by construction),
+	// and the multiplier is mean-relative, so the gate NEVER retires -> permanent entropy
+	// tax -> erratic play that severely limited skill acquisition. SIL alone is the
+	// actuation. NOTE: this flag was still true in-repo while the box ran false (divergence
+	// caught by the 2026-08-08 audit) — flipping it here is what makes push+update safe.
+	// If attempt-supply ever needs reviving, LP = relu(H_old - H_now) is the fix-shaped
+	// substitute (noise floor cancels, self-retiring) — 6.x design notes, untested.
+	cfg.ppo.vdagEntGateEnabled = false;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.
