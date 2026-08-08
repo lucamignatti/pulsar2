@@ -1330,8 +1330,21 @@ int main(int argc, char* argv[]) {
 	// only a 6.1b checkpoint staged there by hand to prove the boot probe still worked.
 	// Surviving lineages, both intact and probe-verified: checkpoints_6.1b (12.63B) and
 	// checkpoints_5.3 (16.7B). 6.2 has no recoverable state.
-	cfg.checkpointFolder = "checkpoints_7.0";
-	cfg.metricsRunName = "7.0-vc";
+	// 7.1 (2026-08-08, user-directed cold start after the 7.0 post-mortem). 7.0 stagnated:
+	// the episodic blend's anneal compared V against discounted RETURNS (std ~75 at ts1's
+	// gamma) while V regresses GAE TARGET VALUES (~0.5-5), so EV was structurally ~0, Epi W
+	// pinned at 0.5 forever, and half the GAE baseline/bootstrap was permanently replaced by
+	// kNN-over-raw-obs noise. epiBlendEnabled is now false.
+	// A COLD START is right rather than a resume: 7.0's weights were trained for 2.5B steps
+	// against drowned advantages, so they carry the damage the fix removes -- and nothing
+	// shape-breaks (epiBlend is a blend weight, not a model), so a stale folder would silently
+	// resume exactly those weights. checkpoints_7.0 stays intact for post-mortem.
+	// NOTE the entropy settings below are MINE, not the branch defaults: vdagEntGateCap 1.5
+	// instead of 3.0, set while chasing 7.0's entropy decline before the epi blend was known to
+	// be the cause. 6.1b and 6.2 both ran cap 3.0. Worth reverting to the default if 7.1's
+	// entropy misbehaves -- it is an unvalidated middle rung, not a measured optimum.
+	cfg.checkpointFolder = "checkpoints_7.1";
+	cfg.metricsRunName = "7.1-vc";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
