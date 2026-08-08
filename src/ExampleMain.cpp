@@ -1057,15 +1057,19 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.reachability.psi.addLayerNorm = addLayerNorm;
 	cfg.ppo.goalCritic.model.addLayerNorm = addLayerNorm;
 
-	// GEOMETRY (4th rung) — three INDEPENDENT nets on raw obs, no trunk. Deliberately small:
-	// geo_v is a scalar field whose only job is to satisfy a local PDE, and its cost is one
-	// extra input-gradient per minibatch, so width here buys little and costs learn-pass peak
-	// memory (the constraint that forced the r-hat heads off in the first place).
-	// ON as of the 5.3 cold start. This is a FRESH-RUN mechanism (see the config comment and
-	// research/reports/GEOMETRIC_CRITIC.md): it actuates as a PERMANENT 4th potential at a
-	// constant mix weight, and its largest measured wins are early, so it belongs to a lineage
-	// from step 0 rather than being inserted mid-run. Revert is this flag.
-	cfg.ppo.geoEnabled = true;
+	// GEOMETRY (4th rung) — RETIRED 2026-08-08 (audit; research/reports/EPSILON_CRITIC.md).
+	// The eps-critic verdict was "geo trio + Phi-mix retire; everything rides the hull
+	// critic", but only the injection half ever shipped (geoSeekBeta 0 below): the trio kept
+	// training three nets + an HJB input-gradient per minibatch, and the SIL gate kept riding
+	// it (hMix = 0.5 geo + 0.5 vdag). This flag completes the retirement: no geo nets are
+	// built, the SIL gate degrades to unit(tH) alone (documented at its Learner.cpp site),
+	// and the donor bank + hull chart are UNAFFECTED (feed and training gate on hullEnabled
+	// independently). Known cost, accepted: geo's measured edge was the 0-3M cold-start
+	// window (4.7x headroom signal over V-dagger when the policy is worst) — but the hull's
+	// whole claim is pricing what the policy can't yet do; giving it a crutch there would
+	// unfalsify exactly the window it must win. Revert is this flag (geoGamma/geoModel below
+	// stay configured, inert while off).
+	cfg.ppo.geoEnabled = false;
 	// 6.1 (2026-08-03): the HJB residual's gamma is DECOUPLED from gaeGamma and pinned to the
 	// value the rung was validated at (ts8's 0.9969). At ts1's gaeGamma the residual is
 	// ill-conditioned — the level-anchoring (1-gamma) path fell 8x relative to the
@@ -1174,33 +1178,25 @@ int main(int argc, char* argv[]) {
 	// without (a) a target-scale anneal signal and (b) a learned/low-dim kNN space.
 	cfg.ppo.epiBlendEnabled = false;
 	cfg.ppo.oppCondEnabled = true;
-	// KEPT DISABLED through the 7.0 merge (2026-08-07). This line reads `true` on the
-	// incoming branch only because that branch predates the 2026-08-06 measurement; it is
-	// not a deliberate re-enable. What was measured on 6.2: the gate reads H, H inflated
-	// 175x (0.0003 -> 3.96) with no conversion behind it, so Ent Gate Mean pinned at its 3.0
-	// CAP from ~2.0B on. A gate saturated at its cap is not a gate, it is a flat 3x entropy
-	// bonus -- and Policy Entropy did not move for 3.34B steps as a result. Disabling it made
-	// entropy fall 0.755 -> 0.49 within 850M steps and Nexto share step 9.8% -> 14.1% -> 58%,
-	// overtaking 6.1b. Re-enable deliberately if the composite critic changes H's behaviour,
-	// but do it as its own lever with Ent Gate Mean watched against the cap.
-	// RE-ENABLED at 223M with the cap HALVED (2026-08-07). Both failure directions are now
-	// measured, on the same entropyScale 0.0175:
-	//   gate ON, cap 3.0 (6.2): H inflated 175x, Ent Gate Mean pinned AT the cap from ~2.0B,
-	//     and Policy Entropy did not move for 3.34B steps -- a gate at its cap is not a gate,
-	//     it is a flat 3x entropy bonus, and it blocked the takeoff.
-	//   gate OFF (7.0, my call on the merge): entropy fell off a cliff --
-	//     0.718 (50M) -> 0.712 (100M) -> 0.641 (150M) -> 0.456 (200M) -> 0.335 (225M),
-	//     against 6.1b's 0.698 and 6.2's 0.757 at the SAME step with the gate on. That is the
-	//     6.1-proper pathology: the formative window spent without exploration.
-	// So the gate IS load-bearing against collapse, exactly as its original comment claimed;
-	// disabling it outright was the wrong lever. The cap is the right one, and 1.5 is the
-	// middle rung the 6.2 note already named. Watch Headroom/Ent Gate Mean AGAINST the cap: if
-	// it pins at 1.5 the way it pinned at 3.0, the gate has saturated again and the next move
-	// is to bound H rather than to keep trimming the cap.
-	cfg.ppo.vdagEntGateEnabled = true;
-	cfg.ppo.vdagEntGateCap = 1.5f;
-	                                   // at ts1 it also de-risks the global entropy
-	                                   // coefficient fragility that killed 6.1 proper
+	// Resolved to THEIRS at the 7.2 merge (2026-08-08): disabling the gate is the stated
+	// intent of that commit, and the cap-1.5 variant it replaces was mine — set while
+	// chasing 7.0's entropy decline BEFORE the epi blend was identified as the cause, so
+	// it was a fix for a symptom of a different bug. Recorded finding that outlives the
+	// setting: this gate SATURATES at whatever cap it is given (2.95/3.0 on 6.2, exactly
+	// 1.5000 on 7.0) whenever H is large, making it a constant multiplier on entropyScale
+	// rather than a state-dependent gate. On 7.1, with the epi blend fixed, it finally read
+	// BELOW its cap (1.4419) — i.e. sane advantages are what let it gate at all. If entropy
+	// misbehaves on 7.2, entropyScale is the honest lever, not this flag.
+	// ENT GATE: OFF — live 7.0 finding (2026-08-06), overriding the toy validation this line
+	// used to cite (ignition seed-spread 5x -> 0). Mechanism: expectile H has a structural
+	// noise floor once the critic bootstraps (V-dagger/V_exp sit above V by construction),
+	// and the multiplier is mean-relative, so the gate NEVER retires -> permanent entropy
+	// tax -> erratic play that severely limited skill acquisition. SIL alone is the
+	// actuation. NOTE: this flag was still true in-repo while the box ran false (divergence
+	// caught by the 2026-08-08 audit) — flipping it here is what makes push+update safe.
+	// If attempt-supply ever needs reviving, LP = relu(H_old - H_now) is the fix-shaped
+	// substitute (noise floor cancels, self-retiring) — 6.x design notes, untested.
+	cfg.ppo.vdagEntGateEnabled = false;
 
 	// Skill rating: Elo-style eval matches vs saved versions (logged as Rating/1v1). Also turns on
 	// savePolicyVersions.
@@ -1343,8 +1339,17 @@ int main(int argc, char* argv[]) {
 	// instead of 3.0, set while chasing 7.0's entropy decline before the epi blend was known to
 	// be the cause. 6.1b and 6.2 both ran cap 3.0. Worth reverting to the default if 7.1's
 	// entropy misbehaves -- it is an unvalidated middle rung, not a measured optimum.
-	cfg.checkpointFolder = "checkpoints_7.1";
-	cfg.metricsRunName = "7.1-vc";
+	// 7.2 (2026-08-08, user-directed cold start on the audit-conformance config: geo trio
+	// retired, entropy gate off; the epi blend was already off from the 7.0 post-mortem).
+	// NOTE the incoming branch carried `checkpoints_6.1b` here — a stale value from before the
+	// 7.0/7.1 lineages existed, not an intent to write there. Left as-is it would have been the
+	// worst outcome available: 6.1b is the BEST SURVIVING MODEL (12.63B, probe-verified, the
+	// only mature lineage left after 6.2 was destroyed on 2026-08-07), and nothing in this
+	// config shape-breaks — so the loader would have cleanly resumed it under a materially
+	// different critic (geo off, gate off, blend off) and then rotated its good checkpoints out
+	// of the window. A silent semantic resume onto the one model that cannot be replaced.
+	cfg.checkpointFolder = "checkpoints_7.2";
+	cfg.metricsRunName = "7.2-vc";
 
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
