@@ -1,0 +1,180 @@
+//! Scenario tests for the car-car contact pipeline rebuilt from the decompiled
+//! Car_TA::ApplyCarImpactForces / ShouldDemolish / GetBumpImpulse
+//! (SIM2REAL_AUDIT.md S36). Each scenario builds a fresh Soccar arena, stages two
+//! cars, steps until they touch, and asserts on the resulting events/impulses.
+
+use glam::{Mat3A, Vec3A};
+use rocketsim::{Arena, ArenaEvent, CarBodyConfig, GameMode, Team};
+
+const MESHES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../../build/collision_meshes"
+);
+
+fn setup() -> (Arena, usize, usize) {
+    rocketsim::init(MESHES, true).ok(); // idempotent across tests
+    let mut arena = Arena::new(GameMode::Soccar);
+    let attacker = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+    let victim = arena.add_car(Team::Orange, CarBodyConfig::OCTANE);
+    // Park the ball far away so it can't interfere.
+    let mut bs = *arena.get_ball_state();
+    bs.phys.pos = Vec3A::new(-3500.0, 4800.0, 93.0);
+    bs.phys.vel = Vec3A::ZERO;
+    arena.set_ball_state(bs);
+    (arena, attacker, victim)
+}
+
+fn yaw_mat(yaw: f32) -> Mat3A {
+    Mat3A::from_cols(
+        Vec3A::new(yaw.cos(), yaw.sin(), 0.0),
+        Vec3A::new(-yaw.sin(), yaw.cos(), 0.0),
+        Vec3A::Z,
+    )
+}
+
+/// Stage attacker/victim, run until first CarHitCar event (or `max_ticks`).
+/// Returns (was_demo, victim_vel_before_hit, victim_vel_after_hit).
+fn run_contact(
+    arena: &mut Arena,
+    attacker: usize,
+    victim: usize,
+    attacker_yaw: f32,
+    attacker_vel: Vec3A,
+    victim_pos: Vec3A,
+    max_ticks: usize,
+) -> Option<(bool, Vec3A, Vec3A)> {
+    let mut asrc = *arena.get_car_state(attacker);
+    asrc.phys.pos = Vec3A::new(0.0, 0.0, 17.0);
+    asrc.phys.rot_mat = yaw_mat(attacker_yaw);
+    asrc.phys.vel = attacker_vel;
+    asrc.phys.ang_vel = Vec3A::ZERO;
+    asrc.is_on_ground = true;
+    arena.set_car_state(attacker, asrc);
+
+    let mut vs = *arena.get_car_state(victim);
+    vs.phys.pos = victim_pos;
+    vs.phys.rot_mat = Mat3A::IDENTITY;
+    vs.phys.vel = Vec3A::ZERO;
+    vs.phys.ang_vel = Vec3A::ZERO;
+    vs.is_on_ground = victim_pos.z < 30.0;
+    arena.set_car_state(victim, vs);
+
+    for _ in 0..max_ticks {
+        let pre_vel = arena.get_car_state(victim).phys.vel;
+        let events: Vec<ArenaEvent> = arena.step_tick().to_vec();
+        for ev in events {
+            if let ArenaEvent::CarHitCar(e) = ev
+                && e.bumper_car_idx == attacker
+                && e.victim_car_idx == victim
+            {
+                let post_vel = arena.get_car_state(victim).phys.vel;
+                return Some((e.is_demo, pre_vel, post_vel));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn supersonic_head_on_demos() {
+    let (mut arena, a, v) = setup();
+    let hit = run_contact(
+        &mut arena,
+        a,
+        v,
+        0.0,
+        Vec3A::new(2300.0, 0.0, 0.0),
+        Vec3A::new(400.0, 0.0, 17.0),
+        60,
+    )
+    .expect("cars never touched");
+    assert!(hit.0, "supersonic head-on front hit must demolish");
+}
+
+#[test]
+fn supersonic_sideways_slide_does_not_demo() {
+    let (mut arena, a, v) = setup();
+    // Facing +y, sliding +x at supersonic speed: forward-projected speed ~0.
+    let hit = run_contact(
+        &mut arena,
+        a,
+        v,
+        std::f32::consts::FRAC_PI_2,
+        Vec3A::new(2300.0, 0.0, 0.0),
+        Vec3A::new(400.0, 0.0, 17.0),
+        60,
+    );
+    if let Some((is_demo, _, _)) = hit {
+        assert!(!is_demo, "sideways-sliding supersonic car must NOT demolish");
+    }
+    assert!(
+        !arena.get_car_state(v).is_demoed,
+        "victim demoed by a sideways slide"
+    );
+}
+
+#[test]
+fn supersonic_reversing_rear_hit_demos() {
+    let (mut arena, a, v) = setup();
+    // Facing -x (yaw pi), moving +x: rear-first supersonic contact.
+    let hit = run_contact(
+        &mut arena,
+        a,
+        v,
+        std::f32::consts::PI,
+        Vec3A::new(2300.0, 0.0, 0.0),
+        Vec3A::new(400.0, 0.0, 17.0),
+        60,
+    )
+    .expect("cars never touched");
+    assert!(
+        hit.0,
+        "bAllowBackwardsDemolitions: reversing supersonic rear hit must demolish"
+    );
+}
+
+#[test]
+fn ground_bump_pushes_up_air_bump_does_not() {
+    // Grounded victim: impulse includes a push along the victim's up axis.
+    let (mut arena, a, v) = setup();
+    let (is_demo, pre, post) = run_contact(
+        &mut arena,
+        a,
+        v,
+        0.0,
+        Vec3A::new(1500.0, 0.0, 0.0),
+        Vec3A::new(400.0, 0.0, 17.0),
+        60,
+    )
+    .expect("ground bump never landed");
+    assert!(!is_demo, "1500 uu/s must not demo");
+    let dvz_ground = post.z - pre.z;
+
+    // Airborne victim: no vertical component from the script impulse. The victim
+    // falls before contact, so aim the attacker where the victim will be and give
+    // the drop only a few ticks.
+    let (mut arena, a, v) = setup();
+    let (is_demo, pre, post) = run_contact(
+        &mut arena,
+        a,
+        v,
+        0.0,
+        Vec3A::new(2000.0, 0.0, 0.0),
+        Vec3A::new(300.0, 0.0, 45.0),
+        30,
+    )
+    .expect("air bump never landed");
+    assert!(!is_demo);
+    let dvz_air = post.z - pre.z;
+
+    // The grounded bump gets the scripted up-push; the airborne one only whatever
+    // the rigid-body contact itself produced. Grounded must be clearly larger.
+    assert!(
+        dvz_ground > 100.0,
+        "grounded bump up-push missing: dvz={dvz_ground}"
+    );
+    assert!(
+        dvz_air < dvz_ground * 0.5,
+        "airborne victim should get no scripted up-push: air {dvz_air} vs ground {dvz_ground}"
+    );
+}

@@ -231,6 +231,10 @@ impl From<&RsfCarState> for CarState {
             auto_flip_timer: s.auto_flip_timer,
             auto_flip_torque_scale: s.auto_flip_torque_scale,
             bump_cooldown_timer: s.bump_cooldown_timer,
+            // Not carried over the FFI: a state set clears the per-victim bump memory,
+            // so the first bump after a state set is never interval-limited. State sets
+            // happen at episode resets where the cooldown is stale anyway.
+            bump_last_victim: 0,
             world_contact_normal: (s.has_world_contact != 0)
                 .then(|| s.world_contact_normal.into()),
             is_demoed: s.is_demoed != 0,

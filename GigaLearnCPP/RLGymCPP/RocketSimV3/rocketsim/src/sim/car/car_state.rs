@@ -63,6 +63,10 @@ pub struct CarState {
     pub auto_flip_timer: f32,
     pub auto_flip_torque_scale: f32,
     pub bump_cooldown_timer: f32,
+    /// RL's bump rate limit is PER VICTIM (`CarInteraction.LastHitCar` + `BumpInterval`
+    /// in the ShouldDemolish decompile): hitting a DIFFERENT car is never blocked by
+    /// the cooldown. Stores `1 + victim arena index` of the last bumped car; 0 = none.
+    pub bump_last_victim: u32,
     /// If in contact with a static mesh/body, this is the collision normal of that contact on said body
     pub world_contact_normal: Option<Vec3A>,
     pub is_demoed: bool,
@@ -107,6 +111,7 @@ impl CarState {
         is_auto_flipping: false,
         world_contact_normal: None,
         bump_cooldown_timer: 0.0,
+        bump_last_victim: 0,
         auto_flip_timer: 0.0,
         auto_flip_torque_scale: 0.0,
         is_demoed: false,

@@ -969,8 +969,34 @@ impl Arena {
             let attacker_state = &attacker.state;
             let victim_state = &victim.state;
 
-            if attacker_state.bump_cooldown_timer > 0.0 {
-                // In cooldown
+            // Pipeline rebuilt 2026-08-09 to match the decompiled
+            // Car_TA::ApplyCarImpactForces / ShouldDemolish / GetBumpImpulse
+            // (SIM2REAL_AUDIT.md S36; sources: ShouldDemolish.uc + "code soul"
+            // decompile screenshots). Structural rules ported:
+            //   - The three approach gates run FIRST, then the demo check, then the
+            //     bump. The bump-interval cooldown gates only the BUMP -- a demo is
+            //     never blocked by it.
+            //   - A demo needs FORWARD-projected speed >= SuperSonicSettings.Speed -
+            //     TurnoffSpeedBuffer (2200 - 100), not just the supersonic flag: a
+            //     supersonic car sliding sideways cannot demo in RL.
+            //   - bAllowBackwardsDemolitions = 1 in the CDO: the projection takes
+            //     abs(), and the contact test runs with the forward axis reversed
+            //     (a reversing supersonic car demos with its REAR bumper).
+            //   - The bump impulse curves take the attacker's FULL speed
+            //     (Speed = VSize(OldRBState.LinearVelocity)), not the toward-victim
+            //     projection (replays measured sim bumps ~0.82x real -- one-sided,
+            //     consistent with the projection being the smaller input).
+            //   - An airborne victim gets NO vertical push (GetBumpImpulse only sets
+            //     ImpulseZ in the grounded branch); a grounded victim's push is along
+            //     ITS up axis.
+            // NOT ported (constants unknown -- the CDO dump is truncated): the four
+            // Bump/Demolish angle-cone checks (this keeps the local_point_x bumper
+            // proxy), AddedCarForceMultiplier for opposite teams, and demo spawn
+            // invulnerability. Revisit when the full CarInteractionSettings CDO is
+            // available.
+
+            let attacker_speed = attacker_state.phys.vel.length();
+            if attacker_speed <= 0.0 {
                 continue;
             }
 
@@ -995,18 +1021,37 @@ impl Arena {
             } else {
                 manifold_point.local_point_a
             }
-            .x;
+            .x * BT_TO_UU;
 
-            let hit_with_bumper = local_point_x * BT_TO_UU > consts::car::bump::MIN_FORWARD_DIST;
-            if !hit_with_bumper {
-                // Didn't hit with bumper
-                continue;
-            }
+            // Forward-projected speed; abs() because backwards demolitions are on.
+            let forward_speed = attacker_state.phys.vel.dot(attacker_state.phys.rot_mat.x_axis);
+            let reversing = forward_speed < 0.0;
+            // Contact test with the forward axis reversed for a reversing attacker.
+            // The hitbox is offset FORWARD from the body origin (Octane: front extent
+            // 74.1 uu, rear 46.4), so the rear threshold is the front one scaled to
+            // the rear extent -- a fixed 64.5 could never trigger on the shorter rear.
+            let demo_contact_ok = if reversing {
+                let cfg = &attacker.config;
+                let half_len = cfg.hitbox_size.x * 0.5;
+                let front_extent = half_len + cfg.hitbox_pos_offset.x;
+                let rear_extent = half_len - cfg.hitbox_pos_offset.x;
+                let rear_thresh =
+                    consts::car::bump::MIN_FORWARD_DIST * (rear_extent / front_extent);
+                -local_point_x > rear_thresh
+            } else {
+                local_point_x > consts::car::bump::MIN_FORWARD_DIST
+            };
 
             let mut is_demo = match self.config.mutators.demo_mode {
-                DemoMode::OnContact => true,
+                DemoMode::OnContact => demo_contact_ok,
                 DemoMode::Disabled => false,
-                DemoMode::Normal => attacker_state.is_supersonic,
+                DemoMode::Normal => {
+                    // MAINTAIN_MIN_SPEED == SuperSonicSettings.Speed - TurnoffSpeedBuffer
+                    // (2200 - 100; the CDO dump independently confirms both values).
+                    attacker_state.is_supersonic
+                        && forward_speed.abs() >= consts::car::supersonic::MAINTAIN_MIN_SPEED
+                        && demo_contact_ok
+                }
             };
             if is_demo && !self.config.mutators.enable_team_demos {
                 is_demo = attacker.team != victim.team;
@@ -1015,28 +1060,39 @@ impl Arena {
             if is_demo {
                 victim.demolish(self.config.mutators.respawn_delay);
             } else {
-                let ground_hit = victim_state.is_on_ground;
-                let base_scale = if ground_hit {
-                    consts::curves::BUMP_VEL_AMOUNT_GROUND
-                } else {
-                    consts::curves::BUMP_VEL_AMOUNT_AIR
+                // Bump. Forward hits only (IsBumperHit runs without reverseForward),
+                // rate-limited per victim: a repeat bump on the SAME car within the
+                // interval is dropped, a different car is always bumpable.
+                let same_victim =
+                    attacker_state.bump_last_victim == (victim_idx as u32).wrapping_add(1);
+                if attacker_state.bump_cooldown_timer > 0.0 && same_victim {
+                    continue;
                 }
-                .get_output(speed_towards_other_car);
+                // Non-bumper hit: PushFactor = 0 in the CDO -- zero script impulse, but
+                // RL still calls BumpCar (which records LastHitCar/LastHitTime), so the
+                // contact ARMS the per-victim interval like any bump.
+                if local_point_x > consts::car::bump::MIN_FORWARD_DIST {
+                    let ground_hit = victim_state.is_on_ground;
+                    let base_scale = if ground_hit {
+                        consts::curves::BUMP_VEL_AMOUNT_GROUND
+                    } else {
+                        consts::curves::BUMP_VEL_AMOUNT_AIR
+                    }
+                    .get_output(attacker_speed);
 
-                let hit_up_dir = if victim_state.is_on_ground {
-                    victim_state.phys.rot_mat.z_axis
-                } else {
-                    Vec3A::Z
-                };
-
-                let upward_vel_curve = &consts::curves::BUMP_UPWARD_VEL_AMOUNT;
-                let upward_force = upward_vel_curve.get_output(speed_towards_other_car)
-                    * self.config.mutators.bump_force_scale;
-                let bump_impulse = (vel_dir * base_scale) + (hit_up_dir * upward_force);
-                victim.vel_impulse_cache += bump_impulse * UU_TO_BT;
+                    let mut bump_impulse = vel_dir * base_scale;
+                    if ground_hit {
+                        let upward_force = consts::curves::BUMP_UPWARD_VEL_AMOUNT
+                            .get_output(attacker_speed)
+                            * self.config.mutators.bump_force_scale;
+                        bump_impulse += victim_state.phys.rot_mat.z_axis * upward_force;
+                    }
+                    victim.vel_impulse_cache += bump_impulse * UU_TO_BT;
+                }
             }
 
             attacker.state.bump_cooldown_timer = self.config.mutators.bump_cooldown_time;
+            attacker.state.bump_last_victim = (victim_idx as u32).wrapping_add(1);
 
             let contact_point = if is_swapped {
                 manifold_point.pos_world_on_b

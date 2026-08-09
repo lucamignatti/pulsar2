@@ -2121,3 +2121,56 @@ The trainer binary was rebuilt with the §34 damper fix (build/ at 18:49); it de
 the next trainer start. The maneuver sim runner and rlbot_sim both build against the same
 vendored engine, so all three venues (trainer, offline maneuvers, future sim matches) now
 share one physics.
+
+## §36 — Demo/bump pipeline rebuilt from the Car_TA decompile (2026-08-09)
+
+Sources (user-provided, RLGym community / "code soul" leak decompile): `ShouldDemolish.uc`
+(archived at `research/reports/assets/ShouldDemolish.uc`), decompile screenshots of
+`OnRigidBodyCollision`, `ApplyCarImpactForces`, `OnHitCar`, `IsValidBump`, `IsBumperHit`,
+`GetBumpImpulse`, `BumpCar`, `InitTimeOfImpactFromOldRBState`, `IsInvulnerableToDemolishSource`,
+and a partial `defaultproperties` CDO dump. This closes most of §31.4's "bumps/demos never
+exercised" gap with real game logic instead of guesses.
+
+**Independent confirmation first:** the CDO dump has `SuperSonicSettings = (Speed=2200,
+TurnoffSpeedBuffer=100, TurnoffTime=1)` — exactly RocketSim's `START_SPEED` /
+`MAINTAIN_MIN_SPEED` / `MAINTAIN_MAX_TIME`. Also `JumpLeaveGroundTime=0.125`,
+`bAllowBackwardsDemolitions=1`, `PushFactor=0`, `DemoSpeedThreshold[2..4]=900/1300/1700`
+(the slow/medium/fast demo mutators).
+
+**Structural rules ported into `on_car_car_collision`** (all from the decompiled control flow):
+
+1. Order: approach gates (speed>0, closing, relative-speed) → demo check → bump. The
+   bump interval NEVER blocks a demo (it used to here: one cooldown gated both).
+2. Demos require **forward-projected** speed ≥ 2100 (`Speed − TurnoffSpeedBuffer`), not
+   just the supersonic flag — a sideways-sliding supersonic car cannot demo.
+3. `bAllowBackwardsDemolitions=1`: the projection takes `abs()` and the contact test
+   mirrors to the rear bumper (threshold scaled by rear/front hitbox extent, since the
+   hitbox is offset forward — a fixed 64.5 can never fire on the Octane's 46-uu rear).
+4. Bump curves are fed the attacker's FULL speed (`VSize(OldRBState.LinearVelocity)`),
+   not the toward-victim projection. §8 measured sim bumps at 0.82× real, one-sided —
+   consistent with the projection having been the smaller input.
+5. Airborne victims get NO scripted vertical push (`GetBumpImpulse` only sets `ImpulseZ`
+   in the grounded branch); grounded victims are pushed along THEIR up axis.
+6. Bump rate-limiting is per-victim (`LastHitCar` + `BumpInterval`): a different car is
+   always bumpable inside the cooldown. New `CarState::bump_last_victim` (not carried
+   over the FFI; a state set clears it).
+7. A non-bumper contact still "bumps" with zero impulse (CDO `PushFactor=0`) and arms
+   the per-victim interval, exactly as `BumpCar` does.
+
+**NOT ported (constants unknown — the CDO dump is truncated):** the four angle-cone
+checks (`VictimHitAngleCheck` / `AttackerHitAngleCheck` / `VictimHitAngleCurveCheck` /
+`COMAngleCheck`, with separate Bump* and Demolish* angles; the elliptical-cone code uses
+a 1.01 fudge on the right-axis projection), `ImpactNormalDotProduct{Bump,Demo}`,
+`BumpInterval`'s exact value (kept 0.25), `AddedCarForceMultiplier` for opposite-team
+hits, `CarHitMultiplier`/`CarHitTorque` (the bUseCarsBump=false path — not soccar), and
+demolish spawn invulnerability. The `local_point_x > MIN_FORWARD_DIST` proxy stands in
+for the cones. Get the full `CarInteractionSettings` CDO to finish this.
+
+**Validation:** four scenario tests (`rocketsim/tests/demo_bump.rs`): supersonic head-on
+demos; sideways supersonic slide does NOT demo; reversing supersonic rear hit DOES demo;
+grounded bump carries the up-push while an airborne victim takes none. All pass. The
+80-segment battery is bit-identical (single car — trajectory-neutral, as §32 required for
+demo-path changes). Replay-level validation (23 real demos, bump dV ratio) still pending —
+the §8 boxcars harness did not survive its session and would need rebuilding.
+
+Trainer + RLBot client rebuilt with the new pipeline; deploys on next trainer start.
