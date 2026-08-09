@@ -242,6 +242,18 @@ pub mod car {
     pub mod bump {
         pub const COOLDOWN_TIME: f32 = 0.25;
         pub const MIN_FORWARD_DIST: f32 = 64.5;
+
+        /// Demo/bump elliptical-cone limits (degrees), from the community replica of
+        /// RL's Car_TA hit-angle checks (research/reports/assets/titan_demo_replica.cpp;
+        /// SIM2REAL_AUDIT.md S36). Pitch is exactly atan(3/4). The cone test carries a
+        /// 1.01 projection fudge, reproduced verbatim in `car_within_forward_cone`.
+        pub const DEMO_CONE_YAW_DEG: f32 = 45.572994;
+        pub const DEMO_CONE_PITCH_DEG: f32 = 36.869896;
+        pub const BUMP_CONE_YAW_DEG: f32 = 70.0;
+        pub const BUMP_CONE_PITCH_DEG: f32 = 36.869896;
+        /// A demo also needs this much FORWARD-projected speed
+        /// (SuperSonicSettings.Speed - TurnoffSpeedBuffer).
+        pub const MIN_DEMO_SPEED: f32 = 2100.0;
     }
 
     pub mod spawn {

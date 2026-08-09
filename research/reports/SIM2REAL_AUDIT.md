@@ -2157,18 +2157,28 @@ TurnoffSpeedBuffer=100, TurnoffTime=1)` — exactly RocketSim's `START_SPEED` /
 7. A non-bumper contact still "bumps" with zero impulse (CDO `PushFactor=0`) and arms
    the per-victim interval, exactly as `BumpCar` does.
 
-**NOT ported (constants unknown — the CDO dump is truncated):** the four angle-cone
-checks (`VictimHitAngleCheck` / `AttackerHitAngleCheck` / `VictimHitAngleCurveCheck` /
-`COMAngleCheck`, with separate Bump* and Demolish* angles; the elliptical-cone code uses
-a 1.01 fudge on the right-axis projection), `ImpactNormalDotProduct{Bump,Demo}`,
-`BumpInterval`'s exact value (kept 0.25), `AddedCarForceMultiplier` for opposite-team
-hits, `CarHitMultiplier`/`CarHitTorque` (the bUseCarsBump=false path — not soccar), and
-demolish spawn invulnerability. The `local_point_x > MIN_FORWARD_DIST` proxy stands in
-for the cones. Get the full `CarInteractionSettings` CDO to finish this.
+**Cones ported (second pass, same day):** the user then provided the full community
+replica (`research/reports/assets/titan_demo_replica.cpp` — titan/juan diego, validated
+in their fork as "basically never misses a demo") with the real constants: demo cone
+**45.572994 deg yaw x 36.869896 deg pitch** (pitch is exactly atan(3/4)), bump cone
+**70 x 36.869896 deg**, tested against the CENTER-TO-CENTER direction with a verbatim
+1.01 projection fudge, and reverseForward = vel.fwd < 0. Ported verbatim into
+`car_within_forward_cone` + a deferred two-pass application (both directions evaluated
+against pre-action state, so a MUTUAL supersonic head-on demos both cars). A supersonic
+hit that fails the demo cone DEMOTES to a bump if the wide cone passes. This replaced
+the `local_point_x` proxy entirely. Two places where the replica inherits stock-v2 code
+that the .uc decompile contradicts were kept .uc-faithful and documented in the source:
+the bump curves take FULL attacker speed (not the toward-contact projection) and the
+airborne victim gets no up-push.
 
-**Validation:** four scenario tests (`rocketsim/tests/demo_bump.rs`): supersonic head-on
+**Still NOT ported:** `AddedCarForceMultiplier` for opposite-team hits and demolish
+spawn invulnerability (constants still unknown), `BumpInterval`'s exact value (kept
+0.25).
+
+**Validation:** five scenario tests (`rocketsim/tests/demo_bump.rs`): supersonic head-on
 demos; sideways supersonic slide does NOT demo; reversing supersonic rear hit DOES demo;
-grounded bump carries the up-push while an airborne victim takes none. All pass. The
+grounded bump carries the up-push while an airborne victim takes none; a mutual
+supersonic head-on demolishes BOTH cars. All pass. The
 80-segment battery is bit-identical (single car — trajectory-neutral, as §32 required for
 demo-path changes). Replay-level validation (23 real demos, bump dV ratio) still pending —
 the §8 boxcars harness did not survive its session and would need rebuilding.

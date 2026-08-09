@@ -178,3 +178,35 @@ fn ground_bump_pushes_up_air_bump_does_not() {
         "airborne victim should get no scripted up-push: air {dvz_air} vs ground {dvz_ground}"
     );
 }
+
+#[test]
+fn mutual_supersonic_head_on_demos_both() {
+    let (mut arena, a, v) = setup();
+
+    let mut asrc = *arena.get_car_state(a);
+    asrc.phys.pos = Vec3A::new(0.0, 0.0, 17.0);
+    asrc.phys.rot_mat = yaw_mat(0.0);
+    asrc.phys.vel = Vec3A::new(2300.0, 0.0, 0.0);
+    asrc.is_on_ground = true;
+    arena.set_car_state(a, asrc);
+
+    let mut vs = *arena.get_car_state(v);
+    vs.phys.pos = Vec3A::new(600.0, 0.0, 17.0);
+    vs.phys.rot_mat = yaw_mat(std::f32::consts::PI);
+    vs.phys.vel = Vec3A::new(-2300.0, 0.0, 0.0);
+    vs.is_on_ground = true;
+    arena.set_car_state(v, vs);
+
+    for _ in 0..60 {
+        arena.step_tick();
+        if arena.get_car_state(a).is_demoed || arena.get_car_state(v).is_demoed {
+            break;
+        }
+    }
+    assert!(
+        arena.get_car_state(a).is_demoed && arena.get_car_state(v).is_demoed,
+        "mutual supersonic head-on must demolish BOTH cars (deferred actions): a={} v={}",
+        arena.get_car_state(a).is_demoed,
+        arena.get_car_state(v).is_demoed
+    );
+}
