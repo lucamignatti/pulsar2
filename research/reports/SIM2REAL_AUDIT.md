@@ -2012,3 +2012,61 @@ vptr) or the .upk/reflection route -- both larger undertakings than the behaviou
 **The behavioural route stands and is 91.4% done** (S31.3) with a finite named gap list. That
 remains the way to "verify every leaf": exercise each branch and diff against a real capture
 whose noise floor is median 0.00 uu.
+
+## §34 — The graze-fling: progressive damper engagement past rest length (2026-08-09)
+
+Fresh capture (all 80 segments, same script, RL running live): total 1157.4, matching the
+Aug 2 close-out (1161.1) — the harness and the fixes reproduce across sessions.
+
+### 34.1 A false alarm worth recording: the 5.5 rad/s "cap violation"
+
+Sim angular speed reads 7.37 rad/s sustained through every dodge; the real packet never
+exceeds 5.50. Before "fixing" the clamp order, measure the actual rotation: the REAL car's
+forward vector also rotates at ~7.24 rad/s mid-dodge. **RL clamps only the replicated
+`ang_vel` field to MAX_ANG_SPEED; internally it integrates above the cap during flip
+torque, same clamp-then-torque order as RocketSim.** Do not "fix" this. Residual: sim
+7.37 vs real 7.24 (~1.8%, ≈ 5° over a full dodge) — consistent with the 2.6–3.5° dodge
+attitude medians; a −7% flip-torque scale would close it but was not tested this session.
+
+### 34.2 The fling mechanism (impulse-traced, debug build)
+
+`transition_flip_off` diverges at t57–66, while the car flips with two wheels grazing the
+wall. Per-tick impulse history shows `WheelsSuspension` firing −7..−22 uu/s per tick with
+the suspension EXTENDED past rest (spring force negative — it is all damper), plus two
+−51/−59 spikes from the hard-contact `extra_pushback` resolve. Cause: the damper reads
+contact-POINT velocity, and a flipping car sweeps its wheel contact points at ω×r ≈ 250+
+uu/s — read as approach velocity. The real car in the same window (near-identical pose)
+holds vx constant: RL applies no such force, then settles onto the wall spring-only,
+lands mid-flip (its dodge torque visibly ends at ground=1, t≈100) and drives up the wall.
+The sim car is flung out of suspension reach and can never re-land; it tumbles ballistic
+after TORQUE_TIME with the z-damp having held vz ≈ −16 through the flip.
+
+### 34.3 What was tried, what won
+
+| variant | fit total | holdout total | verdict |
+|---|---|---|---|
+| stock | 1157.5 | 1181.9 | baseline |
+| damp chassis vel, not contact-point | 1352.5 | — | ω×r damping is load-bearing for curve driving |
+| damper off while flipping | 1195.0 | — | worse: flips need some damping |
+| damper only when compressed | 1087.2 | 1117.0 | best total, but median 4.47→5.44, <15: −2, no_jump_control 12.5→37.0 |
+| flat per-wheel impulse cap (5–80) | 1168–1748 | — | nonmonotonic; caps clip legitimate hard landings (tilt_* +30–45) |
+| **linear damper ramp past rest** | **1126.0** | **1151.5** | **adopted** |
+
+Adopted: damper scale fades linearly from 1 at rest length to 0 at max extension
+(compressed range untouched). A barely-touching wheel damps nothing; slow fillet
+transits keep their cushioning. Wins: `transition_land_tilted` 62.1→4.8,
+`transition_supersonic_into` 35.6→9.3, `powerslide_recover` −2.4, `transition_flip_off`
+−4.6. Costs (consistent on both captures): `jump_after_wall_launch` +29 (a chaotic
+re-attach bifurcation; the `compressed` variant flips it the other way to −74),
+`transition_curve_dash` +9, `corner_land_steep` +9. Threshold counts <10uu: 54→57 (fit),
+54→57 (holdout); every steady-state guard bit-identical.
+
+### 34.4 Still open
+
+`transition_flip_off` (181) and `jump_after_wall_launch` (154): the detach itself is now
+dominated by the compressed-range `extra_pushback` spikes (−51/−59 uu/s per tick from
+`resolve_single_collision` while the flip sweeps wheels into the wall). RL presumably
+resolves that geometry as chassis-mesh contact, not per-wheel ray pushback. Next lever:
+trace whether suppressing/spreading `extra_pushback` during high-|ω| contact can keep the
+car near enough to re-land without breaking the hard-landing segments that pushback
+legitimately serves (the flat cap already proved those two families share the code path).

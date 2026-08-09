@@ -147,9 +147,33 @@ impl WheelInfo {
         let proj_vel = contact_normal.dot(self.vel_at_contact_point);
         let denom = contact_normal.dot(up);
 
+        // PROGRESSIVE DAMPER ENGAGEMENT past rest length (SIM2REAL_AUDIT.md S34). The
+        // damper reads contact-POINT velocity, so a fast-rotating car (a flip, or being
+        // pitched by the floor-to-wall fillet at speed) sweeping a barely-touching wheel
+        // along a surface reads omega x r (~250+ uu/s) as approach velocity, and the
+        // full damper yanks the chassis off the surface -- measured -7..-22 uu/s per
+        // tick in transition_flip_off while the REAL car in the same window shows no
+        // such force (vx constant while its wheels graze the wall mid-flip). Fading the
+        // damper linearly from full at rest length to zero at max extension keeps the
+        // approach cushioning that slow fillet transits need (removing extended-range
+        // damping entirely regressed no_jump_control 12.5 -> 37.0 uu) while removing
+        // most of the graze-fling. Validated on two independent captures: total error
+        // 1157.5 -> 1126.0 (fit) and 1181.9 -> 1151.5 (holdout); transition_land_tilted
+        // 62.1 -> 4.8, transition_supersonic_into 35.6 -> 9.3; all steady-state guards
+        // (drive/brake/steer/wall/ceiling/dodge/wavedash) bit-identical.
+        let damp_scale = if suspension_length > self.suspension_rest_length_1 {
+            let span = max_suspension_len - self.suspension_rest_length_1;
+            if span > 0.0 {
+                ((max_suspension_len - suspension_length) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
         let (suspension_relative_vel, clipped_inv_contact_dot_suspension) = if denom > 0.1 {
             let inv = 1.0 / denom;
-            (proj_vel * inv, inv)
+            (proj_vel * inv * damp_scale, inv)
         } else {
             (0.0, 10.0)
         };

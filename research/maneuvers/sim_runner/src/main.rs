@@ -160,14 +160,30 @@ fn main() {
                 s.name, t, p.x,p.y,p.z, v.x,v.y,v.z,
                 m.x_axis.x,m.x_axis.y,m.x_axis.z, m.z_axis.x,m.z_axis.y,m.z_axis.z,
                 av.x,av.y,av.z, if g.is_on_ground {1} else {0}, g.boost));
-            if std::env::var("DBG_SEG").map(|v| v == s.name).unwrap_or(false) {
-                eprintln!("t={:3} z={:7.2} gnd={} hasJmp={} isJmp={} jt={:.3} atsj={:.3} hasFlip={} isFlip={} ft={:.3} jumpIn={}",
-                    t, g.phys.pos.z, g.is_on_ground as u8, g.has_jumped as u8, g.is_jumping as u8,
+            let dbg = std::env::var("DBG_SEG").map(|v| v == s.name).unwrap_or(false);
+            if dbg {
+                eprintln!("t={:3} z={:7.2} gnd={} whl={}{}{}{} hasJmp={} isJmp={} jt={:.3} atsj={:.3} hasFlip={} isFlip={} ft={:.3} jumpIn={}",
+                    t, g.phys.pos.z, g.is_on_ground as u8,
+                    g.wheels_with_contact[0] as u8, g.wheels_with_contact[1] as u8,
+                    g.wheels_with_contact[2] as u8, g.wheels_with_contact[3] as u8,
+                    g.has_jumped as u8, g.is_jumping as u8,
                     g.jump_time, g.air_time_since_jump, g.has_flipped as u8, g.is_flipping as u8,
                     g.flip_time, cur.jump as u8);
             }
             arena.set_car_controls(car, cur);
             arena.step_tick();
+            // Per-tick impulse breakdown (debug builds only): what force moved the car.
+            #[cfg(debug_assertions)]
+            if dbg {
+                use rocketsim::consts::BT_TO_UU;
+                for ((name, accum), (lin, ang)) in arena.get_car_impulse_history(car) {
+                    // lin is a per-tick velocity delta in BT units; report uu/s.
+                    eprintln!("    imp {:>16}{} dv=({:8.2},{:8.2},{:8.2}) dw=({:6.2},{:6.2},{:6.2})",
+                        name, if *accum {"+"} else {" "},
+                        lin.x * BT_TO_UU, lin.y * BT_TO_UU, lin.z * BT_TO_UU,
+                        ang.x, ang.y, ang.z);
+                }
+            }
         }
     }
     let path = a.get(3).cloned().unwrap_or_else(|| "sim_maneuvers.tsv".into());
