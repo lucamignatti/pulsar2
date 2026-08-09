@@ -4,7 +4,7 @@ run_match.sh hardcodes match.toml and reports no score, so this runs a chosen co
 and polls the packet for team scores. The relay message loop MUST run in a background
 thread or MatchManager.packet is never populated.
 """
-import sys, time
+import os, sys, time
 from pathlib import Path
 from rlbot.managers import MatchManager
 from rlbot.config import load_match_config
@@ -17,7 +17,9 @@ mm = MatchManager()
 # rlbot's RLBOT_SERVER_PORT module constant is hardcoded to 23234 and ignores the
 # environment - and 23234 is the VIZ's own VizRLBotServer. Without this the client
 # silently connects to the viewer and the match sits at 0-0 forever.
-mm.rlbot_server_port = 23234
+# GGL_RLBOT_PORT: run against an RLBotServer on a non-default port (lets a sim match
+# run while the real game holds the default 23233/23234 pair hostage).
+mm.rlbot_server_port = int(os.environ.get("GGL_RLBOT_PORT", "23234"))
 mm.start_match(cfg, wait_for_start=False, ensure_server_started=False)
 print(f"[score] match started: {cfgName}, {duration}s", flush=True)
 for _ in range(60):
