@@ -2070,3 +2070,54 @@ resolves that geometry as chassis-mesh contact, not per-wheel ray pushback. Next
 trace whether suppressing/spreading `extra_pushback` during high-|ω| contact can keep the
 car near enough to re-land without breaking the hard-landing segments that pushback
 legitimately serves (the flat cap already proved those two families share the code path).
+
+## §35 — Match play in both venues: real result, sim harness excavated (2026-08-09)
+
+### 35.1 Real game: Pulsar (7.0b @ 8.68B) vs Nexto — 9–10 over 461s
+
+Scored via `score_real.sh` (RLBotServer + the running game as backend + score_match.py;
+new script, committed). Pulsar led 7–3 at t=231s, Nexto came back 9–10 by t=461s when the
+session was ended. 19 goals ≈ one per 24s. Pulsar goal share **47%** — an even match, no
+sign of the catastrophic real-game degradation earlier configs showed. Single match;
+episode-cluster variance means ±15% on this share — treat as one data point, not a curve.
+
+### 35.2 The sim side of every past "sim vs real" match was a THIRD engine
+
+`RLBotSim/exe/Cargo.toml` pulled `rocketsim` from upstream git (v3-rust branch) — not the
+vendored crate the trainer uses. Every sim scored match would have run WITHOUT any audit
+fix (air-throttle gate, boost-pad OBB pickup, coasting brake, adhesion band, dodge
+lockout, §34 damper ramp). Now points at the vendored engine (RLBotSim commit cfee9e4).
+
+### 35.3 …but no sim scored match had ever actually run
+
+Excavated in stages, each with its own fix:
+1. `pkill -f RLBotServer` in a compound command kills the invoking shell (its own cmdline
+   matches) — the CLAUDE.md warning applies to *every* -f pattern, not just the trainer's.
+2. RLBotServer picks its game-bridge port dynamically (first free from 23233) and the
+   running game (pinned to 23233 by `-rlbot`) steals the slot the instant it opens — one
+   "sim" match at 18:48 actually played in the real game while rlbot_sim died retrying.
+   `score_sim.sh` now holds 23233 with a dummy listener and reads the chosen port from
+   the server log. A backend on 23234 (the default client port) connects but is never
+   driven — hold that too.
+3. The server will not drive a SILENT backend: the real game streams state packets even
+   at the menu; rlbot_sim sent nothing until it had an arena, so the server validated the
+   config and then did nothing — no agent launch, no spawn, at any port, with any engine.
+   Fixed: rlbot_sim streams its default (Inactive) state pre-arena. This immediately got
+   agents launched and the map-load command issued.
+4. TERMINAL BLOCKER: the Jul-19 RLBotServer then sends the bridge a packet no rev of
+   RLBot/rust-interface can parse (root vtable length 6 — a union type slot without its
+   value; planus InvalidVtableLength). Tried schema submodule revs a83ce10 (Jun 12) and
+   da7f97b (Jun 30): identical. The current core's bridge protocol has moved past the
+   public Rust bindings. rlbot_sim now hex-dumps undecodable packets; the port to the
+   current bridge protocol is spawned as its own task.
+
+Net: the real-vs-sim MATCH comparison is still one-sided (real only). The maneuver
+harness (§34) remains the only calibrated physics comparison, and it is the stronger
+instrument anyway — fixed states, fixed actions, per-tick error, real-vs-real noise floor.
+
+### 35.4 Deployment note
+
+The trainer binary was rebuilt with the §34 damper fix (build/ at 18:49); it deploys on
+the next trainer start. The maneuver sim runner and rlbot_sim both build against the same
+vendored engine, so all three venues (trainer, offline maneuvers, future sim matches) now
+share one physics.
