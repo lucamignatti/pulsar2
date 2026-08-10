@@ -232,7 +232,12 @@ fn analyze_rlpr() {
     eprintln!("skipped {skipped_gaps} gap transitions");
     eprintln!("\n=== per-regime single-tick VELOCITY error (uu/s) ===");
     for (name, stats) in &mut regimes {
-        eprintln!("{name:14} {}", stats[0].summary());
+        let summary = stats[0].summary();
+        let v = &stats[0].vals;
+        let n = v.len().max(1) as f32;
+        let frac = |t: f32| 100.0 * v.iter().filter(|&&x| x < t).count() as f32 / n;
+        let (f1, f5, f23) = (frac(1.0), frac(5.0), frac(23.0));
+        eprintln!("{name:14} {summary}  <1uu/s:{f1:5.1}%  <5:{f5:5.1}%  <23(1%vmax):{f23:5.1}%");
     }
     eprintln!("\n=== per-regime single-tick ANG VEL error (rad/s) ===");
     for (name, stats) in &mut regimes {
