@@ -95,6 +95,11 @@ fn analyze_rlpr() {
         // and across TELEPORTS (goal resets / demolitions): no legal physics moves a
         // car more than ~|v_max| * dt + margin in one tick, so a larger real position
         // delta is a game event, not dynamics.
+        // A roster SHRINK is a real demolition during this transition: still step it
+        // (with the same lagged controls) so the demo pipeline can be validated, but
+        // skip the error stats (the vanished car has no ground truth).
+        let demo_transition = from_tick.car_records.len() == num_cars
+            && to_tick.car_records.len() < num_cars;
         let clean = from_tick.car_records.len() == num_cars
             && to_tick.car_records.len() == num_cars
             && (0..num_cars).all(|c| {
@@ -106,6 +111,27 @@ fn analyze_rlpr() {
                 let tp: Vec3A = to_tick.car_records[c].phys.pos.into();
                 (tp - fp).length() < 40.0
             });
+        if !clean && demo_transition {
+            let ctrl_i = (i + 1).saturating_sub(2);
+            if recording.ticks[ctrl_i].car_records.len() == num_cars {
+                let controls: Vec<CarControls> = (0..num_cars)
+                    .map(|c| recording.ticks[ctrl_i].car_records[c].prev_controls.into())
+                    .collect();
+                set_state_to_record_tick(&mut arena, &car_idcs, from_tick, &controls);
+                for ev in arena.step_tick().to_vec() {
+                    if let rocketsim::ArenaEvent::CarHitCar(e) = ev {
+                        eprintln!(
+                            "REALDEMO tick {i}: sim CarHitCar attacker={} victim={} is_demo={}",
+                            e.bumper_car_idx, e.victim_car_idx, e.is_demo
+                        );
+                    }
+                }
+                eprintln!("REALDEMO tick {i}: transition stepped (roster {} -> {})",
+                    from_tick.car_records.len(), to_tick.car_records.len());
+            }
+            skipped_gaps += 1;
+            continue;
+        }
         if !clean {
             skipped_gaps += 1;
             continue;
@@ -159,7 +185,17 @@ fn analyze_rlpr() {
             arena.set_car_state(car_idx, cs);
         }
 
-        arena.step_tick();
+        let step_events: Vec<rocketsim::ArenaEvent> = arena.step_tick().to_vec();
+        for ev in &step_events {
+            if let rocketsim::ArenaEvent::CarHitCar(e) = ev
+                && e.is_demo
+            {
+                eprintln!(
+                    "DEMOEVT tick {i} attacker={} victim={}",
+                    e.bumper_car_idx, e.victim_car_idx
+                );
+            }
+        }
 
         for (c, &car_idx) in car_idcs.iter().enumerate() {
             let pred = arena.get_car_state(car_idx);
@@ -271,6 +307,15 @@ fn analyze_rlpr() {
                     else if c.throttle < -0.5 { "reverse" }
                     else { "coast" };
                 eprintln!("GDECOMP {mode} {:.4} {:.4} {:.4} {i}", dv.dot(up), dv.dot(fwd), dv.dot(lat));
+            }
+
+            // GGL_CARCAR: velocity error on car-proximity ticks (bump/demo pipeline).
+            if std::env::var("GGL_CARCAR").is_ok() && num_cars == 2 {
+                let other: Vec3A = from_tick.car_records[1 - c].phys.pos.into();
+                let dist = (Vec3A::from(fr.phys.pos) - other).length();
+                if dist < 200.0 {
+                    eprintln!("CARCAR {i} c{c} dist={dist:6.1} verr={vel_err:8.2} aerr={ang_err:6.2}");
+                }
             }
 
             let e = regimes.entry(regime).or_default();

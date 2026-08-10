@@ -1055,8 +1055,31 @@ impl Arena {
             let vel_dir = attacker_state.phys.vel / attacker_speed;
             let dir_to_contact =
                 (contact_point - attacker_state.phys.pos).normalize_or_zero();
-            let dir_to_center =
-                (victim_state.phys.pos - attacker_state.phys.pos).normalize_or_zero();
+
+            // TIME-OF-IMPACT rewind (SIM2REAL_AUDIT.md S40). The decompiled
+            // ShouldDemolish runs its angle checks on the SWEPT time-of-impact state
+            // (GetTimeOfImpact; end-of-tick state is only the sweep-miss fallback),
+            // while the states here are start-of-tick and the manifold was detected at
+            // the predicted end-of-tick transforms. At 4000+ uu/s closing speed the
+            // centers move ~35 uu inside one tick -- enough to swing the
+            // center-to-center direction by 10-20 deg at contact range and flip a
+            // marginal 45.57-deg cone decision. Estimate the first-touch fraction from
+            // the manifold penetration and the normal closing speed, and evaluate the
+            // cone direction at that instant (velocities stay OldRBState, as in RL).
+            let normal: Vec3A = manifold_point.normal_world_on_b;
+            let rel_vel_bt = (attacker_state.phys.vel - victim_state.phys.vel) * UU_TO_BT;
+            let closing = rel_vel_bt.dot(normal).abs();
+            let penetration = (-manifold_point.distance_1).max(0.0); // BT units
+            let toi = if closing > 1e-6 {
+                (1.0 - penetration / (closing * TICK_TIME)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let attacker_toi_pos =
+                attacker_state.phys.pos + attacker_state.phys.vel * (toi * TICK_TIME);
+            let victim_toi_pos =
+                victim_state.phys.pos + victim_state.phys.vel * (toi * TICK_TIME);
+            let dir_to_center = (victim_toi_pos - attacker_toi_pos).normalize_or_zero();
 
             let speed_towards_other_car = attacker_state.phys.vel.dot(dir_to_contact);
             let other_car_away_speed = victim_state.phys.vel.dot(vel_dir);

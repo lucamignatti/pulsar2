@@ -937,20 +937,16 @@ impl Car {
                     self.state.supersonic_grace_timer = 0.0;
                 }
             }
-        } else if speed_squared >= START_SPEED_SQ && self.state.is_on_ground {
-            // Supersonic can only START while grounded. Without the ground check a car
-            // that merely exceeds the start speed in the air (a fast aerial, or being
-            // launched off the fillet) becomes supersonic, and since demolitions require
-            // supersonic that manufactures PHANTOM DEMOS on contact.
-            //
-            // NOTE ON EVIDENCE: adopted from an independent sim-vs-real effort
-            // (Moonwatcher), which measured 3 phantom demos removed and 13/13 demos
-            // correct after this change. It is NOT validated by research/maneuvers: this
-            // flag has no effect on trajectory in RocketSim -- it only gates demos -- so
-            // the maneuver harness structurally cannot see it (no segment has a second
-            // car). Verified here only to be trajectory-NEUTRAL: all 80 segments are
-            // bit-identical before and after. Re-test properly once a two-car harness
-            // exists. See SIM2REAL_AUDIT.md S32.
+        } else if speed_squared >= START_SPEED_SQ {
+            // REVERTED S32's grounded-start gate (SIM2REAL_AUDIT.md S40): the 120 Hz
+            // capture's one real demolition has the attacker crossing 2200 while
+            // AIRBORNE (z=72, boost surge 2001 -> 2300 on the contact tick) and the
+            // real game demolishes -- a direct counter-example to "supersonic can only
+            // start while grounded", which had been adopted on external evidence and
+            // was flagged unvalidated. The CDO's SuperSonicSettings carries no ground
+            // condition either. Whatever removed Moonwatcher's phantom demos, it was
+            // not this rule; the hit-angle cones + forward-speed gate (S36) are the
+            // real phantom filters.
             self.state.is_supersonic = true;
             self.state.supersonic_grace_timer = 0.0;
         } else {

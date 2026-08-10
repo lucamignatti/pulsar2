@@ -2299,3 +2299,27 @@ ground 99.1% | air_free 99.3% | flip_air 97.2% | ball_contact 98.0% | flip+wheel
 | air+wheels 95.1% | wall_drive 94.7% -- weighted 98.3% of 94,062 clean transitions.
 Residual tails: contact-phase events (ball blasts, p99 spikes), the ~3 uu/s ground
 quantization floor (S38, tape-limited), and wall-drive's last few percent.
+
+## §40 — Time-of-impact demo evaluation + S32 reverted on real evidence (2026-08-10)
+
+Titan's hint ("the game might be using the exact/interpolated collision point") is
+confirmed by the .uc itself: `ShouldDemolish` runs every angle check on the SWEPT
+time-of-impact state (`GetTimeOfImpact`; end-of-tick is only the sweep-miss fallback).
+Ported: `on_car_car_collision` estimates the first-touch fraction from the manifold
+penetration and normal closing speed, rewinds both centers to that instant, and
+evaluates the hit cones there (velocities stay OldRBState, as in RL). At 4000+ uu/s
+closing speed the centers move ~35 uu in a tick — a 10–20° swing in the cone direction
+at contact range.
+
+**S32 REVERTED — falsified by real data.** The capture's one demolition (tick 16771)
+has the attacker crossing 2200 while AIRBORNE (z=72, g=0, boost surge 2001→2300 on the
+contact tick), and the real game demolishes. "Supersonic can only start while grounded"
+— adopted from external evidence, explicitly flagged unvalidated — is therefore wrong;
+the CDO's `SuperSonicSettings` carries no ground condition either. With the gate the
+sim classified this real demo as a bump; with the revert (+TOI) it reproduces:
+**1/1 real demolitions predicted (correct attacker, victim, tick), 0 phantom demos
+across all 106k replayed transitions.** The analyzer now steps roster-shrink
+transitions as demo probes and reports every sim demo event, so any future
+bump/demo-heavy capture (the plugin records spectated matches) scales this oracle.
+
+Battery bit-identical (single car); all six contact scenario tests pass.
