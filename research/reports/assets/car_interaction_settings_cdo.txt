@@ -1,0 +1,33 @@
+CarInteractionSettings CDO (TAGame.Car_TA defaults), user-relayed from the community
+decompile ("code soul"), 2026-08-10. Confirms at source: only COMAngleCheck enabled
+(cones 70/36.869896 bump, 45.572994/36.869896 demo), PushFactor=0 for non-bumper hits,
+BumpInterval=0.25, bCheckImpactNormal=false, and the three push curves (divide by car
+mass 180 for velocity-delta units).
+
+CarInteractionSettings = (
+    PushFactor = 0,
+    BumperPushFactorCurveGround = ( Points = (
+        ( InVal = 0,    OutVal = 150 ),
+        ( InVal = 1400, OutVal = 200000 ),
+        ( InVal = 2200, OutVal = 275000 ) ), InterpMode = CIM_Linear ),
+    BumperPushFactorCurveAir = ( Points = (
+        ( InVal = 0,    OutVal = 150 ),
+        ( InVal = 1400, OutVal = 250000 ),
+        ( InVal = 2200, OutVal = 350000 ) ), InterpMode = CIM_Linear ),
+    ZPushFactorCurve = ( Points = (
+        ( InVal = 0,    OutVal = 50 ),
+        ( InVal = 1400, OutVal = 50000 ),
+        ( InVal = 2200, OutVal = 75000 ) ), InterpMode = CIM_Linear ),
+    BumpInterval = 0.25,
+    COMAngleCheck = ( bEnabled = true,
+        BumpAngleYaw = 70, BumpAnglePitch = 36.869896,
+        DemolishAngleYaw = 45.572994, DemolishAnglePitch = 36.869896 ),
+    VictimHitAngleCheck = ( bEnabled = false, BumpAngleYaw = 90, BumpAnglePitch = 180,
+        DemolishAngleYaw = 90, DemolishAnglePitch = 180 ),
+    AttackerHitAngleCheck = ( bEnabled = false, BumpAngleYaw = 45, BumpAnglePitch = 90,
+        DemolishAngleYaw = 45, DemolishAnglePitch = 90 ),
+    VictimHitAngleCurveCheck = ( bEnabled = false /* curves omitted, disabled */ ),
+    bCheckImpactNormal = false,
+    ImpactNormalDotProductDemo = 0.707,
+    ImpactNormalDotProductBump = 0.259
+);

@@ -2171,10 +2171,15 @@ that the .uc decompile contradicts were kept .uc-faithful and documented in the 
 the bump curves take FULL attacker speed (not the toward-contact projection) and the
 airborne victim gets no up-push.
 
-**Still NOT ported:** `AddedCarForceMultiplier` for opposite-team hits and demolish
-spawn invulnerability (constants still unknown). `BumpInterval` = 0.25 CONFIRMED
-(user-relayed from the community CDO work, 2026-08-10) -- the shipped
-`bump::COOLDOWN_TIME` was already 0.25, now with provenance.
+**CDO CONFIRMED AT SOURCE (2026-08-10, full CarInteractionSettings relayed; archived
+at assets/car_interaction_settings_cdo.txt):** only `COMAngleCheck` is enabled with
+exactly the ported cones; `VictimHitAngleCheck`/`AttackerHitAngleCheck`/
+`VictimHitAngleCurveCheck` are `bEnabled=false` (skipping them was correct);
+`bCheckImpactNormal=false`; `PushFactor=0`; `BumpInterval=0.25`. The bump curves are
+the CDO's PushFactor points / car mass 180 -- the shipped values were these rounded
+(1100 vs 1111.11); now set exactly. Still unknown: `AddedCarForceMultiplier`
+(opposite-team bump boost, lives outside CarInteractionSettings) and demolish spawn
+invulnerability.
 
 **Validation:** five scenario tests (`rocketsim/tests/demo_bump.rs`): supersonic head-on
 demos; sideways supersonic slide does NOT demo; reversing supersonic rear hit DOES demo;

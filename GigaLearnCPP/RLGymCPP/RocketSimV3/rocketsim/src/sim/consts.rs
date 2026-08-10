@@ -485,12 +485,29 @@ pub mod curves {
     pub const BALL_CAR_EXTRA_IMPULSE_FACTOR: LinearPieceCurve<4> =
         LinearPieceCurve::new([(0., 0.65), (500., 0.65), (2300., 0.55), (4600., 0.30)]);
 
-    pub const BUMP_VEL_AMOUNT_GROUND: LinearPieceCurve<3> =
-        LinearPieceCurve::new([(0., (5.0 / 6.)), (1400., 1100.), (2200., 1530.)]);
-    pub const BUMP_VEL_AMOUNT_AIR: LinearPieceCurve<3> =
-        LinearPieceCurve::new([(0., (5.0 / 6.)), (1400., 1390.), (2200., 1945.)]);
-    pub const BUMP_UPWARD_VEL_AMOUNT: LinearPieceCurve<3> =
-        LinearPieceCurve::new([(0., (2.0 / 6.)), (1400., 278.), (2200., 417.)]);
+    // EXACT values from the CarInteractionSettings CDO (user-relayed from the
+    // community decompile, 2026-08-10; archived at
+    // research/reports/assets/car_interaction_settings_cdo.txt): the game's
+    // BumperPushFactorCurve{Ground,Air} / ZPushFactorCurve points divided by the car
+    // mass (180) -- UE3 applies the PushFactor as a mass-normalized impulse. The
+    // previous values were the same curves measured-and-rounded (1100 vs 1111.11...);
+    // the curve INPUT is the attacker's full speed (S36) and interp is linear
+    // (CIM_Linear), both confirmed by the CDO.
+    pub const BUMP_VEL_AMOUNT_GROUND: LinearPieceCurve<3> = LinearPieceCurve::new([
+        (0., 150. / 180.),
+        (1400., 200_000. / 180.),
+        (2200., 275_000. / 180.),
+    ]);
+    pub const BUMP_VEL_AMOUNT_AIR: LinearPieceCurve<3> = LinearPieceCurve::new([
+        (0., 150. / 180.),
+        (1400., 250_000. / 180.),
+        (2200., 350_000. / 180.),
+    ]);
+    pub const BUMP_UPWARD_VEL_AMOUNT: LinearPieceCurve<3> = LinearPieceCurve::new([
+        (0., 50. / 180.),
+        (1400., 50_000. / 180.),
+        (2200., 75_000. / 180.),
+    ]);
 }
 
 pub mod heatseeker {
