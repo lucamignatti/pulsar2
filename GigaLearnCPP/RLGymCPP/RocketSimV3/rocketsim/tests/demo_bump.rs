@@ -210,3 +210,25 @@ fn mutual_supersonic_head_on_demos_both() {
         arena.get_car_state(v).is_demoed
     );
 }
+
+#[test]
+fn quantized_rest_height_response() {
+    // The 120 Hz capture stores z quantized to 0.01 uu (bQuantizePhysics): a resting
+    // car records 17.01 while the true equilibrium is ~17.012. Restoring at the
+    // quantized height starts the suspension compressed by ~2 milli-uu; this test
+    // measures the one-tick vertical response, i.e. the REPLAY noise floor that
+    // quantization imposes on all ground-regime error stats (S38).
+    let (mut arena, a, _v) = setup();
+    for (z, label) in [(17.0121f32, "equilibrium"), (17.01, "quantized")] {
+        let mut cs = *arena.get_car_state(a);
+        cs.phys.pos = Vec3A::new(0.0, 0.0, z);
+        cs.phys.rot_mat = Mat3A::IDENTITY;
+        cs.phys.vel = Vec3A::ZERO;
+        cs.phys.ang_vel = Vec3A::ZERO;
+        cs.is_on_ground = true;
+        arena.set_car_state(a, cs);
+        arena.step_tick();
+        let vz = arena.get_car_state(a).phys.vel.z;
+        eprintln!("restore z={z:.4} ({label}) -> one-tick vz = {vz:+.3}");
+    }
+}

@@ -2236,3 +2236,27 @@ flip_air ang-vel error p50 0.192 → 0.068, p90 2.021 → 0.272 rad/s; ball_cont
 the argument for the 120 Hz instrument. Remaining, in order: wheel-graze regimes
 (air+wheels / flip+wheels / wall_drive vel p90 15–33, p99 500 — the §34.4 extra_pushback
 family), ground vel p99 ≈ 296 (~1% jump-buffer edge cases), contact-phase tails.
+
+## §38 — The ground error floor is the tape, not the sim (2026-08-10)
+
+Why isn't ground play 100%? Decomposing the ground regime's uniform ~5 uu/s error into
+car-frame components (GGL_GROUND_DECOMP): the forward and lateral medians are
+**−0.03 to −0.5 uu/s** across every control mode (throttle, steer, handbrake, coast,
+reverse) — drive, brake, steer and powerslide dynamics are essentially exact. The whole
+median error is VERTICAL: +2.3 to +3.0 uu/s per tick, one-sided upward, in every mode.
+
+Cause, verified: `bQuantizePhysics=true` — the game quantizes replicated positions to
+**0.01 uu**, and the capture's resting ride height reads exactly 17.0100 while the true
+equilibrium is ~17.012 (sim settles at 17.0121). Every restored tick therefore starts
+~2 milli-uu spring-compressed, and the suspension amplifies milli-uu into uu/s: measured
+in-sim, a 2.1 milli-uu restore offset produces +2.05 uu/s in one tick
+(`quantized_rest_height_response` in demo_bump.rs). The quantization of the RECORDING
+imposes a ~±3 uu/s apparent-error floor on every grounded tick; the sim cannot measure
+better than the tape. (S28's unquantized steady-state telemetry had already measured the
+sticky/suspension equilibrium as exact — a sticky-scale sweep here "fixing" the bias to
+zero at scale≈1.5 would have been fitting the quantization artifact; not adopted.)
+
+Honest ground statement: horizontal dynamics median ≲0.5 uu/s per tick; vertical
+unmeasurable below ~3 uu/s from this instrument. The REAL remaining ground-family gap is
+the heavy landing/graze tail (throttle-mode mean 67 vs median 3 — suspension impact
+response, same family as §34.4/§37.5), which is where wavedash fidelity lives.

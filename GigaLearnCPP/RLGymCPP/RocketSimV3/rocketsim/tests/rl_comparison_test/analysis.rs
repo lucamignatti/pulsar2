@@ -198,6 +198,27 @@ fn analyze_rlpr() {
                 );
             }
 
+            // GGL_GROUND_DECOMP: signed error components for grounded ticks.
+            if std::env::var("GGL_GROUND_DECOMP").is_ok() && regime == "ground" {
+                let dv = pred.phys.vel - real_vel;
+                let fwd: Vec3A = {
+                    let r = &fr.phys.rot;
+                    Vec3A::new(r.rows[0].x, r.rows[1].x, r.rows[2].x)
+                };
+                let up: Vec3A = {
+                    let r = &fr.phys.rot;
+                    Vec3A::new(r.rows[0].z, r.rows[1].z, r.rows[2].z)
+                };
+                let lat = up.cross(fwd);
+                let c = &fr.prev_controls;
+                let mode = if c.handbrake { "handbrake" }
+                    else if c.boost { "boost" }
+                    else if c.throttle > 0.5 { if c.steer.abs() > 0.5 { "throttle+steer" } else { "throttle" } }
+                    else if c.throttle < -0.5 { "reverse" }
+                    else { "coast" };
+                eprintln!("GDECOMP {mode} {:.4} {:.4} {:.4}", dv.dot(up), dv.dot(fwd), dv.dot(lat));
+            }
+
             let e = regimes.entry(regime).or_default();
             e[0].push(vel_err);
             e[1].push(pos_err);
