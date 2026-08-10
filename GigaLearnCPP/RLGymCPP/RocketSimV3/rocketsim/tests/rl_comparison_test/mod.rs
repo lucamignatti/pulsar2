@@ -4,6 +4,7 @@ use glam::Vec3A;
 use rocketsim::consts::BT_TO_UU;
 use rocketsim::{Arena, CarBodyConfig, CarControls, CarState, GameMode, PhysState, Team};
 
+mod analysis;
 mod compare;
 mod recording;
 
@@ -95,6 +96,7 @@ fn test_recording(recording: &Recording) {
                 lines.push(format!(" > Car [{j}]: {:?}", car_state.controls));
             }
             lines.push("CAR IMPULSES DURING TICK:".to_string());
+            #[cfg(debug_assertions)]
             for j in 0..num_cars {
                 lines.push(format!(" > Car [{j}]:"));
                 let pred_impulses = arena.get_car_impulse_history(j);
