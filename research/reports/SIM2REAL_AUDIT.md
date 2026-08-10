@@ -2184,3 +2184,55 @@ demo-path changes). Replay-level validation (23 real demos, bump dV ratio) still
 the §8 boxcars harness did not survive its session and would need rebuilding.
 
 Trainer + RLBot client rebuilt with the new pipeline; deploys on next trainer start.
+
+## §37 — First 120 Hz real capture: pitch-cancel gate + published-state clamp (2026-08-10)
+
+New instrument: an 81 MB `.rlpr` from RLRecord2 (BakkesMod) — 53,680 per-tick states of a
+strong tick-skip-1 bot 1v1 (7.5 min), replayed transition-by-transition through the sim
+(`analysis.rs`, `RLPR_PATH=... cargo test --test mod analyze_rlpr`). Reader now handles
+demolished-car short rosters (size-prefix peek) and skips teleports/gaps. This capture
+carries no impulse traces (num_impulse_records=0 throughout — pre-trace plugin build).
+
+### 37.1 Replay semantics, measured
+
+Records are END-of-frame states, and an input delivered at frame R takes effect in frame
+R+2 (verified on jump activations: press at 285 → jump at 287; 597 → 599). Simulating
+record F → F+1 therefore uses controls from record F−1 (`GGL_CTRL_LAG`, default 2). The
+wrong pairing manufactures a fake error plateau at exactly the jump impulse (291.67).
+
+### 37.2 Validated to the decimal (free physics)
+
+air_free velocity error p50 0.007 uu/s. Jump: first-tick vz 295.6 = immediate 291.67 +
+one tick of accel; climb +4.0/tick = (jump_accel 1458.33 − gravity 650)/120 − sticky
+2.71 exactly; is_jumping ends at MIN_TIME 0.025 on early release. Dodge lin impulses:
+flip_air vel p50 0.009 uu/s once pairing is right.
+
+### 37.3 FIX: the pitch-cancel time gate (`flip::PITCH_CANCEL_MIN_TIME = 0.04`)
+
+Holding pitch INTO the flip cancels dodge torque — but measured along the flip axis
+(uncapped ticks only): FULL torque through flip_time 0.0333 (means 1.48–1.71 rad/s per
+tick), ZERO from 0.0417 (mean 0.07, then ≈0 every later bucket). RocketSim cancelled
+from t=0 — killing torque the real game applies for the first 5 ticks. This is the
+"pitch-cancel time gate at +0x350" the Ghidra pass saw in Dodge_TA::ApplyTorqueForces
+and we never had. A 1ts policy taps pitch during exactly that window (stalls, flip
+cancels, speed flips), so this defect binds hardest against the strongest opponents.
+
+### 37.4 FIX: clamp before publishing state
+
+Real capped-dodge ticks read ang_vel exactly 5.500 and a ball-blasted car exactly
+2300.0: RL clamps the STORED state at end of frame. RocketSim clamped at the start of
+the NEXT tick, so everything between ticks — obs builders, the RLBot bridge, recordings
+— saw pre-clamp values (up to ~7.4 rad/s mid-dodge) the real game never exposes.
+`finish_physics_tick` now clamps before publishing; trajectories are bit-identical (the
+start-of-tick clamp made the same correction before any force ran), only the OBSERVED
+state moves. This also retro-explains §34.1: both engines rotate ~7.3 rad/s mid-dodge;
+they differed only in which side of the clamp they reported.
+
+### 37.5 Result and residuals
+
+flip_air ang-vel error p50 0.192 → 0.068, p90 2.021 → 0.272 rad/s; ball_contact ang p90
+2.457 → 0.116; worst-case ang errors 26 → 7.4. The 80-segment battery is unchanged
+(1126.0 → 1126.5) — at 60 Hz/15 Hz it was structurally blind to this defect, which is
+the argument for the 120 Hz instrument. Remaining, in order: wheel-graze regimes
+(air+wheels / flip+wheels / wall_drive vel p90 15–33, p99 500 — the §34.4 extra_pushback
+family), ground vel p99 ≈ 296 (~1% jump-buffer edge cases), contact-phase tails.

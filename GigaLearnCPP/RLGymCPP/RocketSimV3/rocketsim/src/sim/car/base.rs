@@ -393,6 +393,11 @@ impl Car {
                 if rel_dodge_torque.y != 0.0
                     && self.state.controls.pitch != 0.0
                     && rel_dodge_torque.y.signum() == self.state.controls.pitch.signum()
+                    // The cancel only engages once the flip is PITCH_CANCEL_MIN_TIME
+                    // old -- the first ~5 ticks always get full torque (measured; see
+                    // the constant's comment). Without this gate a 1ts policy's brief
+                    // into-flip pitch taps killed torque the real game applies.
+                    && self.state.flip_time >= car_consts::flip::PITCH_CANCEL_MIN_TIME
                 {
                     pitch_scale = 1.0 - self.state.controls.pitch.abs().min(1.0);
                     do_air_control = true;
@@ -985,6 +990,19 @@ impl Car {
             rb.lin_vel += self.vel_impulse_cache;
             self.vel_impulse_cache = Vec3A::ZERO;
         }
+
+        // Clamp BEFORE publishing, matching RL's observable state (SIM2REAL_AUDIT.md
+        // S37): the real game applies its speed caps to the stored state at the end of
+        // the frame -- a capped dodge reads ang_vel exactly 5.5 and a ball-blasted car
+        // exactly 2300.0 in real captures -- while this sim only clamped at the START
+        // of the next tick, so everything BETWEEN ticks (obs builders, the RLBot
+        // bridge, recordings) saw pre-clamp values up to ~7.4 rad/s that the real game
+        // never exposes. Trajectories are unchanged (the start-of-tick clamp made the
+        // same correction before any force ran); only the published state moves.
+        rb.limit_vels(
+            const { car_consts::MAX_SPEED * UU_TO_BT },
+            car_consts::MAX_ANG_SPEED,
+        );
 
         self.state.phys.pos = rb.get_world_trans().translation * BT_TO_UU;
         self.state.phys.vel = rb.lin_vel * BT_TO_UU;

@@ -81,24 +81,46 @@ fn analyze_rlpr() {
         let from_tick = &recording.ticks[i];
         let to_tick = &recording.ticks[i + 1];
 
-        // Skip transitions across recorder gaps (game paused / frames missed).
-        let clean = (0..num_cars).all(|c| {
-            to_tick.car_records[c].phys.physics_frame
-                == from_tick.car_records[c].phys.physics_frame + 1
-        });
+        // Skip transitions across recorder gaps (game paused / frames missed),
+        // around demo respawns (short roster ticks: slot assignment is ambiguous),
+        // and across TELEPORTS (goal resets / demolitions): no legal physics moves a
+        // car more than ~|v_max| * dt + margin in one tick, so a larger real position
+        // delta is a game event, not dynamics.
+        let clean = from_tick.car_records.len() == num_cars
+            && to_tick.car_records.len() == num_cars
+            && (0..num_cars).all(|c| {
+                to_tick.car_records[c].phys.physics_frame
+                    == from_tick.car_records[c].phys.physics_frame + 1
+            })
+            && (0..num_cars).all(|c| {
+                let fp: Vec3A = from_tick.car_records[c].phys.pos.into();
+                let tp: Vec3A = to_tick.car_records[c].phys.pos.into();
+                (tp - fp).length() < 40.0
+            });
         if !clean {
             skipped_gaps += 1;
             continue;
         }
 
+        // CONTROL PAIRING (measured, 2026-08-10): BakkesMod records are END-of-frame
+        // state, and the input delivered via SetVehicleInput at frame R takes effect
+        // in frame R+2 (verified on jump activations: press at 285 -> jump at 287,
+        // press at 597 -> jump at 599). Simulating frame F+1 (record F -> F+1)
+        // therefore uses the controls recorded at F-1. GGL_CTRL_LAG overrides for
+        // A/B tests (0 = record F+1, 1 = record F, 2 = record F-1 [default]).
+        let lag: usize = std::env::var("GGL_CTRL_LAG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if bakkes_semantics { 2 } else { 0 });
+        if i + 1 < lag {
+            continue;
+        }
+        let ctrl_tick = &recording.ticks[i + 1 - lag];
+        if ctrl_tick.car_records.len() != num_cars {
+            continue;
+        }
         let controls: Vec<CarControls> = (0..num_cars)
-            .map(|c| {
-                if bakkes_semantics {
-                    from_tick.car_records[c].prev_controls.into()
-                } else {
-                    to_tick.car_records[c].prev_controls.into()
-                }
-            })
+            .map(|c| ctrl_tick.car_records[c].prev_controls.into())
             .collect();
 
         set_state_to_record_tick(&mut arena, &car_idcs, from_tick, &controls);
@@ -125,8 +147,12 @@ fn analyze_rlpr() {
 
             let fr = &from_tick.car_records[c];
             let wheels_touching = fr.wheels.iter().filter(|w| w.has_contact).count();
-            let on_wall = fr.phys.has_world_contact
-                && Vec3A::from(fr.phys.world_contact_normal).z.abs() < 0.7;
+            // Wall = WHEEL contact whose normal is closer to horizontal than vertical;
+            // chassis world-contact alone misses ordinary wheel-on-wall driving.
+            let on_wall = fr
+                .wheels
+                .iter()
+                .any(|w| w.has_contact && Vec3A::from(w.contact_normal).z.abs() < 0.7);
             let regime: &'static str = if fr.is_flipping {
                 if wheels_touching > 0 {
                     "flip+wheels"
@@ -151,12 +177,56 @@ fn analyze_rlpr() {
                 "air_free"
             };
 
+            // GGL_DUMP_FLIP: print structure of high-ang-error flipping ticks.
+            if std::env::var("GGL_DUMP_FLIP").is_ok()
+                && fr.is_flipping
+                && wheels_touching == 0
+                && ang_err > 1.0
+            {
+                let pred_d = pred.phys.ang_vel - Vec3A::from(fr.phys.ang_vel);
+                let real_d = real_ang - Vec3A::from(fr.phys.ang_vel);
+                let frt: Vec3A = fr.flip_rel_torque.into();
+                eprintln!(
+                    "FLIP tick {i} car {c} ft={:.4} |av|={:.3} aerr={ang_err:.3} pred_d=({:+.3},{:+.3},{:+.3}) real_d=({:+.3},{:+.3},{:+.3}) frt=({:+.2},{:+.2},{:+.2}) pitch={:+.2} jump={}",
+                    fr.flip_time,
+                    Vec3A::from(fr.phys.ang_vel).length(),
+                    pred_d.x, pred_d.y, pred_d.z,
+                    real_d.x, real_d.y, real_d.z,
+                    frt.x, frt.y, frt.z,
+                    fr.prev_controls.pitch,
+                    u8::from(fr.prev_controls.jump),
+                );
+            }
+
             let e = regimes.entry(regime).or_default();
             e[0].push(vel_err);
             e[1].push(pos_err);
             e[2].push(ang_err);
             worst.push((vel_err, i, c, regime));
         }
+    }
+
+    // ---- REAL impulse census: the game's own per-tick force trace ----
+    // lin impulses are velocity deltas in BT units (x50 -> uu/s); ang in rad/s.
+    let mut imp_lin: std::collections::BTreeMap<String, Stat> = Default::default();
+    let mut imp_ang: std::collections::BTreeMap<String, Stat> = Default::default();
+    for tick in &recording.ticks {
+        for cr in &tick.car_records {
+            for imp in cr.phys.impulse_records() {
+                let name = format!("{:?}", imp.impulse_type);
+                let lin: Vec3A = imp.lin_impulse.into();
+                let ang: Vec3A = imp.ang_impulse.into();
+                imp_lin.entry(name.clone()).or_default().push(lin.length() * 50.0);
+                imp_ang.entry(name).or_default().push(ang.length());
+            }
+        }
+    }
+    eprintln!("\n=== REAL per-tick impulse magnitudes (lin uu/s | ang rad/s) ===");
+    for (name, stat) in &mut imp_lin {
+        eprintln!("{name:14} lin {}", stat.summary());
+    }
+    for (name, stat) in &mut imp_ang {
+        eprintln!("{name:14} ang {}", stat.summary());
     }
 
     eprintln!("skipped {skipped_gaps} gap transitions");

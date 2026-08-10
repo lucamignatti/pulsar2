@@ -61,11 +61,26 @@ impl Recording {
         let num_ticks = reader.read_u32()?;
         let mut ticks = Vec::with_capacity(num_ticks as usize);
 
+        let car_size = size_of::<CarRecord>() as u32;
+        let ball_size = size_of::<PhysRecord>() as u32;
         for _ in 0..num_ticks {
+            // Demolished cars are OMITTED from ticks while they are gone (RLRecord2
+            // spec), so a tick holds 0..=num_cars CarRecords followed by exactly one
+            // ball PhysRecord. The size prefixes disambiguate (584 vs 332).
             let mut car_records = Vec::with_capacity(num_cars);
-            for _ in 0..num_cars {
-                let car_record = unsafe { reader.read_struct_unsafe::<CarRecord>() }?;
-                car_records.push(car_record);
+            loop {
+                let next_size = reader.peek_u32()?;
+                if next_size == car_size && car_records.len() < num_cars {
+                    let car_record = unsafe { reader.read_struct_unsafe::<CarRecord>() }?;
+                    car_records.push(car_record);
+                } else if next_size == ball_size {
+                    break;
+                } else {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Unexpected struct size prefix {next_size} in tick stream"),
+                    ));
+                }
             }
             let ball_record = unsafe { reader.read_struct_unsafe::<PhysRecord>() }?;
             ticks.push(TickRecord {
