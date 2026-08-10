@@ -435,6 +435,10 @@ pub mod bullet_vehicle {
     pub const WHEELS_DAMPING_RELAXATION: f32 = 40.0;
     pub const MAX_SUSPENSION_TRAVEL: f32 = 12.0;
     pub const SUSPENSION_SUBTRACTION: f32 = 0.05;
+    /// Per-tick cap on the wheel hard-contact resolve (BT velocity units, before the
+    /// per-wheel division) -- see the S39 comment at its use site in wheel_info.rs.
+    /// ~41 uu/s of chassis dv per wheel per tick at Octane mass.
+    pub const PUSHBACK_MAX_IMPULSE: f32 = 48.0;
     /// Extra ADHESION probe reach (uu) beyond the suspension's working range.
     ///
     /// A wheel that finds a surface out here sets `adhesion_contact` and feeds ONLY the

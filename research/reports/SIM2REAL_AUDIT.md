@@ -2260,3 +2260,42 @@ Honest ground statement: horizontal dynamics median ≲0.5 uu/s per tick; vertic
 unmeasurable below ~3 uu/s from this instrument. The REAL remaining ground-family gap is
 the heavy landing/graze tail (throttle-mode mean 67 vs median 3 — suspension impact
 response, same family as §34.4/§37.5), which is where wavedash fidelity lives.
+
+## §39 — The landing family closed: capped hard-contact resolve (2026-08-10)
+
+Chasing the last real ground gap (the heavy landing/graze tail) through the 120 Hz
+capture produced one artifact discovery and one shipped fix.
+
+### 39.1 Artifact: kickoff countdowns
+
+The "9.4% of ground ticks phantom-jump" signal was the replay applying recorded inputs
+during KICKOFF COUNTDOWNS, where RL runs physics but ignores all car inputs (~19 goals x
+~3 s = ~5,000 ticks; the 1ts bot spams jump edges throughout). The analyzer now skips
+ticks where the ball sits frozen at the kickoff spot with no car yet driving. Ground p90
+55.7 -> 11.6, p99 295.9 -> 40.6 from the filter alone. (A real edge-triggered-jump rule
+was hypothesised and A/B-disproved: activation was already edge-derived.)
+
+### 39.2 FIX: `bullet_vehicle::PUSHBACK_MAX_IMPULSE = 48`
+
+The deep-compression over-push survived all filters: signed error +14 -> +62 uu/s,
+monotone from -6 to -18 uu recorded compression, 94% sim-over. Threshold experiments
+(engage the resolve later / disable it) zeroed the landings but broke fillet transits --
+the two venues disagree about the same compression band because the resolve KILLS the
+full normal approach velocity in one tick: correct at fillet-transit approach speeds,
+brutal at landing speeds where the real game absorbs through the spring. Capping the
+per-tick resolve reconciles them. Swept 0.5..96; 48 (~41 uu/s per wheel per tick):
+
+- capture: deep-compression signed bias +15.4 -> +0.5 uu/s
+- battery FIT 1126.0 -> **1035.2**, HOLDOUT 1151.5 -> **1064.7** (largest single-change
+  win of the program; jump_after_wall_launch 153.9 -> 21.2, no_jump_control 15.0 -> 8.4,
+  tilt_nose_down 62.5 -> 51.0, transition_flip_off 181.5 -> 180-ish unchanged)
+- honest cost: the tilt_* teleport-settling family +40 total (state-set penetration
+  recovery, not a real-play situation; the capture's real landings are the honest oracle
+  and they say the cap is right)
+
+### 39.3 Scorecard after S34-S39 (single-tick velocity within 1% of v_max)
+
+ground 99.1% | air_free 99.3% | flip_air 97.2% | ball_contact 98.0% | flip+wheels 95.3%
+| air+wheels 95.1% | wall_drive 94.7% -- weighted 98.3% of 94,062 clean transitions.
+Residual tails: contact-phase events (ball blasts, p99 spikes), the ~3 uu/s ground
+quantization floor (S38, tape-limited), and wall-drive's last few percent.

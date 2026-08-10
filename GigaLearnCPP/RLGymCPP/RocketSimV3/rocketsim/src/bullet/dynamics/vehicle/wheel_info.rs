@@ -193,7 +193,21 @@ impl WheelInfo {
                     wheel_trace_dist_delta,
                 );
 
-                self.extra_pushback = collision_result / NUM_WHEELS as f32;
+                // CAPPED (SIM2REAL_AUDIT.md S39). The hard resolve kills the FULL
+                // normal approach velocity in one tick. At fillet-transit speeds that
+                // is the support the real game also provides; at landing speeds the
+                // real game lets the suspension absorb the impact over several ticks
+                // (120 Hz capture: sim over-pushed +15..+62 uu/s per tick, monotone in
+                // compression depth, while the real response stayed spring-shaped).
+                // Capping the per-tick resolve at PUSHBACK_MAX_IMPULSE reconciles both
+                // instruments: deep-compression landing bias +15.4 -> +0.5 uu/s, and
+                // the maneuver battery total 1126.0 -> 1035.2 (jump_after_wall_launch
+                // 153.9 -> 21.2, no_jump_control 15.0 -> 8.4; honest cost: the
+                // teleport-settling tilt_* family +40 total, whose state-set penetration
+                // recovery is not a real-play situation).
+                self.extra_pushback = collision_result
+                    .min(bullet_vehicle::PUSHBACK_MAX_IMPULSE)
+                    / NUM_WHEELS as f32;
             }
         }
 

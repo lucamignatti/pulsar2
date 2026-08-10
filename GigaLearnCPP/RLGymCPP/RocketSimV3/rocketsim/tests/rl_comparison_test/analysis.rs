@@ -12,6 +12,15 @@
 use glam::Vec3A;
 use rocketsim::{Arena, CarBodyConfig, CarControls, GameMode, Team};
 
+trait XyLen {
+    fn xy_len_sq(&self) -> f32;
+}
+impl XyLen for Vec3A {
+    fn xy_len_sq(&self) -> f32 {
+        self.x * self.x + self.y * self.y
+    }
+}
+
 use super::recording::Recording;
 use super::set_state_to_record_tick;
 
@@ -100,6 +109,24 @@ fn analyze_rlpr() {
         if !clean {
             skipped_gaps += 1;
             continue;
+        }
+
+        // KICKOFF COUNTDOWN: after a goal reset RL runs physics but IGNORES all car
+        // inputs for ~3 s while the ball sits frozen at the kickoff spot. Replaying
+        // the recorded (spammed) inputs there manufactures phantom jumps/throttle.
+        // Skip while the ball is frozen at origin and neither car is driving yet.
+        {
+            let bp: Vec3A = from_tick.ball_record.pos.into();
+            let bv: Vec3A = from_tick.ball_record.lin_vel.into();
+            let ball_frozen = bp.x.abs() < 1.0 && bp.y.abs() < 1.0 && bv.length_squared() == 0.0;
+            let cars_staged = (0..num_cars).all(|c| {
+                let v: Vec3A = from_tick.car_records[c].phys.lin_vel.into();
+                v.xy_len_sq() < 50.0 * 50.0
+            });
+            if ball_frozen && cars_staged {
+                skipped_gaps += 1;
+                continue;
+            }
         }
 
         // CONTROL PAIRING (measured, 2026-08-10): BakkesMod records are END-of-frame
@@ -198,6 +225,33 @@ fn analyze_rlpr() {
                 );
             }
 
+            // GGL_DUMP_LAND: landing/impact transitions -- any tick where a wheel is
+            // (or becomes) loaded while the car carries downward velocity, with the
+            // real vs predicted vertical response.
+            if std::env::var("GGL_DUMP_LAND").is_ok() {
+                let from_vz = Vec3A::from(fr.phys.lin_vel).z;
+                let to_wheels = real.wheels.iter().filter(|w| w.has_contact).count();
+                if from_vz < -50.0 && (wheels_touching > 0 || to_wheels > 0) {
+                    let pred_dvz = pred.phys.vel.z - from_vz;
+                    let real_dvz = real_vel.z - from_vz;
+                    let min_susp = fr
+                        .wheels
+                        .iter()
+                        .filter(|w| w.has_contact)
+                        .map(|w| w.susp_length)
+                        .fold(f32::INFINITY, f32::min);
+                    eprintln!(
+                        "LAND {i} c{c} vz={from_vz:8.1} wh={wheels_touching}->{to_wheels} susp={min_susp:7.3} pred_dvz={pred_dvz:8.2} real_dvz={real_dvz:8.2} err={:8.2} flip={} upz={:.2}",
+                        pred_dvz - real_dvz,
+                        u8::from(fr.is_flipping),
+                        Vec3A::from(fr.phys.rot.rows[2]).x.mul_add(0.0, {
+                            let r = &fr.phys.rot;
+                            r.rows[2].z
+                        }),
+                    );
+                }
+            }
+
             // GGL_GROUND_DECOMP: signed error components for grounded ticks.
             if std::env::var("GGL_GROUND_DECOMP").is_ok() && regime == "ground" {
                 let dv = pred.phys.vel - real_vel;
@@ -216,7 +270,7 @@ fn analyze_rlpr() {
                     else if c.throttle > 0.5 { if c.steer.abs() > 0.5 { "throttle+steer" } else { "throttle" } }
                     else if c.throttle < -0.5 { "reverse" }
                     else { "coast" };
-                eprintln!("GDECOMP {mode} {:.4} {:.4} {:.4}", dv.dot(up), dv.dot(fwd), dv.dot(lat));
+                eprintln!("GDECOMP {mode} {:.4} {:.4} {:.4} {i}", dv.dot(up), dv.dot(fwd), dv.dot(lat));
             }
 
             let e = regimes.entry(regime).or_default();
