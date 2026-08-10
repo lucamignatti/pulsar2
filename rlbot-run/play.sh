@@ -37,10 +37,26 @@ TEAM_SIZE=1
 REPLAY=0
 MODE=""
 SYNC=1
+# Which checkpoint to stage. "latest" (default) = newest numbered rotation checkpoint =
+# the policy AS IT IS RIGHT NOW. "golden" = highest-rated best_r* entry.
+#
+# The default is deliberately LATEST, and it is the honest one for measurement. Golden
+# entries are selected by Rating/1v1, which this project has established is inflated ~6x
+# and is a treadmill (PolicyVersionManager::AddVersion copies the main's CURRENT rating
+# into each new version, so the pool tracks the agent). Defaulting to golden would mean
+# every real-match number silently reported a moment when the measuring stick happened to
+# be favourable, biasing eval upward against a Nexto that is always playing its normal
+# self. Use golden when you want to PLAY the best bot you have; use latest when you want
+# to KNOW how strong it currently is.
+# (Golden is also not safer against corruption: on 6.2, best_r2068_10525158912 existed as
+# both a golden entry and a corrupt_ one, having been archived inside a bad save window.)
+CKPT_PICK="latest"
 for a in "$@"; do
 	case "$a" in
 		1|2|3)                 TEAM_SIZE="$a" ;;
 		eval|replay|--eval|--replay) REPLAY=1 ;;
+		golden|--golden)       CKPT_PICK="golden" ;;
+		latest|--latest)       CKPT_PICK="latest" ;;
 		# Gap-verification modes. Written to HANDICAPS marker files (and exported), because
 		# env prefixes on this chain (play.sh -> RLBotServer -> launch manager -> bot) are
 		# unverifiable and silently failed to propagate on 2026-07-31 - the debug log
@@ -51,7 +67,10 @@ for a in "$@"; do
 		#              sampling) - the full sim-reproduction.
 		#   sample: ONE lever - Pulsar samples from the policy like every sim evaluation
 		#           does, instead of the client's argmax default. Nexto untouched.
-		bugnexto|simparity|sample) MODE="$a" ;;
+		# Gap-verification runs ALWAYS save a replay: they exist to produce evidence,
+		# and a replay is the only record that survives the session (remember: the
+		# match is unlimited-length, so the replay is written when you Ctrl-C).
+		bugnexto|simparity|sample) MODE="$a"; REPLAY=1 ;;
 		# Keep the bot on whatever checkpoint is already staged (see sync_checkpoint).
 		nosync|--nosync)       SYNC=0 ;;
 		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'nosync', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
@@ -108,6 +127,29 @@ trainer_active() {
 	done
 	return 1
 }
+# RLBot's FlatBuffers port. If anything already holds it, RLBotServer logs ONE line into
+# core_play.log ("Port 23234 is already in use") and exits - and because the game had
+# already connected by then, what you SEE is a successful launch followed by a generic
+# "RLBotServer exited. Tearing down.", with no hint of the cause. That cost a full
+# launch-the-game cycle on 2026-08-09 before the log was read.
+#
+# The usual culprit is NOT a stale RLBotServer (line ~305 pkills those): it is the VIZ
+# RENDER SERVICE. build-viz is compiled with GGL_VIZ_RLBOT=ON so the viewer can hand its
+# other team to a real RLBot bot, which means it binds this port for as long as it runs.
+# A leftover bot.py from a previous session - including one in the SIBLING checkout, which
+# play.sh also scans - does the same.
+RLBOT_PORT=23234
+PORT_HOLDER=""
+port_held() {
+	PORT_HOLDER=""
+	command -v ss >/dev/null 2>&1 || return 1
+	local out
+	out=$(ss -lptn "sport = :$RLBOT_PORT" 2>/dev/null | tail -n +2) || return 1
+	[ -n "$out" ] || return 1
+	PORT_HOLDER=$(echo "$out" | sed 's/.*users:(//; s/)$//')
+	return 0
+}
+
 # --- live checkpoint sync -----------------------------------------------------
 # pulsar-bot/checkpoint is a STATIC COPY. The viz hot-swaps to the newest save; this
 # does not, so without a sync every real-game eval silently benchmarks an old bot -
@@ -123,14 +165,21 @@ trainer_active() {
 # 5.x lineages are ts8 (15 Hz); 6.0 is ts1 (120 Hz). Derive it from the lineage folder and
 # stage it NEXT TO the checkpoint so the copy carries its own decision rate.
 tick_skip_for_root() {
+	# ORDER MATTERS: 7.0b is ts8 but would be caught by the 7.* rule below it.
+	# The version number does NOT imply the rate -- 7.0/7.1/7.2 were ts1 and 7.0b went
+	# back to ts8 as the validation seat for the composite critic, so this has to be an
+	# explicit table, not a prefix guess. Getting it wrong is SILENT: the bot just decides
+	# at the wrong rate and plays badly with no error anywhere.
 	case "$1" in
-		*checkpoints_6.*) echo 1 ;;   # every 6.x lineage (6.0, 6.1, 6.1b) is ts1
-		*)                echo 8 ;;
+		*checkpoints_7.0b*) echo 8 ;;   # composite critic, ts8 validation seat
+		*checkpoints_7.*)   echo 1 ;;   # 7.0 / 7.1 / 7.2 were all ts1
+		*checkpoints_6.*)   echo 1 ;;   # 6.0 / 6.1 / 6.1b / 6.2 all ts1
+		*)                  echo 8 ;;   # 5.x and earlier
 	esac
 }
 
 sync_checkpoint() {
-	local root="${GGL_CKPT_ROOT:-../build/checkpoints_6.1b}"
+	local root="${GGL_CKPT_ROOT:-../build/checkpoints_7.0b}"
 	local dest="pulsar-bot/checkpoint"
 
 	if [ ! -d "$root" ]; then
@@ -158,16 +207,38 @@ sync_checkpoint() {
 	# can delete it mid-copy, which is why we walk several candidates newest-first
 	# instead of trusting the first one.
 	local cands
-	cands=$(ls "$root" 2>/dev/null | grep -E '^[0-9]+$' | sort -rn | head -5)
-	if [ -z "$cands" ]; then
-		log "SYNC FAILED: no numbered checkpoints in $root"
-		return 1
+	if [ "$CKPT_PICK" = "golden" ]; then
+		# Golden entries are best_r<rating>_<ts>; rank by RATING (field 2 on '_'), not by
+		# timestep, since that is what "best" means here. Map back to the plain <ts> name
+		# used below by resolving through a parallel lookup: the loop stages from
+		# "$root/$ts", so hand it the directory names directly instead.
+		cands=$(ls "$root" 2>/dev/null | grep -E '^best_r[0-9]+_[0-9]+$' \
+			| sort -t_ -k2.2 -rn | head -5)
+		if [ -z "$cands" ]; then
+			log "SYNC FAILED: 'golden' requested but no best_r* entries in $root"
+			log "SYNC: golden entries only appear once the skill tracker has rated a save."
+			return 1
+		fi
+		log "SYNC: picking GOLDEN (best-rated). NOTE Rating/1v1 is the inflated pool metric —"
+		log "SYNC: this is 'the best bot I have', NOT 'how strong it is now'. Use the default"
+		log "SYNC: (latest) for measurement."
+	else
+		cands=$(ls "$root" 2>/dev/null | grep -E '^[0-9]+$' | sort -rn | head -5)
+		if [ -z "$cands" ]; then
+			log "SYNC FAILED: no numbered checkpoints in $root"
+			return 1
+		fi
 	fi
 
 	local ts
 	for ts in $cands; do
-		if [ "$ts" = "$have" ]; then
-			log "SYNC: already current at $ts steps ($(echo "scale=2; $ts/1000000000" | bc 2>/dev/null || echo "?")B)"
+		# $ts is the DIRECTORY NAME, which for a golden pick is best_r<rating>_<steps>,
+		# not a bare step count. Everything user-facing (STEPS.txt, the already-current
+		# check, the log lines) must use the step number, or the staged copy claims to be
+		# at step "best_r1700_13400211456" and the next run re-syncs forever.
+		local steps="${ts##*_}"
+		if [ "$steps" = "$have" ]; then
+			log "SYNC: already current at $steps steps ($(echo "scale=2; $steps/1000000000" | bc 2>/dev/null || echo "?")B)"
 			return 0
 		fi
 		local src="$root/$ts"
@@ -181,14 +252,14 @@ sync_checkpoint() {
 			&& cp "$src/SHARED_HEAD.lt" "$stage/" 2>/dev/null \
 			&& [ -s "$stage/POLICY.lt" ] && [ -s "$stage/SHARED_HEAD.lt" ]; then
 			cp "$src/RUNNING_STATS.json" "$stage/" 2>/dev/null || true
-			echo "$ts" > "$stage/STEPS.txt"
+			echo "$steps" > "$stage/STEPS.txt"
 			mkdir -p "$dest"
 			# Clear stale .lt first: the destination accumulated a full checkpoint's
 			# worth of files (critics, optims) from an old copy, and leaving 6.5B
 			# criticsnext to a 9.7B policy makes the dir lie about what it holds.
 			rm -f "$dest"/*.lt "$dest"/RUNNING_STATS.json 2>/dev/null
 			mv "$stage"/* "$dest"/ && rmdir "$stage"
-			log "SYNC: ${have:-<none>} -> $ts steps ($(echo "scale=2; $ts/1000000000" | bc 2>/dev/null || echo "?")B)"
+			log "SYNC: ${have:-<none>} -> $steps steps ($(echo "scale=2; $steps/1000000000" | bc 2>/dev/null || echo "?")B)${CKPT_PICK:+ [$CKPT_PICK: $ts]}"
 			log "SYNC: if the bot aborts with a size mismatch, RLBotMain.cpp's hardcoded"
 			log "SYNC: net config no longer matches the trainer's (the standing hazard)."
 			return 0
@@ -296,6 +367,30 @@ if trainer_active && [ "${ALLOW_TRAINER:-0}" != "1" ]; then
 	log "#"
 	log "#    tools/trainerctl stop      # then re-run this; restart when done"
 	log "#    ALLOW_TRAINER=1 ./play.sh ...   # override (result is NOT a measurement)"
+	log "############################################################"
+	exit 1
+fi
+if port_held; then
+	log "############################################################"
+	log "#  RLBot port $RLBOT_PORT IS ALREADY HELD"
+	log "#  $PORT_HOLDER"
+	log "#"
+	log "#  RLBotServer would bind-fail and exit, and because the game connects"
+	log "#  first you would see a normal launch followed by a bare teardown."
+	log "#  Refusing to start so the cause is visible here instead of buried in"
+	log "#  core_play.log."
+	log "#"
+	case "$PORT_HOLDER" in
+		*GigaLearnBot*)
+			log "#  That is the VIZ RENDER SERVICE (build-viz is built with"
+			log "#  GGL_VIZ_RLBOT=ON, so it binds this port while it runs):"
+			log "#    systemctl --user stop pulsar-viz-render.service" ;;
+		*bot.py*|*python*)
+			log "#  That is a leftover bot.py from a previous session (check BOTH"
+			log "#  checkouts - play.sh scans the sibling one too). Kill it by PID." ;;
+		*)
+			log "#  Identify and stop it:  ss -lptn 'sport = :$RLBOT_PORT'" ;;
+	esac
 	log "############################################################"
 	exit 1
 fi
