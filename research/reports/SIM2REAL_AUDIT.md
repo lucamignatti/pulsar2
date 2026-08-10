@@ -2172,8 +2172,9 @@ the bump curves take FULL attacker speed (not the toward-contact projection) and
 airborne victim gets no up-push.
 
 **Still NOT ported:** `AddedCarForceMultiplier` for opposite-team hits and demolish
-spawn invulnerability (constants still unknown), `BumpInterval`'s exact value (kept
-0.25).
+spawn invulnerability (constants still unknown). `BumpInterval` = 0.25 CONFIRMED
+(user-relayed from the community CDO work, 2026-08-10) -- the shipped
+`bump::COOLDOWN_TIME` was already 0.25, now with provenance.
 
 **Validation:** five scenario tests (`rocketsim/tests/demo_bump.rs`): supersonic head-on
 demos; sideways supersonic slide does NOT demo; reversing supersonic rear hit DOES demo;

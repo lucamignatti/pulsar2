@@ -250,6 +250,8 @@ pub mod car {
     }
 
     pub mod bump {
+        /// RL's CarInteractionSettings.BumpInterval -- confirmed 0.25 (user-relayed
+        /// from the community CDO work, 2026-08-10). Applied PER VICTIM (S36).
         pub const COOLDOWN_TIME: f32 = 0.25;
         pub const MIN_FORWARD_DIST: f32 = 64.5;
 
