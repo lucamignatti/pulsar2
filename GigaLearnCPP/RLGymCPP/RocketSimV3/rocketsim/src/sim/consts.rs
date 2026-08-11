@@ -197,14 +197,13 @@ pub mod car {
 
     pub mod flip {
         /// Holding pitch INTO the flip cancels its torque -- but only once the flip is
-        /// this old. Measured from a 120 Hz real-game capture (SIM2REAL_AUDIT.md S37):
-        /// with pitch held into the flip, torque along the flip axis is FULL through
-        /// flip_time 0.0333 (mean 1.53 rad/s per tick, n=19) and ZERO from 0.0417
-        /// (mean 0.07, n=9; every later bucket ~0), so the gate lies in
-        /// (0.0333, 0.0417] as read PRE-increment (update_air_torque runs before the
-        /// flip_time += dt in update_double_jump_or_flip). This is the "pitch-cancel
-        /// time gate" seen at +0x350 in the decompiled Dodge_TA::ApplyTorqueForces.
-        pub const PITCH_CANCEL_MIN_TIME: f32 = 0.04;
+        /// this old. First measured from the 120 Hz capture (S37: full torque through
+        /// flip_time 0.0333, zero from 0.0417, gate in (0.0333, 0.0417]); then
+        /// CONFIRMED EXACTLY by the decompiled ACarComponent_Dodge_TA (S41):
+        /// `MinDodgeTorqueTime = 0.0410`, with ApplyTorqueForces applying the full
+        /// DodgeTorque.Y before it and the continuous 1-|input| modulation after --
+        /// the same structure this sim implements.
+        pub const PITCH_CANCEL_MIN_TIME: f32 = 0.041;
 
         pub const Z_DAMP_120: f32 = 0.35;
         pub const Z_DAMP_START: f32 = 0.15;

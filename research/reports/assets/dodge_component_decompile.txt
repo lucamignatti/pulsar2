@@ -1,0 +1,28 @@
+ACarComponent_Dodge_TA field dump + ApplyTorqueForces (FUN_140e65800) decompile,
+user-relayed from the community Ghidra work, 2026-08-10 (SIM2REAL_AUDIT.md S41).
+
+Field values (all confirmed against RocketSim constants; /180 where mass-normalized):
+  DodgeInputThreshold            0.5      (= dodge_deadzone)
+  SideDodgeImpulse               90000    (/180 = 500 = INITIAL_VEL_SCALE)
+  SideDodgeImpulseMaxSpeedScale  1.9
+  ForwardDodgeImpulse            90000
+  ForwardDodgeImpulseMaxSpeedScale 1.0
+  BackwardDodgeImpulse           96000    (96000/90000 = 16/15 = BACKWARD_IMPULSE_SCALE_X)
+  BackwardDodgeImpulseMaxSpeedScale 2.5
+  SideDodgeTorque                260      (= TORQUE_X)
+  ForwardDodgeTorque             224      (= TORQUE_Y)
+  DodgeTorqueTime                0.65
+  MinDodgeTorqueTime             0.041    (= PITCH_CANCEL_MIN_TIME -- S37 measured
+                                           (0.0333,0.0417], shipped 0.04, now exact)
+  DodgeZDamping                  0.35     (= Z_DAMP_120)
+  DodgeZDampingDelay             0.15     (= Z_DAMP_START)
+  DodgeZDampingUpTime            0.06     (delay+up = 0.21 = Z_DAMP_END)
+  DodgeImpulseScale 1.0, DodgeTorqueScale 1.0, MaxDodgeStreak 1
+
+ApplyTorqueForces structure (matches the sim's update_air_torque flip branch):
+  - before MinDodgeTorqueTime: full DodgeTorque.Y
+  - after: Y scaled by a continuous 1-|DodgeForward| factor, sign-matched
+    (+Y torque reduced by negative DodgeForward, -Y by positive)
+  - torque applied via mode-5 angular impulse, scaled by 1/Mesh.Scale
+  - Z damping: force = -vz * DodgeZDamping, active when ActiveTime >= Delay and
+    (vz < 0 or ActiveTime < Delay + UpTime)

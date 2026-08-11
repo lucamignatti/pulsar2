@@ -2329,3 +2329,24 @@ transitions as demo probes and reports every sim demo event, so any future
 bump/demo-heavy capture (the plugin records spectated matches) scales this oracle.
 
 Battery bit-identical (single car); all six contact scenario tests pass.
+
+
+## §41 — Dodge component decompiled: every constant confirmed, gate exact (2026-08-10)
+
+The full `ACarComponent_Dodge_TA` field dump + `ApplyTorqueForces` decompile arrived
+(archived at `assets/dodge_component_decompile.txt`). Every dodge constant RocketSim
+carries is confirmed at source: impulses (90000/96000 over mass 180 = 500 and the 16/15
+backward scale), max-speed scales (1.9/1.0/2.5), torques (260/224), TORQUE_TIME 0.65,
+the Z-damp triplet (0.35 / 0.15 / 0.15+0.06), and the 0.5 input deadzone.
+
+The one correction: **`MinDodgeTorqueTime = 0.0410`** — S37 measured the pitch-cancel
+gate into (0.0333, 0.0417] and shipped 0.04; now set to the exact 0.041. The decompile
+also confirms the structure S37 inferred behaviourally: full torque before the gate, a
+continuous 1−|input| modulation after, sign-matched to the torque direction.
+
+Supersonic note: the vendored grace logic already implements the correct semantics
+(timer accumulates only inside the 2100–2200 band and resets on re-exceeding 2200) —
+the "counts from first supersonic start" flaw is upstream's, not ours.
+
+Both instruments re-validated: capture regime stats unchanged (the 1 ms gate shift is
+below measurement resolution), battery bit-identical.
