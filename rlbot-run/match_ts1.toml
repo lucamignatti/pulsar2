@@ -1,0 +1,24 @@
+#:schema https://rlbot.org/schemas/match.json
+# Headless ts1 smoke test: Pulsar2 self-play on RLBotSim.
+# game_map_upk IS REQUIRED: match.toml omits it (parses to map=''), and without a map
+# the match never loads, so ZERO cars spawn and auto_start_agents never launches the
+# agents -- which looks exactly like "the bot is broken" but is a config gap.
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+existing_match_behavior = "Restart"
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 0
+
+[[cars]]
+config_file = "pulsar-bot/bot.toml"
+team = 1
