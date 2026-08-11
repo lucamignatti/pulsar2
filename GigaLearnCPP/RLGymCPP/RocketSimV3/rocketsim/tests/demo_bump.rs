@@ -232,3 +232,76 @@ fn quantized_rest_height_response() {
         eprintln!("restore z={z:.4} ({label}) -> one-tick vz = {vz:+.3}");
     }
 }
+
+#[test]
+fn supersonic_grace_counts_from_band_entry_not_first_start() {
+    // RL semantics (CDO: TurnoffSpeedBuffer=100, TurnoffTime=1): the 1s grace applies
+    // whenever speed sits in [2100, 2200), timed from ENTERING the band -- not from
+    // when supersonic first started. Upstream C++ v2 accumulates supersonicTime while
+    // above 2200 too, so a car supersonic for >1s loses its grace band entirely; this
+    // test fails under those semantics.
+    let (mut arena, a, _v) = setup();
+    let mut set_speed = |arena: &mut Arena, v: f32| {
+        let mut cs = *arena.get_car_state(a);
+        cs.phys.pos = Vec3A::new(0.0, 0.0, 17.0);
+        cs.phys.rot_mat = Mat3A::IDENTITY;
+        cs.phys.vel = Vec3A::new(v, 0.0, 0.0);
+        cs.phys.ang_vel = Vec3A::ZERO;
+        cs.is_on_ground = true;
+        arena.set_car_state(a, cs);
+    };
+
+    // 2 seconds continuously above start speed (240 ticks).
+    for _ in 0..240 {
+        set_speed(&mut arena, 2250.0);
+        arena.step_tick();
+    }
+    assert!(arena.get_car_state(a).is_supersonic, "supersonic while at 2250");
+
+    // Drop into the maintain band: must KEEP supersonic for ~1s from band entry.
+    for _ in 0..100 {
+        set_speed(&mut arena, 2150.0);
+        arena.step_tick();
+    }
+    assert!(
+        arena.get_car_state(a).is_supersonic,
+        "grace must time from band entry (v2-flaw semantics would have dropped it)"
+    );
+
+    // Briefly back above 2200 resets the grace...
+    for _ in 0..5 {
+        set_speed(&mut arena, 2250.0);
+        arena.step_tick();
+    }
+    // ...so another ~0.9s in the band still holds.
+    for _ in 0..110 {
+        set_speed(&mut arena, 2150.0);
+        arena.step_tick();
+    }
+    assert!(
+        arena.get_car_state(a).is_supersonic,
+        "grace must RESET on re-exceeding start speed"
+    );
+
+    // Staying in the band past 1s total loses it.
+    for _ in 0..15 {
+        set_speed(&mut arena, 2150.0);
+        arena.step_tick();
+    }
+    assert!(
+        !arena.get_car_state(a).is_supersonic,
+        "grace must expire after 1s continuously in the band"
+    );
+
+    // And below the maintain floor it drops instantly.
+    for _ in 0..240 {
+        set_speed(&mut arena, 2250.0);
+        arena.step_tick();
+    }
+    set_speed(&mut arena, 2050.0);
+    arena.step_tick();
+    assert!(
+        !arena.get_car_state(a).is_supersonic,
+        "below 2100 supersonic must drop immediately"
+    );
+}
