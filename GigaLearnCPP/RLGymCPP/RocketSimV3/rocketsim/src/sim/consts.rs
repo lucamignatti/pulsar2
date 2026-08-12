@@ -609,6 +609,15 @@ pub mod boost_pads {
     pub const BOX_HEIGHT: f32 = 64.0;
     pub const BOX_RAD_BIG: f32 = 160.0;
     pub const BOX_RAD_SMALL: f32 = 120.0;
+    /// Ticks between a car first OVERLAPPING a pad and the boost actually being
+    /// granted. Measured from the 120 Hz capture (SIM2REAL_AUDIT.md S42): the sim's
+    /// immediate grant fired at the exact geometric first-contact distance (p50 192 uu
+    /// for small pads = max OBB reach) while the real game's boost_amount jumps ~2
+    /// ticks later (p50 175 uu, ~16 uu further along the path) -- the same 2-frame
+    /// UE3 event pipeline measured for inputs (S37) and pad pickups route through
+    /// touch events too. Also explains the S14 replay observation of real pickups at
+    /// origin distances past geometric reach.
+    pub const GRANT_DELAY_TICKS: u64 = 2;
     pub const COOLDOWN_BIG: f32 = 10.0;
     pub const COOLDOWN_SMALL: f32 = 4.0;
     pub const BOOST_AMOUNT_BIG: f32 = 100.0;

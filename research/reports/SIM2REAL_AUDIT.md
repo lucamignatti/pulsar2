@@ -2350,3 +2350,30 @@ the "counts from first supersonic start" flaw is upstream's, not ours.
 
 Both instruments re-validated: capture regime stats unchanged (the 1 ms gate shift is
 below measurement resolution), battery bit-identical.
+
+## §42 — Boost pad grants are touch-events: 2-tick delay (2026-08-11)
+
+User report: "it keeps missing the boost." The capture's boost_amount stream (a 0..1
+FRACTION — the analyzer's restore was feeding the sim 1% boost until this was caught)
+gives a pickup oracle: ~150 real pickups vs the replay's decisions.
+
+Finding: the sim granted at the exact instant of first OBB-cylinder overlap (trigger
+distance p50 192 uu for small pads = the geometric maximum reach), while the real game's
+boost jumps ~2 ticks later (p50 175 uu, ~16 uu further along the path). Same 2-frame
+UE3 event pipeline as inputs (S37): pickups route through touch events
+(AVehiclePickup_TA + the Touching array, S14), and the event lands two frames after
+overlap. This also retro-explains S14's replay observation of real pickups at origin
+distances past geometric reach (the car keeps moving between touch and grant).
+
+Shipped: `boost_pads::GRANT_DELAY_TICKS = 2` — an overlap CLAIMS the pad
+(first-toucher wins, no re-trigger while pending), and the boost, cooldown start, and
+CarPickupBoost event land 2 ticks later; external pad state sets clear pending claims;
+demoed cars forfeit in-flight grants. Delay swept: 0 → 14 exact-tick matches of ~150,
+1 → 43, **2 → 55 with the residual balanced at ±1 tick** (in-frame touch phase the
+end-of-tick replay cannot resolve, plus cooldown-cascade desync over the 7.5-min
+replay). Battery identical (1035.2), all contact scenario tests pass.
+
+Note the direction of the user-visible symptom: the old instant grant made the SIM
+slightly generous (collects at max reach, 2 ticks early), so policies tuned in sim
+clip pads on lines that the real game does not reward — "missing boost" in the real
+game. The sim is now calibrated to the real grant timing.

@@ -11,6 +11,9 @@ pub(crate) struct BoostPad {
     pub boost_amount: f32,
     pub aabb: Aabb,
     pub gave_boost_tick_count: Option<i64>,
+    /// A car has touched this pad; the grant lands GRANT_DELAY_TICKS after the touch
+    /// (SIM2REAL_AUDIT.md S42). (grant_due_tick, car_idx). First toucher wins.
+    pub pending_grant: Option<(u64, usize)>,
 }
 
 impl BoostPad {
@@ -59,11 +62,13 @@ impl BoostPad {
             boost_amount,
             aabb,
             gave_boost_tick_count: None,
+            pending_grant: None,
         }
     }
 
     pub const fn reset(&mut self) {
         self.gave_boost_tick_count = None;
+        self.pending_grant = None;
     }
 
     pub const fn config(&self) -> &BoostPadConfig {

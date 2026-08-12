@@ -178,10 +178,11 @@ fn analyze_rlpr() {
 
         set_state_to_record_tick(&mut arena, &car_idcs, from_tick, &controls);
         // Boost amount gates whether a boost input actually fires; the shared
-        // state-setter does not carry it.
+        // state-setter does not carry it. The recording stores boost as a 0..1
+        // FRACTION (a big-pad pickup reads +1.0); the sim uses 0..100.
         for (c, &car_idx) in car_idcs.iter().enumerate() {
             let mut cs = *arena.get_car_state(car_idx);
-            cs.boost = from_tick.car_records[c].boost_amount;
+            cs.boost = from_tick.car_records[c].boost_amount * 100.0;
             arena.set_car_state(car_idx, cs);
         }
 
@@ -307,6 +308,25 @@ fn analyze_rlpr() {
                     else if c.throttle < -0.5 { "reverse" }
                     else { "coast" };
                 eprintln!("GDECOMP {mode} {:.4} {:.4} {:.4} {i}", dv.dot(up), dv.dot(fwd), dv.dot(lat));
+            }
+
+            // GGL_BOOST: pad-pickup comparison. A real pickup is a boost INCREASE
+            // between records; compare with whether the replay's arena granted one.
+            if std::env::var("GGL_BOOST").is_ok() {
+                let real_gain = (real.boost_amount - fr.boost_amount) * 100.0;
+                let pred_gain = pred.boost - fr.boost_amount * 100.0;
+                let real_pick = real_gain > 6.0;
+                let sim_pick = pred_gain > 6.0;
+                if real_pick || sim_pick {
+                    let pos: Vec3A = fr.phys.pos.into();
+                    eprintln!(
+                        "BOOSTPICK {i} c{c} real={} sim={} gain_r={real_gain:6.1} gain_s={pred_gain:6.1} pos=({:7.1},{:7.1},{:5.1}) grounded={}",
+                        u8::from(real_pick),
+                        u8::from(sim_pick),
+                        pos.x, pos.y, pos.z,
+                        u8::from(fr.is_on_ground),
+                    );
+                }
             }
 
             // GGL_CARCAR: velocity error on car-proximity ticks (bump/demo pipeline).

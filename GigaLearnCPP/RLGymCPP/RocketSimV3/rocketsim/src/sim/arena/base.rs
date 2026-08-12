@@ -572,19 +572,45 @@ impl Arena {
             car.finish_physics_tick(rb);
 
             if let Some(boost_pad_grid) = self.boost_pad_grid.as_mut() {
-                let collected_pad_op = boost_pad_grid.maybe_give_car_boost(
+                // Detection only: an overlap CLAIMS the pad; the grant (boost,
+                // cooldown, event) lands GRANT_DELAY_TICKS later, below. S42.
+                let car_idx = car.idx;
+                let hitbox_size = car.info.config.hitbox_size;
+                boost_pad_grid.maybe_give_car_boost(
                     &mut car.state,
                     &self.config.mutators,
                     self.tick_count,
-                    car.info.config.hitbox_size,
+                    hitbox_size,
+                    car_idx,
                 );
+            }
+        }
 
-                if let Some(collected_pad_idx) = collected_pad_op {
-                    self.events.push(CarPickupBoost(CarPickupBoostEvent {
-                        car_idx: car.idx,
-                        boost_pad_idx: collected_pad_idx,
-                    }));
+        // Apply pad grants whose touch-event delay has elapsed (S42).
+        if let Some(boost_pad_grid) = self.boost_pad_grid.as_mut() {
+            let mut due: Vec<(usize, usize, f32)> = Vec::new();
+            for (pad_idx, pad) in boost_pad_grid.all_pads.iter_mut().enumerate() {
+                if let Some((grant_tick, car_idx)) = pad.pending_grant
+                    && self.tick_count >= grant_tick
+                {
+                    pad.pending_grant = None;
+                    pad.gave_boost_tick_count = Some(self.tick_count as i64);
+                    due.push((pad_idx, car_idx, pad.boost_amount));
                 }
+            }
+            for (pad_idx, car_idx, amount) in due {
+                let Some(car) = self.cars.iter_mut().find(|c| c.idx == car_idx) else {
+                    continue;
+                };
+                if car.state.is_demoed {
+                    continue;
+                }
+                car.state.boost =
+                    (car.state.boost + amount).min(self.config.mutators.car_max_boost_amount);
+                self.events.push(CarPickupBoost(CarPickupBoostEvent {
+                    car_idx,
+                    boost_pad_idx: pad_idx,
+                }));
             }
         }
 
@@ -738,6 +764,8 @@ impl Arena {
         let boost_pad_grid = self.boost_pad_grid.as_mut().unwrap();
         let tick_count = self.tick_count;
         let pad = &mut boost_pad_grid.all_pads[idx];
+        // An external state set overrides any in-flight touch grant (S42).
+        pad.pending_grant = None;
         if state.cooldown > 0.0 {
             let time_since_pickup = (pad.max_cooldown - state.cooldown).max(0.0);
             let ticks_since_pickup = (time_since_pickup * TICK_RATE).round() as i64;

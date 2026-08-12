@@ -14,6 +14,8 @@ pub struct BoostPadProcessor<'a> {
     pad_idx: Option<usize>,
     /// VENDOR PATCH (pulsar 2026-08-01): full hitbox size of the car body.
     car_hitbox_size: Vec3A,
+    /// Arena index of the car being tested, recorded into `pending_grant`.
+    car_idx: usize,
 }
 
 impl bvh::ProcessNode for BoostPadProcessor<'_> {
@@ -24,6 +26,9 @@ impl bvh::ProcessNode for BoostPadProcessor<'_> {
 
         let pad = &mut self.all_pads[pad_idx];
 
+        if pad.pending_grant.is_some() {
+            return; // Already claimed by a touch awaiting its grant
+        }
         if let Some(last_give_tick_count) = pad.gave_boost_tick_count
             && ((self.tick_count as i64 - last_give_tick_count) as f32 * TICK_TIME)
                 < pad.max_cooldown
@@ -64,10 +69,11 @@ impl bvh::ProcessNode for BoostPadProcessor<'_> {
         let overlapping = dist_sq_2d < pad.box_radius.powi(2)
             && (closest.z - pad_pos.z).abs() <= boost_pads::CYL_HEIGHT;
         if overlapping {
-            // Give boost
-            self.car_state.boost = (self.car_state.boost + pad.boost_amount)
-                .min(self.mutator_config.car_max_boost_amount);
-            pad.gave_boost_tick_count = Some(self.tick_count as i64);
+            // Touch: the grant lands GRANT_DELAY_TICKS later (S42) -- Rocket League
+            // routes pickups through the UE3 touch-event pipeline, so the boost (and
+            // the cooldown) start ~2 ticks after first overlap, not at overlap.
+            pad.pending_grant =
+                Some((self.tick_count + boost_pads::GRANT_DELAY_TICKS, self.car_idx));
             self.pad_idx = Some(pad_idx);
         }
     }
@@ -144,6 +150,7 @@ impl BoostPadGrid {
         mutator_config: &MutatorConfig,
         tick_count: u64,
         car_hitbox_size: Vec3A,
+        car_idx: usize,
     ) -> Option<usize> {
         if car_state.boost >= mutator_config.car_max_boost_amount {
             return None; // Already full on boost
@@ -164,6 +171,7 @@ impl BoostPadGrid {
             tick_count,
             pad_idx: None,
             car_hitbox_size,
+            car_idx,
         };
         self.bvh_tree
             .report_aabb_overlapping_node(&mut pad_processor, &car_center_aabb);
