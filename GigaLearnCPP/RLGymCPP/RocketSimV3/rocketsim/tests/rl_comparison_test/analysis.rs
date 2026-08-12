@@ -10,7 +10,7 @@
 //! itself; sim-generated fixtures store them in record F+1's `prev_controls`.
 
 use glam::Vec3A;
-use rocketsim::{Arena, CarBodyConfig, CarControls, GameMode, Team};
+use rocketsim::{Arena, ArenaEvent, CarBodyConfig, CarControls, GameMode, Team};
 
 trait XyLen {
     fn xy_len_sq(&self) -> f32;
@@ -71,7 +71,17 @@ fn analyze_rlpr() {
         if bakkes_semantics { "BakkesMod" } else { "sim-fixture" }
     );
 
-    let mut arena = Arena::new(GameMode::Soccar);
+    let mut arena = {
+        let mut cfg = rocketsim::ArenaConfig::new(GameMode::Soccar);
+        // GGL_BALL_SCALE: experiment knob on the ball-hit extra impulse (S43).
+        if let Ok(v) = std::env::var("GGL_BALL_SCALE")
+            && let Ok(f) = v.parse::<f32>()
+        {
+            cfg.mutators.ball_hit_extra_force_scale = f;
+            eprintln!("GGL_BALL_SCALE applied: {f}");
+        }
+        Arena::new_with_config(cfg)
+    };
     let car_idcs: Vec<usize> = (0..num_cars)
         .map(|i| {
             let team = if i % 2 == 0 { Team::Blue } else { Team::Orange };
@@ -188,12 +198,50 @@ fn analyze_rlpr() {
 
         let step_events: Vec<rocketsim::ArenaEvent> = arena.step_tick().to_vec();
         for ev in &step_events {
-            if let rocketsim::ArenaEvent::CarHitCar(e) = ev
+            if let ArenaEvent::CarHitCar(e) = ev
                 && e.is_demo
             {
                 eprintln!(
                     "DEMOEVT tick {i} attacker={} victim={}",
                     e.bumper_car_idx, e.victim_car_idx
+                );
+            }
+        }
+
+        // GGL_BALL: ball one-tick prediction error, split by regime. The ball state
+        // was restored from from_tick, so this measures ball dynamics + contacts.
+        if std::env::var("GGL_BALL").is_ok() {
+            let bs = arena.get_ball_state();
+            let real_bp: Vec3A = to_tick.ball_record.pos.into();
+            let real_bv: Vec3A = to_tick.ball_record.lin_vel.into();
+            let real_bav: Vec3A = to_tick.ball_record.ang_vel.into();
+            let from_bp: Vec3A = from_tick.ball_record.pos.into();
+            let from_bv: Vec3A = from_tick.ball_record.lin_vel.into();
+            // Skip ball teleports (goal resets).
+            if (real_bp - from_bp).length() < 60.0 {
+                let verr = (bs.phys.vel - real_bv).length();
+                let averr = (bs.phys.ang_vel - real_bav).length();
+                let touching = (0..num_cars).any(|c| {
+                    from_tick.car_records[c].is_touching_ball
+                        || to_tick.car_records[c].is_touching_ball
+                });
+                let near_wall = real_bp.x.abs() > 3990.0
+                    || real_bp.y.abs() > 5010.0
+                    || real_bp.z > 1940.0
+                    || real_bp.z < 95.0;
+                let regime = if touching {
+                    "touch"
+                } else if near_wall {
+                    "world"
+                } else {
+                    "flight"
+                };
+                eprintln!(
+                    "BALLERR {i} {regime} verr={verr:8.2} averr={averr:6.3} |rv|={:7.1} |pv|={:7.1} z={:6.0} dv_real={:7.1}",
+                    real_bv.length(),
+                    bs.phys.vel.length(),
+                    real_bp.z,
+                    (real_bv - from_bv).length(),
                 );
             }
         }
@@ -367,6 +415,104 @@ fn analyze_rlpr() {
     }
     for (name, stat) in &mut imp_ang {
         eprintln!("{name:14} ang {}", stat.summary());
+    }
+
+    // GGL_BALL_EVENTS: phase-robust hit-power measurement. For each touch EVENT
+    // (rising edge of any is_touching_ball), restore the full state 2 ticks before,
+    // roll the sim through the event WITHOUT resyncing, and compare the outgoing ball
+    // velocity 4 ticks after the touch flag clears. Reports speed ratio + direction.
+    if std::env::var("GGL_BALL_EVENTS").is_ok() {
+        let touching_at = |i: usize| {
+            recording.ticks[i].car_records.len() == num_cars
+                && (0..num_cars).any(|c| recording.ticks[i].car_records[c].is_touching_ball)
+        };
+        let mut i = 3;
+        while i + 8 < recording.ticks.len() {
+            if !(touching_at(i) && !touching_at(i - 1)) {
+                i += 1;
+                continue;
+            }
+            // find event end (touch flag clears for both cars)
+            let mut end = i;
+            while end + 1 < recording.ticks.len() && touching_at(end + 1) && end - i < 60 {
+                end += 1;
+            }
+            let start = i - 2;
+            let fin = (end + 4).min(recording.ticks.len() - 1);
+            // roster/frames must be clean across the whole window
+            let mut ok = true;
+            for k in start..=fin {
+                if recording.ticks[k].car_records.len() != num_cars {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                // restore at `start`, then step to `fin` with lagged controls
+                let lag = 2usize;
+                let c0: Vec<CarControls> = (0..num_cars)
+                    .map(|c| recording.ticks[start.saturating_sub(lag) + 1]
+                        .car_records[c].prev_controls.into())
+                    .collect();
+                set_state_to_record_tick(&mut arena, &car_idcs, &recording.ticks[start], &c0);
+                for (c, &car_idx) in car_idcs.iter().enumerate() {
+                    let mut cs = *arena.get_car_state(car_idx);
+                    cs.boost = recording.ticks[start].car_records[c].boost_amount * 100.0;
+                    arena.set_car_state(car_idx, cs);
+                }
+                let mut extra_sum = Vec3A::ZERO;
+                for k in start..fin {
+                    let ci = (k + 1).saturating_sub(lag);
+                    if recording.ticks[ci].car_records.len() == num_cars {
+                        for (c, &car_idx) in car_idcs.iter().enumerate() {
+                            let mut cs = *arena.get_car_state(car_idx);
+                            cs.controls =
+                                recording.ticks[ci].car_records[c].prev_controls.into();
+                            arena.set_car_state(car_idx, cs);
+                        }
+                    }
+                    for ev in arena.step_tick().to_vec() {
+                        if let ArenaEvent::CarHitBall(e) = ev {
+                            extra_sum += e.extra_hit_vel;
+                        }
+                    }
+                }
+                let sim_v = arena.get_ball_state().phys.vel;
+                let real_v: Vec3A = recording.ticks[fin].ball_record.lin_vel.into();
+                let pre_v: Vec3A = recording.ticks[start].ball_record.lin_vel.into();
+                let real_dv = (real_v - pre_v).length();
+                if real_dv > 150.0 && real_v.length() > 100.0 {
+                    let ratio = sim_v.length() / real_v.length();
+                    let dir = sim_v
+                        .normalize_or_zero()
+                        .dot(real_v.normalize_or_zero())
+                        .clamp(-1.0, 1.0)
+                        .acos()
+                        .to_degrees();
+                    let bz = recording.ticks[i].ball_record.pos.z;
+                    // relative car-ball speed just before contact (max over cars)
+                    let bv0: Vec3A = recording.ticks[i - 1].ball_record.lin_vel.into();
+                    let rel = (0..num_cars)
+                        .map(|c| {
+                            let cv: Vec3A =
+                                recording.ticks[i - 1].car_records[c].phys.lin_vel.into();
+                            (bv0 - cv).length()
+                        })
+                        .fold(0.0f32, f32::max);
+                    eprintln!(
+                        "BALLEVT {i} len={} ratio={ratio:6.3} dir={dir:6.2} |real|={:7.1} |sim|={:7.1} ballz={bz:6.0} dv={real_dv:6.0} rel={rel:6.0} extra=({:.1},{:.1},{:.1}) sim=({:.1},{:.1},{:.1}) realv=({:.1},{:.1},{:.1}) prev=({:.1},{:.1},{:.1})",
+                        end - i + 1,
+                        real_v.length(),
+                        sim_v.length(),
+                        extra_sum.x, extra_sum.y, extra_sum.z,
+                        sim_v.x, sim_v.y, sim_v.z,
+                        real_v.x, real_v.y, real_v.z,
+                        pre_v.x, pre_v.y, pre_v.z,
+                    );
+                }
+            }
+            i = end + 1;
+        }
     }
 
     eprintln!("skipped {skipped_gaps} gap transitions");

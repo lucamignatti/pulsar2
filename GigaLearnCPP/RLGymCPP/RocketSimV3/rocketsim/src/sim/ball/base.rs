@@ -284,11 +284,19 @@ impl Ball {
                 * rel_speed
                 * consts::curves::BALL_CAR_EXTRA_IMPULSE_FACTOR.get_output(rel_speed)
                 * mutator_config.ball_hit_extra_force_scale;
+            // DIRECT, not accumulated (SIM2REAL_AUDIT.md S43). on_hit runs in the
+            // POST-step contact pass: the solver has already consumed accum_lin_vel
+            // for this tick and clear_accum_forces wipes it at the top of the next,
+            // so an accum add here was NEVER APPLIED -- the psyonix ball-hit impulse
+            // was silently absent from every touch (measured: sim hit power 0.94x
+            // real on soft touches where the extra is small, degrading to 0.58x on
+            // 2000+ uu/s strikes). Direct application matches v2's
+            // _velocityImpulseCache timing (post-solve, pre-publish).
             rb.add_impulse(
                 None,
                 Impulse::Linear(added_hit_impulse * UU_TO_BT),
                 false,
-                true,
+                false,
             );
 
             self.state.last_extra_hit_tick = Some(tick_count);
@@ -369,17 +377,19 @@ impl Ball {
                     let bounce_impulse = bounce_dir
                         * self.state.phys.vel.length()
                         * heatseeker::WALL_BOUNCE_FORCE_SCALE;
+                    // Direct: post-step context, accum is never applied here (S43).
                     rb.add_impulse(
                         None,
                         Impulse::Linear(bounce_impulse * UU_TO_BT),
                         false,
-                        true,
+                        false,
                     );
                 }
             }
             GameMode::Snowday if !self.ground_stick_applied => {
                 let force = -normal * snowday::PUCK_GROUND_STICK_FORCE * TICK_TIME;
-                rb.add_impulse(None, Impulse::Linear(force), true, true);
+                // Direct: post-step context, accum is never applied here (S43).
+                rb.add_impulse(None, Impulse::Linear(force), true, false);
                 self.ground_stick_applied = true;
             }
             _ => {}

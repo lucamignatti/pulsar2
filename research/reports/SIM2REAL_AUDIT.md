@@ -2377,3 +2377,36 @@ Note the direction of the user-visible symptom: the old instant grant made the S
 slightly generous (collects at max reach, 2 ticks early), so policies tuned in sim
 clip pads on lines that the real game does not reward — "missing boost" in the real
 game. The sim is now calibrated to the real grant timing.
+
+## §43 — THE BALL-HIT IMPULSE WAS NEVER APPLIED (2026-08-11)
+
+User report: Pulsar misjudges ball trajectories and hit power (air dribbles into the
+ceiling). The capture's per-tick ball stream localized it in three steps:
+
+1. Ball flight and world bounces: exact (verr p50 0.010 / 0.000, p99 0.01 uu/s).
+2. Touch ticks: p90 520 uu/s. Event-level rollouts (restore 2 ticks before each touch,
+   simulate through, compare outgoing ball velocity — phase-robust) on 131 clean
+   strikes: sim/real speed ratio 0.94 on soft touches degrading monotonically to 0.58
+   at 2000+ uu/s hits; direction error p50 18.7°.
+3. A scale sweep on `ball_hit_extra_force_scale` changed NOTHING — the psyonix extra
+   impulse had no effect at all.
+
+Root cause: `Ball::on_hit` runs in the arena's POST-step contact pass, but queued its
+impulse with `accum=true`. The solver consumes `accum_lin_vel` when solver bodies are
+built — before the contact pass — and `clear_accum_forces` wipes it at the top of the
+next tick. **The ball-car extra impulse was added to a buffer that is never read.**
+Every ball touch in this engine has been pure Bullet contact. (Same dead-path class:
+the heatseeker wall bounce and snowday ground stick, both post-step accum adds; fixed
+alike. The S15 audit note "sensitivity probe gave byte-identical metrics" was this bug
+being felt without being recognized.)
+
+Fix: apply the impulse directly (accum=false) — post-solve, pre-publish, exactly v2's
+`_velocityImpulseCache` timing. Result on the 131 strikes: **speed ratio p50 0.997
+(p25 0.987 / p75 1.000), direction error p50 0.33°, p90 3.8°**. Touch-tick verr p90
+520 → 27.7 uu/s. Battery bit-identical (ball parked); all scenario tests pass.
+
+Training note: policies trained before this fix learned ball striking ~5–40% weaker
+than reality (worst exactly where power matters), then met real-game physics where
+every hit comes out hotter than expected — overshooting touches, misjudged aerial
+power, dribbles popped into the ceiling. This was almost certainly the largest single
+sim2real behavioural gap in the entire program.
