@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "pulsar-dashboard",
-      "runtimeExecutable": "env",
-      "runtimeArgs": ["DASHBOARD_PORT=8599", "python3", "tools/remote/dashboard.py"],
-      "port": 8599
+      "name": "viz-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "9375", "-d", "tools/viz/RocketSimVisWeb/visualizer"],
+      "port": 9375
     }
   ]
 }
