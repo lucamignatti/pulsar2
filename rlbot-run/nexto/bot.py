@@ -51,7 +51,6 @@ GAME_MODES = [
 class Nexto(Bot):
     # Beta controls randomness:
     # 1=best action, 0.5=sampling from probability, 0=random, -1=worst action, or anywhere inbetween
-    beta = 1
     render = False
     # GAP-VERIFICATION HANDICAPS (2026-07-31, default OFF - normal Nexto unless set).
     # Together they recreate the conditions viz-Nexto played under, so a real-game match
@@ -63,6 +62,14 @@ class Nexto(Bot):
     #   NEXTO_VIZ_BUG=1     - see get_output: has_flip never expires by window lapse,
     #                         the exact effect the bridge's old dodge_timeout sentinel
     #                         had on rlgym_compat's reconstruction.
+    #   NEXTO_BETA=<f>      - act at this beta instead of the full-strength argmax
+    #                         default (see the beta scale above). Sampling at beta<1
+    #                         is the SILENT nerf: same net, same style, no visible
+    #                         randomness - Nexto just occasionally takes its 2nd/3rd
+    #                         choice action, which compounds into quietly worse play.
+    #                         agent.py sharpens logits by log_3((1+b)/(1-b)), so 0.85
+    #                         is a mild notch (~2.3x logit scale) and 0.5 is raw-
+    #                         policy sampling (the stochastic-kickoff strength).
     # Read from the environment OR a HANDICAPS marker file next to this script - the
     # env chain through RLBotServer's launch manager is unverifiable and silently
     # dropped these on first attempt (2026-07-31); play.sh owns the marker's lifecycle
@@ -79,9 +86,29 @@ class Nexto(Bot):
         except OSError:
             return False
 
+    @staticmethod
+    def _handicap_value(name, default):
+        val = os.environ.get(name)
+        if val is None:
+            try:
+                marker = os.path.join(
+                    os.path.dirname(os.path.realpath(__file__)), "HANDICAPS")
+                with open(marker) as f:
+                    for line in f:
+                        key, sep, v = line.strip().partition("=")
+                        if sep and key == name:
+                            val = v
+            except OSError:
+                pass
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
     hardcoded_kickoffs = not _handicap.__func__("NEXTO_NO_KICKOFF")
     stochastic_kickoffs = not _handicap.__func__("NEXTO_NO_KICKOFF")
     viz_bug = _handicap.__func__("NEXTO_VIZ_BUG")
+    beta = _handicap_value.__func__("NEXTO_BETA", 1)
 
     agent = Agent()
     tick_skip = 8
@@ -122,10 +149,10 @@ class Nexto(Bot):
         )
         # RECEIPT for gap-verification runs: if a mode was requested and this line is
         # absent from core_play.log, the flags did NOT reach this process.
-        if self.viz_bug or not self.hardcoded_kickoffs:
+        if self.viz_bug or not self.hardcoded_kickoffs or self.beta != 1:
             self.logger.warning(
-                "Nexto HANDICAPS active: viz_bug=%s hardcoded_kickoffs=%s stochastic_kickoffs=%s",
-                self.viz_bug, self.hardcoded_kickoffs, self.stochastic_kickoffs,
+                "Nexto HANDICAPS active: viz_bug=%s hardcoded_kickoffs=%s stochastic_kickoffs=%s beta=%s",
+                self.viz_bug, self.hardcoded_kickoffs, self.stochastic_kickoffs, self.beta,
             )
         self.logger.info(
             "Also check out the RLGym Twitch stream to watch live bot training and occasional showmatches!"

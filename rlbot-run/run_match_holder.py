@@ -75,6 +75,25 @@ if REPLAY:
     cfg.skip_replays = False
     print("[holder] EVAL mode: auto_save_replay=True, skip_replays=False", flush=True)
 
+# QUALIFIER RACE MODE (QUAL_FOR/QUAL_AGAINST env, armed by play.sh for eval-vs-Nexto):
+# the session is a sequence of ATTEMPTS at "score QUAL_FOR before the opponent scores
+# QUAL_AGAINST", inside one holder process. Our team reaching QUAL_FOR ends the match
+# (StopMatch in the finally block -> auto_save_replay writes the .replay) and stamps
+# rlbot-run/QUALIFIED; the opponent reaching QUAL_AGAINST restarts the match (fresh
+# 0-0 - existing_match_behavior="Restart") and the grind continues. Unset -> the old
+# hold-forever behavior. The opponent is at FULL STRENGTH here: play.sh only arms this
+# in plain eval mode, where no HANDICAPS markers exist - a qualifier replay must show
+# a real Nexto or it shows nothing.
+QUAL_FOR = int(os.environ.get("QUAL_FOR", "0"))
+QUAL_AGAINST = int(os.environ.get("QUAL_AGAINST", "0"))
+QUAL_TEAM = int(os.environ.get("QUAL_TEAM", "0"))  # our team index in the toml (0 = blue/Pulsar)
+QUAL_ON = QUAL_FOR > 0 and QUAL_AGAINST > 0
+QUAL_MARKER = Path(__file__).parent / "QUALIFIED"
+if QUAL_ON:
+    QUAL_MARKER.unlink(missing_ok=True)
+    print(f"[holder] QUALIFIER mode: first to {QUAL_FOR} before opponent reaches "
+          f"{QUAL_AGAINST}; failed attempts auto-restart", flush=True)
+
 # play.sh tears the holder down with a plain SIGTERM (kill_all), but Python's default
 # SIGTERM handler exits WITHOUT running the finally block below - which would skip the
 # replay save entirely. Re-raise SIGTERM as KeyboardInterrupt so both Ctrl-C and the
@@ -105,8 +124,41 @@ man = MatchManager()
 try:
     man.start_match(cfg, wait_for_start=False, ensure_server_started=False)
     print(f"[holder] match config sent: team_size={TEAM_SIZE}, {len(players)} cars", flush=True)
+    attempt = 1
+    last = (-1, -1)
+    # After a restart the packet can lag with the DEAD match's score still >= the
+    # threshold, which would re-trigger instantly; stay disarmed until 0-0 is seen.
+    armed = True
     while True:
         time.sleep(0.5)
+        if not QUAL_ON:
+            continue
+        p = man.packet
+        if p is None or not p.teams or len(p.teams) < 2:
+            continue
+        us = p.teams[QUAL_TEAM].score
+        them = p.teams[1 - QUAL_TEAM].score
+        if not armed:
+            if us == 0 and them == 0:
+                armed = True
+                print(f"[holder] attempt {attempt} live at 0-0", flush=True)
+            continue
+        if (us, them) != last:
+            print(f"[holder] attempt {attempt}: {us}-{them} "
+                  f"(need {QUAL_FOR} before {QUAL_AGAINST})", flush=True)
+            last = (us, them)
+        if us >= QUAL_FOR:
+            print(f"[holder] *** QUALIFIED {us}-{them} on attempt {attempt} *** "
+                  f"stopping match to save the replay", flush=True)
+            QUAL_MARKER.write_text(f"{us}-{them} attempt={attempt}\n")
+            break  # -> finally: StopMatch + flush -> auto_save_replay writes the file
+        if them >= QUAL_AGAINST:
+            print(f"[holder] attempt {attempt} FAILED at {us}-{them}; "
+                  f"restarting match for attempt {attempt + 1}", flush=True)
+            attempt += 1
+            last = (-1, -1)
+            armed = False
+            man.start_match(cfg, wait_for_start=False, ensure_server_started=False)
 except KeyboardInterrupt:
     pass
 except Exception:

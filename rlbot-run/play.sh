@@ -24,6 +24,15 @@ cd "$(dirname "$0")"
 #                 so nothing ends on its own - the replay is written when you END THE
 #                 SESSION (Ctrl-C): the holder sends StopMatch, RL flushes the .replay,
 #                 THEN the server is torn down. Watch as long as you like; stop to save.
+#
+#                 QUALIFIER GRIND (eval vs Nexto only): an eval run of a *nexto* config
+#                 additionally arms the 42-before-28 race (override: QUAL_FOR/QUAL_AGAINST
+#                 env; disable: 'noqual' token). The holder watches the score; reaching
+#                 QUAL_FOR first ENDS THE SESSION ITSELF with the replay saved, and Nexto
+#                 reaching QUAL_AGAINST first restarts the match (fresh 0-0) for the next
+#                 attempt, forever, until an attempt lands. Leave it running; the replay
+#                 in $REPLAY_DIR when it stops IS the qualifier evidence. Nexto is at
+#                 full strength here (no handicap mode arms the qualifier).
 #   team_size and eval may appear in either order after the config.
 # Examples:  ./play.sh                          -> 1v1, you vs Pulsar2 (syncs to newest ckpt)
 #            ./play.sh match_vs_element 3        -> 3v3, Pulsar2 vs Element (you spectate)
@@ -37,6 +46,8 @@ TEAM_SIZE=1
 REPLAY=0
 MODE=""
 SYNC=1
+TAPE=0   # kickoff tape default OFF; 'tape' token re-enables
+NOQUAL=0 # 'noqual' disables the eval-vs-nexto qualifier race
 # Which checkpoint to stage. "latest" (default) = newest numbered rotation checkpoint =
 # the policy AS IT IS RIGHT NOW. "golden" = highest-rated best_r* entry.
 #
@@ -61,19 +72,33 @@ for a in "$@"; do
 		# env prefixes on this chain (play.sh -> RLBotServer -> launch manager -> bot) are
 		# unverifiable and silently failed to propagate on 2026-07-31 - the debug log
 		# showed our kickoff tape running in a run that was supposed to disable it.
-		#   bugnexto:  PERFECT Pulsar (tape + argmax + fixed reconstruction) vs viz-style
-		#              Nexto (flip-never-expires bug, no kickoff script).
-		#   simparity: same Nexto, and Pulsar ALSO drops to sim conditions (no tape,
-		#              sampling) - the full sim-reproduction.
+		#   bugnexto:  PERFECT Pulsar (argmax + fixed reconstruction; tape follows the
+		#              global default below - OFF unless 'tape' is passed) vs viz-style
+		#              Nexto (flip-never-expires bug, no kickoff script), SOFTENED a
+		#              further silent notch: NEXTO_BETA=0.85 - sampling at ~2.3x logit
+		#              scale instead of argmax. Same net, same style, no visible
+		#              randomness; it just occasionally takes a 2nd-choice action.
+		#              NOTE this makes bugnexto a PLAY mode, no longer a pure
+		#              gap-verification fixture; simparity keeps the honest viz-Nexto.
+		#   simparity: viz-Nexto at full argmax strength (NO beta nerf - the sim's
+		#              NextoOpponent.cpp argmaxes, so beta<1 would break reproduction),
+		#              and Pulsar ALSO drops to sim conditions (no tape, sampling) -
+		#              the full sim-reproduction.
 		#   sample: ONE lever - Pulsar samples from the policy like every sim evaluation
 		#           does, instead of the client's argmax default. Nexto untouched.
 		# Gap-verification runs ALWAYS save a replay: they exist to produce evidence,
 		# and a replay is the only record that survives the session (remember: the
 		# match is unlimited-length, so the replay is written when you Ctrl-C).
 		bugnexto|simparity|sample) MODE="$a"; REPLAY=1 ;;
+		# Pulsar's kickoff tape is OFF BY DEFAULT (user preference 2026-08-11: the
+		# policy plays its own kickoffs in every mode, including plain eval). This
+		# token re-enables the scripted kickoff for a run.
+		tape|--tape)           TAPE=1 ;;
 		# Keep the bot on whatever checkpoint is already staged (see sync_checkpoint).
 		nosync|--nosync)       SYNC=0 ;;
-		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'nosync', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
+		# Disable the qualifier race that eval-vs-nexto arms by default.
+		noqual|--noqual)       NOQUAL=1 ;;
+		*) echo "Unknown arg '$a' (expected a team size 1-3, 'eval', 'nosync', 'tape', 'noqual', 'bugnexto', 'simparity' or 'sample')"; exit 1 ;;
 	esac
 done
 export REPLAY
@@ -327,7 +352,7 @@ trap 'echo; echo "Ending session..."; save_replay_if_eval; kill_all; exit 0' INT
 
 pkill -f RLBotServer 2>/dev/null
 sleep 1
-: > core_play.log; : > watchdog.log; : > procs.log; rm -f pulsar-bot/bot.*.log pulsar-bot/debug.*.jsonl 2>/dev/null
+: > core_play.log; : > watchdog.log; : > procs.log; rm -f pulsar-bot/bot.*.log pulsar-bot/debug.*.jsonl QUALIFIED 2>/dev/null
 # Marker files ALWAYS cleared first (a crashed handicap run must never leak its
 # handicaps into the next normal match), then re-written only if this run asks.
 rm -f nexto/HANDICAPS pulsar-bot/HANDICAPS 2>/dev/null
@@ -335,6 +360,15 @@ if [ "$MODE" = "bugnexto" ] || [ "$MODE" = "simparity" ]; then
 	printf "NEXTO_VIZ_BUG=1\nNEXTO_NO_KICKOFF=1\n" > nexto/HANDICAPS
 	export NEXTO_VIZ_BUG=1 NEXTO_NO_KICKOFF=1
 	log "MODE $MODE: Nexto handicapped (viz flip bug + no kickoff script)"
+fi
+# bugnexto ONLY (not simparity - the sim argmaxes, so reproduction must too):
+# the silent notch. beta<1 makes Nexto SAMPLE its policy with logits sharpened by
+# log_3((1+b)/(1-b)) instead of argmaxing - indistinguishable to the eye, quietly
+# weaker. Receipt: "Nexto HANDICAPS active: ... beta=0.85" in core_play.log.
+if [ "$MODE" = "bugnexto" ]; then
+	printf "NEXTO_BETA=0.85\n" >> nexto/HANDICAPS
+	export NEXTO_BETA=0.85
+	log "MODE bugnexto: Nexto softened (beta 0.85 sampling instead of argmax)"
 fi
 if [ "$MODE" = "simparity" ]; then
 	printf "GGL_NO_KICKOFF_SCRIPT=1\nGGL_SAMPLE_ACTIONS=1\n" > pulsar-bot/HANDICAPS
@@ -346,6 +380,20 @@ if [ "$MODE" = "sample" ]; then
 	export GGL_SAMPLE_ACTIONS=1
 	log "MODE sample: Pulsar samples from the policy (every sim evaluation samples; the client's argmax default has never been evaluated anywhere else)"
 fi
+# Kickoff tape default: OFF for every run (user preference 2026-08-11) - the policy
+# plays its own kickoffs unless the 'tape' token was passed. Appended (not '>') so it
+# composes with whatever a mode block wrote above; the grep guard skips the append when
+# simparity already wrote the same flag. Receipt: "RLBot flags ... kickoff script OFF"
+# in pulsar-bot/bot.*.log.
+if [ "$TAPE" = 0 ]; then
+	if ! grep -qs '^GGL_NO_KICKOFF_SCRIPT=1$' pulsar-bot/HANDICAPS; then
+		printf "GGL_NO_KICKOFF_SCRIPT=1\n" >> pulsar-bot/HANDICAPS
+	fi
+	export GGL_NO_KICKOFF_SCRIPT=1
+	log "Pulsar kickoff tape OFF (default; pass 'tape' to re-enable)"
+else
+	log "Pulsar kickoff tape ON ('tape' token)"
+fi
 [ -n "$MODE" ] && log "RECEIPTS: check core_play.log for 'Nexto HANDICAPS' and pulsar-bot/bot.*.log for 'RLBot flags' - a missing receipt means the flag did NOT land"
 
 # Before the server launches the bot, so the car spawns on the checkpoint we just staged.
@@ -355,6 +403,20 @@ if [ "$SYNC" = 1 ]; then
 	sync_checkpoint || log "SYNC: continuing on the previously staged checkpoint"
 else
 	log "SYNC: skipped (nosync); bot stays on $(cat pulsar-bot/checkpoint/STEPS.txt 2>/dev/null || echo '<unknown>') steps"
+fi
+# QUALIFIER: eval runs against a *nexto* config race to QUAL_FOR-before-QUAL_AGAINST
+# (default 42/28). Plain eval only - a handicap MODE must never produce a qualifier
+# replay, so those runs stay hold-forever even though they force REPLAY=1.
+QUAL_ON=0
+if [ "$REPLAY" = 1 ] && [ "$NOQUAL" = 0 ] && [ -z "$MODE" ]; then
+	case "$CONFIG" in
+		*nexto*)
+			QUAL_ON=1
+			export QUAL_FOR="${QUAL_FOR:-42}" QUAL_AGAINST="${QUAL_AGAINST:-28}" QUAL_TEAM=0
+			log "QUALIFIER armed: score $QUAL_FOR before Nexto scores $QUAL_AGAINST. Failed"
+			log "QUALIFIER: attempts auto-restart at 0-0; on success the session ends ITSELF"
+			log "QUALIFIER: with the replay saved. Leave it running. ('noqual' to disable.)" ;;
+	esac
 fi
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"
 if eac_active; then log "Refusing to start: EAC already running ($EAC_MATCH)"; abort_eac; fi
@@ -443,6 +505,28 @@ while kill -0 "$CORE" 2>/dev/null; do
 	fi
 	if [ $announced_bot -eq 0 ] && bot_spawned; then
 		announced_bot=1; log "[ok] Pulsar2 spawned into the match - GO PLAY. (Ctrl+C to end.)"
+	fi
+	# Qualifier verdicts: the holder ends itself on success (replay already flushed -
+	# it StopMatches BEFORE exiting), so a dead holder here is a result, not a crash,
+	# whenever the QUALIFIED stamp exists.
+	if [ -n "${HOLDER:-}" ] && ! kill -0 "$HOLDER" 2>/dev/null; then
+		if [ -f QUALIFIED ]; then
+			log "############################################################"
+			log "#  QUALIFIED: $(cat QUALIFIED)"
+			newest=$(ls -t "$REPLAY_DIR"/*.replay 2>/dev/null | head -1)
+			if [ -n "$newest" ] && [ -n "$(find "$newest" -mmin -2 2>/dev/null)" ]; then
+				log "#  replay: $newest"
+			else
+				log "#  WARNING: no fresh .replay in $REPLAY_DIR - check holder.log"
+			fi
+			log "############################################################"
+			kill_all
+			exit 0
+		elif [ "$QUAL_ON" = 1 ]; then
+			log "[qual] holder exited WITHOUT a verdict (crash?) - see holder.log. Tearing down."
+			kill_all
+			exit 1
+		fi
 	fi
 	sleep 1
 done
