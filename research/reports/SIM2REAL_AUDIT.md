@@ -2410,3 +2410,54 @@ than reality (worst exactly where power matters), then met real-game physics whe
 every hit comes out hotter than expected — overshooting touches, misjudged aerial
 power, dribbles popped into the ceiling. This was almost certainly the largest single
 sim2real behavioural gap in the entire program.
+
+## §44 — POST-S43 RESIDUAL SWEEP: PER-CAR IMPULSE GATE, PICKUP BOX OFFSET, CDO INTEL (2026-08-13)
+
+Prompted by two new community artifacts (screenshots archived in assets/):
+`AddedCarForceMultiplier = 0.0f` confirmed from the CDO, and the
+`AddDemolishInvulnerability(ObjectSource, EDemolishSource)` decompile — a per-source
+invulnerability array the function `Resize(1)`s, so only the most recent ObjectSource
+is ever tracked. Call sites and duration remain unknown; still not ported.
+`AddedCarForceMultiplier = 0` means the sim's total absence of any scripted car-side
+force on ball contact is EXACT, not a gap (comment updated at the car-car pipeline).
+
+### 44a — the psyonix-impulse repeat gate is PER CAR, not per ball
+
+The remaining touch-event outliers after S43 were exclusively multi-car contacts:
+every stereotyped single-car kickoff strike measured ratio 1.000 / dir 0.0°, while
+kickoff pinches and 50-50s ran 0.44–0.88 with the winner under-powered. Cause: the v3
+port hoisted v2's repeat-impulse cooldown from `car->_internalState.ballHitInfo`
+(per car) onto the ball (`last_extra_hit_tick`, global). With a global gate, when two
+cars strike the same tick the second car's extra impulse is silently dropped, and in
+extended two-car contact impulses land at half cadence. v2 semantics (per-car
+timestamp, same-tick impulses SUM in the cache; window consumed on gate pass even at
+rel_speed 0; blocked gate early-returns past the game-mode section) restored, with the
+timestamp in `CarState::ball_extra_impulse_tick` (FFI state-set clears it, like
+`bump_last_victim`).
+
+Measured (217 touch events): aggregate p50 unchanged (0.997), dir p90 9.43° → 8.06°.
+The physically-decisive short high-power double-touches went to ~exact
+(t13219: 0.774→1.000 / 27.3°→0.0°; t23825: 0.832→0.974; t16564: dir 23.5°→1.1°).
+Long 19–37-tick scrambles shuffled both ways — a 20+ tick unresynced rollout through
+repeated multi-car contact is chaotic (the three bit-identical kickoffs now diverge
+from each other on sub-quantization initial differences), so those rows measure
+sensitivity, not correctness. Battery bit-identical (single-car).
+
+### 44b — pickup trigger box now centred on the hitbox, not the RB origin
+
+The S42 boost audit left 153 real pickups; classifying every one against the sim's
+pad-cooldown transitions (new GGL_PADGEO instrument: closest-point-on-box geometry +
+per-pad sim cooldown on every near-pad tick): 150 matched within ±2 ticks (offset
+histogram peaked at 0/+1), 3 missed, 6 phantom. Both clean geometric misses were
+airborne passes over a big pad's edge, 13–17uu OUTSIDE the origin-centred test box
+but INSIDE the box centred at the true hitbox centre (`hitbox_pos_offset`, Octane
++13.88 fwd +20.75 up — the trigger was clamping onto a box ~14uu behind and ~21uu
+below the real collision primitive). Switched the trigger (and its broad-phase pad)
+to the offset centre: 151/153 matched, phantoms 6 → 5. The residuals are sub-uu
+boundary grazes (worst new phantom: d=119.3 vs radius 120 during a landing) plus one
+cooldown-cascade echo — irreducible under position quantization.
+
+Full-boost pad consumption (does RL consume a pad crossed at 100 boost?) stays
+UNRESOLVED: the capture holds only 2 full-boost crossings, neither followed by a
+discriminating pickup inside the cooldown window. v2 behaviour (skip at full) kept —
+do not "fix" this without a capture that actually decides it.

@@ -14,6 +14,9 @@ pub struct BoostPadProcessor<'a> {
     pad_idx: Option<usize>,
     /// VENDOR PATCH (pulsar 2026-08-01): full hitbox size of the car body.
     car_hitbox_size: Vec3A,
+    /// Hitbox centre offset in car-local space (S44): the collision box is NOT
+    /// centred on the rigid-body origin (Octane: +13.88 fwd, +20.75 up).
+    car_hitbox_offset: Vec3A,
     /// Arena index of the car being tested, recorded into `pending_grant`.
     car_idx: usize,
 }
@@ -54,12 +57,21 @@ impl bvh::ProcessNode for BoostPadProcessor<'_> {
         // See research/reports/SIM2REAL_AUDIT.md S14.
         let half = self.car_hitbox_size * 0.5;
         let rot = self.car_state.rot_mat;
-        let rel = pad_pos - self.car_state.pos;
+        // Box CENTRE = rigid-body origin + local hitbox offset (S44). Testing an
+        // origin-centred box missed real big-pad pickups where the car flew over the
+        // pad edge (2/153 in the 120Hz capture, 13-17uu outside the origin box but
+        // inside the offset box; the only events the offset box adds sit <1uu inside
+        // the radius -- quantization-level boundary noise).
+        let center = self.car_state.pos
+            + rot.x_axis * self.car_hitbox_offset.x
+            + rot.y_axis * self.car_hitbox_offset.y
+            + rot.z_axis * self.car_hitbox_offset.z;
+        let rel = pad_pos - center;
         // pad centre in car-local space, then clamped onto the box => closest point
         let local = Vec3A::new(rel.dot(rot.x_axis), rel.dot(rot.y_axis), rel.dot(rot.z_axis));
         let clamped = local.clamp(-half, half);
         let closest =
-            self.car_state.pos + rot.x_axis * clamped.x + rot.y_axis * clamped.y + rot.z_axis * clamped.z;
+            center + rot.x_axis * clamped.x + rot.y_axis * clamped.y + rot.z_axis * clamped.z;
 
         let dist_sq_2d = pad_pos.truncate().distance_squared(closest.truncate());
         // Radius is BOX_RAD (120 small / 160 big), not CYL_RAD (144/208): the larger
@@ -150,6 +162,7 @@ impl BoostPadGrid {
         mutator_config: &MutatorConfig,
         tick_count: u64,
         car_hitbox_size: Vec3A,
+        car_hitbox_offset: Vec3A,
         car_idx: usize,
     ) -> Option<usize> {
         if car_state.boost >= mutator_config.car_max_boost_amount {
@@ -161,7 +174,9 @@ impl BoostPadGrid {
         }
 
         // VENDOR PATCH: broad-phase must cover the car body, matching the test below.
-        let body_reach = car_hitbox_size * 0.5;
+        // Padded by the hitbox offset magnitude so the offset-centred box (S44) is
+        // always inside the queried AABB regardless of orientation.
+        let body_reach = car_hitbox_size * 0.5 + Vec3A::splat(car_hitbox_offset.length());
         let car_center_aabb = Aabb::new(car_state.pos - body_reach, car_state.pos + body_reach);
 
         let mut pad_processor = BoostPadProcessor {
@@ -171,6 +186,7 @@ impl BoostPadGrid {
             tick_count,
             pad_idx: None,
             car_hitbox_size,
+            car_hitbox_offset,
             car_idx,
         };
         self.bvh_tree

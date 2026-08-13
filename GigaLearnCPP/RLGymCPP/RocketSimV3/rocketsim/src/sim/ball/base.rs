@@ -243,12 +243,27 @@ impl Ball {
 
     pub(crate) fn on_hit(
         &mut self,
-        car: &Car,
+        car: &mut Car,
         game_mode: GameMode,
         mutator_config: &MutatorConfig,
         tick_count: u64,
         rb: &mut RigidBody,
     ) {
+        // Repeat-impulse gate, PER CAR (SIM2REAL_AUDIT.md S44). v2 keeps this
+        // timestamp in car->_internalState.ballHitInfo: after applying, the SAME car
+        // must wait 1 tick, but a DIFFERENT car applies immediately -- in a same-tick
+        // double contact (every kickoff 50-50) both cars' impulses land and sum.
+        // v2 also consumes the window on gate pass even if rel_speed ends up 0, and
+        // early-returns (skipping the game-mode section) when blocked; both matched.
+        let gate_ok = car
+            .state
+            .ball_extra_impulse_tick
+            .is_none_or(|last| tick_count > last + 1 || last > tick_count);
+        if !gate_ok {
+            return;
+        }
+        car.state.ball_extra_impulse_tick = Some(tick_count);
+
         let car_forward = car.state.phys.rot_mat.x_axis;
         let rel_pos = self.state.phys.pos - car.state.phys.pos;
         let rel_vel = self.state.phys.vel - car.state.phys.vel;
@@ -257,13 +272,7 @@ impl Ball {
             .length()
             .min(consts::ball::car_hit_impulse::MAX_DELTA_VEL_UU);
 
-        // Prevent repeated extra impulses
-        let can_accel = self
-            .state
-            .last_extra_hit_tick
-            .is_none_or(|last_hit_tick| last_hit_tick + 1 < tick_count);
-
-        if rel_speed > 0.0 && can_accel {
+        if rel_speed > 0.0 {
             let extra_z_scale = game_mode == GameMode::Hoops
                 && car.state.is_on_ground
                 && car.state.phys.rot_mat.z_axis.z
@@ -298,8 +307,6 @@ impl Ball {
                 false,
                 false,
             );
-
-            self.state.last_extra_hit_tick = Some(tick_count);
         }
 
         match game_mode {

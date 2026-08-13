@@ -89,6 +89,8 @@ fn analyze_rlpr() {
         })
         .collect();
 
+    let pad_configs = arena.get_all_boost_pad_configs();
+
     // regime name -> (vel_err, pos_err, ang_vel_err) stats
     let mut regimes: std::collections::BTreeMap<&'static str, [Stat; 3]> =
         std::collections::BTreeMap::new();
@@ -373,6 +375,51 @@ fn analyze_rlpr() {
                         u8::from(sim_pick),
                         pos.x, pos.y, pos.z,
                         u8::from(fr.is_on_ground),
+                    );
+                }
+            }
+
+            // GGL_PADGEO: near-pad geometry dump (S44 boost audit). For every tick a
+            // car's REAL position is within 400uu (2D) of a pad center, print the
+            // trigger geometry exactly as boost_pad_grid computes it (closest point on
+            // the ORIGIN-centred oriented box; offset variant too) plus the pad's sim
+            // cooldown, real boost and both gains -- lets offline analysis classify
+            // every real/sim pickup mismatch as geometry vs cooldown-desync vs timing.
+            if std::env::var("GGL_PADGEO").is_ok() {
+                let real_gain = (real.boost_amount - fr.boost_amount) * 100.0;
+                let pred_gain = pred.boost - fr.boost_amount * 100.0;
+                let cfg = rocketsim::CarBodyConfig::OCTANE;
+                let half = cfg.hitbox_size * 0.5;
+                let r = &fr.phys.rot;
+                let fwd = Vec3A::new(r.rows[0].x, r.rows[1].x, r.rows[2].x);
+                let rightax = Vec3A::new(r.rows[0].y, r.rows[1].y, r.rows[2].y);
+                let up = Vec3A::new(r.rows[0].z, r.rows[1].z, r.rows[2].z);
+                let cpos: Vec3A = fr.phys.pos.into();
+                for (pi, pcfg) in pad_configs.iter().enumerate() {
+                    let pp = pcfg.pos;
+                    if pp.truncate().distance_squared(cpos.truncate()) > 400.0 * 400.0 {
+                        continue;
+                    }
+                    let closest = |center: Vec3A| -> Vec3A {
+                        let rel = pp - center;
+                        let local =
+                            Vec3A::new(rel.dot(fwd), rel.dot(rightax), rel.dot(up));
+                        let cl = local.clamp(-half, half);
+                        center + fwd * cl.x + rightax * cl.y + up * cl.z
+                    };
+                    // as-implemented (origin-centred) and offset-corrected variants
+                    let c0 = closest(cpos);
+                    let off = cfg.hitbox_pos_offset;
+                    let c1 = closest(cpos + fwd * off.x + rightax * off.y + up * off.z);
+                    let cd = arena.get_boost_pad_state(pi).cooldown;
+                    eprintln!(
+                        "PADGEO {i} c{c} p{pi} big={} d0={:6.1} z0={:6.1} d1={:6.1} z1={:6.1} cd={cd:5.2} boost={:5.1} gr={real_gain:5.1} gs={pred_gain:5.1}",
+                        u8::from(pcfg.is_big),
+                        pp.truncate().distance(c0.truncate()),
+                        c0.z - pp.z,
+                        pp.truncate().distance(c1.truncate()),
+                        c1.z - pp.z,
+                        fr.boost_amount * 100.0,
                     );
                 }
             }

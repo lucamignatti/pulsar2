@@ -576,11 +576,13 @@ impl Arena {
                 // cooldown, event) lands GRANT_DELAY_TICKS later, below. S42.
                 let car_idx = car.idx;
                 let hitbox_size = car.info.config.hitbox_size;
+                let hitbox_offset = car.info.config.hitbox_pos_offset;
                 boost_pad_grid.maybe_give_car_boost(
                     &mut car.state,
                     &self.config.mutators,
                     self.tick_count,
                     hitbox_size,
+                    hitbox_offset,
                     car_idx,
                 );
             }
@@ -936,7 +938,7 @@ impl Arena {
         let ball_rb = &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx];
         let ball_vel_before = ball_rb.lin_vel;
         self.ball.on_hit(
-            &self.cars[car_idx],
+            &mut self.cars[car_idx],
             self.config.game_mode,
             &self.config.mutators,
             self.tick_count,
@@ -1037,8 +1039,11 @@ impl Arena {
         //     plus the up-push along the VICTIM's up axis only when it is grounded
         //     (the .uc air branch never sets ImpulseZ; the replica's world-Z air push
         //     is likewise inherited stock-v2 code).
-        // NOT ported: AddedCarForceMultiplier for opposite-team hits and demolish
-        // spawn invulnerability (constants still unknown).
+        // AddedCarForceMultiplier is CONFIRMED 0.0 in the CDO (2026-08-12), so the
+        // absence of any scripted car-side extra force here is exact, not a gap.
+        // NOT ported: demolish spawn invulnerability (mechanism known -- per-source
+        // DemolishInvulnerabilities array, Resize(1) keeps only the latest
+        // ObjectSource -- but call sites/duration still unknown; SIM2REAL_AUDIT S44).
         struct Pending {
             attacker_idx: usize,
             victim_idx: usize,

@@ -67,6 +67,12 @@ pub struct CarState {
     /// in the ShouldDemolish decompile): hitting a DIFFERENT car is never blocked by
     /// the cooldown. Stores `1 + victim arena index` of the last bumped car; 0 = none.
     pub bump_last_victim: u32,
+    /// Tick when this car last applied the psyonix ball-hit extra impulse. The 1-tick
+    /// repeat gate is PER CAR (v2 keeps it in `car->_internalState.ballHitInfo`), NOT
+    /// global to the ball: two cars striking the same tick BOTH apply, and their
+    /// impulses sum -- a ball-global gate silently dropped the second car's impulse in
+    /// every kickoff pinch / 50-50 (SIM2REAL_AUDIT.md S44).
+    pub ball_extra_impulse_tick: Option<u64>,
     /// If in contact with a static mesh/body, this is the collision normal of that contact on said body
     pub world_contact_normal: Option<Vec3A>,
     pub is_demoed: bool,
@@ -112,6 +118,7 @@ impl CarState {
         world_contact_normal: None,
         bump_cooldown_timer: 0.0,
         bump_last_victim: 0,
+        ball_extra_impulse_tick: None,
         auto_flip_timer: 0.0,
         auto_flip_torque_scale: 0.0,
         is_demoed: false,
