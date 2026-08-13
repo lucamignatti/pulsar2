@@ -1,4 +1,5 @@
 #include <GigaLearnCPP/Learner.h>
+#include <GigaLearnCPP/Distributed/Session.h>
 #include <GigaLearnCPP/NextoEval.h>
 
 #ifdef GGL_VIZ_RLBOT
@@ -473,9 +474,25 @@ int main(int argc, char* argv[]) {
 	// block-buffers; unitbuf flushes after every insertion so --follow behaves like a terminal.
 	std::cout << std::unitbuf;
 
+	// MPI+NCCL (or stub). Collective self-test runs inside Init.
+	auto dist = Dist::Session::Init(argc, argv);
+
 	// Initialize RocketSim with collision meshes (run from the repo/build dir;
 	// provision them with tools/get_collision_meshes.sh if missing)
 	RocketSim::Init("collision_meshes");
+	{
+		auto arena = Arena::Create(GameMode::SOCCAR);
+		(void)arena;
+	}
+	if (dist.rank() == 0)
+		RG_LOG("RocketSim loaded collision_meshes (rank 0/" << dist.world() << ")");
+
+	// Dist + sim bring-up only: skip Learner / training.
+	if (const char* b = std::getenv("GGL_DIST_BRINGUP"); b && b[0] && std::string(b) != "0") {
+		if (dist.rank() == 0)
+			RG_LOG("GGL_DIST_BRINGUP: dist + RocketSim ok, exiting");
+		return 0;
+	}
 
 	// Offline qualifier eval (GGL_NEXTO_EVAL=1): pure-sim goal-share measurement of a
 	// saved checkpoint vs the embedded Nexto - runs INSTEAD of the trainer, CPU-only,

@@ -60,6 +60,13 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 file(GLOB_RECURSE FILES_SRC CONFIGURE_DEPENDS "src/*.cpp" "src/*.h" "src/*.hpp" "libsrc/*.cpp" "libsrc/*.h" "libsrc/*.hpp")
 
 add_library(GigaLearnCPP SHARED ${FILES_SRC})
+
+# Session backends live outside src/ so GLOB_RECURSE cannot compile both.
+if (GGL_USE_MULTI_GPU)
+	target_sources(GigaLearnCPP PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/distributed/SessionMpiNccl.cpp)
+else()
+	target_sources(GigaLearnCPP PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/distributed/SessionStub.cpp)
+endif()
 target_compile_definitions(GigaLearnCPP PRIVATE -DWITHIN_GGL)
 target_include_directories(GigaLearnCPP PUBLIC "src/public")
 target_include_directories(GigaLearnCPP PRIVATE "src/private")

@@ -5,6 +5,11 @@
 #include <string>
 #include <vector>
 
+// TODO(titan): MPI/NCCL Session self-test currently runs inside
+// GGL::Dist::Session::Init (GigaLearnCPP/distributed). Move those
+// cases here as TEST()s launched with mpirun. Do not GLOB them into
+// this single-process runner.
+
 // Minimal hand-rolled test harness (the pre-reset GigaLearnTests pattern):
 // TEST(name) { ... } registers a case; CHECK/CHECK_NEAR throw on failure;
 // RunAllTests() runs everything and returns a process exit code.
