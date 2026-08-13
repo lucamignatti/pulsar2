@@ -526,8 +526,20 @@ impl Car {
                 );
             }
 
-            let jump_force = up_dir * mutator_config.jump_accel * const { UU_TO_BT * TICK_TIME };
-            rb.add_impulse(Some("Jump"), Impulse::Linear(jump_force), false, true);
+            // Decide whether the jump is still HELD before applying the hold force
+            // (SIM2REAL_AUDIT S45c). Applying first and deciding after fired one extra
+            // hold impulse on the release tick -- a free ~12 uu/s that corrupted exactly
+            // the jump->double-jump/dodge transition. Measured: battery fit 1027.8 ->
+            // 1017.9, holdout 1057.3 -> 1048.2, moving 7 of 80 segments (all jump/dodge),
+            // with double_jump -5.14 and dodge_diagonal -4.89 carrying it.
+            let still_held = self.state.jump_time < car_consts::jump::MIN_TIME
+                || (self.state.controls.jump
+                    && self.state.jump_time < car_consts::jump::MAX_TIME);
+            if still_held {
+                let jump_force =
+                    up_dir * mutator_config.jump_accel * const { UU_TO_BT * TICK_TIME };
+                rb.add_impulse(Some("Jump"), Impulse::Linear(jump_force), false, true);
+            }
 
             self.state.jump_time += TICK_TIME;
             self.state.is_jumping = self.state.jump_time < car_consts::jump::MIN_TIME

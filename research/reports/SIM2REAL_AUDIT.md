@@ -2612,3 +2612,53 @@ p90 as 0.00 because the summary parser's `max=\S+` missed space-padded values, w
 corrupted the "overall" weighting. Caught because overall read 98.66% against the known
 98.3% scorecard. Sanity-check aggregate metrics against a known value before believing a
 sweep.
+
+### 45c — THE STRUCTURAL ROWS, MEASURED (2026-08-13)
+
+The five rows S45/S45b left untested were implemented behind env gates (since stripped)
+and A/B'd. Baseline = HEAD after S45b (ERP 0.10).
+
+| variant | battery fit | holdout | overall <1% v_max | ground p50 | flip+wh p90 | wall p90 |
+|---|---|---|---|---|---|---|
+| BASELINE | 1027.8 | 1057.3 | 98.32% | 3.47 | 15.26 | 15.21 |
+| wheel forces pre-step (rows 1-2) | 1322.0 | 1345.7 | 97.83% | **0.35** | 20.20 | 18.68 |
+| + end-of-tick contact report (row 7) | 1370.7 | 1394.4 | 97.83% | 0.34 | 20.20 | 18.68 |
+| **jump: decide before hold (row 6)** | **1017.9** | **1048.2** | 98.32% | 3.45 | 15.26 | 15.14 |
+
+**ADOPTED — row 6, the release-tick jump impulse.** We applied the hold force and THEN
+decided whether the jump was still held, firing one extra hold impulse on the release
+tick. Deciding first: fit 1027.8 → 1017.9, holdout 1057.3 → 1048.2, and every capture
+regime flat-or-better. The footprint is exactly right for a targeted fix — 7 of 80
+segments move, all jump/dodge, with `double_jump` −5.14 and `dodge_diagonal` −4.89
+carrying it (a spurious impulse at release corrupts precisely the jump→dodge transition).
+Second time the fork was right.
+
+**REJECTED — rows 1/2/7, the pre-step wheel ordering — and WHY THE TWO INSTRUMENTS
+DISAGREE (the important part).** Moving the raycast + suspension/friction impulses ahead
+of `step_simulation` makes single-tick ground error **10x better** (p50 3.47 → 0.35) while
+making both battery captures ~29% WORSE (+294 fit, +288 holdout) and every impact regime
+worse (flip+wheels 15.26 → 20.20, wall 15.21 → 18.68).
+
+That is not a real conflict, it is a **harness bias**, and it disqualifies the capture as
+the instrument for this particular question. The capture replays by RESTORING true state
+each tick and stepping once. A scheme that computes wheel forces from START-of-tick
+geometry therefore reads them off ground truth, while our post-step scheme computes them
+from the sim's own PREDICTED end-of-tick geometry. Pre-step wins the single-tick metric by
+construction — an advantage that does not exist in free-running play, where the position
+is always the sim's own. The battery free-runs whole segments and has no such bias; it is
+decisive here, and it says the reorder is much worse. **Any future restore-then-step
+comparison of a force-timing change inherits this bias — check it against the battery.**
+(The end-of-tick contact report on top costs another 49/49 and shifts `is_on_ground` by a
+tick for a trained policy; rejected twice over.)
+
+**REJECTED — row 11, origin-vs-cylinder pickup.** Measured on the pad oracle rather than
+the battery, since the battery parks the ball and never touches pads: ours (car body vs
+box radius) 151/153 matched, 2 missed, 5 phantom; theirs (car origin vs cylinder radius)
+146/153, 7 missed, 1 phantom. Close, and the two schemes trade error types — theirs is
+more conservative (fewer phantoms, 3.5x the misses), ours catches more real pickups. Kept
+ours on total agreement (7 vs 8 disagreements) and on matched count.
+
+**Fork scorecard, complete:** 11 rows — 2 adopted (their split-impulse bug catch, their
+release-tick jump ordering) plus 1 constant adopted in S45b (ERP 0.10), 6 rejected with
+numbers, 1 undecidable on current data (full-boost pad consumption), 1 premise that does
+not hold for our code (ball-world signed penetration). Nothing remains untested.
