@@ -69,12 +69,18 @@ target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
 # NCCL lives in the shared lib (all collectives are in GigaLearnCPP). PRIVATE so
 # the static archive is not pulled a second time into GigaLearnBot.
-if (GGL_USE_NCCL)
-	target_compile_definitions(GigaLearnCPP PUBLIC USE_NCCL=1)
+if (GGL_USE_MULTI_GPU)
+	target_compile_definitions(GigaLearnCPP PUBLIC USE_MULTI_GPU=1 USE_NCCL=1 USE_MPI=1)
 	target_link_libraries(GigaLearnCPP PRIVATE nccl)
 	target_link_libraries(GigaLearnCPP PUBLIC Threads::Threads)
+	if (TARGET MPI::MPI_CXX)
+		target_link_libraries(GigaLearnCPP PRIVATE MPI::MPI_CXX)
+	else()
+		target_include_directories(GigaLearnCPP PRIVATE ${MPI_CXX_INCLUDE_PATH})
+		target_link_libraries(GigaLearnCPP PRIVATE ${MPI_CXX_LIBRARIES})
+	endif()
 else()
-	target_compile_definitions(GigaLearnCPP PUBLIC USE_NCCL=0)
+	target_compile_definitions(GigaLearnCPP PUBLIC USE_MULTI_GPU=0 USE_NCCL=0 USE_MPI=0)
 endif()
 
 # TORCH_CUDA_LIBRARIES is not reliably exported by every libtorch build (the cu128

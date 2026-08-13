@@ -15,14 +15,20 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# NCCL: same idea as the working GigaLearn-2 tree (imported static lib + cudart),
-# but require NCCL_ROOT and the .a to exist, and do not create the target when off.
-option(GGL_USE_NCCL "Link NCCL (static) for multi-GPU collectives" OFF)
-if (GGL_USE_NCCL)
+# Multi-GPU HPC path: NCCL (device collectives) + MPI (host reductions and
+# NCCL unique-id broadcast). OFF by default so a normal PC configure does not
+# need NCCL, CUDAToolkit, or MPI. Does not replace CMAKE_CXX_COMPILER with
+# mpicxx (Spectrum MPI's mpicc is xlc; we keep gcc and only link the libs).
+option(GGL_USE_MULTI_GPU "Link NCCL + MPI for multi-GPU training" OFF)
+if (GGL_USE_MULTI_GPU)
 	find_package(Threads REQUIRED)
 	find_package(CUDAToolkit REQUIRED)
+	find_package(MPI REQUIRED)
+	if (NOT MPI_CXX_FOUND)
+		message(FATAL_ERROR "GGL_USE_MULTI_GPU=ON requires a C++ MPI implementation")
+	endif()
 	if (NOT NCCL_ROOT)
-		message(FATAL_ERROR "GGL_USE_NCCL=ON requires -DNCCL_ROOT=<nccl prefix>")
+		message(FATAL_ERROR "GGL_USE_MULTI_GPU=ON requires -DNCCL_ROOT=<nccl prefix>")
 	endif()
 	set(_ggl_nccl_lib "${NCCL_ROOT}/lib/libnccl_static.a")
 	if (NOT EXISTS "${_ggl_nccl_lib}")
@@ -35,6 +41,7 @@ if (GGL_USE_NCCL)
 	)
 	target_link_libraries(nccl INTERFACE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 	message(STATUS "NCCL: ${_ggl_nccl_lib}")
+	message(STATUS "MPI: include=${MPI_CXX_INCLUDE_PATH} libs=${MPI_CXX_LIBRARIES}")
 endif()
 
 add_executable(GigaLearnBot src/ExampleMain.cpp)
@@ -51,8 +58,8 @@ set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}")
 # Include RLGymSim_PPO
 add_subdirectory(GigaLearnCPP)
 target_link_libraries(GigaLearnBot PRIVATE GigaLearnCPP)
-if (GGL_USE_NCCL)
-	target_compile_definitions(GigaLearnBot PUBLIC USE_NCCL=1)
+if (GGL_USE_MULTI_GPU)
+	target_compile_definitions(GigaLearnBot PUBLIC USE_MULTI_GPU=1 USE_NCCL=1 USE_MPI=1)
 	target_link_libraries(GigaLearnBot PRIVATE Threads::Threads)
 endif()
 
