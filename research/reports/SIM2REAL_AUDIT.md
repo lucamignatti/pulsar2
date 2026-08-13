@@ -2461,3 +2461,57 @@ Full-boost pad consumption (does RL consume a pad crossed at 100 boost?) stays
 UNRESOLVED: the capture holds only 2 full-boost crossings, neither followed by a
 discriminating pickup inside the cooldown window. v2 behaviour (skip at full) kept —
 do not "fix" this without a capture that actually decides it.
+
+### 44c — GHIDRA VERIFICATION OF THE CAR-CONTACT CONE (first-party, not a replica)
+
+Re-opened the `rocketsim-fixing` Ghidra project (RocketLeague.exe, 4173 named UE3 natives)
+in HEADLESS mode — `com.xebyte.headless.GhidraMCPHeadlessServer` on the existing project,
+REST at 127.0.0.1:8089, no GUI (the trainer was live on the GPU; a GUI is the documented
+OOM risk). Note the headless build's `search_functions_*` endpoints ignore their pattern
+and return everything — dump `/list_functions` once and grep locally.
+
+Chain walked: `AVehicle_TA::execIsCarWithinForwardEllipticalCone` @0x140e83020 (script glue)
+→ `FUN_140f0c940` (builds the two impact transforms, forms the direction) → `FUN_140f0d620`
+(the angle test). Result: **the cone we ported from the community replica is confirmed
+correct at the instruction level** —
+
+- 1.01 fudge divisor applied SIGN-DEPENDENTLY (`dot>=0 ? dot/1.01 : dot*1.01`) ✓
+- project the dir out of the axis, renormalize, `acos(clamp(forward·proj))`, ×57.29578 ✓
+- forward negated wholesale when the reverse flag is set ✓
+- axis→limit pairing: project-out-Y(right) is checked against the PITCH limit FIRST and
+  short-circuits; project-out-Z(up) against the YAW limit ✓
+- direction is CENTRE-TO-CENTRE — `FUN_140f0c940` transforms each car's COM (`+0x838`)
+  through its own time-of-impact transform. Our `dir_to_center` (TOI-rewound, S40) is
+  right, and using the contact point here would have been wrong ✓
+
+One divergence found and fixed: the degenerate-projection cutoff was `1e-9`; RL's is
+`1e-8` (below it RL zeroes the projection → the angle is exactly 90°). Microscopic, but
+free to match now that the ground truth is readable. Battery 1035.2 unchanged, tests pass.
+
+Cross-checking the CDO against the script settles which checks are even live:
+`ShouldDemolish` runs FOUR optional gates and **only `COMAngleCheck` is enabled**
+(`VictimHitAngleCheck`, `AttackerHitAngleCheck`, `VictimHitAngleCurveCheck`,
+`bCheckImpactNormal` are all false). So the contact-point and curve-driven variants —
+`IsHitLocationWithinForwardAngle` and `IsCarHitAngleWithinForwardAngleCurve`
+(@0x140f0c450, which evaluates a curve per angle and feeds the OUTPUTS back in as the
+limits) — are dead config in the live game. Nothing to port; recorded so the next reader
+doesn't implement them from the .uc.
+
+Also read: `GetNumWheelContacts` (`FUN_140ef4040`) counts wheels whose contact bit
+(`+0x160 & 1`) is set but **skips wheels resting on your own car / an attached actor**.
+RocketSim counts unconditionally — an edge case only reachable in car-on-car stacking,
+noted not fixed.
+
+### 44d — WHAT THE EXE CANNOT ANSWER (stop asking it)
+
+`AVehiclePickup_TA::IsPickedUp` is a bare bitfield read (`+0x2b0 & 1`) and no RL-specific
+ball/pickup impulse native exists in the table — the pickup DECISION and the demolish
+invulnerability bookkeeping live in UnrealScript inside the encrypted `TAGame.upk`, which
+is exactly where the community's `ShouldDemolish.uc` came from. The two open questions
+therefore need SCRIPT, not the binary:
+
+- **`VehiclePickup_Boost_TA` / `VehiclePickup_TA.uc`** — does `Touch`/`Pickup` consume a
+  pad when the car is already at 100 boost? (Our capture holds 2 non-discriminating
+  crossings; v2's skip-at-full is currently assumed.)
+- **`Car_TA.uc` demolish paths** — where `AddDemolishInvulnerability` is CALLED and when
+  entries are removed (spawn duration).

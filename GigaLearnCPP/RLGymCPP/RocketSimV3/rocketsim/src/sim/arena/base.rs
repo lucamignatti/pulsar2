@@ -990,9 +990,12 @@ impl Arena {
             let scaled = if dot >= 0.0 { dot / FUDGE } else { dot * FUDGE };
             let proj = impact_dir - axis * scaled;
             let len_sq = proj.length_squared();
+            // Degenerate threshold is RL's exactly (1e-8, verified in the binary --
+            // S44b): below it the projection is ZEROED, which makes the subsequent
+            // dot 0 and the angle exactly 90 deg, rather than normalizing noise.
             if (len_sq - 1.0).abs() < 1e-6 {
                 proj
-            } else if len_sq >= 1e-9 {
+            } else if len_sq >= 1e-8 {
                 proj / len_sq.sqrt()
             } else {
                 Vec3A::ZERO
