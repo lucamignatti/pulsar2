@@ -81,7 +81,7 @@ namespace GGL {
 		// straight-through seq->forward() path, so non-residual models are bit-identical.
 		std::vector<std::pair<int, int>> residualSpans;
 
-		torch::optim::Optimizer* optim;
+		torch::optim::Optimizer* optim = nullptr;
 
 		// When true, ModelSet::StepOptims() skips this model — it is stepped
 		// independently by its owning module (e.g. ProposerModule::Train()).
@@ -231,8 +231,17 @@ namespace GGL {
 		}
 
 		void Free() {
-			for (Model* model : *this)
+			for (Model* model : *this) {
+				// `delete model` alone leaks the optimizer (raw pointer, ~Model() is default),
+				// and the optimizer's param_groups hold strong Tensor refs to every parameter -
+				// so the whole clone's weights stay pinned on the GPU. At the 25M-step version
+				// cadence the evicted-version + dropped-reference clones leaked ~1GB/h and
+				// OOM-crashed the run every ~3.5h (2026-08-12). Delete the optimizer first so
+				// the parameters can actually die.
+				delete model->optim;
+				model->optim = nullptr;
 				delete model;
+			}
 			map.clear();
 		}
 	};
