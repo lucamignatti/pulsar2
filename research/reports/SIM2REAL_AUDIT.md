@@ -2571,3 +2571,44 @@ inside 4 s; a denied second pickup proves consumption. Until then v2 behaviour s
 - *Jump hold/release ordering, `jump_time` reset, `FLIP_MIN_DELAY` 0.025 vs 2 ticks* —
   testable against the 120Hz capture's jump activations; queued behind items with measured
   convictions, since flip error is already p90 0.27 rad/s.
+
+### 45b — THE THREE SINGLE-CONSTANT CLAIMS, ACTUALLY MEASURED (2026-08-13)
+
+S45's first pass triaged the fork by prior evidence. Three of its rows are single-constant
+changes, so argument was unnecessary — they were A/B'd on BOTH instruments (maneuver
+battery fit + holdout captures, and the 120Hz per-tick capture regimes) using a temporary
+env-gated harness, since stripped. Baseline = shipped HEAD.
+
+| variant | battery fit | holdout | overall <1% v_max | ground p50 | wall p90 |
+|---|---|---|---|---|---|
+| BASELINE (ERP 0.2, cap 48, iters 10, autoroll on) | 1035.2 | 1064.7 | 98.31% | 3.61 | 15.83 |
+| **ERP 0.10** | **1027.8** | **1057.3** | 98.32% | 3.47 | 15.21 |
+| no pushback cap (tuned) | 1126.5 | 1152.1 | 97.91% | 3.70 | — |
+| ERP 0.10 + no cap (tuned's actual pair) | 1186.0 | 1209.6 | 98.21% | 3.52 | — |
+| solver iterations 4 (tuned) | 1042.2 | 1070.4 | 98.26% | 3.61 | 15.87 |
+| autoroll off (tuned) | 1162.7 | 1190.0 | 98.31% | 3.62 | 15.82 |
+
+**ADOPTED — `ERP 0.2 → 0.10`.** Swept 0.0/0.05/0.10/0.15/0.20/0.30: fit
+1046.5/1035.2/**1027.8**/1029.4/1035.2/1035.9, holdout
+1076.4/1065.4/**1057.3**/1059.2/1064.7/1065.4. A clean interior minimum at 0.10 on two
+INDEPENDENT captures — not a monotone slide toward "no positional correction", which is
+what a fitting artifact would look like. Bullet's stock 0.2 was never fit to Rocket League.
+Worth -7.4 uu on both captures (0.7%), and it also improves wall_drive p90 (15.83→15.21),
+our worst regime. Note the convergence: the tuned fork independently arrived at 0.1.
+
+**REJECTED, now with numbers instead of arguments:**
+- *Solver iterations 10→4*: worse on all three metrics (fit +7.0, holdout +5.7, overall
+  −0.05 pp). Their own commit message calls it a speed change; it costs accuracy here.
+- *Autoroll off*: catastrophic — fit +127.5, holdout +125.3. Autoroll is load-bearing for
+  landings/recoveries in the battery even though the capture's per-tick regimes barely
+  move (autoroll acts in inverted/air phases that the regime split dilutes). This is the
+  clearest case of the battery catching what the capture cannot.
+- *No pushback cap*: reproduces the pre-S39 number almost exactly (1126.5 vs the recorded
+  1126.0), independently re-confirming that fix. Tuned's ERP-0.1-without-cap pair is the
+  WORST variant tested (1186.0/1209.6) — i.e. our cap is what makes the low ERP usable.
+
+Method note worth keeping: the first run of this sweep reported flip+wheels/wall_drive
+p90 as 0.00 because the summary parser's `max=\S+` missed space-padded values, which also
+corrupted the "overall" weighting. Caught because overall read 98.66% against the known
+98.3% scorecard. Sanity-check aggregate metrics against a known value before believing a
+sweep.
