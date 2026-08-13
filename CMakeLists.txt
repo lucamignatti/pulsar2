@@ -15,6 +15,28 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# NCCL: same idea as the working GigaLearn-2 tree (imported static lib + cudart),
+# but require NCCL_ROOT and the .a to exist, and do not create the target when off.
+option(GGL_USE_NCCL "Link NCCL (static) for multi-GPU collectives" OFF)
+if (GGL_USE_NCCL)
+	find_package(Threads REQUIRED)
+	find_package(CUDAToolkit REQUIRED)
+	if (NOT NCCL_ROOT)
+		message(FATAL_ERROR "GGL_USE_NCCL=ON requires -DNCCL_ROOT=<nccl prefix>")
+	endif()
+	set(_ggl_nccl_lib "${NCCL_ROOT}/lib/libnccl_static.a")
+	if (NOT EXISTS "${_ggl_nccl_lib}")
+		message(FATAL_ERROR "NCCL static library not found: ${_ggl_nccl_lib}")
+	endif()
+	add_library(nccl STATIC IMPORTED GLOBAL)
+	set_target_properties(nccl PROPERTIES
+		IMPORTED_LOCATION "${_ggl_nccl_lib}"
+		INTERFACE_INCLUDE_DIRECTORIES "${NCCL_ROOT}/include"
+	)
+	target_link_libraries(nccl INTERFACE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+	message(STATUS "NCCL: ${_ggl_nccl_lib}")
+endif()
+
 add_executable(GigaLearnBot src/ExampleMain.cpp)
 
 # Set C++ version to 20
@@ -28,32 +50,42 @@ set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}")
 
 # Include RLGymSim_PPO
 add_subdirectory(GigaLearnCPP)
-target_link_libraries(GigaLearnBot GigaLearnCPP)
+target_link_libraries(GigaLearnBot PRIVATE GigaLearnCPP)
+if (GGL_USE_NCCL)
+	target_compile_definitions(GigaLearnBot PUBLIC USE_NCCL=1)
+	target_link_libraries(GigaLearnBot PRIVATE Threads::Threads)
+endif()
 
-# Official RLBot v5 C++ interface (defines the RLBotCPP target). Its CMake uses
-# FetchContent to pull matching flatbuffers + RLBot/flatbuffers-schema versions,
-# so building GigaLearnRLBot needs network access on a fresh build dir.
-add_subdirectory(cpp-interface)
+# RLBot v5 client / viz opponent. OFF by default: this tree is a training box
+# (GigaLearnBot only). Enable with -DGGL_BUILD_RLBOT=ON after `git submodule update
+# --init cpp-interface` (FetchContent needs network on a fresh build dir).
+option(GGL_BUILD_RLBOT "Build GigaLearnRLBot and the cpp-interface RLBot v5 client" OFF)
+if (GGL_BUILD_RLBOT)
+	# Official RLBot v5 C++ interface (defines the RLBotCPP target).
+	add_subdirectory(cpp-interface)
 
-# Standalone RLBot v5 client binary: loads a trained checkpoint via InferUnit and
-# plays live matches (RLBotSim or real Rocket League). Deliberately NOT linked into
-# GigaLearnBot - the trainer and the play-against-the-bot client are separate concerns.
-add_executable(GigaLearnRLBot src/RLBotClient.cpp src/RLBotMain.cpp)
-set_target_properties(GigaLearnRLBot PROPERTIES CXX_STANDARD 20)
-target_link_libraries(GigaLearnRLBot GigaLearnCPP RLBotCPP)
+	# Standalone RLBot v5 client binary: loads a trained checkpoint via InferUnit and
+	# plays live matches (RLBotSim or real Rocket League). Deliberately NOT linked into
+	# GigaLearnBot - the trainer and the play-against-the-bot client are separate concerns.
+	add_executable(GigaLearnRLBot src/RLBotClient.cpp src/RLBotMain.cpp)
+	set_target_properties(GigaLearnRLBot PROPERTIES CXX_STANDARD 20)
+	target_link_libraries(GigaLearnRLBot GigaLearnCPP RLBotCPP)
+endif()
 
 # Let the VIEWER host an RLBot bot as the opponent inside its own arena (see
-# src/VizRLBotServer.h). OFF by default for the same reason GGL_BUILD_TESTS is: the
-# training box's `cmake --build build` must stay byte-identical, and the trainer has no
-# business linking a bot server. Turn it on for the viz tree:
-#     cmake -S . -B build-viz -DGGL_VIZ_RLBOT=ON
+# src/VizRLBotServer.h). Requires GGL_BUILD_RLBOT. OFF by default so the training
+# box's `cmake --build build` stays trainer-only. Turn it on for the viz tree:
+#     cmake -S . -B build-viz -DGGL_BUILD_RLBOT=ON -DGGL_VIZ_RLBOT=ON
 option(GGL_VIZ_RLBOT "Viewer can host an RLBot bot as the opponent" OFF)
 if (GGL_VIZ_RLBOT)
+	if (NOT GGL_BUILD_RLBOT)
+		message(FATAL_ERROR "GGL_VIZ_RLBOT=ON requires GGL_BUILD_RLBOT=ON")
+	endif()
 	target_sources(GigaLearnBot PRIVATE src/VizRLBotServer.cpp)
 	target_compile_definitions(GigaLearnBot PRIVATE GGL_VIZ_RLBOT)
 	# RLBotCPP for the generated flatbuffer types; its own socket layer is unused,
 	# since this is the SERVER side of the protocol and that library is the client.
-	target_link_libraries(GigaLearnBot RLBotCPP)
+	target_link_libraries(GigaLearnBot PRIVATE RLBotCPP)
 endif()
 
 # Offline unit tests (GigaLearnTests). OFF by default so the training box's

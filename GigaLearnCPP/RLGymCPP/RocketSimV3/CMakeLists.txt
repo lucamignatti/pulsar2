@@ -47,7 +47,11 @@ set_target_properties(RocketSimV3 PROPERTIES CXX_STANDARD 20)
 
 # Same collection-hot-path flags as the v2 engine build (see RocketSim/CMakeLists.txt).
 if(NOT MSVC)
-    target_compile_options(RocketSimV3 PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc")
+        target_compile_options(RocketSimV3 PRIVATE -mcpu=native -ffast-math -fno-finite-math-only -funroll-loops)
+    else()
+        target_compile_options(RocketSimV3 PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    endif()
 endif()
 
 target_link_libraries(RocketSimV3 PUBLIC ${RSV3_RUST_LIB})

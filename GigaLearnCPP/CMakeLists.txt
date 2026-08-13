@@ -67,6 +67,16 @@ target_include_directories(GigaLearnCPP PRIVATE "src/private")
 # Include libtorch
 target_link_libraries(GigaLearnCPP PRIVATE "${TORCH_LIBRARIES}")
 
+# NCCL lives in the shared lib (all collectives are in GigaLearnCPP). PRIVATE so
+# the static archive is not pulled a second time into GigaLearnBot.
+if (GGL_USE_NCCL)
+	target_compile_definitions(GigaLearnCPP PUBLIC USE_NCCL=1)
+	target_link_libraries(GigaLearnCPP PRIVATE nccl)
+	target_link_libraries(GigaLearnCPP PUBLIC Threads::Threads)
+else()
+	target_compile_definitions(GigaLearnCPP PUBLIC USE_NCCL=0)
+endif()
+
 # TORCH_CUDA_LIBRARIES is not reliably exported by every libtorch build (the cu128
 # zips in particular), which silently compiled out the CUDA cache-empty path on the
 # Linux box — gate on platform instead, like main does
@@ -81,7 +91,11 @@ set_target_properties(GigaLearnCPP PROPERTIES CXX_STANDARD 20)
 
 if(NOT MSVC)
     # -fno-finite-math-only restores correct NaN/Inf semantics for nlohmann/json (serialises float infinity).
-    target_compile_options(GigaLearnCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc")
+        target_compile_options(GigaLearnCPP PRIVATE -mcpu=native -ffast-math -fno-finite-math-only -funroll-loops)
+    else()
+        target_compile_options(GigaLearnCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    endif()
 endif()
 
 # Include RLGymCPP

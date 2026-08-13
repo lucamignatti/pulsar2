@@ -18,5 +18,9 @@ set_target_properties(RocketSim PROPERTIES CXX_STANDARD 20)
 # exactly: -fno-finite-math-only keeps NaN/Inf semantics intact under -ffast-math so the
 # obs finiteness guards still work.
 if(NOT MSVC)
-    target_compile_options(RocketSim PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc")
+        target_compile_options(RocketSim PRIVATE -mcpu=native -ffast-math -fno-finite-math-only -funroll-loops)
+    else()
+        target_compile_options(RocketSim PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    endif()
 endif()

@@ -5,6 +5,7 @@
 #include <torch/csrc/autograd/autograd.h>   // torch::autograd::grad — the input-gradient the HJB residual needs
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <ATen/autocast_mode.h>             // bf16 autocast for the learn pass (config.learnAutocastBF16)
+#include <torch/version.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <RLGymCPP/CommonValues.h>
 #include "../Util/Plasticity.h"
@@ -22,16 +23,27 @@ namespace {
 		explicit AutocastScope(bool enable) : active(enable) {
 			if (!active)
 				return;
+			// Libtorch 2.1 uses global GPU autocast; 2.4+ takes a device type.
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
 			prev = at::autocast::is_autocast_enabled(at::kCUDA);
 			at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
 			at::autocast::set_autocast_enabled(at::kCUDA, true);
+#else
+			prev = at::autocast::is_enabled();
+			at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
+			at::autocast::set_enabled(true);
+#endif
 		}
 		// End the region early and idempotently. Everything after the call — the geo HJB
 		// double-backward, the InfoNCE heads, and backward() itself — runs in fp32.
 		void End() {
 			if (!active)
 				return;
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
 			at::autocast::set_autocast_enabled(at::kCUDA, prev);
+#else
+			at::autocast::set_enabled(prev);
+#endif
 			at::autocast::clear_cache();
 			active = false;
 		}

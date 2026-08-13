@@ -14,7 +14,11 @@ set_target_properties(RLGymCPP PROPERTIES CXX_STANDARD 20)
 # Env stepping / obs building is collection-hot; match GigaLearnCPP's vectorization flags
 # (see the note in RocketSim/CMakeLists.txt about -fno-finite-math-only).
 if(NOT MSVC)
-    target_compile_options(RLGymCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc")
+        target_compile_options(RLGymCPP PRIVATE -mcpu=native -ffast-math -fno-finite-math-only -funroll-loops)
+    else()
+        target_compile_options(RLGymCPP PRIVATE -march=native -ffast-math -fno-finite-math-only -funroll-loops)
+    endif()
 endif()
 
 # Engine selection: v3 (vendored Rust engine + compat facade, the default since

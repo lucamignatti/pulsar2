@@ -1,4 +1,8 @@
 #include "Muon.h"
+#include <torch/version.h>
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 2)
+#include <c10/util/C++17.h>
+#endif
 
 using namespace torch;
 
@@ -52,12 +56,19 @@ torch::Tensor GGL::Muon::step(LossClosure closure) {
 			Tensor grad = param.grad();
 
 			if (grad.dim() == 2 && grad.size(0) > 1 && grad.size(1) > 1) {
-				// Momentum buffer in SGD's own param state so it checkpoints with the model
-				auto stateItr = state_.find(param.unsafeGetTensorImpl());
+				// Momentum buffer in SGD's own param state so it checkpoints with the model.
+				// Libtorch 2.1 keys Optimizer::state_ by stringified TensorImpl*; 2.2+
+				// (PR 108748) keys by the pointer itself.
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 2)
+				const auto stateKey = c10::guts::to_string(param.unsafeGetTensorImpl());
+#else
+				const auto stateKey = param.unsafeGetTensorImpl();
+#endif
+				auto stateItr = state_.find(stateKey);
 				if (stateItr == state_.end()) {
 					auto newState = std::make_unique<optim::SGDParamState>();
 					newState->momentum_buffer(torch::zeros_like(param));
-					stateItr = state_.insert({ param.unsafeGetTensorImpl(), std::move(newState) }).first;
+					stateItr = state_.insert({ stateKey, std::move(newState) }).first;
 				}
 
 				Tensor buf = static_cast<optim::SGDParamState&>(*stateItr->second).momentum_buffer();
