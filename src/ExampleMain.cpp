@@ -1,4 +1,5 @@
 #include <GigaLearnCPP/Learner.h>
+#include <GigaLearnCPP/NextoEval.h>
 
 #ifdef GGL_VIZ_RLBOT
 // Viewer-only: hosts an RLBot bot as the opponent (see CMake's GGL_VIZ_RLBOT).
@@ -475,6 +476,12 @@ int main(int argc, char* argv[]) {
 	// Initialize RocketSim with collision meshes (run from the repo/build dir;
 	// provision them with tools/get_collision_meshes.sh if missing)
 	RocketSim::Init("collision_meshes");
+
+	// Offline qualifier eval (GGL_NEXTO_EVAL=1): pure-sim goal-share measurement of a
+	// saved checkpoint vs the embedded Nexto - runs INSTEAD of the trainer, CPU-only,
+	// see NextoEval.h for the knobs. Inert without the env var.
+	if (const char* ne = std::getenv("GGL_NEXTO_EVAL"); ne && *ne && std::string(ne) != std::string("0"))
+		return GGL::RunNextoEval();
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
