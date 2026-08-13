@@ -56,6 +56,12 @@ pub struct SeqImpulseConstraintSolver {
     fixed_body_id: Option<usize>,
     least_squares_residual: f32,
     special_resolve_info: SpecialResolveInfo,
+    /// Per-constraint "still converging" flags for the split-impulse pass. This used to
+    /// be a `u64` bitmask, which silently broke at >= 64 contact constraints:
+    /// `1u64 << 64` wraps to 1 in release, so `should_run` became 0 and penetration
+    /// recovery was DISABLED for that whole tick (reachable in 3v3 pile-ups; debug
+    /// builds panic instead). Reused across ticks so the fix costs no allocation.
+    split_impulse_should_run: Vec<bool>,
 }
 
 impl Default for SeqImpulseConstraintSolver {
@@ -67,6 +73,7 @@ impl Default for SeqImpulseConstraintSolver {
             fixed_body_id: None,
             least_squares_residual: 0.0,
             special_resolve_info: SpecialResolveInfo::DEFAULT,
+            split_impulse_should_run: Vec::new(),
         }
     }
 }
@@ -370,7 +377,10 @@ impl SeqImpulseConstraintSolver {
     }
 
     fn solve_group_split_impulse_iterations(&mut self) {
-        let mut should_run = (1u64 << self.tmp_solver_contact_constraint_pool.len()) - 1;
+        let should_run = &mut self.split_impulse_should_run;
+        should_run.clear();
+        should_run.resize(self.tmp_solver_contact_constraint_pool.len(), true);
+        let mut num_running = should_run.len();
 
         for _ in 0..contact_solver_info::NUM_ITERATIONS {
             for (i, contact) in self
@@ -378,8 +388,7 @@ impl SeqImpulseConstraintSolver {
                 .iter_mut()
                 .enumerate()
             {
-                let mask = 1 << i;
-                if should_run & mask == 0 {
+                if !should_run[i] {
                     continue;
                 }
 
@@ -393,11 +402,12 @@ impl SeqImpulseConstraintSolver {
 
                 let residual = contact.resolve_split_penetration_impulse(body_a, body_b);
                 if residual * residual == 0.0 {
-                    should_run ^= mask;
+                    should_run[i] = false;
+                    num_running -= 1;
                 }
             }
 
-            if should_run == 0 {
+            if num_running == 0 {
                 break;
             }
         }

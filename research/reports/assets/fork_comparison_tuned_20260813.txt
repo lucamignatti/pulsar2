@@ -1,0 +1,68 @@
+Code-level pass with four Grok 4.6 dives: [car tick](5b800725-5d87-42a3-9f55-c10e8b3372a0), [wheels/solver](4130b26f-ef91-4281-90f9-43e28bd4cbc4), [ball and car–car](b64df41e-8d51-47e1-85ae-c531e5164e6e), [pads](f011905f-95a4-4f1b-a46f-a988e11a3cb2). Wheel-vs-step order is confirmed in both `arena/base.rs` files. Below is only what changes the physical model, not two ways of writing the same force.
+
+## 1. When wheel forces enter the integrator (largest split)
+
+**Pulsar:** `pre_tick` (engine, jump, sticky, autoroll, boost) → `step_simulation` → `post_tick` runs `update_vehicle_first` **and** `update_vehicle_second`. Suspension and friction are applied **after** Bullet has already integrated this tick.
+
+**Tuned:** `pre_tick` raycasts (or reuses last end-of-tick cache), then `update_vehicle_second` **before** `step_simulation`. Wheel impulses go into the **same** step as gravity.
+
+That is a different discrete-time scheme. Everything else about wheels sits on top of it.
+
+Tuned also recomputes friction / pushback / suspension relative velocity at **apply** time from current velocities (defaults on). Pulsar stores those at **raycast** time. Combined with the step-order split, landings and jump-on-contact ticks will not match.
+
+## 2. Jump / dodge state machine
+
+Not the same lockout with a different constant:
+
+- **Pitch cancel:** pulsar waits `PITCH_CANCEL_MIN_TIME = 0.041` s before dodge pitch torque can cancel. Tuned cancels from tick 0.
+- **Jump hold vs release:** pulsar applies hold, then decides `is_jumping`. Tuned decides first. On release after `MIN_TIME`, pulsar fires one extra jump impulse (~12 uu/s); tuned does not.
+- **Jump timer:** pulsar keeps `jump_time` as time-since-start and will not start another jump while `has_jumped`. Tuned zeros `jump_time` when the jump phase ends and can start another grounded jump during the pad.
+- **Dodge lockout:** pulsar `FLIP_MIN_DELAY = 0.025` s. Tuned default is **2 ticks (~0.0167 s)**. Coupled with the jump-end off-by-one, earliest legal dodge is not the same event.
+
+## 3. Sticky, air control, autoroll, chassis scrape
+
+- **Sticky / air-control gate:** pulsar uses this tick’s wheel list from the previous-end raycast. Tuned uses a `gating_contact` delay line latched **before** the end-of-tick report refresh — sticky and air control run one contact-sample behind pulsar on touchdown/liftoff.
+- **Autoroll:** both consts still say 100 / 80. Pulsar applies them. Tuned multiplies by scales that **default to 0**, so autoroll is off.
+- **Chassis–world friction:** pulsar always zeros it when `num_wheels_in_contact >= 3` (fillet scrape). Tuned keeps world friction 0.3 unless you turn that knob on.
+
+## 4. Contact solver numbers
+
+| | Pulsar | Tuned |
+|---|---|---|
+| Wheel pushback ERP | 0.2 | **0.1** |
+| Hard-contact pushback cap | **48** then `/4` | no cap, `/4` |
+| Sequential-impulse iterations | **10** | **4** |
+| Ball–world penetration recovery | dead (unsigned lengths → no positional ERP) | **on**, signed distance |
+| Graze-fling damper past rest length | fade `suspension_relative_vel` | none |
+| Split-impulse constraint mask | `1u64 << len` (breaks at ≥64 contacts) | unbounded `Vec<bool>` |
+
+Suspension `1/cos` amplification is the same at shipped defaults.
+
+## 5. Ball extra impulse (same formula, different ownership)
+
+Both apply the Psyonix extra hit. The **gate** is different:
+
+- Pulsar: per-**car** `ball_extra_impulse_tick`; same-tick two-car contact **sums**; a blocked car returns immediately.
+- Tuned: per-**ball** `last_extra_hit_tick`; second car on the same tick is dropped; stamp only if `rel_speed > 0`.
+
+That is the 50/50 / pinch model, not a coding style split.
+
+## 6. Bump / demo (different collision law)
+
+Pulsar: time-of-impact center-to-center elliptical cones (demo 45.57°×36.87°, bump 70°×36.87°, 1.01 fudge), demo also needs `|vel·forward| ≥ 2100`, reverse flips the forward axis, **both directions evaluated then applied** (mutual SS can demo both). Bump curve uses **full attacker speed**; upward component only if the victim is grounded.
+
+Tuned: bumper X > 64.5 and closing speed; demo is `is_supersonic` only; **no cones**; apply inside the loop and `return` after the first demo so the other direction never fires. Bump curve uses **projected** closing speed; air victims always get world-+Z up-push.
+
+## 7. Boost pads (different pickup world)
+
+Pulsar: OBB of the **hitbox** (offset COM) vs **box** radii; grant **2 ticks later**; skip the pad if already at max boost.
+
+Tuned: first contact is **origin vs cylinder**; lock then uses a shorter box vs Bullet AABB; **immediate** grant; **consumes even at full boost** (comment: real RL lets full cars deny pads). Lock can survive cooldown.
+
+Unknown-hash meshes: pulsar **loads** them (your trainer dump); tuned **skips** them. That can change arena triangles, not just a warning.
+
+## Same physics (not worth merging as “fixes”)
+
+Air throttle suppressed while boosting (empty-tank edge only: pulsar still suppresses on `controls.boost`; tuned requires `boost > 0`). Supersonic can start airborne. Dodge torque is **not** inertia-scaled. Extra ball impulse **is** applied. Bump cooldown 0.25 s per victim. Car gets no scripted force from a ball hit. Ball sleep is velocity-only.
+
+The two engines are not “the same RocketSim with extra comments.” Tick integration, jump/dodge timing, autoroll, chassis friction, solver stiffness, extra-hit ownership, demo cones, and pad pickup are different physical designs.

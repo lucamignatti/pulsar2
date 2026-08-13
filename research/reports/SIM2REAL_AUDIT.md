@@ -2515,3 +2515,59 @@ therefore need SCRIPT, not the binary:
   crossings; v2's skip-at-full is currently assumed.)
 - **`Car_TA.uc` demolish paths** — where `AddDemolishInvulnerability` is CALLED and when
   entries are removed (spawn duration).
+
+## §45 — TRIAGE AGAINST THE "TUNED" FORK (2026-08-13)
+
+A code-level comparison of this engine against another RocketSim fork ("tuned", aimed at
+BlitzRL) was relayed by the user (four LLM dives; `research/reports/assets/`). Treated as
+CLAIMS, not findings: every item below was checked against our own evidence before any
+action. One was a real bug in our code, one is undecidable, the rest we out-evidence.
+
+**ADOPTED — the split-impulse constraint mask (real latent bug, independently confirmed).**
+`solve_group_split_impulse_iterations` built `should_run = (1u64 << pool.len()) - 1`. At
+exactly 64 contact constraints `1u64 << 64` wraps to 1 in release, so `should_run` becomes
+0 and **penetration recovery is silently disabled for the entire tick**; above 64 the
+per-constraint masks alias (`1 << 64` == `1 << 0`). Debug builds panic instead. Reachable
+in 3v3 pile-ups, not in the 1v1 battery — which is why no instrument ever caught it.
+Replaced with a reused `Vec<bool>` (no per-tick allocation). Battery bit-identical on both
+captures (1035.2 / 1064.7), scenario tests pass, as expected for <64-contact scenes.
+
+**UNDECIDABLE ON CURRENT DATA — full-boost pad consumption.** Tuned consumes the pad even
+at max boost ("real RL lets full cars deny pads"); we skip. Re-tested on the 120Hz capture:
+only **2** full-boost trigger crossings exist (t=10693 pad 13, t=37727 pad 11) and neither
+is followed by a real pickup of that pad inside its cooldown, so both models predict the
+observed data identically. Note the structural reason this capture can never settle it: a
+full-boost pickup produces NO boost increase, so it is invisible except through a LATER
+denied pickup. Decisive test available with machinery we already have — a scripted
+real-game segment: cross a small pad at 100 boost, burn boost, re-cross the SAME pad
+inside 4 s; a denied second pickup proves consumption. Until then v2 behaviour stands.
+
+**REJECTED — we hold stronger evidence than the fork on each of these:**
+
+| Tuned | Why we keep ours |
+|---|---|
+| Dodge pitch-cancel from tick 0 | THREE independent sources for 0.041: measured (flip ang err p90 2.02→0.27, S37), the Ghidra `+0x350` gate, and CDO `MinDodgeTorqueTime=0.0410` |
+| No demo cones (bumper X > 64.5) | CDO has `COMAngleCheck.bEnabled = true`, and the cone native is verified instruction-by-instruction in the binary (S44c) |
+| `return` after first demo | The decompiled pipeline defers actions; mutual supersonic head-ons demo BOTH (scenario test) |
+| Per-BALL extra-impulse gate | v2 keeps it per-car in `ballHitInfo`; per-car measurably fixes pinches/50-50s (S44a) |
+| Immediate pad grant | Measured 2-tick delay: exact-tick pickup matches 14→55 (S42) |
+| Origin-vs-cylinder pickup | Body-vs-box measured correct (S14) and further improved by the hitbox offset (S44b) |
+| Autoroll off (scales 0) | Validated over 5824 inverted frames / 1611 episodes |
+| Solver iterations 10→4 | Their own commit calls it a SPEED change; we are optimizing accuracy |
+| Skip unknown-hash meshes | Our 10-mesh dump is geometrically equivalent to the canonical set (max vertex delta 0.091 uu) |
+
+**NOTED, NOT ACTED ON:**
+- *Wheel forces before vs after the Bullet step* — the one genuinely structural difference.
+  Their claim is +0.12 pp headline / +0.36 pp in-phase; our current post-step ordering is
+  what `PUSHBACK_MAX_IMPULSE = 48` and the damper ramp were FIT under (worth 1126→1035 and
+  the landing bias), so a reorder invalidates that calibration and must re-fit both. It
+  also shifts `is_on_ground` by one tick, i.e. an obs change mid-run for a trained policy.
+  Deferred deliberately: the expected gain is an order of magnitude below what S43 moved.
+- *Wheel pushback ERP 0.1 vs our 0.2* — an alternative parameterization of the same landing
+  physics we already fit with the cap. Cheap A/B on battery+capture if landings regress.
+- *Ball–world penetration recovery* — our solver takes signed `distance`, and world-regime
+  ball error is p50 0.000 / p99 0.01 uu/s over 12k ticks, so any dead positional path is
+  measurably immaterial at real contact depths.
+- *Jump hold/release ordering, `jump_time` reset, `FLIP_MIN_DELAY` 0.025 vs 2 ticks* —
+  testable against the 120Hz capture's jump activations; queued behind items with measured
+  convictions, since flip error is already p90 0.27 rad/s.
