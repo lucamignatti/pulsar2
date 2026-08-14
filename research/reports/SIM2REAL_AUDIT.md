@@ -2757,45 +2757,57 @@ present in both files, so the 80-segment totals are unchanged (verified: fit sti
 until a fresh real capture includes them. Sim currently lifts off at tick 6 (z = 31.68) for
 both; the real number is the open quantity.
 
-## §48 — SCENARIO TESTS FOR JUMP LIFT-OFF AND PAD PICKUP (2026-08-13)
+## §48 — SCENARIO TESTS, AND A RULE ABOUT WHAT MAY BE ASSERTED (2026-08-13)
 
-`rocketsim/tests/jump_and_pads.rs`, 6 tests. Three pin behaviour that is measured and
-settled; three are explicitly TRIPWIRES for behaviour whose real-game value is still open,
-each naming the experiment that would settle it. The distinction is written into the test
-comments so a future reader does not mistake a pin for a proof.
+`rocketsim/tests/jump_and_pads.rs`. The first draft had six tests; three were deleted the
+same day after a user correction that is now **binding doctrine**:
 
-| test | pins | status |
-|---|---|---|
-| `minimum_jump_from_rest_liftoff_tick` | 3-tick jump from rest lifts off at tick 5 | TRIPWIRE (S47: no real value yet) |
-| `one_tick_tap_matches_minimum_jump` | 1-tick tap == 3-tick hold (MIN_TIME floor) | settled by construction |
-| `no_jump_impulse_on_the_release_tick` | minimum-jump apex 94.55 | settled (S45c) |
-| `pad_grant_lands_two_ticks_after_overlap` | grant + cooldown land at overlap+2 | settled (S42, measured 14->55) |
-| `full_boost_car_does_not_consume_the_pad` | max-boost car leaves the pad available | TRIPWIRE (the open question) |
-| `pickup_box_is_centred_on_the_hitbox_not_the_origin` | offset box reaches a pad the origin box misses | settled (S44b) |
+> **Every assertion in the sim test suite must trace to an EXTERNAL truth source** — a
+> real-game capture, the maneuver battery, the decompiled game code, or a CDO constant.
+> **Never to this sim's own output.**
 
-The apex thresholds are MEASURED, not guessed: shipped build 94.55, pre-S45c build 100.29
-(hold force applied before deciding). The tolerance pins the former and excludes the latter,
-so re-adding a release-tick impulse fails the test. My first draft asserted an invented
-~60.6 and failed immediately — a useful reminder that a pinned constant has to be read off
-the build, never estimated.
+The deleted three (`minimum_jump_from_rest_liftoff_tick`, `full_boost_car_does_not_consume_the_pad`,
+`no_jump_impulse_on_the_release_tick`) asserted values read off THIS SIM: lift-off at tick 5,
+pads skipped at full boost, apex 94.55. They were labelled "tripwires", which flattered them.
+Two problems, the second worse than the first:
 
-**`pad_full_boost_deny` battery segment added** — the decisive real-game experiment for the
-one open question. Straight line throughout (no steering error to miss the pad with): start
-at (3584, -400) rolling +y with 100 boost, cross the big pad at (3584, 0), brake-and-boost
-to burn the tank, then reverse back across the SAME pad far inside its 10 s cooldown.
-Validated in sim, where it discriminates cleanly: first crossing t=51 at boost 100 with NO
-gain and no cooldown, tank burned to 85, then **+15 on the return pass at t=317**.
-- real shows a gain there  -> pads are NOT consumed at full; our model and its test stand.
-- real shows no gain       -> RL consumes pads at full; invert the model and the tripwire.
+1. They cannot fail for the reason that matters. "The sim does what the sim does" detects
+   only that someone changed our answer, never that our answer is wrong about Rocket League.
+2. **They entrench guesses.** If the real lift-off is tick 4, that test makes the CORRECT
+   fix look like a regression — friction pointed against the truth. A green suite that
+   encodes unverified numbers is worse than no suite, because it reads as validation.
 
-All three new segments (`jump_min_from_rest`, `jump_tap_from_rest`, `pad_full_boost_deny`)
-are DORMANT: compare.py scores only segments present in both files, so the 80-segment
-totals are untouched (verified: fit 1017.9 / holdout 1048.2) until a real capture includes
-them. Recording one real battery run answers all three open questions at once.
+What survives (3 tests), each citing its external source:
 
-**Pre-existing failure, not caused by this work:** `rl_comparison_test::case_simple_jump_land`
-fails at i=0 with norm_error 1.3503364. Verified identical at HEAD before any change in this
-session (stash test). It is a recorded fixture that predates the S34-S45 physics work
-(damper ramp, pushback cap, ERP 0.10, jump ordering), so it is stale by construction rather
-than a regression. Left alone deliberately -- regenerating it would overwrite a reference
-whose provenance is not recorded.
+| test | external source |
+|---|---|
+| `pad_grant_lands_two_ticks_after_overlap` | 120 Hz capture: exact-tick pickup matches 14 -> 55 (S42) |
+| `pickup_box_is_centred_on_the_hitbox_not_the_origin` | 2 real big-pad pickups outside the origin box, inside the offset box (S44b) |
+| `one_tick_tap_matches_minimum_jump` | `jump::MIN_TIME`, an RL constant |
+
+`tests/demo_bump.rs` (7 tests) already satisfied the rule — every one of its assertions
+traces to the decompiled `ShouldDemolish` / the CDO, not to the sim.
+
+The guard for S45c's release-tick fix is therefore the BATTERY, which is a genuine sim2real
+instrument: the recorded totals (fit 1017.9 / holdout 1048.2) and the per-segment deltas
+(`double_jump` -5.14, `dodge_diagonal` -4.89) move if the ordering regresses. That is the
+right place for it — a magic apex number in a unit test was never the right place.
+
+**The open questions stay open, and that is the honest state.** Minimum-jump lift-off timing
+and full-boost pad consumption are unknown. They live as DORMANT battery segments
+(`jump_min_from_rest`, `jump_tap_from_rest`, `pad_full_boost_deny`), skipped by compare.py
+until a real capture includes them, so the 80-segment totals are untouched (verified: fit
+1017.9 / holdout 1048.2). One real battery recording answers all three at once.
+
+`pad_full_boost_deny` was validated in SIM only to confirm it DISCRIMINATES — straight line
+throughout, first crossing t=51 at boost 100 with no gain, tank burned to 85, +15 on the
+return pass at t=317. That is a statement about the experiment's power, not about physics:
+in the real game it reads as gain-vs-nothing.
+- real gain    -> pads are not consumed at full; our model stands.
+- real no gain -> RL consumes pads at full; invert the model.
+
+**Pre-existing failure, not from this work:** `rl_comparison_test::case_simple_jump_land`
+fails at i=0 with norm_error 1.3503364 — identical at HEAD before any change this session
+(verified by stash). A recorded fixture predating the S34-S45 physics work, so stale by
+construction. Left alone: regenerating would overwrite a reference whose provenance is not
+recorded.
