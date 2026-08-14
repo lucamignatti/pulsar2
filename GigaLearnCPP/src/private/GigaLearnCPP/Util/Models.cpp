@@ -4,6 +4,10 @@
 #include <torch/csrc/api/include/torch/nn/utils/convert_parameters.h>
 #include <torch/nn/modules/normalization.h>
 
+#ifdef RG_CUDA_SUPPORT
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 GGL::Model::Model(
 	const char* modelName,
 	ModelConfig config,
@@ -28,7 +32,7 @@ GGL::Model::Model(
 	for (int i = 0; i < numLayers; i++) {
 
 		// Open a 2-layer residual block at layer i. Never at the stem (i=0, which changes width
-		// from numInputs), and only when layer i+1 exists to pair with - a trailing odd layer
+		// from numInputs), and only when layer i+1 exists to pair with - a trailing odd laye
 		// stays plain, so {W} and {W,W} are unaffected by addResiduals.
 		if (config.addResiduals && blockRemaining == 0 && i >= 1 && (i + 1) < numLayers) {
 			blockRemaining = 2;
@@ -102,7 +106,7 @@ static torch::Tensor ForwardResidual(
 	return x;
 }
 
-torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec) {
+torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepHalf) {
 
 	if (torch::GradMode::is_enabled())
 		halfPrec = false;
@@ -125,12 +129,15 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec) {
 				}
 			}
 		}
-		
-		auto halfInput = input.to(RG_HALFPERC_TYPE);
+
+		auto halfParams = seqHalf->parameters();
+		const auto halfType = halfParams.empty() ? RG_HALFPERC_TYPE : halfParams[0].scalar_type();
+		if (input.scalar_type() != halfType)
+			input = input.to(halfType);
 		auto halfOutput = residualSpans.empty()
-			? seqHalf->forward(halfInput)
-			: ForwardResidual(seqHalf, residualSpans, halfInput);
-		return halfOutput.to(torch::kFloat);
+			? seqHalf->forward(input)
+			: ForwardResidual(seqHalf, residualSpans, input);
+		return keepHalf ? halfOutput : halfOutput.to(torch::kFloat);
 	} else {
 		return residualSpans.empty()
 			? seq->forward(input)
@@ -291,7 +298,7 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 	// The bf16 inference mirror must be rebuilt from the weights just loaded. StepOptim sets this
 	// and so does the collect-snapshot sync — but Load did NOT, so any Model that had already
 	// served one half-precision forward kept serving its PRE-LOAD weights forever, silently.
-	// Boot resume is unaffected (load precedes the first forward). The live victim is render
+	// Boot resume is unaffected (load precedes the first forward). The live victim is rende
 	// mode's checkpoint hot-swap, which loads into already-used models: the viewer would keep
 	// showing the OLD policy while logging the new checkpoint's timestep.
 	_seqHalfOutdated = true;
@@ -299,4 +306,86 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 
 torch::Tensor GGL::Model::CopyParams() const {
 	return torch::nn::utils::parameters_to_vector(parameters()).cpu();
+}
+
+static GGL::Dist::Session::Stream GGLCurrentCudaStream(const torch::Tensor& t) {
+#ifdef RG_CUDA_SUPPORT
+	if (t.is_cuda())
+		return at::cuda::getCurrentCUDAStream(t.device().index()).stream();
+#endif
+	(void)t;
+	return nullptr;
+}
+
+static void GGLCollectGrads(torch::nn::Module& m, const char* name, std::vector<GGL::Dist::Session::GradRef>& refs) {
+	for (auto& p : m.parameters()) {
+		if (!p.requires_grad())
+			continue;
+		if (!p.grad().defined())
+			p.mutable_grad() = torch::zeros_like(p);
+		auto g = p.grad();
+		if (!g.is_cuda() || g.scalar_type() != torch::kFloat)
+			RG_ERR_CLOSE("AllReduceGrads: expected CUDA float32 grad on " << name);
+		if (!g.is_contiguous()) {
+			p.mutable_grad() = g.contiguous();
+			g = p.grad();
+		}
+		refs.push_back({ g.data_ptr<float>(), (size_t)g.numel() });
+	}
+}
+
+void GGL::Model::BroadcastParameters(Dist::Session* dist) {
+	if (!dist || !dist->distributed())
+		return;
+	RG_NO_GRAD;
+	for (auto& p : parameters()) {
+		if (p.is_cuda() && p.scalar_type() == torch::kFloat) {
+			auto t = p.contiguous();
+			dist->bcast_device(t.data_ptr<float>(), (size_t)t.numel(), 0, GGLCurrentCudaStream(t));
+			if (!p.is_same(t))
+				p.copy_(t);
+		} else {
+			auto cpu = p.contiguous().cpu();
+			dist->bcast_host(cpu.data_ptr(), (size_t)cpu.numel() * cpu.element_size(), 0);
+			p.copy_(cpu);
+		}
+	}
+	_seqHalfOutdated = true;
+}
+
+void GGL::Model::AllReduceGrads(Dist::Session* dist) {
+	if (!dist || !dist->distributed())
+		return;
+	std::vector<Dist::Session::GradRef> refs;
+	GGLCollectGrads(*this, modelName, refs);
+	if (refs.empty())
+		return;
+	dist->allreduce_avg_grads(refs, GGLCurrentCudaStream(parameters()[0]));
+}
+
+void GGL::ModelSet::BroadcastParameters(Dist::Session* dist) {
+	if (!dist || !dist->distributed())
+		return;
+	for (Model* model : *this)
+		model->BroadcastParameters(dist);
+}
+
+void GGL::ModelSet::AllReduceGrads(Dist::Session* dist, bool includeExempt) {
+	if (!dist || !dist->distributed())
+		return;
+	std::vector<Dist::Session::GradRef> refs;
+	torch::Tensor streamSrc;
+	for (Model* model : *this) {
+		if (!includeExempt && model->groupStepExempt)
+			continue;
+		GGLCollectGrads(*model, model->modelName, refs);
+		if (!streamSrc.defined()) {
+			auto ps = model->parameters();
+			if (!ps.empty())
+				streamSrc = ps[0];
+		}
+	}
+	if (refs.empty())
+		return;
+	dist->allreduce_avg_grads(refs, streamSrc.defined() ? GGLCurrentCudaStream(streamSrc) : nullptr);
 }

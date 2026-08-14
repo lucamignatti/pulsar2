@@ -142,9 +142,10 @@ namespace GGL {
 		// Set empty to disable saving
 		std::filesystem::path checkpointFolder = "checkpoints"; 
 
-		// Save every timestep
-		// Set to zero to just use timestepsPerIteration
-		int64_t tsPerSave = 1'000'000;
+		// Save every this many training iterations (rank-0 auto-save joins the
+		// collect worker, so this must NOT be a global-timestep interval — that
+		// fired every iter at 10+ nodes). Zero means every iteration.
+		int64_t iterPerSave = 40;
 
 		int64_t randomSeed = -1; // Set to -1 to use the current time
 		int checkpointsToKeep = 8; // Checkpoint storage limit before old checkpoints are deleted, set to -1 to disable

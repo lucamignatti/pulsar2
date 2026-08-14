@@ -1,10 +1,14 @@
 #include "PPOLearner.h"
 
+#include <cstdlib>
+#include <cmath>
+#include <string>
+
 #include <torch/nn/utils/convert_parameters.h>
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/csrc/autograd/autograd.h>   // torch::autograd::grad — the input-gradient the HJB residual needs
 #include <torch/csrc/api/include/torch/serialize.h>
-#include <ATen/autocast_mode.h>             // bf16 autocast for the learn pass (config.learnAutocastBF16)
+#include <ATen/autocast_mode.h>             // learn-pass autocast (BF16 sm_80+ / FP16 V100)
 #include <torch/version.h>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <RLGymCPP/CommonValues.h>
@@ -12,25 +16,29 @@
 
 using namespace torch;
 
-// RAII bf16 autocast for the learn pass; see PPOLearnerConfig::learnAutocastBF16.
+// RAII learn-pass autocast; see PPOLearnerConfig::learnAutocastBF16.
 // Restores the previous state on scope exit (including on a thrown exception) and clears
 // autocast's weight-cast cache, which MUST NOT outlive an optimizer step or the next
 // minibatch would matmul against stale casts of the pre-step weights.
+// Dtype is GGLHalfPrecType(): BF16 on sm_80+, FP16 on V100. FP16 needs loss scaling
+// (done around backward, not here). Geo HJB / InfoNCE / backward stay outside the region.
 namespace {
 	struct AutocastScope {
 		bool active;
 		bool prev = false;
-		explicit AutocastScope(bool enable) : active(enable) {
-			if (!active)
+		explicit AutocastScope(bool enable) : active(false) {
+			if (!enable)
 				return;
+			active = true;
+			auto dt = GGL::GGLHalfPrecType();
 			// Libtorch 2.1 uses global GPU autocast; 2.4+ takes a device type.
 #if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
 			prev = at::autocast::is_autocast_enabled(at::kCUDA);
-			at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+			at::autocast::set_autocast_dtype(at::kCUDA, dt);
 			at::autocast::set_autocast_enabled(at::kCUDA, true);
 #else
 			prev = at::autocast::is_enabled();
-			at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
+			at::autocast::set_autocast_gpu_dtype(dt);
 			at::autocast::set_enabled(true);
 #endif
 		}
@@ -49,9 +57,45 @@ namespace {
 		}
 		~AutocastScope() { End(); }
 	};
+
+	template <typename Fn>
+	void AmpForEachGrad(GGL::ModelSet& models, Fn&& fn) {
+		for (GGL::Model* m : models) {
+			if (!m)
+				continue;
+			for (auto& p : m->parameters()) {
+				auto g = p.grad();
+				if (g.defined())
+					fn(g);
+			}
+		}
+	}
+
+	void AmpUnscaleGrads(GGL::ModelSet& models, float scale) {
+		if (scale == 1.f)
+			return;
+		AmpForEachGrad(models, [scale](torch::Tensor& g) { g.div_(scale); });
+	}
+
+	bool AmpGradsFinite(GGL::ModelSet& models) {
+		torch::Tensor acc;
+		AmpForEachGrad(models, [&](torch::Tensor& g) {
+			auto f = g.isfinite().all();
+			acc = acc.defined() ? acc.logical_and(f) : f;
+		});
+		return !acc.defined() || acc.item<bool>();
+	}
+
+	void AmpZeroGrads(GGL::ModelSet& models) {
+		for (GGL::Model* m : models) {
+			if (!m || m->groupStepExempt || !m->optim)
+				continue;
+			m->optim->zero_grad();
+		}
+	}
 }
 
-GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device) : config(_config), device(_device) {
+GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device, Dist::Session* dist) : config(_config), device(_device), dist(dist) {
 
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
@@ -60,6 +104,18 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		RG_ERR_CLOSE("PPOLearner: config.batchSize (" << config.batchSize << ") must be a multiple of config.miniBatchSize (" << config.miniBatchSize << ")");
 
 	numActionsCached = numActions; obsSizeCached = obsSize;
+	if (const char* s = std::getenv("GGL_AMP_SCALE"); s && s[0]) {
+		float v = std::strtof(s, nullptr);
+		if (v >= 1.f)
+			ampLossScale = v;
+	}
+	if (config.learnAutocastBF16 && device.is_cuda()) {
+		if (GGL::GGLCudaHasBF16()) {
+			RG_LOG("PPOLearner: learn autocast bf16 (no scaler)");
+		} else {
+			RG_LOG("PPOLearner: learn autocast fp16 loss_scale=" << ampLossScale);
+		}
+	}
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic,
 		config.criticTrunk, device, models);
 
@@ -297,21 +353,22 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 		// fnValueTrunk in Learn). Header contract: same rows, same model, same order.
 		obs = precomputedTrunk;
 	else if (models["shared_head"])
-		obs = models["shared_head"]->Forward(obs, halfPrec);
+		obs = models["shared_head"]->Forward(obs, halfPrec, /*keepHalf=*/halfPrec);
 
-	// Steered-practice collection: shift the trunk output along the commitment direction for
-	// the masked rows. Model::Forward returns kFloat even on the halfPrec path, so this add is
-	// always fp32. Post-trunk only - steering raw obs would be meaningless.
+	// Steered-practice: shift trunk output in the commitment direction for masked rows.
+	// keepHalf leaves trunk in fp16/bf16, so cast the delta to that dtype.
 	if (steerDelta.defined()) {
 		RG_ASSERT(models["shared_head"]); // the direction lives in trunk-output space
-		obs = obs + steerDelta.to(obs.device());
+		obs = obs + steerDelta.to(obs.dtype());
 	}
 
 	// temperature == 1 is the live setting and `/ 1.0f` is a full [rows x 90] elementwise kernel
 	// launched every collection step for nothing. Inference here is DISPATCH-bound, not
 	// arithmetic-bound (the 21-op network was issuing ~55 GPU ops), so an op that computes an
 	// identity is a real cost.
-	auto logits = models["policy"]->Forward(obs, halfPrec);
+	auto logits = models["policy"]->Forward(obs, halfPrec, /*keepHalf=*/halfPrec);
+	if (logits.scalar_type() != torch::kFloat)
+		logits = logits.to(torch::kFloat);
 	if (temperature != 1.f)
 		logits = logits / temperature;
 
@@ -387,14 +444,19 @@ void GGL::PPOLearner::InferActionsFromModels(
 			*outLogProbs = logProb.flatten();
 	}
 
-	// Deferred non-finite verdict. This drain sits AFTER the sample, immediately before the
-	// caller's D2H of the actions (which then costs ~nothing) - vs the old mid-pipeline sync
-	// that left a GPU bubble between forward and multinomial on every collection step. On
-	// failure, the re-invocation takes the synchronous branch and RG_ERR_CLOSEs with the full
-	// forensic message; sampling above was safe because bad rows were sanitized to uniform.
-	if (!rowOk.all().item<bool>()) {
-		InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
-		RG_ERR_CLOSE("InferActionsFromModels: non-finite logits, but the diagnostic rerun did not reproduce them");
+	// Deferred non-finite verdict. Sanitizer above keeps multinomial safe. The .item() is a
+	// blocking CUDA sync; collection immediately .cpu()'s the actions anyway, so this is a
+	// second drain. GGL_INFER_FINITE_SYNC: 1 = every call (old), N = every Nth, 0 = skip.
+	{
+		static int finiteEvery = []() {
+			const char* s = std::getenv("GGL_INFER_FINITE_SYNC");
+			return (s && *s) ? std::atoi(s) : 1;
+		}();
+		static int finiteCtr = 0;
+		if (finiteEvery > 0 && ((++finiteCtr) % finiteEvery) == 0 && !rowOk.all().item<bool>()) {
+			InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
+			RG_ERR_CLOSE("InferActionsFromModels: non-finite logits, but the diagnostic rerun did not reproduce them");
+		}
 	}
 }
 
@@ -452,7 +514,9 @@ void GGL::PPOLearner::InferValueFamily(
 
 	RG_NO_GRAD;
 	bool hp = config.useHalfPrecision;
-	auto obsDev = obs.to(device, true, true);          // the single upload for this chunk
+	auto obsDev = obs;
+	if (obsDev.device() != device)
+		obsDev = obs.to(device, /*non_blocking=*/true);
 
 	if (outGeoV && models["geo_v"])                    // independent net, raw obs
 		*outGeoV = models["geo_v"]->Forward(obsDev, hp).flatten().to(torch::kFloat32);
@@ -463,29 +527,33 @@ void GGL::PPOLearner::InferValueFamily(
 	if (!needTrunk)
 		return;
 
-	auto vt = ValueTrunk(obsDev, hp);                  // THE one trunk + critic_trunk forward
+	auto vtBare = ValueTrunk(obsDev, hp);              // THE one trunk + critic_trunk forward
+	// Learn and InferVdagMin read V-dagger off the unconditioned trunk. Critic / goal
+	// critic get opp_embed on a copy (vtL = trunk + embed). Do not fold embed into
+	// vtBare or consume-side min(V1,V2) would disagree with the trained heads.
+	torch::Tensor vtCrit = vtBare;
 	if (config.oppCondEnabled && models["opp_embed"] && oppCtxLive.defined())
 		// privileged opponent conditioning: additive, zero-init at birth (exact no-op
 		// until trained); the collection worker sets oppCtxLive for its iteration
-		vt = vt + models["opp_embed"]->Forward(
-			oppCtxLive.unsqueeze(0), false).expand({ vt.size(0), -1 });
+		vtCrit = vtBare + models["opp_embed"]->Forward(
+			oppCtxLive.unsqueeze(0), false).expand({ vtBare.size(0), -1 });
 
 	if (outCritic && models["critic"]) {
-		auto v = models["critic"]->Forward(vt, hp).flatten().to(torch::kFloat32);
+		auto v = models["critic"]->Forward(vtCrit, hp).flatten().to(torch::kFloat32);
 		if (config.valueTwinEnabled && models["critic2"])
-			v = 0.5f * (v + models["critic2"]->Forward(vt, hp).flatten().to(torch::kFloat32));
+			v = 0.5f * (v + models["critic2"]->Forward(vtCrit, hp).flatten().to(torch::kFloat32));
 		*outCritic = v;
 	}
 	if (outGoalCritic && models["goal_critic"]) {
 		// InferGoalCritic reads the critic trunk only when one exists; without it the head
 		// takes raw obs, so preserve that branch exactly.
 		*outGoalCritic = models["critic_trunk"]
-			? models["goal_critic"]->Forward(vt, hp).flatten().to(torch::kFloat32)
+			? models["goal_critic"]->Forward(vtCrit, hp).flatten().to(torch::kFloat32)
 			: models["goal_critic"]->Forward(obsDev, hp).flatten().to(torch::kFloat32);
 	}
 	if (outVdagMin && models["vdag1"] && models["vdag2"]) {
-		auto a = models["vdag1"]->Forward(vt, hp).flatten().to(torch::kFloat32);
-		auto b = models["vdag2"]->Forward(vt, hp).flatten().to(torch::kFloat32);
+		auto a = models["vdag1"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
+		auto b = models["vdag2"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
 		*outVdagMin = torch::minimum(a, b);
 	}
 }
@@ -616,7 +684,10 @@ void GGL::PPOLearner::TrainWorldModel(torch::Tensor states, torch::Tensor action
 	if (!models["wm_dyn1"] || !models["wm_dyn2"])
 		return;
 	int64_t nR = states.size(0);
-	if (nR < 256)
+	int doWm = (nR >= 256) ? 1 : 0;
+	if (dist && dist->distributed())
+		dist->min_host(&doWm, 1);
+	if (!doWm)
 		return;
 
 	torch::Tensor sel;
@@ -624,7 +695,10 @@ void GGL::PPOLearner::TrainWorldModel(torch::Tensor states, torch::Tensor action
 		RG_NO_GRAD;
 		// cont[i] == 1 means row i+1 IS the successor of row i (no episode boundary)
 		auto ok = (cont.slice(0, 0, nR - 1) > 0.5f).nonzero().flatten().to(torch::kCPU);
-		if (ok.numel() < 128)
+		int haveOk = (ok.numel() >= 128) ? 1 : 0;
+		if (dist && dist->distributed())
+			dist->min_host(&haveOk, 1);
+		if (!haveOk)
 			return;
 		int64_t take = RS_MIN((int64_t)config.vdagWmRows, ok.numel());
 		auto perm = torch::randperm(ok.numel(), torch::TensorOptions().dtype(torch::kLong));
@@ -656,6 +730,10 @@ void GGL::PPOLearner::TrainWorldModel(torch::Tensor states, torch::Tensor action
 			l = l.defined() ? l + li : li;
 		}
 		l.backward();
+		if (dist) {
+			if (models["wm_dyn1"]) models["wm_dyn1"]->AllReduceGrads(dist);
+			if (models["wm_dyn2"]) models["wm_dyn2"]->AllReduceGrads(dist);
+		}
 		for (const char* n : { "wm_dyn1", "wm_dyn2" })
 			models[n]->StepOptim();
 		lossSum += l.detach().cpu().item<float>();
@@ -725,10 +803,11 @@ torch::Tensor GGL::PPOLearner::ImagTargetsFor(torch::Tensor sDev, torch::Tensor*
 void GGL::PPOLearner::TrainImagValue(torch::Tensor states) {
 	if (!models["wm_v1"] || !models["wm_dyn1"] || !models["rhat1"])
 		return;
-	if (rhatMaxObserved <= 0.f)
-		return;   // no reward scale observed yet: nothing to bound a hypothesis with
 	int64_t nR = states.size(0);
-	if (nR < 256)
+	int doImag = (rhatMaxObserved > 0.f && nR >= 256) ? 1 : 0;
+	if (dist && dist->distributed())
+		dist->min_host(&doImag, 1);
+	if (!doImag)
 		return;
 
 	torch::Tensor S, Y;
@@ -772,6 +851,10 @@ void GGL::PPOLearner::TrainImagValue(torch::Tensor states) {
 			l = l.defined() ? l + li : li;
 		}
 		l.backward();
+		if (dist) {
+			if (models["wm_v1"]) models["wm_v1"]->AllReduceGrads(dist);
+			if (models["wm_v2"]) models["wm_v2"]->AllReduceGrads(dist);
+		}
 		for (const char* n : { "wm_v1", "wm_v2" })
 			models[n]->StepOptim();
 		lossSum += l.detach().cpu().item<float>();
@@ -862,7 +945,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// residual stays per-minibatch below - the FIELD must track the policy's states; the world
 	// does not move. The geo nets touch no shared parameters, so stepping them here is
 	// independent of the main backward.
-	if (models["geo_v"] && geoResFill > 1024) {
+	int doGeoFit = (models["geo_v"] && geoResFill > 1024) ? 1 : 0;
+	if (dist && dist->distributed())
+		dist->min_host(&doGeoFit, 1);
+	if (doGeoFit) {
 		torch::Tensor sigAcc, rewAcc;
 		int64_t chunk = RS_MIN((int64_t)config.miniBatchSize, geoResFill);
 		constexpr int GEO_FIT_CHUNKS = 4;
@@ -887,6 +973,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			auto rewLoss = mseLoss(rPred, rr);
 
 			(sigLoss + rewLoss).backward();
+			if (dist) {
+				if (models["geo_sigma"]) models["geo_sigma"]->AllReduceGrads(dist);
+				if (models["geo_rew"]) models["geo_rew"]->AllReduceGrads(dist);
+			}
 			nn::utils::clip_grad_norm_(models["geo_sigma"]->parameters(), 1.0f);
 			nn::utils::clip_grad_norm_(models["geo_rew"]->parameters(), 1.0f);
 			models["geo_sigma"]->StepOptim();
@@ -905,7 +995,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// to keep exactly the obs dims that CONDITION the local dynamics; the L1 deletes the
 	// rest. Audit by reading hull_proj's first-layer weights (Hull/Proj L1 panel tracks the
 	// surviving mass).
-	if (config.hullEnabled && models["hull_proj"] && geoResFill > 1024) {
+	int doHullFit = (config.hullEnabled && models["hull_proj"] && geoResFill > 1024) ? 1 : 0;
+	if (dist && dist->distributed())
+		dist->min_host(&doHullFit, 1);
+	if (doHullFit) {
 		torch::Tensor nllAcc;
 		int64_t chunk = RS_MIN((int64_t)config.miniBatchSize, geoResFill);
 		constexpr int HULL_FIT_CHUNKS = 4;
@@ -927,6 +1020,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					l1 = l1.defined() ? l1 + p.abs().mean() : p.abs().mean();
 			auto loss = l1.defined() ? nll + config.hullChartL1 * l1 : nll;
 			loss.backward();
+			if (dist) {
+				if (models["hull_proj"]) models["hull_proj"]->AllReduceGrads(dist);
+				if (models["hull_head"]) models["hull_head"]->AllReduceGrads(dist);
+			}
 			nn::utils::clip_grad_norm_(models["hull_proj"]->parameters(), 1.0f);
 			nn::utils::clip_grad_norm_(models["hull_head"]->parameters(), 1.0f);
 			models["hull_proj"]->StepOptim();
@@ -943,6 +1040,24 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor geoResidAcc, geoMeanAcc;
 	int geoMbCount = 0;
 
+	// Device-side metric sums: one .item() at the end of Learn, not per minibatch
+	// (GGL-2). Per-minibatch .cpu().item() was a stream drain in the same class as
+	// collect's old tActions.cpu().
+	auto metricOpts = torch::TensorOptions().dtype(torch::kFloat32).device(
+		device.is_cuda() ? device : torch::kCPU);
+	auto zmet = [&]() { return torch::zeros({}, metricOpts); };
+	torch::Tensor sumEntropy = zmet(), sumRatio = zmet(), sumPolicyLoss = zmet();
+	torch::Tensor sumRelEntropyLoss = zmet(), sumCriticLoss = zmet(), sumGoalCriticLoss = zmet();
+	torch::Tensor sumGuidingLoss = zmet(), sumClip = zmet(), sumDivergence = zmet();
+	torch::Tensor sumVdagLoss = zmet(), sumVdagTwinSpread = zmet(), sumRhatLoss = zmet();
+	torch::Tensor sumReachLoss = zmet(), sumReachCarStateLoss = zmet();
+	torch::Tensor lastEntGate, lastSilLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
+	torch::Tensor nRelEntropy = zmet();
+	int metricPolicySteps = 0, metricCriticSteps = 0, metricGoalSteps = 0;
+	int metricKlSteps = 0, metricClipSteps = 0, metricGuidingSteps = 0;
+	int metricVdagSteps = 0, metricTwinSteps = 0, metricRhatSteps = 0;
+	int metricReachSteps = 0, metricReachCSSteps = 0;
+
 	// ADVANTAGE FILTERING AS A ROW SUBSET (config.advFilterSubset). Materialize the kept rows
 	// ONCE for the whole Learn call, then run every epoch on them. Built with the buffer's own
 	// _GetSamples, which zips fields POSITIONALLY over ExperienceTensors::begin()/end() — so a
@@ -958,7 +1073,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		int64_t nKept = keptIdx.numel();
 		// Guard the degenerate end: a subset smaller than one minibatch would make the batch
 		// loop below produce nothing and the iteration would silently not train.
-		if (nKept >= (int64_t)config.miniBatchSize) {
+		int useSubset = (nKept >= (int64_t)config.miniBatchSize) ? 1 : 0;
+		if (dist && dist->distributed())
+			dist->min_host(&useSubset, 1);
+		if (useSubset) {
 			filteredExp.data = experience._GetSamples(keptIdx.data_ptr<int64_t>(), (size_t)nKept);
 			learnExp = &filteredExp;
 			// One batch holding every kept row; the minibatch loop below splits it by
@@ -972,12 +1090,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		}
 	}
 
+	learnExp->UploadToDevice();
+
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
 		// Get randomly-ordered timesteps for PPO
 		dbgVdagRows = experience.data.vdagTargets.defined() ? (float)experience.data.vdagTargets.numel() : -2.f;
 		dbgRhatEntry = experience.data.rhatTargets.defined() ? (float)experience.data.rhatTargets.numel() : -2.f;
 		auto batches = learnExp->GetAllBatchesShuffled(learnBatchSize, config.overbatching);
+		if (dist && dist->distributed()) {
+			int bc = (int)batches.size();
+			dist->min_host(&bc, 1);
+			if (bc <= 0)
+				RG_ERR_CLOSE("PPOLearner: a rank has 0 batches; NCCL all-reduces would hang");
+			if ((int)batches.size() > bc)
+				batches.resize((size_t)bc);
+		}
 		if (dbgVdagRows > 0 && !batches.empty())
 			dbgRhatRows = batches[0].vdagTargets.defined() ? (float)batches[0].vdagTargets.numel() : -3.f;
 
@@ -1015,27 +1143,31 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 				float batchSizeRatio = (stop - start) / (float)curBatchSize;
 
-				// Send everything to the device and enforce correct shapes
-				auto acts = batchActs.slice(0, start, stop).to(device, true, true);
-				auto obs = batchObs.slice(0, start, stop).to(device, true, true);
-				auto actionMasks = batchActionMasks.slice(0, start, stop).to(device, true, true);
-				
-				auto advantages = batchAdvantages.slice(0, start, stop).to(device, true, true);
-				auto oldProbs = batchOldProbs.slice(0, start, stop).to(device, true, true);
-				auto targetValues = batchTargetValues.slice(0, start, stop).to(device, true, true);
+				auto take = [&](torch::Tensor t) {
+					if (!t.defined())
+						return t;
+					auto s = t.slice(0, start, stop);
+					if (s.device() == device)
+						return s;
+					return s.to(device, /*non_blocking=*/true, /*copy=*/true);
+				};
+				auto acts = take(batchActs);
+				auto obs = take(batchObs);
+				auto actionMasks = take(batchActionMasks);
+				auto advantages = take(batchAdvantages);
+				auto oldProbs = take(batchOldProbs);
+				auto targetValues = take(batchTargetValues);
 
 				// Advantage filtering (policy only; see the note above the minibatch lambda)
-				torch::Tensor advKeep;
-				float mbKeptRows = (float)(stop - start);
+				torch::Tensor advKeep, keepSum;
 				if (batchAdvFilter.defined()) {
-					auto keepCpu = batchAdvFilter.slice(0, start, stop);
-					mbKeptRows = keepCpu.sum().item<float>();
-					advKeep = keepCpu.to(device, true, true);
+					advKeep = take(batchAdvFilter);
+					keepSum = advKeep.sum().clamp_min(1);
 				}
 
-				// bf16 autocast covers the dense forwards below (policy, critic, goal critic,
+				// Learn autocast covers the dense forwards below (policy, critic, goal critic,
 				// V-dagger twins). It is paused around the geo HJB and the InfoNCE heads, and
-				// ends before totalLoss.backward(). See PPOLearnerConfig::learnAutocastBF16.
+				// ends before totalLoss.backward(). FP16 on V100; BF16 on sm_80+.
 				AutocastScope autocast(config.learnAutocastBF16 && device.is_cuda());
 
 				// THE one main-trunk forward for this minibatch, shared by the policy head and
@@ -1053,7 +1185,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (trainPolicy) {
 
 					// Get policy log probs and entropy
-					float curEntropy;
+					torch::Tensor curEntropyT;
 					{
 						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false,
 							{}, nullptr, fnTrunkVR());
@@ -1061,16 +1193,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						auto entRows = ComputeEntropyRows(probs, actionMasks, config.maskEntropy);
 						// Report the UNWEIGHTED mean so the panel stays comparable to runs
 						// without the gate.
-						curEntropy = entRows.mean().detach().cpu().item<float>();
-						avgEntropy += curEntropy;
+						curEntropyT = entRows.mean().detach();
+						sumEntropy += curEntropyT;
+						metricPolicySteps++;
 						// H-GATED ENTROPY: sample harder where the critic says there is
 						// unrealised value. Only ever ADDS stochasticity -> the entropy
 						// floor is strengthened by construction.
 						if (batch.entWeights.defined()) {
-							auto ew = batch.entWeights.slice(0, start, stop)
-								.to(device, true, true).view_as(entRows);
+							auto ew = take(batch.entWeights).view_as(entRows);
 							entropy = (entRows * ew).mean();
-							dbgEntGate = ew.mean().detach().cpu().item<float>();
+							lastEntGate = ew.mean().detach();
 						} else {
 							entropy = entRows.mean();
 						}
@@ -1080,7 +1212,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 					// Compute PPO loss
 					ratio = exp(logProbs - oldProbs);
-					avgRatio += ratio.mean().detach().cpu().item<float>();
+					sumRatio += ratio.mean().detach();
 					clipped = clamp(
 						ratio, 1 - config.clipRange, 1 + config.clipRange
 					);
@@ -1092,25 +1224,27 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					);
 					// policyLossRatio is this minibatch's share of the batch-wide mean; with no
 					// filter that is just its row share (the original batchSizeRatio)
-					float policyLossRatio = batchSizeRatio;
+					torch::Tensor policyLossScale = torch::full({}, batchSizeRatio, metricOpts);
 					if (advKeep.defined()) {
-						policyLoss = (ppoPerRow * advKeep.view_as(ppoPerRow)).sum()
-							/ RS_MAX(mbKeptRows, 1.f);
-						policyLossRatio = mbKeptRows / batchKeptRows;
+						policyLoss = (ppoPerRow * advKeep.view_as(ppoPerRow)).sum() / keepSum;
+						policyLossScale = keepSum / batchKeptRows;
 					} else {
 						policyLoss = ppoPerRow.mean();
 					}
-					float curPolicyLoss = policyLoss.detach().cpu().item<float>();
-					avgPolicyLoss += curPolicyLoss;
+					auto curPolicyLossT = policyLoss.detach();
+					sumPolicyLoss += curPolicyLossT;
 
 					// A fully-filtered minibatch (no kept rows) gives policyLoss == 0 exactly, and
 					// one inf would poison this tracker for the whole report
-					if (curPolicyLoss != 0)
-						avgRelEntropyLoss += (curEntropy * config.entropyScale) / curPolicyLoss;
+					sumRelEntropyLoss += torch::where(
+						curPolicyLossT != 0,
+						(curEntropyT * config.entropyScale) / curPolicyLossT,
+						torch::zeros({}, curPolicyLossT.options()));
+					nRelEntropy += (curPolicyLossT != 0).to(torch::kFloat32);
 
 					// Entropy keeps the unfiltered row share: it regularizes the policy over the
 					// whole visited state distribution, not just the rows that scored well.
-					ppoLoss = policyLoss * policyLossRatio
+					ppoLoss = policyLoss * policyLossScale
 						- entropy * config.entropyScale * batchSizeRatio;
 
 					// SELF-IMITATION: positive-only BC on conversion rows (weights computed at
@@ -1118,15 +1252,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// minibatch's conversion rows, batchSizeRatio-scaled so gradient
 					// accumulation matches a full-batch pass (the guiding-loss convention).
 					if (batch.silWeights.defined()) {
-						auto sw = batch.silWeights.slice(0, start, stop)
-							.to(device, true, true).view_as(logProbs);
-						float nConv = sw.count_nonzero().item<float>();
-						if (nConv > 0) {
-							auto silLoss = (-(logProbs.flatten()) * sw.flatten()).sum()
-								/ nConv * config.silCoeff * batchSizeRatio;
-							dbgSilLoss = silLoss.detach().cpu().item<float>();
-							ppoLoss = ppoLoss + silLoss;
-						}
+						auto sw = take(batch.silWeights).view_as(logProbs);
+						auto nConv = sw.count_nonzero().to(torch::kFloat32);
+						auto silLoss = (-(logProbs.flatten()) * sw.flatten()).sum()
+							/ nConv.clamp_min(1) * config.silCoeff * batchSizeRatio;
+						silLoss = silLoss * (nConv > 0).to(silLoss.dtype());
+						lastSilLoss = silLoss.detach();
+						ppoLoss = ppoLoss + silLoss;
 					}
 
 					if (config.useGuidingPolicy) {
@@ -1137,7 +1269,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
-						avgGuidingLoss.Add(guidingLoss.detach().cpu().item<float>());
+						sumGuidingLoss += guidingLoss.detach();
+						metricGuidingSteps++;
 						// batchSizeRatio keeps gradient accumulation identical to a full-batch
 						// pass; without it the accumulated guiding gradient scales with the
 						// minibatch count (effective strength would depend on miniBatchSize)
@@ -1159,7 +1292,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// resolution-terminated episodes, so those rows would only teach it "0 here".
 				torch::Tensor keepRow = {};
 				if (batchPracticeMask.defined())
-					keepRow = 1.0f - batchPracticeMask.slice(0, start, stop).to(device, true, true);
+					keepRow = 1.0f - take(batchPracticeMask);
 
 				auto fnMaskedMSE = [&](torch::Tensor pred, torch::Tensor target) {
 					if (!keepRow.defined())
@@ -1203,7 +1336,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// pass on a subsample. All flag-gated; flags off = the original path.
 					torch::Tensor vtL = fnValueTrunk();
 					if (config.oppCondEnabled && models["opp_embed"] && batch.oppCtx.defined()) {
-						auto ctx = batch.oppCtx.slice(0, start, stop).to(device, true, true);
+						auto ctx = take(batch.oppCtx);
 						vtL = vtL + models["opp_embed"]->Forward(ctx, false);
 					}
 					auto tFlat = targetValues.flatten();
@@ -1232,8 +1365,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							auto mVt = models["critic_trunk"]
 								? models["critic_trunk"]->Forward(mTrunk, false) : mTrunk;
 							if (config.oppCondEnabled && models["opp_embed"] && batch.oppCtx.defined()) {
-								auto ctx = batch.oppCtx.slice(0, start, start + mRows)
-									.to(device, true, true);
+								auto ctx = take(batch.oppCtx).slice(0, 0, mRows);
 								mVt = mVt + models["opp_embed"]->Forward(ctx, false);
 							}
 							auto tM = tFlat.slice(0, 0, mRows);
@@ -1250,7 +1382,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							criticLoss = criticLoss + mLoss * (config.valueMirrorFrac * batchSizeRatio);
 						}
 					}
-					avgCriticLoss += criticLoss.detach().cpu().item<float>();
+					sumCriticLoss += criticLoss.detach();
+					metricCriticSteps++;
 				}
 
 				// AUX DISPLACEMENT HEAD (composite value critic): one-step displacement
@@ -1259,17 +1392,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// which is the point (the toy's single largest training lever).
 				torch::Tensor auxDispLoss;
 				if (config.auxDispEnabled && models["aux_disp"] && batch.auxDispTargets.defined()) {
-					auto tgt = batch.auxDispTargets.slice(0, start, stop).to(device, true, true)
-						.to(torch::kFloat32);
-					auto mask = batch.auxDispMask.slice(0, start, stop).to(device, true, true)
-						.to(torch::kFloat32).unsqueeze(1);
+					auto tgt = take(batch.auxDispTargets).to(torch::kFloat32);
+					auto mask = take(batch.auxDispMask).to(torch::kFloat32).unsqueeze(1);
 					auto out = models["aux_disp"]->Forward(fnTrunkVR(), false).to(torch::kFloat32);
 					int64_t od = tgt.size(1);
 					auto mu = out.slice(1, 0, od);
 					auto ls = out.slice(1, od, 2 * od).clamp(-8.f, 2.f);
 					auto nll = ((ls + 0.5f * ((tgt - mu) / ls.exp()).pow(2)) * mask).mean();
 					auxDispLoss = nll * (config.auxDispWeight * batchSizeRatio);
-					dbgAuxNLL = nll.detach().cpu().item<float>();
+					lastAuxNLL = nll.detach();
 				}
 
 				// Secondary goal-only critic: plain value regression on its own channel. It reads
@@ -1279,12 +1410,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// InferGoalCritic's raw-obs path keeps the old isolation.
 				torch::Tensor goalCriticLoss;
 				if (batchGoalTargetValues.defined() && models["goal_critic"]) {
-					auto goalTargets = batchGoalTargetValues.slice(0, start, stop).to(device, true, true);
+					auto goalTargets = take(batchGoalTargetValues);
 					auto goalVals = (models["critic_trunk"]
 						? models["goal_critic"]->Forward(fnValueTrunk(), false).flatten()
 						: InferGoalCritic(obs)).view_as(goalTargets);
 					goalCriticLoss = fnMaskedMSE(goalVals, goalTargets) * batchSizeRatio;
-					avgGoalCriticLoss += goalCriticLoss.detach().cpu().item<float>();
+					sumGoalCriticLoss += goalCriticLoss.detach();
+					metricGoalSteps++;
 				}
 
 				// HEADROOM twin V-dagger: expectile regression vs one-iteration-frozen TD
@@ -1299,7 +1431,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				// (fnValueTrunk) - see the note there for why one shared forward matters.
 				torch::Tensor rhatLoss;
 				if (batch.rhatTargets.defined() && models["rhat1"] && models["rhat2"]) {
-					auto yrRaw = batch.rhatTargets.slice(0, start, stop).to(device, true, true).flatten();
+					auto yrRaw = take(batch.rhatTargets).flatten();
 					// DIMENSIONLESS target: regress r/scale, so the Occam coefficient means
 					// the same thing at any reward magnitude. Against a raw target it was
 					// ~40x too weak here relative to the corridor it was set on, and the
@@ -1326,14 +1458,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						l = l + config.vdagTheoryL1 * firstLin.norm(2, /*dim=*/0).sum() * batchSizeRatio;
 						rhatLoss = rhatLoss.defined() ? rhatLoss + l : l;
 					}
-					avgRhatLoss += rhatLoss.detach().cpu().item<float>();
+					sumRhatLoss += rhatLoss.detach();
+					metricRhatSteps++;
 				}
 
 				torch::Tensor vdagLoss;
 				dbgVdagRows = batch.vdagTargets.defined() ? (float)batch.vdagTargets.numel() : -1.f;
 				dbgRhatRows = batch.rhatTargets.defined() ? (float)batch.rhatTargets.numel() : -1.f;
 				if (batch.vdagTargets.defined() && models["vdag1"] && models["vdag2"]) {
-					auto yv = batch.vdagTargets.slice(0, start, stop).to(device, true, true).flatten();
+					auto yv = take(batch.vdagTargets).flatten();
 					torch::Tensor& trunkV = fnValueTrunk();
 					// TWIN SPREAD: mean |V1 - V2| on the same rows. The min-in-target anti-ratchet
 					// only works while the twins are DIFFERENT functions, and as of 2026-07-29
@@ -1347,8 +1480,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						if (!twinPredA.defined()) {
 							twinPredA = pred.detach();
 						} else {
-							avgVdagTwinSpread += (twinPredA - pred.detach())
-								.abs().mean().item<float>();
+							sumVdagTwinSpread += (twinPredA - pred.detach()).abs().mean();
+							metricTwinSteps++;
 						}
 						auto u = yv - pred;
 						auto w = torch::where(u > 0,
@@ -1356,16 +1489,17 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						auto l = (w * u * u).mean() * batchSizeRatio;
 						vdagLoss = vdagLoss.defined() ? vdagLoss + l : l;
 					}
-					avgVdagLoss += vdagLoss.detach().cpu().item<float>();
-					dbgVdagRaw = vdagLoss.detach().cpu().item<float>();
-					dbgYvAbs = yv.abs().mean().item<float>();
+					sumVdagLoss += vdagLoss.detach();
+					metricVdagSteps++;
+					lastVdagRaw = vdagLoss.detach();
+					lastYvAbs = yv.abs().mean().detach();
 				}
 
 				// ===================== GEOMETRY: the HJB residual =====================
 				// (1 - gamma) V(s) = r_hat(s) + gamma * || grad_s V(s) ||_Sigma(s)
 				//
 				// The gradient here is w.r.t. the INPUT, not the parameters — that is the whole
-				// END OF THE BF16 REGION. Everything below — the geo HJB double-backward, the
+				// END OF THE AUTOCAST REGION. Everything below — the geo HJB double-backward, the
 				// InfoNCE heads, the loss assembly and backward() — runs in fp32 by design.
 				autocast.End();
 
@@ -1415,13 +1549,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					int64_t mbRows = stop - start;
 					int64_t sub = RS_MIN((int64_t)config.reachability.infoSubSample, mbRows);
 					if (sub > 1) {
-						torch::Tensor subIdx = torch::randperm(mbRows, TensorOptions().dtype(kLong)).slice(0, 0, sub);
-						torch::Tensor subIdxDev = subIdx.to(device);
+						torch::Tensor subIdx = torch::randperm(
+							mbRows, TensorOptions().dtype(kLong).device(obs.device())).slice(0, 0, sub);
 
-						torch::Tensor subObs = obs.index_select(0, subIdxDev);
-						torch::Tensor subActs = acts.index_select(0, subIdxDev);
-						torch::Tensor subCarGoals = batch.carHerGoals.slice(0, start, stop)
-							.index_select(0, subIdx).to(device, true, true);
+						torch::Tensor subObs = obs.index_select(0, subIdx);
+						torch::Tensor subActs = acts.index_select(0, subIdx);
+						torch::Tensor subCarGoals = take(batch.carHerGoals).index_select(0, subIdx);
 
 						torch::Tensor trunkOut = models["shared_head"]
 							? models["shared_head"]->Forward(subObs, false)
@@ -1436,13 +1569,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 						// The ball head only trains on rows from episodes where the ball moved
 						if (batch.ballHerGoals.defined() && batch.ballMovedMask.defined()) {
-							torch::Tensor subMoved = batch.ballMovedMask.slice(0, start, stop).index_select(0, subIdx);
+							torch::Tensor subMoved = take(batch.ballMovedMask).index_select(0, subIdx);
 							torch::Tensor movedIdx = subMoved.nonzero().flatten();
 							if (movedIdx.size(0) > 1) {
-								torch::Tensor subBallGoals = batch.ballHerGoals.slice(0, start, stop)
-									.index_select(0, subIdx).index_select(0, movedIdx).to(device, true, true);
+								torch::Tensor subBallGoals = take(batch.ballHerGoals)
+									.index_select(0, subIdx).index_select(0, movedIdx);
 								auto ballRes = reach->ComputeInfoNCELoss(
-									reach->psiBall, sa.index_select(0, movedIdx.to(device)), subBallGoals);
+									reach->psiBall, sa.index_select(0, movedIdx), subBallGoals);
 								if (ballRes.loss.defined()) {
 									reachLoss = reachLoss.defined() ? reachLoss + ballRes.loss : ballRes.loss;
 
@@ -1466,8 +1599,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						// OUT of reachLoss so Reach/Aux Loss keeps meaning "trunk-coupled aux
 						// pressure" (its 0.5 baseline is the fix's verification signal on wandb).
 						if (reach->psiCarState && batch.carStateHerGoals.defined()) {
-							torch::Tensor subCarStateGoals = batch.carStateHerGoals.slice(0, start, stop)
-								.index_select(0, subIdx).to(device, true, true);
+							torch::Tensor subCarStateGoals = take(batch.carStateHerGoals)
+								.index_select(0, subIdx);
 							float couple = config.reachability.carStateCouple;
 							torch::Tensor saCS = couple >= 1.f ? sa
 								: (couple <= 0.f ? sa.detach()
@@ -1476,7 +1609,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							if (carStateRes.loss.defined()) {
 								carStateLoss = carStateRes.loss
 									* config.reachability.auxLossWeight * batchSizeRatio;
-								avgReachCarStateLoss += carStateLoss.detach().cpu().item<float>();
+								sumReachCarStateLoss += carStateLoss.detach();
+								metricReachCSSteps++;
 								avgReachCarStateAcc += carStateRes.categoricalAccuracy;
 							}
 						}
@@ -1484,7 +1618,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						if (reachLoss.defined()) {
 							reachLoss = (reachLoss + reach->StateActionVarPenalty(sa))
 								* config.reachability.auxLossWeight * batchSizeRatio;
-							avgReachLoss += reachLoss.detach().cpu().item<float>();
+							sumReachLoss += reachLoss.detach();
+							metricReachSteps++;
 						}
 					}
 				}
@@ -1496,10 +1631,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 						auto logRatio = logProbs - oldProbs;
 						auto klTensor = (exp(logRatio) - 1) - logRatio;
-						avgDivergence += klTensor.mean().detach().cpu().item<float>();
+						sumDivergence += klTensor.mean().detach();
+						metricKlSteps++;
 
 						auto clipFraction = mean((abs(ratio - 1) > config.clipRange).to(kFloat));
-						avgClip += clipFraction.cpu().item<float>();
+						sumClip += clipFraction.detach();
+						metricClipSteps++;
 					}
 				}
 
@@ -1525,8 +1662,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (geoLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + geoLoss : geoLoss;
 
-				if (totalLoss.defined())
-					totalLoss.backward();
+				if (totalLoss.defined()) {
+					const bool fp16Amp = config.learnAutocastBF16 && device.is_cuda()
+						&& !GGL::GGLCudaHasBF16();
+					if (fp16Amp)
+						(totalLoss * ampLossScale).backward();
+					else
+						totalLoss.backward();
+				}
 			};
 
 			
@@ -1541,6 +1684,37 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				}
 			}
 
+
+			if (dist)
+				models.AllReduceGrads(dist, /*includeExempt=*/false);
+
+			const bool fp16Amp = config.learnAutocastBF16 && device.is_cuda()
+				&& !GGL::GGLCudaHasBF16();
+			if (fp16Amp)
+				AmpUnscaleGrads(models, ampLossScale);
+
+			int stepOk = 1;
+			if (fp16Amp && !AmpGradsFinite(models))
+				stepOk = 0;
+			if (dist && dist->distributed())
+				dist->min_host(&stepOk, 1);
+
+			if (!stepOk) {
+				ampSkipCount++;
+				ampGoodEpochs = 0;
+				if (ampLossScale > 1.f)
+					ampLossScale *= 0.5f;
+				if (ampLossScale < 1.f)
+					ampLossScale = 1.f;
+				AmpZeroGrads(models);
+			} else {
+				if (fp16Amp) {
+					ampGoodEpochs++;
+					if (ampGoodEpochs >= 32 && ampLossScale < 65536.f) {
+						ampLossScale *= 2.f;
+						ampGoodEpochs = 0;
+					}
+				}
 
 			if (trainPolicy)
 				nn::utils::clip_grad_norm_(models["policy"]->parameters(), 0.5f);
@@ -1579,8 +1753,50 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			}
 
 			models.StepOptims();
+			}
 		}
 	}
+
+	if (metricPolicySteps > 0) {
+		avgEntropy.Add(sumEntropy.item<float>(), (uint64_t)metricPolicySteps);
+		avgRatio.Add(sumRatio.item<float>(), (uint64_t)metricPolicySteps);
+		avgPolicyLoss.Add(sumPolicyLoss.item<float>(), (uint64_t)metricPolicySteps);
+	}
+	{
+		float nRel = nRelEntropy.item<float>();
+		if (nRel > 0.5f)
+			avgRelEntropyLoss.Add(sumRelEntropyLoss.item<float>(), (uint64_t)(nRel + 0.5f));
+	}
+	if (metricCriticSteps > 0)
+		avgCriticLoss.Add(sumCriticLoss.item<float>(), (uint64_t)metricCriticSteps);
+	if (metricGoalSteps > 0)
+		avgGoalCriticLoss.Add(sumGoalCriticLoss.item<float>(), (uint64_t)metricGoalSteps);
+	if (metricGuidingSteps > 0)
+		avgGuidingLoss.Add(sumGuidingLoss.item<float>(), (uint64_t)metricGuidingSteps);
+	if (metricClipSteps > 0)
+		avgClip.Add(sumClip.item<float>(), (uint64_t)metricClipSteps);
+	if (metricKlSteps > 0)
+		avgDivergence.Add(sumDivergence.item<float>(), (uint64_t)metricKlSteps);
+	if (metricVdagSteps > 0)
+		avgVdagLoss.Add(sumVdagLoss.item<float>(), (uint64_t)metricVdagSteps);
+	if (metricTwinSteps > 0)
+		avgVdagTwinSpread.Add(sumVdagTwinSpread.item<float>(), (uint64_t)metricTwinSteps);
+	if (metricRhatSteps > 0)
+		avgRhatLoss.Add(sumRhatLoss.item<float>(), (uint64_t)metricRhatSteps);
+	if (metricReachSteps > 0)
+		avgReachLoss.Add(sumReachLoss.item<float>(), (uint64_t)metricReachSteps);
+	if (metricReachCSSteps > 0)
+		avgReachCarStateLoss.Add(sumReachCarStateLoss.item<float>(), (uint64_t)metricReachCSSteps);
+	if (lastEntGate.defined())
+		dbgEntGate = lastEntGate.item<float>();
+	if (lastSilLoss.defined())
+		dbgSilLoss = lastSilLoss.item<float>();
+	if (lastAuxNLL.defined())
+		dbgAuxNLL = lastAuxNLL.item<float>();
+	if (lastYvAbs.defined())
+		dbgYvAbs = lastYvAbs.item<float>();
+	if (lastVdagRaw.defined())
+		dbgVdagRaw = lastVdagRaw.item<float>();
 
 	// GEOMETRY debug panel values: one sync for the whole learn pass (see accumulators above).
 	if (geoMbCount > 0) {
@@ -1591,6 +1807,20 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// Compute magnitude of updates made to the policy and value estimator
 	auto policyAfter = models["policy"]->CopyParams();
 	auto criticAfter = models["critic"]->CopyParams();
+
+	if (dist && dist->distributed()) {
+		if (const char* chk = std::getenv("GGL_DIST_LOCKSTEP_CHECK"); chk && chk[0] && std::string(chk) != "0") {
+			float sums[2] = { policyAfter.sum().item<float>(), criticAfter.sum().item<float>() };
+			float root[2] = { sums[0], sums[1] };
+			dist->bcast_host(root, sizeof(root), 0);
+			if (std::abs(sums[0] - root[0]) > 1e-2f || std::abs(sums[1] - root[1]) > 1e-2f)
+				RG_ERR_CLOSE("PPOLearner lockstep checksum mismatch rank " << dist->rank()
+					<< " policy " << sums[0] << " vs " << root[0]
+					<< " critic " << sums[1] << " vs " << root[1]);
+			if (dist->rank() == 0)
+				RG_LOG("DIST lockstep ok  policy=" << sums[0] << " critic=" << sums[1]);
+		}
+	}
 
 	float policyUpdateMagnitude = (policyBefore - policyAfter).norm().item<float>();
 	float criticUpdateMagnitude = (criticBefore - criticAfter).norm().item<float>();
@@ -1679,6 +1909,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// Assemble and return report
 	report["Policy Entropy"] = avgEntropy.Get();
 	report["Mean KL Divergence"] = avgDivergence.Get();
+	if (config.learnAutocastBF16 && device.is_cuda() && !GGL::GGLCudaHasBF16()) {
+		report["AMP/Scale"] = ampLossScale;
+		report["AMP/Skip"] = (float)ampSkipCount;
+	}
 	if (!isFirstIteration) {
 		// These metrics give bad data on the first iteration, which will mess up graph scaling
 		// So we'll just skip them for the first iteration

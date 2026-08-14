@@ -37,6 +37,7 @@ void Session::sum_host(int64_t*, size_t) {}
 void Session::sum_host(float*, size_t) {}
 void Session::sum_host(double*, size_t) {}
 void Session::min_host(int*, size_t) {}
+void Session::max_host(int*, size_t) {}
 void Session::max_host(double*, size_t) {}
 void Session::avg_host(float*, size_t) {}
 void Session::bcast_host(void*, size_t, int) {}
@@ -44,6 +45,7 @@ void Session::bcast_host(void*, size_t, int) {}
 void Session::allreduce_sum_device(float*, size_t, Stream) {}
 void Session::allreduce_avg_device(float*, size_t, Stream) {}
 void Session::bcast_device(float*, size_t, int, Stream) {}
+void Session::allreduce_avg_grads(const GradRef*, size_t, Stream, size_t) {}
 
 void Session::RunSelfTest() {
 	if (rank() != 0 || world() != 1 || local_rank() != 0) {

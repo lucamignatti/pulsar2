@@ -7,6 +7,7 @@
 #include <GigaLearnCPP/Util/RenderSender.h>
 
 #include <nlohmann/json.hpp>
+#include <GigaLearnCPP/Distributed/Session.h>
 
 namespace GGL {
 
@@ -107,6 +108,7 @@ namespace GGL {
 		} refBattery;
 
 		RenderSender* renderSender;
+		Dist::Session* dist = nullptr;
 
 		PolicyVersionManager(
 			std::filesystem::path saveFolder, int maxVersions, uint64_t tsPerVersion,

@@ -480,10 +480,6 @@ int main(int argc, char* argv[]) {
 	// Initialize RocketSim with collision meshes (run from the repo/build dir;
 	// provision them with tools/get_collision_meshes.sh if missing)
 	RocketSim::Init("collision_meshes");
-	{
-		auto arena = Arena::Create(GameMode::SOCCAR);
-		(void)arena;
-	}
 	if (dist.rank() == 0)
 		RG_LOG("RocketSim loaded collision_meshes (rank 0/" << dist.world() << ")");
 
@@ -685,6 +681,10 @@ int main(int argc, char* argv[]) {
 	// KILL SWITCH if anything looks off (ratio/KL spikes, entropy crash, Elo bleed):
 	// set false, rebuild, restart — the flag-off path is the exact pre-pipeline sequential code.
 	cfg.pipelinedCollection = true;
+	if (const char* p = std::getenv("GGL_PIPELINED_COLLECTION"); p && *p) {
+		cfg.pipelinedCollection = !(p[0] == '0' || std::string(p) == "false" || std::string(p) == "off");
+		RG_LOG("GGL_PIPELINED_COLLECTION: " << (cfg.pipelinedCollection ? "on" : "off"));
+	}
 
 	// Leave this empty to use a random seed each run
 	cfg.randomSeed = 123;
@@ -776,8 +776,9 @@ int main(int argc, char* argv[]) {
 	// Against losing 1.2B steps and the entire recovery chain, that trade is no longer close.
 	cfg.ppo.miniBatchSize = 12'500;
 
-	// BF16 inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
+	// Half inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
+	// Dtype is runtime-gated: BF16 on sm_80+ (5080), FP16 on V100 (see GGLHalfPrecType).
 	cfg.ppo.useHalfPrecision = true;
 
 	// 6.1b (2026-08-04, user-directed): bf16 autocast for the LEARN pass, the one throughput
@@ -788,7 +789,10 @@ int main(int argc, char* argv[]) {
 	// so learn-pass cost sets both halves. Weights/optimizer stay fp32; see
 	// PPOLearnerConfig::learnAutocastBF16 for the deliberately partial scope (geo HJB and
 	// InfoNCE stay fp32) and the revert.
+	// Autocast: BF16 on sm_80+ (no scaler), FP16 + loss scale on V100. GGL_LEARN_AMP=0 reverts.
 	cfg.ppo.learnAutocastBF16 = true;
+	if (const char* s = std::getenv("GGL_LEARN_AMP"); s && s[0] && std::string(s) == "0")
+		cfg.ppo.learnAutocastBF16 = false;
 
 	// GGL_SMOKE=1: shrink the fleet + iteration so an offline sandbox (Mac CPU, resuming a
 	// COPY of the real checkpoints with WANDB_MODE=offline) can complete iterations in
@@ -1193,6 +1197,10 @@ int main(int argc, char* argv[]) {
 	// Revert: this flag, restart. The feed-side teleport filter this change adds also
 	// removes the long-flagged respawn pollution from the geo Sigma reservoir.
 	cfg.ppo.hullEnabled = true;
+	if (const char* h = std::getenv("GGL_HULL"); h && *h) {
+		cfg.ppo.hullEnabled = !(h[0] == '0' || std::string(h) == "false" || std::string(h) == "off");
+		RG_LOG("GGL_HULL: " << (cfg.ppo.hullEnabled ? "on" : "off"));
+	}
 	cfg.ppo.hullHeadModel.layerSizes = { 64 };
 	cfg.ppo.hullHeadModel.activationType = activation;
 	cfg.ppo.hullHeadModel.addLayerNorm = false;
@@ -1383,18 +1391,16 @@ int main(int argc, char* argv[]) {
 	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0")
 		cfg.metricsRunName = "SMOKE-" + cfg.metricsRunName;
 
-	// 1M default => a save every ~6s at ~170k SPS, making the 8-deep rotation window ~50
-	// SECONDS wide - which is why the 2026-07-13 GPU lockup poisoned EVERY checkpoint in
-	// it. 25M = a save every ~2.5 min, window ~20 min, and far less IO. Worst-case crash
-	// loss rises from ~6s to ~2.5min of training - the wrapper restart costs more anyway.
-	cfg.tsPerSave = 25'000'000;
+	// Save every 40 training iterations (not global timesteps — a timestep interval
+	// fires every iter once fleet steps/iter exceed the interval).
+	cfg.iterPerSave = 40;
 	// GGL_SMOKE: force a real checkpoint round-trip within a few CPU iterations, so the smoke
 	// actually exercises SaveVersions/SaveReferences and the reference_goals persistence rather
 	// than only the in-memory path. MUST live here, AFTER the production assignment above - an
 	// earlier override is silently clobbered (this exact mistake cost a smoke cycle on
 	// 2026-07-25, which is why the rule is written down in three places). Never on the trainer.
 	if (const char* s = std::getenv("GGL_SMOKE"); s && s[0] && std::string(s) != "0")
-		cfg.tsPerSave = 100'000;
+		cfg.iterPerSave = 2;
 	// Golden archive + boot sanity probe use LearnerConfig defaults (keep 3 best-rated
 	// checkpoints outside rotation; probe loaded checkpoints rated >= 400).
 
@@ -1635,6 +1641,15 @@ int main(int argc, char* argv[]) {
 	// marker cannot engage team modes behind your back.
 	g_PhaseB = PHASE_B_ENABLED && std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
 	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
+	if (const char* n = std::getenv("GGL_NUM_GAMES"); n && *n)
+		cfg.numGames = std::atoi(n);
+	if (const char* c = std::getenv("GGL_CHECKPOINT_FOLDER"); c && *c)
+		cfg.checkpointFolder = c;
+	// Dist A/B: zero old/Nexto so every rank is self-play. Leave unset for production.
+	if (const char* s = std::getenv("GGL_TRAIN_AGAINST_OLD_CHANCE"); s && *s)
+		cfg.trainAgainstOldChance = std::strtof(s, nullptr);
+	if (const char* s = std::getenv("GGL_NEXTO_SERVE_FRAC"); s && *s)
+		cfg.externalOpponent.serveFrac = std::strtof(s, nullptr);
 	g_NumGames = cfg.numGames;
 	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
 	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
@@ -1659,7 +1674,16 @@ int main(int argc, char* argv[]) {
 			<< g_SkillArenas2v2 << " 2v2 / " << g_SkillArenas3v3 << " 3v3 arenas");
 
 	// Make the learner with the environment creation function and the config we just made
-	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback);
+	if (const char* smoke = std::getenv("GGL_DIST_SMOKE"); smoke && smoke[0] && std::string(smoke) != "0") {
+		cfg.sendMetrics = false;
+		if (!std::getenv("GGL_CHECKPOINT_FOLDER"))
+			cfg.checkpointFolder = "checkpoints_dist_smoke";
+		cfg.externalOpponent.enabled = false;
+		RG_LOG("GGL_DIST_SMOKE: metrics off, ckpt=" << cfg.checkpointFolder
+			<< " numGames=" << cfg.numGames);
+	}
+
+	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback, &dist);
 
 	// The automatic PHASE A -> PHASE B flip. Runs at the tail of every iteration; ratings
 	// only appear in the report on iterations where the skill tracker actually evaluated,
@@ -1683,9 +1707,11 @@ int main(int argc, char* argv[]) {
 				return;
 
 			auto markerPath = learner->config.checkpointFolder / PHASE_B_MARKER;
-			std::filesystem::create_directories(learner->config.checkpointFolder);
-			std::ofstream(markerPath) << "engaged at ts " << learner->totalTimesteps
-				<< ", Rating/1v1 " << rating << "\n";
+			if (learner->DistRank() == 0) {
+				std::filesystem::create_directories(learner->config.checkpointFolder);
+				std::ofstream(markerPath) << "engaged at ts " << learner->totalTimesteps
+					<< ", Rating/1v1 " << rating << "\n";
+			}
 			RG_LOG("=============================================================");
 			RG_LOG("TEAM CURRICULUM: PHASE B ENGAGED - Rating/1v1 held >= "
 				<< PHASE_B_RATING_TRIGGER << " for " << PHASE_B_TRIGGER_STREAK

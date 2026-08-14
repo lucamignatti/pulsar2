@@ -76,6 +76,8 @@ GGL::PolicyVersion& GGL::PolicyVersionManager::AddVersion(ModelSet modelsToClone
 }
 
 void GGL::PolicyVersionManager::SaveVersions() {
+	if (dist && dist->rank() != 0)
+		return;
 	RG_NO_GRAD;
 
 	// Remove old saved versions
@@ -344,6 +346,21 @@ void GGL::PolicyVersionManager::RunSkillMatches(PPOLearner* ppo, Report& report)
 				fnUpdateRatings(oldVersion.ratings, skill.curRatings, const_cast<RLGC::GameState&>(gs));
 		});
 
+	if (dist && dist->distributed()) {
+		auto avgR = [&](SkillRating& r) {
+			const char* modes[] = { "1v1", "2v2", "3v3" };
+			float vals[3];
+			for (int i = 0; i < 3; i++)
+				vals[i] = r.data.count(modes[i]) ? r.data[modes[i]] : skill.config.initialRating;
+			dist->avg_host(vals, 3);
+			for (int i = 0; i < 3; i++)
+				r.data[modes[i]] = vals[i];
+		};
+		avgR(skill.curRatings);
+		for (auto& v : versions)
+			avgR(v.ratings);
+	}
+
 	for (auto& pair : skill.curRatings.data) {
 		float prevRating = prevCurRatings.GetRating(pair.first, skill.config.initialRating);
 		float delta = pair.second - prevRating;
@@ -409,6 +426,8 @@ void GGL::PolicyVersionManager::ConsiderReference(ModelSet modelsToClone, uint64
 }
 
 void GGL::PolicyVersionManager::SaveReferences() {
+	if (dist && dist->rank() != 0)
+		return;
 	RG_NO_GRAD;
 	if (skill.config.maxReferences <= 0)
 		return;
@@ -514,9 +533,12 @@ void GGL::PolicyVersionManager::RunReferenceMatches(PPOLearner* ppo, Report& rep
 			(mainScored ? mainGoals : oppGoals)++;
 		});
 
+	int64_t scored[2] = { mainGoals, oppGoals };
+	if (dist && dist->distributed())
+		dist->sum_host(scored, 2);
 	auto& tally = refGoals[ref.timesteps];
-	tally.first += mainGoals;
-	tally.second += oppGoals;
+	tally.first += scored[0];
+	tally.second += scored[1];
 
 	// Cumulative counters: as with Nexto/Goals *, the SLOPE is the signal and the level is not
 	// directly comparable across runs.

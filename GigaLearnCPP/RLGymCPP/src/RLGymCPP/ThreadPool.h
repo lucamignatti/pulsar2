@@ -2,15 +2,37 @@
 #include "Framework.h"
 
 #include <thread_pool.h>
+#include <thread>
+#ifndef _WIN32
+#include <sched.h>
+#endif
 
 namespace RLGC {
+	// Size the pool to this process's CPU affinity, not hardware_concurrency().
+	// numactl --physcpubind does not change hardware_concurrency(), so the default
+	// 160-wide pool oversubscribed each rank's ~27-CPU slice (6 ranks × 160 threads).
+	inline unsigned PoolThreadCount() {
+		unsigned n = 0;
+#ifndef _WIN32
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		if (sched_getaffinity(0, sizeof(set), &set) == 0)
+			n = (unsigned)CPU_COUNT(&set);
+#endif
+		if (n == 0)
+			n = std::thread::hardware_concurrency();
+		if (n == 0)
+			n = 1;
+		return n;
+	}
+
 	// Modified version of https://stackoverflow.com/questions/26516683/reusing-thread-in-loop-c
 	struct ThreadPool {
 
 		dp::thread_pool<>* _tp;
 
 		ThreadPool() {
-			_tp = new dp::thread_pool();
+			_tp = new dp::thread_pool(PoolThreadCount());
 		}
 
 		RG_NO_COPY(ThreadPool);

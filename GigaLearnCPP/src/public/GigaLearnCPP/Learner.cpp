@@ -14,6 +14,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAFunctions.h>
 #endif
 #include <private/GigaLearnCPP/PPO/ExperienceBuffer.h>
 #include <private/GigaLearnCPP/PPO/GAE.h>
@@ -25,12 +26,73 @@
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 
 #include <algorithm>
+#include <cstring>
+#include <cstdlib>
 #include <map>
 #include <random>
+#include <string>
 #include <thread>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "Util/AvgTracker.h"
 
 using namespace RLGC;
+
+namespace {
+	torch::Tensor EnsureBuf(torch::Tensor& buf, at::IntArrayRef sizes, torch::TensorOptions opts) {
+		if (!buf.defined() || buf.sizes() != sizes || buf.dtype() != opts.dtype() || buf.device() != opts.device())
+			buf = torch::empty(sizes, opts);
+		return buf;
+	}
+
+	torch::Tensor EnsureBufCapacity(torch::Tensor& buf, int64_t minElems, torch::TensorOptions opts) {
+		if (!buf.defined() || buf.numel() < minElems || buf.dtype() != opts.dtype() || buf.device() != opts.device())
+			buf = torch::empty({ minElems }, opts);
+		return buf;
+	}
+
+	torch::Tensor MakePinnedFromVector(const std::vector<float>& data, at::IntArrayRef sizes) {
+		auto t = torch::empty(sizes, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+		if (data.empty())
+			return t;
+		auto view = torch::from_blob(
+			const_cast<float*>(data.data()),
+			{ (int64_t)data.size() },
+			torch::TensorOptions().dtype(torch::kFloat32));
+		t.view({ -1 }).copy_(view);
+		return t;
+	}
+
+	template <typename T>
+	torch::Tensor MakePinned1D(const std::vector<T>& data) {
+		auto t = torch::empty(
+			{ (int64_t)data.size() },
+			torch::TensorOptions().dtype(torch::CppTypeToScalarType<T>()).pinned_memory(true));
+		if (data.empty())
+			return t;
+		auto view = torch::from_blob(
+			const_cast<T*>(data.data()),
+			{ (int64_t)data.size() },
+			torch::TensorOptions().dtype(torch::CppTypeToScalarType<T>()));
+		t.copy_(view);
+		return t;
+	}
+
+	torch::Tensor MakePinnedActionIndices(const std::vector<int32_t>& data) {
+		auto t = torch::empty(
+			{ (int64_t)data.size() },
+			torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+		if (data.empty())
+			return t;
+		auto view = torch::from_blob(
+			const_cast<int32_t*>(data.data()),
+			{ (int64_t)data.size() },
+			torch::TensorOptions().dtype(torch::kInt32));
+		t.copy_(view);
+		return t;
+	}
+}
 
 // V_exp - the return-level expectile twin of the value critic (COMPOSITION_CRITIC.md section 8,
 // ladder rung 2: "what I sometimes do"). Trained on the SAME extrinsic GAE targets as the
@@ -68,8 +130,8 @@ struct GGL::GapState {
 		optim = std::make_shared<torch::optim::Adam>(exp->parameters(), lr);
 	}
 };
-GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback) :
-	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback)
+GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback, Dist::Session* dist) :
+	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback), dist(dist)
 {
 	pybind11::initialize_interpreter();
 
@@ -80,8 +142,8 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	RG_SLEEP(1000);
 #endif
 
-	if (config.tsPerSave == 0)
-		config.tsPerSave = config.ppo.tsPerItr;
+	if (config.iterPerSave <= 0)
+		config.iterPerSave = 1;
 
 	// State shell exists from boot (net lazily built at first use so the feature width
 	// comes from the real trunk output, not a config guess)
@@ -90,10 +152,17 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	RG_LOG("Learner::Learner():");
 
-	if (config.randomSeed == -1)
-		config.randomSeed = RS_CUR_MS();
+	if (config.randomSeed == -1) {
+		if (!dist || dist->rank() == 0)
+			config.randomSeed = RS_CUR_MS();
+	}
+	if (dist)
+		dist->bcast_host(&config.randomSeed, sizeof(config.randomSeed), 0);
 
 	RG_LOG("\tCheckpoint Save/Load Dir: " << config.checkpointFolder);
+	if (dist && dist->distributed())
+		RG_LOG("\tDistributed: rank " << dist->rank() << "/" << dist->world()
+			<< "  local_gpu=" << dist->local_rank());
 
 	torch::manual_seed(config.randomSeed);
 
@@ -104,12 +173,25 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		) {
 		RG_LOG("\tUsing CUDA GPU device...");
 
+		// Pin libtorch to Session's device. Do NOT set CUDA_VISIBLE_DEVICES from
+		// inside the process — torch/NCCL often initialize against the visible set
+		// before setenv is seen, and every rank then fights over logical cuda:0.
+		// cudaSetDevice already ran in Session::Init; tell ATen the same index.
+		const int cudaIndex = dist ? dist->local_rank() : 0;
+#ifdef RG_CUDA_SUPPORT
+		c10::cuda::set_device(cudaIndex);
+#endif
+		device = at::Device(at::kCUDA, cudaIndex);
+
 		// Test out moving a tensor to GPU and back to make sure the device is working
 		torch::Tensor t;
 		bool deviceTestFailed = false;
+		int tensorDev = -1;
 		try {
-			t = torch::tensor(0);
-			t = t.to(at::Device(at::kCUDA));
+			t = torch::zeros({ 1 }, torch::TensorOptions().device(device));
+			tensorDev = t.get_device();
+			if (tensorDev != cudaIndex)
+				throw std::runtime_error("tensor landed on the wrong CUDA device");
 			t = t.cpu();
 		} catch (...) {
 			deviceTestFailed = true;
@@ -121,7 +203,17 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 				(torch::cuda::is_available() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
 				"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
 			)
-		device = at::Device(at::kCUDA);
+		RG_LOG("[DIST][GPU] Learner rank=" << DistRank()
+#ifndef _WIN32
+			<< " pid=" << getpid()
+#endif
+			<< " at::Device=cuda:" << cudaIndex
+			<< " tensor.device=" << tensorDev
+			<< " c10.current=" << (int)c10::cuda::current_device()
+			<< " infer_half=" << (config.ppo.useHalfPrecision ? GGLHalfPrecName() : "off")
+			<< " sm_bf16=" << (GGLCudaHasBF16() ? "yes" : "no")
+			<< " learn_autocast=" << (!config.ppo.learnAutocastBF16 ? "off"
+				: (GGLCudaHasBF16() ? "bf16" : "fp16")));
 	} else if (
 		config.deviceType == LearnerDeviceType::GPU_MPS ||
 		(config.deviceType == LearnerDeviceType::AUTO && torch::mps::is_available())
@@ -164,9 +256,9 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		device = at::Device(at::kCPU);
 	}
 
-	// The ctor body mutates its `config` PARAMETER (tsPerSave/randomSeed fix-ups above, the
+	// The ctor body mutates its `config` PARAMETER (iterPerSave/randomSeed fix-ups above, the
 	// MPS halfPrec fallback) but the member was copy-initialized before the body ran - sync
-	// it here or Start()/Save() read the un-fixed values (e.g. tsPerSave=0 saving every
+	// it here or Start()/Save() read the un-fixed values (e.g. iterPerSave=0 saving every
 	// iteration; the same shadowing family as the Model ctor bug fixed in 155c2da).
 	this->config = config;
 
@@ -258,7 +350,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	try {
 		RG_LOG("\tMaking PPO learner...");
-		ppo = new PPOLearner(obsSize, numActions, config.ppo, device);
+		ppo = new PPOLearner(obsSize, numActions, config.ppo, device, dist);
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
 	}
@@ -297,6 +389,27 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	if (!config.checkpointFolder.empty())
 		Load();
 
+	if (versionMgr)
+		versionMgr->dist = dist;
+
+	if (dist && dist->distributed()) {
+		ppo->models.BroadcastParameters(dist);
+		torch::manual_seed((uint64_t)config.randomSeed + (uint64_t)dist->rank() + 1);
+		dist->barrier();
+	}
+
+	if (device.is_cuda()) {
+#ifdef RG_CUDA_SUPPORT
+		const int idx = device.index();
+		auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(idx);
+		const auto agg = static_cast<size_t>(c10::cuda::CUDACachingAllocator::StatType::AGGREGATE);
+		RG_LOG("[DIST][GPU] after-models rank=" << DistRank()
+			<< " cuda:" << idx
+			<< " allocated_mb=" << (stats.allocated_bytes[agg].current / (1024 * 1024))
+			<< " reserved_mb=" << (stats.reserved_bytes[agg].current / (1024 * 1024)));
+#endif
+	}
+
 	if (config.savePolicyVersions && !config.renderMode) {
 		if (config.checkpointFolder.empty())
 			RG_ERR_CLOSE("Cannot save/load old policy versions with no checkpoint save folder");
@@ -305,7 +418,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		versionMgr->LoadReferences(models, totalTimesteps);
 	}
 
-	if (config.sendMetrics && !config.renderMode) {
+	if (config.sendMetrics && !config.renderMode && DistRank() == 0) {
 		if (!runID.empty())
 			RG_LOG("\tRun ID: " << runID);
 		metricSender = new MetricSender(config.metricsProjectName, config.metricsGroupName, config.metricsRunName, runID);
@@ -415,6 +528,9 @@ void GGL::Learner::LoadStats(std::filesystem::path path) {
 	nextoGoalsFor = j.value("nexto_goals_for", (int64_t)0);
 	nextoGoalsAgainst = j.value("nexto_goals_against", (int64_t)0);
 	nextoServeIters = j.value("nexto_serve_iters", (int64_t)0);
+	nextoLoadedFor = (int64_t)nextoGoalsFor;
+	nextoLoadedAgainst = (int64_t)nextoGoalsAgainst;
+	nextoLoadedServes = (int64_t)nextoServeIters;
 }
 
 // Different than RLGym-PPO to show that they are not compatible
@@ -493,6 +609,25 @@ bool GGL::Learner::BootSanityProbe() {
 void GGL::Learner::Save() {
 	if (config.checkpointFolder.empty())
 		RG_ERR_CLOSE("Learner::Save(): Cannot save because config.checkpointSaveFolder is not set");
+
+	// Fold per-rank Nexto increments into a shared cumulative before rank 0 writes.
+	if (nexto && DistActive()) {
+		int64_t dF = (int64_t)nextoGoalsFor - nextoLoadedFor;
+		int64_t dA = (int64_t)nextoGoalsAgainst - nextoLoadedAgainst;
+		int64_t dS = (int64_t)nextoServeIters - nextoLoadedServes;
+		dist->sum_host(&dF, 1);
+		dist->sum_host(&dA, 1);
+		dist->sum_host(&dS, 1);
+		nextoLoadedFor += dF;
+		nextoLoadedAgainst += dA;
+		nextoLoadedServes += dS;
+		nextoGoalsFor = nextoLoadedFor;
+		nextoGoalsAgainst = nextoLoadedAgainst;
+		nextoServeIters = nextoLoadedServes;
+	}
+
+	if (DistRank() != 0)
+		return;
 
 	// ATOMIC save (2026-07-13): a CUDA-watchdog crash mid-save left a truncated
 	// checkpoint (0-byte RUNNING_STATS.json); the loader aborted on it every restart and
@@ -863,7 +998,8 @@ void GGL::Learner::Start() {
 		std::thread keyPressThread;
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
-		ExperienceBuffer experience = ExperienceBuffer(config.randomSeed, torch::kCPU);
+		ExperienceBuffer experience = ExperienceBuffer(
+			config.randomSeed + (dist ? dist->rank() + 1 : 1), torch::kCPU);
 
 		int numPlayers = envSet->state.numPlayers;
 
@@ -926,8 +1062,10 @@ void GGL::Learner::Start() {
 			std::vector<uint8_t> steerMode;
 
 
+			// GGL-2 Clear(): drop contents, keep allocations. `*this = Trajectory()` was
+			// reallocating every episode (512 players × ~1800-step episodes).
 			void Clear() {
-				*this = Trajectory();
+				ClearKeepCapacity();
 			}
 
 			// For the long-lived combinedTraj: drop contents but KEEP allocations, so the
@@ -986,6 +1124,10 @@ void GGL::Learner::Start() {
 					carHerGoals.reserve(rows * 6);
 					ballHerGoals.reserve(rows * 6);
 					ballMoved.reserve(rows);
+					// +1 terminal outcome row appended at finalize
+					achievedBall.reserve((rows + 1) * 6);
+					achievedCarBall.reserve((rows + 1) * 6);
+					achievedCarState.reserve((rows + 1) * 6);
 				}
 
 				if (proposer) {
@@ -1079,6 +1221,7 @@ void GGL::Learner::Start() {
 
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
+		const size_t expectedStepsPerEpisode = (size_t)RS_MAX(1, (int)(maxEpisodeLength * 1.2f));
 
 		// Reachability collection extras
 		const auto& reachCfg = config.ppo.reachability;
@@ -1091,6 +1234,12 @@ void GGL::Learner::Start() {
 
 		// Deliberate-practice DRILLS (Stage 3): off unless explicitly enabled with a bank attached
 		const bool goalCriticOn = config.ppo.goalCritic.enabled && !render;
+
+		// GGL-2 ReserveAll on every per-player traj before collect. They pass tsPerItr*8/10
+		// as flat FList counts; ours is row-aware (rows * obsSize). Use the episode-length
+		// they computed as expected_steps_per_episode (1.2 * maxEpisodeLength).
+		for (auto& traj : trajectories)
+			traj.Reserve(expectedStepsPerEpisode, obsSize, numActions, reachOn, false, goalCriticOn);
 
 		// The report key the skill tracker writes for the TRAINING arenas' team size
 		// ("Rating/1v1", "Rating/2v2", ...). Every in-loop rating consumer (steering rating
@@ -1172,7 +1321,10 @@ void GGL::Learner::Start() {
 			if (n <= 0)
 				return;
 
-			int numChunks = RS_MIN(n, RS_MAX(1, RLGC::g_ThreadPool.GetNumThreads() * 4));
+			// One chunk per pool thread. `* 4` oversubscribed 512-player steps into hundreds of
+			// tiny jobs (and that many pool wakeups) per parallel-for, three times per env tick.
+			int nThreads = RS_MAX(1, RLGC::g_ThreadPool.GetNumThreads());
+			int numChunks = RS_MIN(n, nThreads);
 			int chunkSize = (n + numChunks - 1) / numChunks;
 			RLGC::g_ThreadPool.StartBatchedJobs(
 				[&body, n, chunkSize](int chunk) {
@@ -1183,6 +1335,16 @@ void GGL::Learner::Start() {
 				},
 				numChunks, false
 			);
+		};
+
+		// DimList2::GetRow heap-allocates a temp row every call. Insert from the live buffer.
+		auto fnAppendObsRow = [&](FList& dst, int row) {
+			const float* p = &envSet->state.obs.At((size_t)row, 0);
+			dst.insert(dst.end(), p, p + obsSize);
+		};
+		auto fnAppendMaskRow = [&](std::vector<uint8_t>& dst, int row) {
+			const uint8_t* p = &envSet->state.actionMasks.At((size_t)row, 0);
+			dst.insert(dst.end(), p, p + numActions);
 		};
 
 		// Terminal types decided by the parallel per-player pass, consumed by the serial finalize
@@ -1354,7 +1516,10 @@ void GGL::Learner::Start() {
 
 
 		// ================= Pipelined collection (config.pipelinedCollection) =================
-		// Overlaps NEXT-iteration experience collection with THIS iteration's processing + Learn().
+		// Overlaps NEXT-iteration experience collection with THIS iteration's Learn() only.
+		// Value-pred / GAE / reach / gap stay in the barrier (worker idle) so InferActions
+		// does not share the GPU with InferValueFamily (4630604: value-pred 0.51→1.01s).
+		// Collect (~1.6s uncontended) still fits behind Learn (~2.1s AMP).
 		// Collapse-safety design (this exact failure mode has killed runs before):
 		//   * The worker NEVER infers from live training weights — it uses `collectSnapshot`, a frozen
 		//     copy synced at the barrier, so a forward can never see half-updated (torn) parameters.
@@ -1403,6 +1568,7 @@ void GGL::Learner::Start() {
 		};
 
 		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
+		combinedTrajNext.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, false, false);
 		Report collectReport;         // worker-owned between barriers; merged into the iteration report
 		int collectSteps = 0;
 		float collectWallTime = 0;
@@ -1410,6 +1576,7 @@ void GGL::Learner::Start() {
 
 
 		std::jthread collectThread;
+		float lastDisplayTime = 0.f;
 
 		// Opponent-source RNG. Deliberately NOT RocketSim's Math::RandFloat: that is a
 		// thread_local minstd_rand0 seeded RS_CUR_MS() + hash(thread_id), and fnCollectIteration
@@ -1422,9 +1589,15 @@ void GGL::Learner::Start() {
 		// One persistent engine, advanced once per iteration, restores a real Bernoulli. Safe
 		// without a lock: only the single live collector touches it, and the barrier joins the
 		// worker before launching the next one.
-		std::mt19937_64 oppRng(std::random_device{}());
+		std::mt19937_64 oppRng((uint64_t)config.randomSeed + (uint64_t)DistRank() + 1ULL);
 
 		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
+		// Long-lived pinned host + reused device buffers for collect H2D/D2H (GGL-2 path).
+		// Pageable from_blob + .to(device, true) is silently blocking; pin then copy_(non_blocking).
+		torch::Tensor pinned_states, pinned_action_masks, gpu_states, gpu_action_masks;
+		torch::Tensor pinned_actions_out, pinned_logprobs_out;
+		size_t last_pinned_num_rows = 0;
+
 		// Defined OUTSIDE the iteration loop on purpose: it must not capture any loop-local (the
 		// compiler enforces this — loop locals aren't in scope here), because in pipelined mode it
 		// executes concurrently with the NEXT iteration's locals.
@@ -1465,8 +1638,12 @@ void GGL::Learner::Start() {
 			// InferActions (Nexto reads GameStates, not our obs).
 			bool oppExternal = false;
 			std::vector<bool> oldVersionPlayerMask;
-			std::vector<int> newPlayerIndices = {}, oldPlayerIndices = {};
+			std::vector<int> newPlayerIndices, oldPlayerIndices;
+			newPlayerIndices.reserve((size_t)numPlayers);
+			oldPlayerIndices.reserve((size_t)numPlayers);
+			oldVersionPlayerMask.reserve((size_t)numPlayers);
 			torch::Tensor tNewPlayerIndices, tOldPlayerIndices;
+			torch::Tensor tNewIndicesDevice, tOldIndicesDevice;
 			Team oppTeam = Team::BLUE;
 
 			for (int i = 0; i < numPlayers; i++)
@@ -1476,22 +1653,38 @@ void GGL::Learner::Start() {
 				RG_ASSERT(config.trainAgainstOldChance >= 0 && config.trainAgainstOldChance <= 1);
 				std::uniform_real_distribution<float> oppRoll(0.0f, 1.0f);
 				float oppAgeFrac = 0.f;
-				if (nexto && oppRoll(oppRng) < config.externalOpponent.serveFrac) {
+				// Rank 0 draws once; every rank applies the same (mode, version, team).
+				// Independent local rolls were the Dist Sync skew: self-play ranks finished
+				// ~8s before vs-old/Nexto ranks that ran two InferActions and half as many
+				// learner rows into Length()-fill.
+				int oppPack[3] = { 0, -1, 0 }; // mode 0=self 1=old 2=nexto, pickIdx, team
+				if (DistRank() == 0) {
+					if (nexto && oppRoll(oppRng) < config.externalOpponent.serveFrac) {
+						oppPack[0] = 2;
+					} else if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
+						&& oppRoll(oppRng) < config.trainAgainstOldChance) {
+						std::uniform_int_distribution<size_t> pick(0, versionMgr->versions.size() - 1);
+						oppPack[0] = 1;
+						oppPack[1] = (int)pick(oppRng);
+					}
+					if (oppPack[0] != 0)
+						oppPack[2] = RocketSim::Math::RandInt(0, 2);
+				}
+				if (dist && dist->distributed())
+					dist->bcast_host(oppPack, sizeof(oppPack), 0);
+
+				if (oppPack[0] == 2 && nexto) {
 					oppExternal = true;
 					nexto->BeginServe(numPlayers);
 					nextoServeIters++;
-				} else if (config.trainAgainstOldVersions && versionMgr && !versionMgr->versions.empty()
-					&& oppRoll(oppRng) < config.trainAgainstOldChance) {
-					// Uniform over the version ring. The REFERENCE set is a separate vector and is
-					// never drawn here - it is the measuring stick (Ref/*) and must stay
-					// uncontaminated by being trained against.
-					std::uniform_int_distribution<size_t> pick(0, versionMgr->versions.size() - 1);
-					size_t pickIdx = pick(oppRng);
+				} else if (oppPack[0] == 1 && versionMgr && oppPack[1] >= 0
+					&& (size_t)oppPack[1] < versionMgr->versions.size()) {
+					size_t pickIdx = (size_t)oppPack[1];
 					oppModels = &versionMgr->versions[pickIdx].models;
-					// 0 = newest ring entry, 1 = oldest: a coarse strength prior for the critic
 					oppAgeFrac = versionMgr->versions.size() > 1
 						? 1.f - (float)pickIdx / (float)(versionMgr->versions.size() - 1) : 0.f;
 				}
+				oppTeam = Team(oppPack[2]);
 				// PRIVILEGED OPPONENT CONTEXT (composite value critic): the baseline may see
 				// who it is playing; the policy never does. oppCtxLive conditions THIS
 				// iteration's collection-time value inference; oppCtxCollected is handed to
@@ -1527,13 +1720,19 @@ void GGL::Learner::Start() {
 						i++;
 					}
 				}
-				tNewPlayerIndices = torch::tensor(newPlayerIndices);
-				tOldPlayerIndices = torch::tensor(oldPlayerIndices);
+				tNewPlayerIndices = torch::tensor(newPlayerIndices, torch::TensorOptions().dtype(torch::kInt64));
+				tOldPlayerIndices = torch::tensor(oldPlayerIndices, torch::TensorOptions().dtype(torch::kInt64));
+				if (ppo->device.is_cuda()) {
+					tNewIndicesDevice = tNewPlayerIndices.to(ppo->device);
+					tOldIndicesDevice = tOldPlayerIndices.to(ppo->device);
+				} else {
+					tNewIndicesDevice = tNewPlayerIndices;
+					tOldIndicesDevice = tOldPlayerIndices;
+				}
 			};
 
 			bool oppServed = oppModels || oppExternal;
 			if (oppServed) {
-				oppTeam = Team(RocketSim::Math::RandInt(0, 2));
 				fnBuildOppSplit(oppTeam);
 			}
 
@@ -1601,12 +1800,7 @@ void GGL::Learner::Start() {
 				// Players handed to the opponent this iteration stop being collected; their in-flight
 				// partial episode must not silently SPLICE with a later episode when they return to
 				// collecting (HER goals and gate windows would cross a hidden reset). DISCARD the
-				// partial (Clear) rather than finalize-and-append it: appending up to half the players'
-				// in-flight episodes into this iteration's freshly-cleared buffer can exceed tsPerItr
-				// and starve fresh collection entirely — the loop condition is `Length() < tsPerItr`,
-				// so a pre-filled buffer collects ZERO steps (Collection SPS -> 0, no progress). The
-				// discarded tails are minor, slightly-off-policy truncated data PPO doesn't want; the
-				// collection loop still gathers a full tsPerItr of fresh on-policy experience.
+				// partial (Clear) rather than finalize-and-append it.
 				if (oppServed) {
 					for (int oldPlayerIdx : oldPlayerIndices)
 						trajectories[oldPlayerIdx].Clear();
@@ -1617,9 +1811,15 @@ void GGL::Learner::Start() {
 					RG_NO_GRAD;
 
 					float inferTime = 0;
+					float inferH2dTime = 0;
+					float inferKernTime = 0;
+					float inferD2hTime = 0;
 					float envStepTime = 0;
 					float prepTime = 0;
 					float recordTime = 0;
+					float obsNormTime = 0;
+					float obsNanTime = 0;
+					float toVecTime = 0;
 
 					// Obs-normalization stats, fetched/clamped ONCE per collect call (hoisted out of the
 					// step loop): the running stat moves negligibly within a single iteration.
@@ -1633,7 +1833,23 @@ void GGL::Learner::Start() {
 							f = RS_MAX(f, config.minObsSTD);
 					}
 
-					for (int step = 0; combinedTrajNext.Length() < config.ppo.tsPerItr || render; step++, collectSteps += numRealPlayers) {
+					int targetStepsPerPlayer = 1;
+					if (DistRank() == 0) {
+						targetStepsPerPlayer = (numRealPlayers > 0)
+							? (int)(config.ppo.tsPerItr / numRealPlayers) : 1;
+						if (targetStepsPerPlayer < 1)
+							targetStepsPerPlayer = 1;
+					}
+					if (dist && dist->distributed())
+						dist->bcast_host(&targetStepsPerPlayer, sizeof(targetStepsPerPlayer), 0);
+
+					std::vector<int> curActions;
+					FList newLogProbs;
+					std::vector<uint8_t> curTerminals(numPlayers, 0);
+					curActions.reserve((size_t)numPlayers);
+					newLogProbs.reserve((size_t)numPlayers);
+
+					for (int step = 0; step < targetStepsPerPlayer || render; step++, collectSteps += numRealPlayers) {
 						Timer stepTimer = {};
 
 						// -- Viewer control panel (render only) --
@@ -1692,13 +1908,16 @@ void GGL::Learner::Start() {
 						// source persists across steps, so sampling keeps the guarantee while
 						// dropping ~75% of its (measurable) cost
 						if ((step & 3) == 0) {
+							Timer nanTimer = {};
 							torch::Tensor tObsCheck = torch::from_blob(
 								envSet->state.obs.data.data(), { (int64_t)envSet->state.obs.data.size() }, torch::kFloat32);
 							if (!torch::isfinite(tObsCheck).all().item<bool>())
 								RG_ERR_CLOSE("Obs builder produced a NaN/inf value");
+							obsNanTime += nanTimer.Elapsed();
 						}
 
 						if (!render && obsStat) {
+							Timer obsNormTimer = {};
 							// TODO: This samples from old versions too
 							int numSamples = RS_MIN(envSet->state.numPlayers, config.maxObsSamples);
 							for (int i = 0; i < numSamples; i++) {
@@ -1709,26 +1928,56 @@ void GGL::Learner::Start() {
 							// mean/std hoisted: refreshed once per iteration below (obsNormMean/Std) — the
 							// running stat drifts negligibly within one iteration and per-step GetMean/GetSTD
 							// re-fetch + clamp was pure overhead
-							for (int i = 0; i < envSet->state.numPlayers; i++) {
-								for (int j = 0; j < obsSize; j++) {
-									float& obsVal = envSet->state.obs.At(i, j);
-									obsVal = (obsVal - obsNormMean[j]) / obsNormStd[j];
-								}
-							}
+							fnParallelFor(envSet->state.numPlayers, [&](int i) {
+								float* row = &envSet->state.obs.At(i, 0);
+								for (int j = 0; j < obsSize; j++)
+									row[j] = (row[j] - (float)obsNormMean[j]) / (float)obsNormStd[j];
+							});
+							obsNormTime += obsNormTimer.Elapsed();
 						}
 
-						// Zero-copy views over the env's storage (safe: they're consumed within this
-						// step — device transfer / index_select materialize immediately, and the
-						// underlying buffers only mutate on the next env step)
+						// Pageable views of env storage. Copied into pinned host, then async H2D
+						// into reused device tensors — do not .to(device, true) from from_blob.
 						torch::Tensor tActions, tLogProbs;
-						torch::Tensor tStates = torch::from_blob(
+						torch::Tensor tStates_view = torch::from_blob(
 							envSet->state.obs.data.data(),
 							{ (int64_t)envSet->state.obs.size[0], (int64_t)envSet->state.obs.size[1] },
 							torch::kFloat32);
-						torch::Tensor tActionMasks = torch::from_blob(
+						torch::Tensor tActionMasks_view = torch::from_blob(
 							envSet->state.actionMasks.data.data(),
 							{ (int64_t)envSet->state.actionMasks.size[0], (int64_t)envSet->state.actionMasks.size[1] },
 							torch::kUInt8);
+
+						const int64_t current_rows = tStates_view.size(0);
+						Timer h2dTimer = {};
+						if (!pinned_states.defined() || pinned_states.size(0) < current_rows ||
+							last_pinned_num_rows != (size_t)current_rows) {
+							pinned_states = torch::empty({ current_rows, obsSize },
+								torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+							pinned_action_masks = torch::empty({ current_rows, numActions },
+								torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+							last_pinned_num_rows = (size_t)current_rows;
+						}
+						pinned_states.narrow(0, 0, current_rows).copy_(tStates_view);
+						pinned_action_masks.narrow(0, 0, current_rows).copy_(tActionMasks_view);
+						torch::Tensor tStates_pinned = pinned_states.narrow(0, 0, current_rows);
+						torch::Tensor tMasks_pinned = pinned_action_masks.narrow(0, 0, current_rows);
+
+						torch::Tensor tdStates, tdActionMasks;
+						if (ppo->device.is_cuda()) {
+							EnsureBuf(gpu_states, { current_rows, obsSize },
+								torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device));
+							EnsureBuf(gpu_action_masks, { current_rows, numActions },
+								torch::TensorOptions().dtype(torch::kUInt8).device(ppo->device));
+							gpu_states.narrow(0, 0, current_rows).copy_(tStates_pinned, /*non_blocking=*/true);
+							gpu_action_masks.narrow(0, 0, current_rows).copy_(tMasks_pinned, /*non_blocking=*/true);
+							tdStates = gpu_states.narrow(0, 0, current_rows);
+							tdActionMasks = gpu_action_masks.narrow(0, 0, current_rows);
+						} else {
+							tdStates = tStates_pinned.to(ppo->device, true);
+							tdActionMasks = tMasks_pinned.to(ppo->device, true);
+						}
+						inferH2dTime += h2dTimer.Elapsed();
 
 						// Snapshot the obs the policy is about to act on. StepSecondHalf rewrites
 						// the shared buffer in place, so by the time the frame is streamed the
@@ -1743,8 +1992,8 @@ void GGL::Learner::Start() {
 							Timer prepTimer = {};
 							fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 								int newPlayerIdx = newPlayerIndices[k];
-								trajectories[newPlayerIdx].states += envSet->state.obs.GetRow(newPlayerIdx);
-								trajectories[newPlayerIdx].actionMasks += envSet->state.actionMasks.GetRow(newPlayerIdx);
+								fnAppendObsRow(trajectories[newPlayerIdx].states, newPlayerIdx);
+								fnAppendMaskRow(trajectories[newPlayerIdx].actionMasks, newPlayerIdx);
 
 								if (reachOn) {
 									auto& traj = trajectories[newPlayerIdx];
@@ -1753,8 +2002,8 @@ void GGL::Learner::Start() {
 									// if the mode somehow has no opponent, reuse our own row (control reads 0.5)
 									int partner = playerPartnerIdx[newPlayerIdx];
 									int oppIdx = (partner >= 0) ? partner : newPlayerIdx;
-									traj.oppStates += envSet->state.obs.GetRow(oppIdx);
-									traj.oppActionMasks += envSet->state.actionMasks.GetRow(oppIdx);
+									fnAppendObsRow(traj.oppStates, oppIdx);
+									fnAppendMaskRow(traj.oppActionMasks, oppIdx);
 
 									auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
 									fnAppendAchieved(traj, gs, gs.players[playerSlotIdx[newPlayerIdx]]);
@@ -1763,13 +2012,17 @@ void GGL::Learner::Start() {
 							prepTime += prepTimer.Elapsed();
 						}
 
+						stepTimer.Reset();
 						envSet->StepFirstHalf(true);
+						envStepTime += stepTimer.Elapsed();
 
 						Timer inferTimer = {};
 
 						if (oppServed) {
-							torch::Tensor tdNewStates = tStates.index_select(0, tNewPlayerIndices).to(ppo->device, true);
-							torch::Tensor tdNewActionMasks = tActionMasks.index_select(0, tNewPlayerIndices).to(ppo->device, true);
+							torch::Tensor idxNew = tNewIndicesDevice.defined() ? tNewIndicesDevice : tNewPlayerIndices;
+							torch::Tensor idxOld = tOldIndicesDevice.defined() ? tOldIndicesDevice : tOldPlayerIndices;
+							torch::Tensor tdNewStates = tdStates.index_select(0, idxNew);
+							torch::Tensor tdNewActionMasks = tdActionMasks.index_select(0, idxNew);
 
 							torch::Tensor tNewActions;
 							torch::Tensor tOldActions;
@@ -1788,31 +2041,23 @@ void GGL::Learner::Start() {
 								nexto->Act(envSet->state.gameStates, oldVersionPlayerMask,
 									envSet->state.terminals, extActions);
 								auto tExt = torch::tensor(extActions);
-								tOldActions = tExt.index_select(0, tOldPlayerIndices);
+								tOldActions = tExt.index_select(0, tOldPlayerIndices).to(tNewActions.device());
 							} else {
-								torch::Tensor tdOldStates = tStates.index_select(0, tOldPlayerIndices).to(ppo->device, true);
-								torch::Tensor tdOldActionMasks = tActionMasks.index_select(0, tOldPlayerIndices).to(ppo->device, true);
+								torch::Tensor tdOldStates = tdStates.index_select(0, idxOld);
+								torch::Tensor tdOldActionMasks = tdActionMasks.index_select(0, idxOld);
 								ModelSet* oldModelsPtr = oppModels;
 						if (render)
 							oldModelsPtr = renderOrangeModels.map.empty() ? NULL : &renderOrangeModels;
 						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr);
 							}
 
-							tActions = torch::zeros(numPlayers, tNewActions.dtype());
-							tActions.index_copy_(0, tNewPlayerIndices, tNewActions.cpu());
-							tActions.index_copy_(0, tOldPlayerIndices, tOldActions.cpu().to(tNewActions.dtype()));
+							tActions = torch::zeros({ (int64_t)numPlayers }, tNewActions.options());
+							tActions.index_copy_(0, idxNew, tNewActions);
+							tActions.index_copy_(0, idxOld, tOldActions.to(tNewActions.dtype()));
 						} else {
-							torch::Tensor tdStates = tStates.to(ppo->device, true);
-							torch::Tensor tdActionMasks = tActionMasks.to(ppo->device, true);
 							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr);
-							tActions = tActions.cpu();
 						}
-						inferTime += inferTimer.Elapsed();
-
-						auto curActions = TENSOR_TO_VEC<int>(tActions);
-						FList newLogProbs;
-						if (tLogProbs.defined() && !render)
-							newLogProbs = TENSOR_TO_VEC<float>(tLogProbs);	
+						inferKernTime += inferTimer.Elapsed();
 
 						// External opponent (viewer only): let an RLBot agent drive its cars with
 						// raw controller state. Set per step and cleared when it declines, so a
@@ -1861,6 +2106,55 @@ void GGL::Learner::Start() {
 
 						stepTimer.Reset();
 						envSet->Sync(); // Make sure the first half is done
+						envStepTime += stepTimer.Elapsed();
+
+						Timer d2hTimer = {};
+						{
+							const int64_t nActs = tActions.size(0);
+							curActions.resize((size_t)nActs);
+							torch::Tensor hostActs;
+							if (tActions.is_cuda()) {
+								EnsureBufCapacity(pinned_actions_out, nActs, torch::TensorOptions()
+									.dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
+								hostActs = pinned_actions_out.narrow(0, 0, nActs);
+								hostActs.copy_(tActions.to(torch::kInt64).contiguous(), /*non_blocking=*/true);
+							} else {
+								hostActs = tActions.contiguous().to(torch::kInt64);
+							}
+
+							torch::Tensor hostLogp;
+							const bool needLogp = tLogProbs.defined() && !render;
+							if (needLogp) {
+								const int64_t n = tLogProbs.size(0);
+								newLogProbs.resize((size_t)n);
+								if (tLogProbs.is_cuda()) {
+									EnsureBufCapacity(pinned_logprobs_out, n, torch::TensorOptions()
+										.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+									hostLogp = pinned_logprobs_out.narrow(0, 0, n);
+									hostLogp.copy_(tLogProbs.to(torch::kFloat32).contiguous(), /*non_blocking=*/true);
+								} else {
+									hostLogp = tLogProbs.contiguous().to(torch::kFloat32);
+								}
+							}
+
+#ifdef RG_CUDA_SUPPORT
+							if (ppo->device.is_cuda())
+								c10::cuda::getCurrentCUDAStream(ppo->device.index()).synchronize();
+#endif
+							{
+								const int64_t* p = hostActs.data_ptr<int64_t>();
+								for (int64_t i = 0; i < nActs; i++)
+									curActions[(size_t)i] = (int)p[i];
+							}
+							if (needLogp)
+								std::memcpy(newLogProbs.data(), hostLogp.data_ptr<float>(),
+									newLogProbs.size() * sizeof(float));
+						}
+						inferD2hTime += d2hTimer.Elapsed();
+						toVecTime = inferD2hTime;
+						inferTime = inferH2dTime + inferKernTime + inferD2hTime;
+
+						stepTimer.Reset();
 						envSet->StepSecondHalf(curActions, false);
 						envStepTime += stepTimer.Elapsed();
 
@@ -1959,53 +2253,7 @@ void GGL::Learner::Start() {
 						// exactly here later. Serial - O(numArenas * playersPerArena), same order
 						// as the arenaTeamTouched scan just above.
 
-						// Now that we've inferred and stepped the env, we can add that stuff to the
-						// trajectories. Parallel per-player; logProbs is indexed by the ordinal k
-						// (its rows follow newPlayerIndices order, not global player order).
-						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
-							int newPlayerIdx = newPlayerIndices[k];
-							trajectories[newPlayerIdx].actions.push_back(curActions[newPlayerIdx]);
-							trajectories[newPlayerIdx].rewards += envSet->state.rewards[newPlayerIdx];
-							trajectories[newPlayerIdx].logProbs += newLogProbs[k];
-
-							// Steered-practice row tags: ROLE (0 match, 1 steered, 2 control)
-							// + MODE (team size - 1). Tagged by ARENA, not by whether a vector
-							// is active: the resolution-terminated returns are what poison the
-							// critic, steered or not; the 1-vs-2 split feeds the causal gates.
-							// Ladder impossible-control rows: tagged by arena (the drive
-							// injection masks them; the probe panels read them)
-
-							if (goalCriticOn) {
-								// Goal-only channel, straight from game outcomes (same convention as
-								// GoalReward: RS_TEAM_FROM_Y(ball.y) = the team whose net the ball is
-								// in = the CONCEDING team; the scorer is the other one).
-								auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
-								float gr = 0;
-								if (gs.goalScored) {
-									auto& player = gs.players[playerSlotIdx[newPlayerIdx]];
-									gr = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y)) ? 1.f : -1.f;
-								}
-								trajectories[newPlayerIdx].goalRews += gr;
-							}
-
-							if (reachOn) {
-								auto& traj = trajectories[newPlayerIdx];
-								traj.gatedPos += envSet->state.gatedPosRewards[newPlayerIdx];
-
-								// Post-step touch flags (which team touched during this step)
-								int arenaIdx = playerArenaIdx[newPlayerIdx];
-								auto& player = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[newPlayerIdx]];
-								traj.touched.push_back(player.ballTouchedStep);
-								traj.oppTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 1 : 0][arenaIdx]);
-								traj.teamTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 0 : 1][arenaIdx]);
-
-								// Deliberate-practice DRILL per-row tagging (Stage 3): only the
-								// PRACTICING team's rows get tagged - the opponent trains normally
-							}
-						});
-
-
-						auto curTerminals = std::vector<uint8_t>(numPlayers, 0);
+						std::fill(curTerminals.begin(), curTerminals.end(), (uint8_t)0);
 						for (int idx = 0; idx < envSet->arenas.size(); idx++) {
 							uint8_t terminalType = envSet->state.terminals[idx];
 							if (!terminalType)
@@ -2017,28 +2265,42 @@ void GGL::Learner::Start() {
 								curTerminals[playerStartIdx + i] = terminalType;
 						}
 
-						// Parallel per-player: decide the terminal type, record it, store the
-						// truncation next-state. Finalization stays serial below — the HER relabel
-						// draws from the shared RNG and combinedTrajNext is shared.
+						// One pool wait per env tick: actions/rewards/reach flags + terminal
+						// bookkeeping. Finalization stays serial — HER uses a shared RNG.
 						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 							int newPlayerIdx = newPlayerIndices[k];
-							int8_t terminalType = curTerminals[newPlayerIdx];
 							auto& traj = trajectories[newPlayerIdx];
+							traj.actions.push_back(curActions[newPlayerIdx]);
+							traj.rewards += envSet->state.rewards[newPlayerIdx];
+							traj.logProbs += newLogProbs[k];
 
-							if (!terminalType && traj.Length() >= maxEpisodeLength) {
-								// Episode is too long, truncate it here
-								// This won't actually reset the env, but rather will just add it to experience buffer as truncated
-								terminalType = RLGC::TerminalType::TRUNCATED;
+							if (goalCriticOn) {
+								auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
+								float gr = 0;
+								if (gs.goalScored) {
+									auto& player = gs.players[playerSlotIdx[newPlayerIdx]];
+									gr = (player.team != RS_TEAM_FROM_Y(gs.ball.pos.y)) ? 1.f : -1.f;
+								}
+								traj.goalRews += gr;
 							}
+
+							if (reachOn) {
+								traj.gatedPos += envSet->state.gatedPosRewards[newPlayerIdx];
+								int arenaIdx = playerArenaIdx[newPlayerIdx];
+								auto& player = envSet->state.gameStates[arenaIdx].players[playerSlotIdx[newPlayerIdx]];
+								traj.touched.push_back(player.ballTouchedStep);
+								traj.oppTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 1 : 0][arenaIdx]);
+								traj.teamTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 0 : 1][arenaIdx]);
+							}
+
+							int8_t terminalType = curTerminals[newPlayerIdx];
+							if (!terminalType && traj.Length() >= maxEpisodeLength)
+								terminalType = RLGC::TerminalType::TRUNCATED;
 
 							traj.terminals.push_back(terminalType);
 							if (terminalType == RLGC::TerminalType::TRUNCATED) {
-								// Truncation requires an additional next state for the critic
-								traj.nextStates += envSet->state.obs.GetRow(newPlayerIdx);
+								fnAppendObsRow(traj.nextStates, newPlayerIdx);
 								if (!render && obsStat) {
-									// This row is post-step, captured BEFORE the next loop-top
-									// standardization pass - normalize it here or the critic
-									// (trained on standardized obs) bootstraps from a raw row
 									size_t rowStart = traj.nextStates.size() - obsSize;
 									for (int j = 0; j < obsSize; j++)
 										traj.nextStates[rowStart + j] =
@@ -2064,13 +2326,65 @@ void GGL::Learner::Start() {
 						recordTime += recordTimer.Elapsed();
 					}
 
+					// Boundary truncate: fixed env-step budget leaves unfinished episodes in
+					// `trajectories`. Mark the last recorded step TRUNCATED so the critic can
+					// bootstrap; do not reset the env (episode continues next iteration in a
+					// fresh Trajectory). Same as pre-a20cce5 GigaLearn-2.
+					if (!render) {
+						for (int newPlayerIdx : newPlayerIndices) {
+							auto& traj = trajectories[newPlayerIdx];
+							if (traj.Length() == 0)
+								continue;
+							traj.terminals.back() = RLGC::TerminalType::TRUNCATED;
+							fnAppendObsRow(traj.nextStates, newPlayerIdx);
+							if (obsStat) {
+								size_t rowStart = traj.nextStates.size() - obsSize;
+								for (int j = 0; j < obsSize; j++)
+									traj.nextStates[rowStart + j] =
+										(traj.nextStates[rowStart + j] - (float)obsNormMean[j]) / (float)obsNormStd[j];
+							}
+							fnRelabelReachGoals(traj, newPlayerIdx);
+							combinedTrajNext.Append(traj);
+							traj.Clear();
+						}
+					}
+
 					collectReport["Inference Time"] = inferTime;
+					collectReport["Infer H2D Time"] = inferH2dTime;
+					collectReport["Infer Kernel Time"] = inferKernTime;
+					collectReport["Infer D2H Time"] = inferD2hTime;
 					collectReport["Env Step Time"] = envStepTime;
 					collectReport["Prep Time"] = prepTime;
 					collectReport["Record Time"] = recordTime;
+					collectReport["Obs Norm Time"] = obsNormTime;
+					collectReport["Obs Nan Time"] = obsNanTime;
+					collectReport["ToVec Time"] = toVecTime;
+					collectWallTime = collectionTimer.Elapsed();
+					collectReport["Collection Time"] = collectWallTime;
+					{
+						const int ticks = (numRealPlayers > 0) ? (int)(collectSteps / numRealPlayers) : 0;
+						RG_LOG("[DIST][COLLECT] rank=" << DistRank()
+							<< " nreal=" << numRealPlayers
+							<< " opp=" << (oppExternal ? "nexto" : (oppModels ? "old" : "self"))
+							<< " target=" << targetStepsPerPlayer
+							<< " env_steps=" << collectSteps
+							<< " ticks=" << ticks
+							<< " traj=" << combinedTrajNext.Length()
+							<< " infer_s=" << inferTime
+							<< " h2d_s=" << inferH2dTime
+							<< " kern_s=" << inferKernTime
+							<< " d2h_s=" << inferD2hTime
+							<< " env_s=" << envStepTime
+							<< " prep_s=" << prepTime
+							<< " record_s=" << recordTime
+							<< " obsnorm_s=" << obsNormTime
+							<< " obsnan_s=" << obsNanTime
+							<< " tovec_s=" << toVecTime
+							<< " collect_s=" << collectWallTime
+							<< " obs=" << obsSize
+							<< " pool=" << RLGC::g_ThreadPool.GetNumThreads());
+					}
 				}
-				collectWallTime = collectionTimer.Elapsed();
-				collectReport["Collection Time"] = collectWallTime;
 		};
 
 		while (true) {
@@ -2081,41 +2395,66 @@ void GGL::Learner::Start() {
 			// ================= Collection (pipelined orchestration) =================
 			// Sequential mode: collect runs inline right here (worker thread never started).
 			// Pipelined mode: the worker collected THIS iteration's data during the previous
-			// iteration's processing+Learn; join it, swap buffers, run the barrier-zone work, then
-			// kick the worker for the NEXT iteration with a freshly-frozen policy snapshot.
+			// iteration's Learn(); join it, swap buffers, run the barrier-zone work (including
+			// value-pred), then kick the worker for the NEXT iteration as Learn() starts.
 			Timer iterTimer = {};
-			if (collectThread.joinable()) {
-				collectThread.join();
-			} else {
-				fnCollectIteration(); // first iteration, or sequential mode
+			float collectJoinTime = 0.f;
+			{
+				Timer joinTimer = {};
+				if (collectThread.joinable()) {
+					collectThread.join();
+					collectJoinTime = joinTimer.Elapsed();
+				} else {
+					fnCollectIteration(); // first iteration, or sequential mode
+				}
 			}
+			report["Collect Join Time"] = collectJoinTime;
+			report["Display Time"] = lastDisplayTime; // previous iter; this iter's Display is after Overall
 			int stepsCollected = collectSteps;
-			std::swap(combinedTraj, combinedTrajNext);
-			// composite value critic: hand the just-joined collection's opponent context
-			// to the learn pass BEFORE the worker relaunches and overwrites it
-			if (config.ppo.oppCondEnabled)
-				ppo->oppCtxForLearn = ppo->oppCtxCollected.defined()
-					? ppo->oppCtxCollected.clone()
-					: torch::zeros({ config.ppo.oppCtxDim }, torch::kFloat32);
-			collectReport.Finish();
-			for (auto& kv : collectReport.data)
-				report.data[kv.first] = kv.second;
-			collectReport.Clear();
+			{
+				Timer obsSyncTimer = {};
+				if (obsStat)
+					obsStat->SyncAcrossRanks(dist);
+				report["Obs Stat Sync Time"] = obsSyncTimer.Elapsed();
+			}
+			{
+				Timer glueTimer = {};
+				std::swap(combinedTraj, combinedTrajNext);
+				// composite value critic: hand the just-joined collection's opponent context
+				// to the learn pass BEFORE the worker relaunches and overwrites it
+				if (config.ppo.oppCondEnabled)
+					ppo->oppCtxForLearn = ppo->oppCtxCollected.defined()
+						? ppo->oppCtxCollected.clone()
+						: torch::zeros({ config.ppo.oppCtxDim }, torch::kFloat32);
+				collectReport.Finish();
+				for (auto& kv : collectReport.data)
+					report.data[kv.first] = kv.second;
+				collectReport.Clear();
+				report["Barrier Glue Time"] = glueTimer.Elapsed();
+			}
 			float collectionTime = collectWallTime;
 
 			// ---- BARRIER ZONE (worker idle): shared-resource consumers. In sequential mode these
 			// stay at their original tail call sites; exactly one site is active per mode. Running
 			// them here (top of iteration N) is the same program point as the tail of iteration N-1.
 			if (pipelineOn) {
-				if (versionMgr)
-					versionMgr->OnIteration(ppo, report, totalTimesteps, prevVersionTimesteps);
+				{
+					Timer versionMgrTimer = {};
+					if (versionMgr)
+						versionMgr->OnIteration(ppo, report, totalTimesteps, prevVersionTimesteps);
+					report["VersionMgr Time"] = versionMgrTimer.Elapsed();
+				}
 				prevVersionTimesteps = totalTimesteps;
 				if (report.Has(ratingKey))
 					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-				// Freeze the current policy for the worker, then collect the next iteration
-				// concurrently with this iteration's processing + Learn.
+				// Freeze the current policy for the worker. Kick is deferred until Learn()
+				// so value-pred does not share the GPU with collect InferActions.
+				Timer snapshotTimer = {};
 				fnSyncSnapshot();
-				collectThread = std::jthread([&]() { fnCollectIteration(); });
+				report["Snapshot Time"] = snapshotTimer.Elapsed();
+			} else {
+				report["VersionMgr Time"] = 0.f;
+				report["Snapshot Time"] = 0.f;
 			}
 
 
@@ -2133,17 +2472,31 @@ void GGL::Learner::Start() {
 					RG_NO_GRAD;
 
 					// Make and transpose tensors
-					torch::Tensor tStates = torch::tensor(combinedTraj.states).reshape({ -1, obsSize });
-					torch::Tensor tActionMasks = torch::tensor(combinedTraj.actionMasks).reshape({ -1, numActions });
-					torch::Tensor tActions = torch::tensor(combinedTraj.actions);
-					torch::Tensor tLogProbs = torch::tensor(combinedTraj.logProbs);
-					torch::Tensor tRewards = torch::tensor(combinedTraj.rewards);
-					torch::Tensor tTerminals = torch::tensor(combinedTraj.terminals);
+					Timer trajCopyTimer = {};
+					const int64_t totalSteps = (int64_t)combinedTraj.Length();
+					torch::Tensor tStates = MakePinnedFromVector(combinedTraj.states, { totalSteps, obsSize });
+					torch::Tensor tActionMasks = torch::empty(
+						{ totalSteps, numActions },
+						torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+					{
+						auto masksView = torch::from_blob(
+							combinedTraj.actionMasks.data(),
+							{ (int64_t)combinedTraj.actionMasks.size() },
+							torch::TensorOptions().dtype(torch::kUInt8));
+						tActionMasks.view({ -1 }).copy_(masksView);
+					}
+					torch::Tensor tActions = MakePinnedActionIndices(combinedTraj.actions);
+					torch::Tensor tLogProbs = MakePinned1D<float>(combinedTraj.logProbs);
+					torch::Tensor tRewards = MakePinned1D<float>(combinedTraj.rewards);
+					torch::Tensor tTerminals = MakePinned1D<int8_t>(combinedTraj.terminals);
 
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
 					if (!combinedTraj.nextStates.empty())
-						tNextTruncStates = torch::tensor(combinedTraj.nextStates).reshape({ -1, obsSize });
+						tNextTruncStates = MakePinnedFromVector(
+							combinedTraj.nextStates,
+							{ (int64_t)(combinedTraj.nextStates.size() / (size_t)obsSize), obsSize });
+					report["Traj Copy Time"] = trajCopyTimer.Elapsed();
 
 					report["Average Step Reward"] = tRewards.mean().item<float>();
 					report["Collected Timesteps"] = stepsCollected;
@@ -2154,47 +2507,78 @@ void GGL::Learner::Start() {
 					// Filled by the fused GPU loop below alongside tValPreds — see the note
 					// there. Undefined on the CPU path and on a goal-critic-off run.
 					torch::Tensor tGoalValPredsFused;
+					torch::Tensor tVdagPredsFused;
 
 					if (ppo->device.is_cpu()) {
 						// Predict values all at once
 						tValPreds = ppo->InferCritic(tStates.to(ppo->device, true, true)).cpu();
 						if (tNextTruncStates.defined())
 							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+						if (config.ppo.vdagEnabled)
+							tVdagPredsFused = ppo->InferVdagMin(tStates.to(ppo->device, true, true)).cpu();
 					} else {
 						// Predict values using minibatching.
 						// FUSED (2026-08-04): the critic and the goal critic are read from ONE
-						// upload and ONE shared_head+critic_trunk forward per chunk. They used to
-						// run as two separate chunk loops, each calling an Infer* helper that
-						// rebuilds ValueTrunk internally — so the trunk (3.57M MAC/row) and
-						// critic_trunk (6.68M MAC/row) were each computed twice over every row,
-						// and the same ~186 MB of states was uploaded twice, to produce two
-						// scalars that read off the identical body. Same duplication the learn
-						// pass had until the policy/value trunk share landed earlier today.
-						// (The V-dagger and geo reads further down are still separate loops and
-						// still re-forward the trunk a third time — a further ~10.3M MAC/row.)
-						tValPreds = torch::zeros({ (int64_t)combinedTraj.Length() });
-						if (goalCriticOn)
-							tGoalValPredsFused = torch::zeros({ (int64_t)combinedTraj.Length() });
-						for (int i = 0; i < combinedTraj.Length(); i += ppo->config.miniBatchSize) {
-							int start = i;
-							int end = RS_MIN(i + ppo->config.miniBatchSize, combinedTraj.Length());
-							torch::Tensor tStatesPart = tStates.slice(0, start, end);
-
-							torch::Tensor vCrit, vGoal;
-							ppo->InferValueFamily(tStatesPart, &vCrit,
-								goalCriticOn ? &vGoal : nullptr, nullptr, nullptr);
-							RG_ASSERT(vCrit.size(0) == (end - start));
-							tValPreds.slice(0, start, end).copy_(vCrit.cpu(), true);
-							if (vGoal.defined())
-								tGoalValPredsFused.slice(0, start, end).copy_(vGoal.cpu(), true);
+						// upload and ONE shared_head+critic_trunk forward per chunk.
+						// 2026-08-14: V-dagger min rides the same trunk (unconditioned; opp_embed
+						// stays on critic/goal only). InferVdagMin remains for HullBootstrap.
+						// GGL-2 transfers: pinned tStates, reused GPU chunk, pinned D2H,
+						// one stream sync — not vCrit.cpu() per chunk (that drains).
+						static torch::Tensor gpu_critic_states;
+						static torch::Tensor pinned_val_preds, pinned_goal_preds, pinned_vdag_preds;
+						static torch::Tensor pinned_trunc_vals;
+						const int64_t n = (int64_t)combinedTraj.Length();
+						const int64_t chunkMax = std::max<int64_t>(1, ppo->config.miniBatchSize);
+						EnsureBuf(gpu_critic_states, { chunkMax, obsSize },
+							torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device));
+						EnsureBufCapacity(pinned_val_preds, n, torch::TensorOptions()
+							.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+						tValPreds = pinned_val_preds.narrow(0, 0, n);
+						if (goalCriticOn) {
+							EnsureBufCapacity(pinned_goal_preds, n, torch::TensorOptions()
+								.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+							tGoalValPredsFused = pinned_goal_preds.narrow(0, 0, n);
 						}
+						if (config.ppo.vdagEnabled) {
+							EnsureBufCapacity(pinned_vdag_preds, n, torch::TensorOptions()
+								.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+							tVdagPredsFused = pinned_vdag_preds.narrow(0, 0, n);
+						}
+						for (int64_t i = 0; i < n; i += ppo->config.miniBatchSize) {
+							int64_t start = i;
+							int64_t end = RS_MIN(i + ppo->config.miniBatchSize, n);
+							int64_t chunk = end - start;
+							gpu_critic_states.narrow(0, 0, chunk).copy_(
+								tStates.slice(0, start, end), /*non_blocking=*/true);
+							torch::Tensor vCrit, vGoal, vVdag;
+							ppo->InferValueFamily(gpu_critic_states.narrow(0, 0, chunk), &vCrit,
+								goalCriticOn ? &vGoal : nullptr,
+								config.ppo.vdagEnabled ? &vVdag : nullptr, nullptr);
+							RG_ASSERT(vCrit.size(0) == chunk);
+							pinned_val_preds.slice(0, start, end).copy_(vCrit, /*non_blocking=*/true);
+							if (vGoal.defined())
+								pinned_goal_preds.slice(0, start, end).copy_(vGoal, /*non_blocking=*/true);
+							if (vVdag.defined())
+								pinned_vdag_preds.slice(0, start, end).copy_(vVdag, /*non_blocking=*/true);
+						}
+#ifdef RG_CUDA_SUPPORT
+						c10::cuda::getCurrentCUDAStream(ppo->device.index()).synchronize();
+#endif
 
 						if (tNextTruncStates.defined()) {
 							// This really just should never happen
 							// If this is ever actually a real problem in a legitimate use case, ping Zealan in the dead of night
 							RG_ASSERT(tNextTruncStates.size(0) <= ppo->config.miniBatchSize);
 
-							tTruncValPreds = ppo->InferCritic(tNextTruncStates.to(ppo->device, true, true)).cpu();
+							torch::Tensor truncGpu = tNextTruncStates.to(ppo->device, /*non_blocking=*/true);
+							torch::Tensor truncVals = ppo->InferCritic(truncGpu);
+							EnsureBufCapacity(pinned_trunc_vals, truncVals.size(0), torch::TensorOptions()
+								.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
+							tTruncValPreds = pinned_trunc_vals.narrow(0, 0, truncVals.size(0));
+							tTruncValPreds.copy_(truncVals, /*non_blocking=*/true);
+#ifdef RG_CUDA_SUPPORT
+							c10::cuda::getCurrentCUDAStream(ppo->device.index()).synchronize();
+#endif
 						}
 					}
 
@@ -2411,6 +2795,12 @@ void GGL::Learner::Start() {
 								reachAccEMA = decay * reachAccEMA + (1 - decay) * ppo->lastReachAccuracy;
 							if (agreement >= 0)
 								reachAgreeEMA = decay * reachAgreeEMA + (1 - decay) * agreement;
+							if (DistActive()) {
+								float em[2] = { reachAccEMA, reachAgreeEMA };
+								dist->avg_host(em, 2);
+								reachAccEMA = em[0];
+								reachAgreeEMA = em[1];
+							}
 
 							auto fnSmoothstep = [](float x, float lo, float hi) {
 								float t = RS_CLAMP((x - lo) / RS_MAX(1e-6f, hi - lo), 0.f, 1.f);
@@ -2625,14 +3015,23 @@ void GGL::Learner::Start() {
 						}
 						auto scaledR = advF - g * lmb * cont * advN - g * cont * vpN + vpF
 							- g * vTrunc;
-						// V-dagger on all rows (chunked trunk+head forwards)
-						auto vdag = torch::empty({ nR }, torch::kFloat32);
+						// V-dagger: fused into the value-pred InferValueFamily pass (same
+						// unconditioned trunk as InferVdagMin). Fallback loop only if that
+						// tensor was not filled (CPU path without InferValueFamily).
+						Timer vdagInferTimer = {};
 						constexpr int64_t VCH = 32768;
-						for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
-							int64_t i1 = RS_MIN(i0 + VCH, nR);
-							vdag.slice(0, i0, i1).copy_(
-								ppo->InferVdagMin(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
+						torch::Tensor vdag;
+						if (tVdagPredsFused.defined() && tVdagPredsFused.numel() == nR) {
+							vdag = tVdagPredsFused.to(torch::kFloat32).flatten();
+						} else {
+							vdag = torch::empty({ nR }, torch::kFloat32);
+							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+								int64_t i1 = RS_MIN(i0 + VCH, nR);
+								vdag.slice(0, i0, i1).copy_(
+									ppo->InferVdagMin(tStates.slice(0, i0, i1)).to(torch::kCPU, torch::kFloat32));
+							}
 						}
+						report["Vdag Infer Time"] = vdagInferTimer.Elapsed();
 						auto vdagN = torch::cat({ vdag.slice(0, 1, nR), z1 });
 						// ===== HULL OPERATOR (EPSILON_CRITIC.md s7; PPOLearnerConfig::hullEnabled)
 						// Relax the bootstrap: max over the real next state and hullK candidates
@@ -2642,6 +3041,7 @@ void GGL::Learner::Start() {
 						// bootstrap term entirely. Hull/Uplift is the how-much-extra-optimism
 						// panel: relu(hull - plain) averaged over bootstrapped rows.
 						if (config.ppo.hullEnabled) {
+							Timer hullTimer = {};
 							auto tNxt = torch::cat({ tStates.slice(0, 1, nR),
 								tStates.slice(0, nR - 1, nR) });
 							auto tvHull = ppo->HullBootstrap(tNxt);
@@ -2652,6 +3052,7 @@ void GGL::Learner::Start() {
 									.item<float>();
 								vdagN = torch::maximum(vdagN, tvHull);
 							}
+							report["Hull Time"] = hullTimer.Elapsed();
 						}
 						float vScale = tTargetVals.abs().to(torch::kFloat32).quantile(0.99).item<float>();
 						tVdagTargets = (scaledR + g * cont * vdagN)
@@ -2821,6 +3222,7 @@ void GGL::Learner::Start() {
 						// silently while the sensor is young (< 5 updates) or disabled.
 						if (config.ppo.silEnabled && gapSensor && gapSensor->exp
 							&& gapSensor->updates >= 5) {
+							Timer silTimer = {};
 							auto tgtF = tTargetVals.to(torch::kFloat32).flatten();
 							auto vexp = torch::empty({ nR }, torch::kFloat32);
 							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
@@ -2846,6 +3248,7 @@ void GGL::Learner::Start() {
 							report["SIL/Frac"] = nConv / (float)nR;
 							report["SIL/Mean W"] = nConv > 0
 								? tSilWeights.sum().item<float>() / nConv : 0.f;
+							report["SIL Time"] = silTimer.Elapsed();
 						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
 						report["Headroom/H Mean"] = tH.mean().item<float>();
@@ -2862,6 +3265,10 @@ void GGL::Learner::Start() {
 							returnStat->Increment(TENSOR_TO_VEC<float>(selectedReturns));
 						}
 					}
+					Timer distSyncTimer = {};
+					if (returnStat)
+						returnStat->SyncAcrossRanks(dist);
+					report["Dist Sync Time"] = distSyncTimer.Elapsed();
 					report["GAE/Avg Return"] = tReturns.abs().mean().item<float>();
 					report["GAE/Avg Advantage"] = rawAdvAbsMean; // pre-injection (see above)
 					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
@@ -3017,7 +3424,10 @@ void GGL::Learner::Start() {
 					// literally zero), std-floored beta_eff, clamped +-3 sigma_ext.
 					// Value/expectile targets were computed BEFORE any injection (the
 					// sensor never measures its own payments).
-					if (gapSensor && (int64_t)combinedTraj.Length() > 0 && tTargetVals.defined()) {
+					int doGap = (gapSensor && (int64_t)combinedTraj.Length() > 0 && tTargetVals.defined()) ? 1 : 0;
+					if (DistActive())
+						dist->min_host(&doGap, 1);
+					if (doGap) {
 						const auto& gc = config.gapSensor;
 						Timer gapTimer = {};
 						int64_t nAll = combinedTraj.Length();
@@ -3030,26 +3440,49 @@ void GGL::Learner::Start() {
 							auto perm = torch::randperm(nAll,
 								torch::TensorOptions().dtype(torch::kLong))
 								.slice(0, 0, RS_MIN((int64_t)gc.trainRows, nAll));
+							int nChunks = (int)((perm.size(0) + chunk - 1) / chunk);
+							if (DistActive())
+								dist->min_host(&nChunks, 1);
 							float lossSum = 0; int lossN = 0;
-							for (int64_t i = 0; i < perm.size(0); i += chunk) {
-								auto idx = perm.slice(0, i, RS_MIN(i + chunk, perm.size(0)));
-								torch::Tensor h2;
-								{
-									RG_NO_GRAD;
-									h2 = ppo->models["shared_head"]->Forward(
-										tStates.index_select(0, idx).to(ppo->device, true), false);
+							for (int c = 0; c < nChunks; c++) {
+								int64_t i = (int64_t)c * chunk;
+								bool have = i < perm.size(0);
+								if (have) {
+									auto idx = perm.slice(0, i, RS_MIN(i + chunk, perm.size(0)));
+									torch::Tensor h2;
+									{
+										RG_NO_GRAD;
+										h2 = ppo->models["shared_head"]->Forward(
+											tStates.index_select(0, idx).to(ppo->device, true), false);
+									}
+									if (!gapSensor->exp)
+										gapSensor->Build(h2.size(1), ppo->device, gc.lr);
+									gapSensor->optim->zero_grad();
+									auto pred = gapSensor->exp->forward(h2).flatten();
+									auto u = tTgt.index_select(0, idx).to(ppo->device) - pred;
+									auto w = torch::where(u > 0,
+										torch::full_like(u, gc.tau), torch::full_like(u, 1.f - gc.tau));
+									auto loss = (w * u * u).mean();
+									loss.backward();
+									lossSum += loss.item<float>(); lossN++;
+								} else if (gapSensor->exp && gapSensor->optim) {
+									gapSensor->optim->zero_grad();
 								}
-								if (!gapSensor->exp)
-									gapSensor->Build(h2.size(1), ppo->device, gc.lr);
-								gapSensor->optim->zero_grad();
-								auto pred = gapSensor->exp->forward(h2).flatten();
-								auto u = tTgt.index_select(0, idx).to(ppo->device) - pred;
-								auto w = torch::where(u > 0,
-									torch::full_like(u, gc.tau), torch::full_like(u, 1.f - gc.tau));
-								auto loss = (w * u * u).mean();
-								loss.backward();
-								gapSensor->optim->step();
-								lossSum += loss.item<float>(); lossN++;
+								if (DistActive() && gapSensor->exp) {
+									std::vector<Dist::Session::GradRef> refs;
+									for (auto& p : gapSensor->exp->parameters()) {
+										if (!p.requires_grad())
+											continue;
+										if (!p.grad().defined())
+											p.mutable_grad() = torch::zeros_like(p);
+										auto g = p.grad();
+										if (g.is_cuda() && g.scalar_type() == torch::kFloat)
+											refs.push_back({ g.data_ptr<float>(), (size_t)g.numel() });
+									}
+									dist->allreduce_avg_grads(refs);
+								}
+								if (gapSensor->optim)
+									gapSensor->optim->step();
 							}
 							gapSensor->updates++;
 							if (lossN > 0)
@@ -3154,10 +3587,27 @@ void GGL::Learner::Start() {
 
 				}
 
-				// Free CUDA cache
+				// Free CUDA cache. GigaLearn-2 does not call emptyCache(). On V100/POWER
+				// cudaFree of the learn-pass pool was a suspected multi-second stall every
+				// iteration. Default ON preserves desktop behavior. Cluster A/B: GGL_EMPTY_CACHE=0.
 #ifdef RG_CUDA_SUPPORT
-				if (ppo->device.is_cuda())
-					c10::cuda::CUDACachingAllocator::emptyCache();
+				if (ppo->device.is_cuda()) {
+					static const bool doEmptyCache = []() {
+						const char* e = std::getenv("GGL_EMPTY_CACHE");
+						if (!e || !*e)
+							return true;
+						return !(e[0] == '0' || std::string(e) == "false" || std::string(e) == "off");
+					}();
+					static bool loggedEmptyCache = false;
+					if (!loggedEmptyCache) {
+						RG_LOG("GGL_EMPTY_CACHE: " << (doEmptyCache ? "on" : "off"));
+						loggedEmptyCache = true;
+					}
+					Timer emptyCacheTimer = {};
+					if (doEmptyCache)
+						c10::cuda::CUDACachingAllocator::emptyCache();
+					report["Empty Cache Time"] = emptyCacheTimer.Elapsed();
+				}
 #endif
 
 				// Deliberate-practice proposer training: deferred until here (outside the
@@ -3166,7 +3616,9 @@ void GGL::Learner::Start() {
 				// pre-update goals/rho computed above for this iteration's shaping/logging, then
 				// updates - so what got logged/shaped this iteration reflects the OLD proposer.
 
-				// Learn
+				// Learn. Pipelined collect starts here so it overlaps Learn only, not value-pred.
+				if (pipelineOn)
+					collectThread = std::jthread([&]() { fnCollectIteration(); });
 				Timer learnTimer = {};
 				ppo->Learn(experience, report, isFirstIteration);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
@@ -3183,7 +3635,12 @@ void GGL::Learner::Start() {
 					(pipelineOn ? RS_MAX(1e-6f, iterTimer.Elapsed()) : (collectionTime + consumptionTime));
 
 				uint64_t prevTimesteps = totalTimesteps;
-				totalTimesteps += stepsCollected;
+				uint64_t prevIterations = totalIterations;
+				int64_t globalSteps = stepsCollected;
+				if (dist)
+					dist->sum_host(&globalSteps, 1);
+				totalTimesteps += (uint64_t)globalSteps;
+				report["Collected Timesteps"] = globalSteps;
 				report["Total Timesteps"] = totalTimesteps;
 				totalIterations++;
 				report["Total Iterations"] = totalIterations;
@@ -3205,21 +3662,29 @@ void GGL::Learner::Start() {
 				if (iterationCallback)
 					iterationCallback(this, report);
 
-				if (saveQueued || exitRequested) {
+				int exitFlag = (saveQueued || exitRequested) ? 1 : 0;
+				int exitCode = exitRequested ? requestedExitCode.load() : 0;
+				if (dist) {
+					dist->sum_host(&exitFlag, 1);
+					dist->max_host(&exitCode, 1);
+				}
+				if (exitFlag) {
 					// Never exit with a collection worker in flight
 					if (collectThread.joinable())
 						collectThread.join();
 					if (!config.checkpointFolder.empty())
 						Save();
-					int exitCode = exitRequested ? requestedExitCode.load() : 0;
-					if (exitCode != 0)
+					if (dist)
+						dist->barrier();
+					if (exitCode != 0 && DistRank() == 0)
 						RG_LOG("Learner: exiting with code " << exitCode
 							<< " (programmatic restart request - the ops wrapper relaunches onto the saved checkpoint)");
 					exit(exitCode);
 				}
 
 				if (!config.checkpointFolder.empty()) {
-					if (totalTimesteps / config.tsPerSave > prevTimesteps / config.tsPerSave) {
+					if (totalIterations / (uint64_t)config.iterPerSave
+						> prevIterations / (uint64_t)config.iterPerSave) {
 						// Auto-save. JOIN THE COLLECT WORKER FIRST (2026-08-07): this was the
 						// only save path that did not, while the exit path 15 lines above has
 						// always joined with the comment "Never exit with a collection worker
@@ -3228,9 +3693,7 @@ void GGL::Learner::Start() {
 						// mirror refresh on _seqHalfOutdated) writing through. That asymmetry
 						// is the only structural difference between the save path that has
 						// never produced a corrupt file and the one that produced 15 of them
-						// on 2026-08-07. Joining costs one iteration of pipelining per save,
-						// i.e. ~3s per ~4 minutes, which is not worth arguing about against
-						// losing 350M steps and half the golden archive.
+						// on 2026-08-07. Joining costs one pipelined iteration per save.
 						if (collectThread.joinable())
 							collectThread.join();
 						Save();
@@ -3242,6 +3705,10 @@ void GGL::Learner::Start() {
 				if (metricSender)
 					metricSender->Send(report);
 
+				if (DistRank() != 0)
+					continue;
+
+				Timer displayTimer = {};
 				report.Display(
 					{
 						"Average Step Reward",
@@ -3339,8 +3806,21 @@ void GGL::Learner::Start() {
 						"-Env Step Time",
 						"-Prep Time",
 						"-Record Time",
+						"Collect Join Time",
+						"-Obs Stat Sync Time",
+						"-VersionMgr Time",
+						"-Snapshot Time",
+						"-Barrier Glue Time",
+						"-Display Time",
 						"Consumption Time",
 						"-Value Pred Time",
+						"-Traj Copy Time",
+						"-Vdag Infer Time",
+						"-Hull Time",
+						"-SIL Time",
+						"-Empty Cache Time",
+						"-Dist Sync Time",
+						"-Gap/Time",
 						"-Reach Read Time",
 						"-GAE Time",
 						"-PPO Learn Time",
@@ -3350,6 +3830,7 @@ void GGL::Learner::Start() {
 						"Total Iterations"
 					}
 				);
+				lastDisplayTime = displayTimer.Elapsed();
 		}
 		
 	} catch (std::exception& e) {

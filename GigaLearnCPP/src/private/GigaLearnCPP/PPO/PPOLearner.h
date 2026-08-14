@@ -38,10 +38,12 @@ namespace GGL {
 
 		PPOLearnerConfig config;
 		torch::Device device;
+		Dist::Session* dist = nullptr;
 
 		PPOLearner(
 			int obsSize, int numActions,
-			PPOLearnerConfig config, torch::Device device
+			PPOLearnerConfig config, torch::Device device,
+			Dist::Session* dist = nullptr
 		);
 
 		static void MakeModels(
@@ -107,6 +109,8 @@ namespace GGL {
 		// feeding critic / goal critic / V-dagger min, plus geo_v off the same upload. Pass
 		// nullptr for any head you do not need. Prefer this over calling the singles in
 		// separate loops — that forwards the trunk once PER CALL (see the note on the impl).
+		// V-dagger (and r-hat) read the UNCONDITIONED trunk, matching InferVdagMin and Learn.
+		// opp_embed is added only for critic / goal critic.
 		void InferValueFamily(
 			torch::Tensor obs, torch::Tensor* outCritic, torch::Tensor* outGoalCritic,
 			torch::Tensor* outVdagMin, torch::Tensor* outGeoV);
@@ -191,6 +195,11 @@ namespace GGL {
 		// chunked so the [rows, bank, dims] broadcast never materializes at full n.
 		// The 5 wire values for a batch: rawObs feeds the map encoder, trunkOut feeds
 		// critic/expectile. Detached, fp32 for the gamma^d map (bf16-safe upstream).
+
+		// FP16 learn autocast (V100): persist scale across Learn() calls. BF16 leaves this unused.
+		float ampLossScale = 4096.f;
+		int ampGoodEpochs = 0;
+		int ampSkipCount = 0;
 
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
 

@@ -11,6 +11,7 @@
 
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
 #include <GigaLearnCPP/Util/ModelConfig.h>
+#include <GigaLearnCPP/Distributed/Session.h>
 
 namespace GGL {
 
@@ -96,7 +97,7 @@ namespace GGL {
 			torch::Device device
 		);
 
-		virtual torch::Tensor Forward(torch::Tensor input, bool halfPrec);
+		virtual torch::Tensor Forward(torch::Tensor input, bool halfPrec, bool keepHalf = false);
 		
 		void SetOptimLR(float newLR);
 
@@ -132,6 +133,9 @@ namespace GGL {
 		bool VerifySavedWeights(std::filesystem::path folder) const;
 
 		virtual torch::Tensor CopyParams() const;
+
+		void BroadcastParameters(Dist::Session* dist);
+		void AllReduceGrads(Dist::Session* dist);
 
 		// NOTE: Resets parameters
 		Model* MakeEmptyClone() {
@@ -181,7 +185,13 @@ namespace GGL {
 			map[model->modelName] = model;
 		}
 
-		// NOTE: Automatically zeros grad after
+		void BroadcastParameters(Dist::Session* dist);
+		// All-reduce grads of models that StepOptims() will step (skips groupStepExempt
+		// unless includeExempt). Missing grads are zero-filled so every rank contributes
+		// the same tensor list.
+		void AllReduceGrads(Dist::Session* dist, bool includeExempt = false);
+
+		// NOTE: Automatically zeros grad afte
 		void StepOptims() {
 			for (Model* model : *this) {
 				if (model->groupStepExempt)

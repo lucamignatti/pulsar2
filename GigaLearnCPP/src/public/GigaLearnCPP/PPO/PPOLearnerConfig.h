@@ -196,16 +196,17 @@ namespace GGL {
 
 		// Use half-precision models for inference
 		// This is much faster on GPU, not so much for CPU
+		// Dtype is GGLHalfPrecType(): BF16 on sm_80+ (5080), FP16 on V100 (sm_70).
 		bool useHalfPrecision = false;
 
-		// BF16 AUTOCAST FOR THE LEARN PASS (2026-08-04, user-directed "more sps").
+		// AUTOCAST FOR THE LEARN PASS (2026-08-04, user-directed "more sps"; FP16 on V100 2026-08-14).
 		// useHalfPrecision above covers only INFERENCE; the learn pass ran strict fp32, and
 		// profiling made it the system bottleneck: the GPU sits at 92-98% and the collect
 		// worker's small forwards queue behind it, so learn-pass cost sets BOTH halves of the
 		// iteration (collection 5.3s / consumption 3.9s under pipelining). Weights and the
-		// optimizer stay fp32 — autocast only runs the matmuls in bf16 and keeps reductions
-		// and loss functions in fp32, so no gradient scaler is needed (that is an fp16
-		// requirement; bf16 has fp32's exponent range).
+		// optimizer stay fp32 — autocast only runs the matmuls in GGLHalfPrecType() and keeps
+		// reductions and loss functions in fp32. BF16 (sm_80+) needs no GradScaler; FP16 (V100)
+		// scales the loss before backward and unscales grads before clip.
 		//
 		// SCOPE IS DELIBERATE, not blanket. Autocast covers the policy / critic / goal-critic /
 		// V-dagger forwards — the 1536-wide value family that dominates the pass — and is
@@ -219,6 +220,9 @@ namespace GGL {
 		//
 		// REVERT = this flag. Watch for non-finite losses, a Policy Entropy discontinuity, or
 		// Headroom/Vdag Update Magnitude changing scale.
+		//
+		// Flag name is historical (BF16). On V100 this now means FP16 autocast + loss scale.
+		// Revert: GGL_LEARN_AMP=0. Watch non-finite losses, Policy Entropy, Vdag Update Magnitude.
 		bool learnAutocastBF16 = false;
 
 		// ADVANTAGE FILTERING AS A TRUE ROW SUBSET (2026-08-04, user-directed).

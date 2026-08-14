@@ -6,6 +6,7 @@
 #include "Util/RenderSender.h"
 #include "Util/VizControl.h"
 #include "LearnerConfig.h"
+#include <GigaLearnCPP/Distributed/Session.h>
 
 namespace GGL {
 
@@ -20,6 +21,10 @@ namespace GGL {
 	class RG_IMEXPORT Learner {
 	public:
 		LearnerConfig config;
+		Dist::Session* dist = nullptr;
+
+		int DistRank() const { return dist ? dist->rank() : 0; }
+		bool DistActive() const { return dist && dist->distributed(); }
 
 		RLGC::EnvSet* envSet;
 
@@ -109,6 +114,7 @@ namespace GGL {
 		// yardstick (persisted so the series survives restarts).
 		std::shared_ptr<class NextoOpponent> nexto;
 		std::atomic<int64_t> nextoGoalsFor = 0, nextoGoalsAgainst = 0, nextoServeIters = 0;
+		int64_t nextoLoadedFor = 0, nextoLoadedAgainst = 0, nextoLoadedServes = 0;
 
 
 		StepCallbackFn stepCallback = NULL;
@@ -125,7 +131,8 @@ namespace GGL {
 			exitRequested = true;
 		}
 
-		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL);
+		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL,
+			Dist::Session* dist = nullptr);
 		void Start();
 
 

@@ -48,6 +48,10 @@ namespace GGL {
 		auto end() { return &advantages + 1; }
 		auto begin() const { return &states; }
 		auto end() const { return &advantages + 1; }
+
+		bool IsOnCUDA() const {
+			return states.defined() && states.is_cuda();
+		}
 	};
 
 	// https://github.com/AechPro/rlgym-ppo/blob/main/rlgym_ppo/ppo/experience_buffer.py
@@ -64,8 +68,12 @@ namespace GGL {
 		ExperienceBuffer(int seed, torch::Device device);
 
 		ExperienceTensors _GetSamples(const int64_t* indices, size_t size) const;
+		ExperienceTensors _GetSamples(torch::Tensor indices) const;
 
 		// Not const because it uses our random engine
 		std::vector<ExperienceTensors> GetAllBatchesShuffled(int64_t batchSize, bool overbatching);
+
+		/** Pin + non-blocking H2D of all defined fields (no-op if already on CUDA / CPU device). */
+		void UploadToDevice();
 	};
 }

@@ -1,0 +1,419 @@
+pulsar2 CCNI/AiMOS experiment log
+=================================
+Machine: dcs compute, 1 node exclusive, 6x Tesla V100-SXM2 32GB (sm_70, FP16 TC, no BF16)
+Ranks: 6 (ntasks-per-node=6), Session cudaSetDevice(local_rank)
+Transport: Windows Cursor -> Git SSH mux -> blp01 -> dcsfen02 / sbatch el8
+Repo: /gpfs/u/home/RLFR/RLFRkllj/barn-shared/pulsar2-private
+Fixed knobs unless a row says otherwise:
+  tsPerItr = batchSize = 200k, miniBatchSize = 12.5k, 2 epochs
+  GGL_PIPELINED_COLLECTION=0 (sequential collect then learn)
+  GGL_EMPTY_CACHE=0, GGL_HULL=0, GGL_DIST_SMOKE=1
+  GGL_TRAIN_AGAINST_OLD_CHANCE=0, GGL_NEXTO_SERVE_FRAC=0 (from 4630548 on)
+  tickSkip=8, obs size=230, 1v1 so players = 2 * numGames
+  NUMA: pulsar2_numa_rank.sh (GPU0-2 CPUs 0-79, GPU3-5 CPUs 80-159)
+  gcc-15 libstdc++ LD_PRELOAD, Spectrum MPI --bind-to none
+SPS: printed Overall/Collection/Consumption are PER RANK (local 200k / wall).
+     Node SPS = per-rank * 6. Total Timesteps in the report is already summed x6.
+Timers: rank-0 Display / [DIST][COLLECT] lines. Means skip first iter unless noted.
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630541  (diagnostic, not an SPS baseline)
+--------------------------------------------------------------------------------
+Change: per-rank [DIST][COLLECT] log after collect, before first collective.
+Still production old/Nexto chances (0.30 / 0.15), Length()-fill collect
+  (combinedTraj.Length() < tsPerItr), independent opp roll per rank.
+
+Result: collect wall is bimodal, not noisy GPUs.
+  Self-play ranks: nreal=512, ~8-12s collect, ~355-600 ticks, traj often ~230k overshoot.
+  Vs-old/Nexto:    nreal=256, ~15-20s collect, ~750-960 ticks, two InferActions/tick.
+  Dist Sync on a fast rank ~8s = waiting for vs-opp ranks.
+  Rank 0 Display Overall ~9-14k depending on whether rank 0 was the straggler.
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630548  self-play + broadcast opponent roll, still Length()-fill
+--------------------------------------------------------------------------------
+Change:
+  Rank 0 draws opp mode/version/team, bcast_host to all ranks.
+  sbatch forces GGL_TRAIN_AGAINST_OLD_CHANCE=0, GGL_NEXTO_SERVE_FRAC=0.
+  ExampleMain production chances unchanged (env override only).
+
+Result: every rank opp=self nreal=512. Dist Sync 0-1s (was ~8s).
+  Length()-fill still jitters: 347-467 ticks, collect 7.1-9.5s in the same iter.
+  First iter all 600 ticks / ~230-246k traj (episode-completion overshoot).
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630552  FIXED env-step budget + boundary truncate   [SPS BASELINE]
+--------------------------------------------------------------------------------
+Change: GGL-2 pre-a20cce5 loop.
+  targetStepsPerPlayer = tsPerItr / numRealPlayers, broadcast from rank 0 (390 at 256 arenas).
+  After the loop, unfinished episodes TRUNCATED for critic bootstrap; env does not reset.
+  Unfinished Trajectory cleared; next iter continues in the live env.
+
+Result (iters 2-20, rank 0):
+  Every rank every iter: target=390 ticks=390 traj=199680 env_steps=199680
+  Collect 8.24s  infer 3.29  env 1.28  prep 0.90  record 2.17
+  Consume 6.34s  learn 4.72  value 0.56  vdag 0.28  dist sync 0.20  gap 0.18  SIL 0.17
+  Overall 13,714 /rank  (x6 = 82,300)   last 13,664
+  Collection SPS 24,271    Consumption SPS 31,624
+  Iter wall ~14.6s. Dist Sync 0-0.6s.
+  Reach Read ~1.7s every 16 iters (not in consume mean).
+  Pool still hardware_concurrency() = 160 threads/rank (not yet known as a problem).
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630553  collect CPU / thread-pool enqueue tax
+--------------------------------------------------------------------------------
+Change:
+  fnParallelFor: numChunks = nThreads, not nThreads*4 (was up to 640 jobs for 512 players,
+    three times per env tick).
+  Merge the two per-tick record parallel-fors into one.
+  Parallelize obs standardize (no-op here: standardizeObs off, obsnorm_s=0).
+  GGL_INFER_FINITE_SYNC=0: skip rowOk.all().item() extra CUDA sync (sanitize-where remains).
+    Default in code is still 1; sbatch sets 0.
+
+Result (iters 2-12, rank 0):
+  pool=160  obs=230
+  Collect 6.47s  infer 3.48  env 1.25  prep 0.42  record 0.65
+    obsnan 0.05  tovec 0.02
+  Overall 15,713 /rank  (x6 = 94,300)
+  Collection SPS 30,882
+  Infer did NOT drop: tActions.cpu() already drains the stream, so skipping .item() is free
+    but not an infer win. Prep -53%, record -70% vs 4630552.
+  ~0.6s collect still unnamed: StepFirstHalf is not on any timer.
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630554  thread pool = process CPU affinity
+--------------------------------------------------------------------------------
+Change: RLGymCPP ThreadPool ctor uses sched_getaffinity / CPU_COUNT, not
+  std::thread::hardware_concurrency(). numactl --physcpubind does not change
+  hardware_concurrency(), so each rank was creating 160 threads on a ~27-CPU slice
+  (6*160=960 threads on 160 CPUs). GigaLearn-2 has the same 160/rank ctor; they
+  only enqueue ~40 arena jobs so it hurts them less.
+
+Result (iters 2-29, rank 0):
+  pool=27 on ranks 0,1,3,4; pool=26 on ranks 2,5 (those NUMA slices are 26 CPUs)
+  Collect 4.36s  infer 3.43  env 0.52  prep 0.08  record 0.09
+  Overall 18,843 /rank  (x6 = 113,060)
+  Collection SPS 45,881
+  Env/prep/record collapsed. Infer unchanged (~3.4s). Collect now faster than consume
+  (~6.1s, learn still ~4.6s) -> overall is learn-bound at 256 arenas sequential.
+
+--------------------------------------------------------------------------------
+2026-08-13  jobs 4630563 / 4630580  arena-count sweep (same 200k steps/iter)
+--------------------------------------------------------------------------------
+Same binary/config as 4630554; only GGL_NUM_GAMES changes.
+targetSteps = 200000 / (2*numGames). Total arena-ticks ~100k in all three (same env work).
+
+                 arenas  players  ticks  collect  infer   env   overall/rank  x6 node  coll SPS
+  4630563          128      256    781    8.43s   7.34   0.58     13.7k        82k      24k
+  4630554          256      512    390    4.36s   3.43   0.52     18.8k       113k      46k
+  4630580          512     1024    195    2.56s   1.73   0.50     22.8k       137k      76k
+
+  512-arena last Display: collect 2.56 (infer 1.73) consume 6.18 (learn 4.62) overall 22.8k
+  512 did not OOM on 32GB V100s (22 iters).
+
+Per InferActions call is ~9ms at batch 256, 512, AND 1024. Infer wall scales with CALL COUNT
+not GEMM size -> not GPU-compute bound. Env time ~0.5s at all three (same arena-ticks).
+
+--------------------------------------------------------------------------------
+Inference bottleneck after pinned path (4630584)
+--------------------------------------------------------------------------------
+Pinned reuse + non-blocking H2D/D2H + GPU actions + memcpy is IN. Transfers are
+~0.06s/iter. Remaining ~3.38s is InferActions (kern_s): Model::Forward fp16/fp32
+round-trip per module, isfinite+where, softmax, multinomial. Dispatch-bound.
+
+--------------------------------------------------------------------------------
+2026-08-13  job 4630584  pinned H2D/D2H + overlap StepFirstHalf  [TRANSFER A/B]
+--------------------------------------------------------------------------------
+Change (Learner.cpp collect, GGL-2 path):
+  Long-lived pinned obs/mask host buffers; CPU copy_ from from_blob; reused GPU
+    buffers via EnsureBuf + copy_(pinned, non_blocking).
+  InferActions leaves actions/logprobs on GPU (no tActions.cpu() in infer).
+  Order: pin+H2D launch -> StepFirstHalf -> InferActions -> Sync -> pinned D2H
+    of int64 actions + fp32 logprobs -> one stream sync -> memcpy.
+  Split timers: h2d_s / kern_s / d2h_s. Checkpoint dir checkpoints_dist_6gpu_pinned.
+  Same knobs as 4630554: 256 arenas, sequential, self-play, affinity pool.
+
+Result (rank 0, skip iter 1; ~20 iters):
+  Collect ~4.35s  infer ~3.44  (h2d 0.041  kern 3.38  d2h 0.020)  env ~0.62
+  Overall ~18.9k/rank  (x6 ~113k)  Collection SPS ~46k
+  vs 4630554: collect 4.36 / infer 3.43 / overall 18.8k  — no material SPS change.
+
+Conclusion: transfers were already not the 9ms. 390 InferActions * ~8.7ms = kern.
+  H2D+D2H together ~0.06s/iter. Keep the pinned path (correct, cheap, matches GGL-2).
+  Next cost is InferActions itself (shared_head+policy Forward fp16 in/fp32 out,
+  isfinite+where sanitize, softmax, multinomial; already noted dispatch-bound).
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630587  GGL-2 trajectory vector reserve / no GetRow temp
+--------------------------------------------------------------------------------
+Change (Learner.cpp only):
+  Per-player Trajectory::Reserve(1.2 * maxEpisodeLength) — GGL-2 ReserveAll before
+    collect. Clear() keeps capacity (was `*this = Trajectory()` every episode).
+  Reserve combinedTrajNext. Hoist curActions/newLogProbs/curTerminals out of the
+    step loop. Append obs/masks from DimList2::At pointers (GetRow allocated a
+    temp row per player per tick).
+  Same knobs as 4630584: 256 arenas, sequential, self-play, affinity pool, pinned path.
+
+Result (rank 0, skip iter 1; ~20 iters):
+  Collect ~4.32s  infer ~3.47  kern ~3.41  env ~0.61
+  Prep 0.047  (was 0.078)   Record 0.085  (was 0.090)
+  Overall ~19.05k/rank  (x6 ~114k)  Collection SPS ~46k
+  vs 4630584: collect 4.35 / overall 18.9k — prep -40% (~30ms), overall in noise.
+  kern unchanged. Keep the reserves.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630591  keepHalf: fp16 across shared_head+policy
+--------------------------------------------------------------------------------
+Change:
+  Model::Forward(..., keepHalf=false): skip output to(fp32); skip input to(half) if
+    already seqHalf dtype. InferPolicyProbsFromModels: keepHalf on trunk+policy,
+    one logits.to(fp32) before isfinite/where/softmax (mask logit -1e10).
+  Same knobs as 4630587. Checkpoint checkpoints_dist_6gpu_fp16chain.
+
+Result (rank 0, skip iter 1; ~30 iters):
+  Collect ~1.64s  infer ~0.73  kern ~0.66  env ~0.66  (physics no longer hidden)
+  Overall ~26.7k/rank  (x6 ~160k)  Collection SPS ~122k
+  vs 4630587: collect 4.32 / kern 3.41 / overall 19.1k
+  kern -80% (~8.7ms/call -> ~1.7ms). Now learn-bound (PPO Learn still ~4.66s).
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630597  fuse V-dagger into InferValueFamily
+--------------------------------------------------------------------------------
+Change:
+  InferValueFamily: V-dagger heads read UNCONDITIONED trunk (vtBare); opp_embed
+    only on critic/goal (matches InferVdagMin + Learn). Learner fused loop fills
+    tVdagPredsFused; HEADROOM skips the second 200k-row InferVdagMin pass.
+  InferVdagMin remains for HullBootstrap (perturbed next-states). GGL_HULL=0.
+  Same knobs as 4630591: 256 arenas, sequential, self-play, affinity pool,
+    keepHalf, pinned collect. Resumed checkpoints_dist_6gpu_fp16chain.
+
+Result (rank 0, skip first Display; 27 iters, job cancelled):
+  Collect ~1.63s  infer ~0.73  kern ~0.67  env ~0.63
+  Consume median ~5.78  (mean 5.91; Dist Sync noise)
+    Value Pred ~0.51  (was ~0.37; now includes vdag heads)
+    Vdag Infer ~0  (was ~0.25)
+    PPO Learn ~4.66  (unchanged)
+  Overall median ~27.0k/rank  (mean 26.6k; x6 ~160k)  vs 4630591 26.7k
+
+Conclusion: fuse is correct and the duplicate trunk is gone (~0.11s on
+  value+vdag: 0.62 -> 0.51). Learn is still ~80% of consume. Overall in noise.
+  Keep. Next consume cost is PPO Learn (fp32 + per-minibatch .item() + pageable
+  experience H2D), not another value-family forward.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630601  Learn: pinned UploadToDevice + deferred .item()
+--------------------------------------------------------------------------------
+Change (ExperienceBuffer + PPOLearner::Learn, GGL-2 path):
+  UploadToDevice: pin_memory then non_blocking H2D of all defined fields, one
+    stream sync. GPU randperm shuffle + index_select (no per-minibatch pageable
+    .to(device) of 12.5k slices).
+  Metric sums stay on GPU; MutAvgTracker.Add(sum, n) once at end of Learn.
+  SIL / adv-filter keep counts stay tensor (no per-mb .item() in the loss).
+  Same knobs as 4630597. Resumed checkpoints_dist_6gpu_fp16chain.
+
+Result (rank 0, skip first Display; 23 iters):
+  Collect ~1.62s  (unchanged)
+  PPO Learn median **4.53s**  (was 4.66 on 4630597)
+  Consume median **5.65s**  (was 5.78)
+  Overall median **27.6k/rank**  (was 27.0k; mean 27.1k)
+  Value Pred ~0.52  Vdag Infer ~0  (fuse still in)
+
+Conclusion: ~130ms off Learn (~3%). Keep. Remaining Learn is fp32
+  forward+backward (2 epochs x ~16 minibatches of 12.5k), not host syncs.
+  Sequential overall still learn-bound. Next: pipeline to hide 1.62s collect,
+  or CUDA-graph InferActions if collect wall matters.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630602  pinned value-pred H2D/D2H + drop UploadToDevice sync
+--------------------------------------------------------------------------------
+Change:
+  Traj tensors built pinned (GGL-2 MakePinnedFromVector / 1D). Value-pred: reused
+    GPU chunk copy_(pinned, non_blocking), InferValueFamily skips .to() if already
+    on device, pinned D2H of critic/goal/vdag, ONE stream sync (no vCrit.cpu()
+    per chunk). UploadToDevice no longer host-syncs after H2D (same-stream GEMM
+    waits on the copies). Same knobs as 4630601.
+
+Result (rank 0, skip first Display; 24 iters):
+  Value Pred median **0.54s**  (was 0.52 on 4630601) — in noise; kernels dominate
+  Traj Copy median **0.017s**  (was 0.030)
+  PPO Learn median **4.51s**  (was 4.53)
+  Consume median **5.61s**  (was 5.65)
+  Overall median **27.7k/rank**  (was 27.6k)
+
+Conclusion: per-chunk .cpu() was not the 0.52s. Keep the pinned path (correct,
+  matches GGL-2, UploadToDevice H2D is actually async). Sequential still
+  learn-bound at ~4.51s. Next: pipeline.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630603  FP16 learn AMP (V100)
+--------------------------------------------------------------------------------
+Change:
+  AutocastScope no longer requires BF16. V100 uses fp16 autocast + loss scale 4096
+  (unscale after allreduce, before clip; skip step on inf). Same scope: geo/InfoNCE/
+  backward in fp32. Ampere stays BF16 no scaler. GGL_LEARN_AMP=0 reverts.
+  Same knobs as 4630602 (sequential, 256 arenas, self-play).
+
+Result (rank 0, skip first Display; 60 iters, job still running at eval):
+  PPO Learn median **2.08s**  (was 4.52 on 4630602)
+  Consume median **3.15s**  (was 5.61)
+  Collect median **1.61s**  (unchanged)
+  Overall median **42.0k/rank**  (was 27.7k)
+  Policy Entropy 0.784 vs 0.785; policy/vdag update mag slightly lower, no jump.
+
+Conclusion: Keep AMP. Sequential overall still collect+learn. Next: pipeline.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630604  GGL_PIPELINED_COLLECTION=1 on AMP binary
+--------------------------------------------------------------------------------
+Change:
+  Same binary/knobs as 4630603 except GGL_PIPELINED_COLLECTION=1. Cancelled 4630603
+  after AMP eval so this could start. Resumed checkpoints_dist_6gpu_fp16chain.
+
+Result (rank 0, skip first Display; 55 iters, still running at eval):
+  Overall median **52.7k/rank**  (was 41.9k on 4630603)  mean 48.9k
+  Collection Time median **2.37s**  (was 1.60) — overlap, not added to overall
+  rank0 infer_s **1.41s** / kern **1.20s**  (was 0.71 / 0.65) — GPU contention
+  PPO Learn median **2.19s**  (was 2.08)
+  Consume median **3.78s**  (was 3.15)  Value Pred **1.01s** (was 0.51)
+  Iteration wall tracks consume (~3.8s), so collect is hidden.
+  Policy Entropy 0.783 vs 0.784. Policy update mag 0.305 vs 0.344 (watch).
+
+Conclusion: Net win. Keep pipeline. Contention tax is value-pred + infer sharing
+  the GPU with Learn; still faster than sequential AMP. Next: CUDA-graph Infer
+  only if collect wall must drop; do not grow arenas.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630605  pipeline kick after value-pred (overlap Learn only)
+--------------------------------------------------------------------------------
+Change:
+  fnSyncSnapshot stays in the barrier. collectThread starts immediately before
+  Learn(), not at the start of consume. Same AMP + GGL_PIPELINED_COLLECTION=1
+  as 4630604.
+
+Result (rank 0, skip first Display; 42 iters):
+  Value Pred median **0.58s**  (was 1.01 on 4630604, 0.51 sequential AMP)
+  Consume median **3.47s**  (was 3.79)
+  PPO Learn median **2.37s**  (was 2.20 / 2.08 sequential) — collect now fights Learn
+  Collect / infer_s still contended **2.54 / 1.56s** (was 1.60 / 0.71 sequential)
+  Overall median **54.7k/rank**  (was 52.5k on 4630604, 41.9k sequential AMP)
+  Policy Entropy 0.777 vs 0.782/0.784 (watch).
+
+Conclusion: Keep delayed kick. Value-pred recovered; overall only a small bump
+  because InferActions now contends with Learn instead. Next: keepHalf on
+  InferValueFamily (item 2), not CUDA graphs yet.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630606  keepHalf on consume value family
+--------------------------------------------------------------------------------
+Change:
+  ValueTrunk / InferValueFamily / InferCritic / InferVdagMin / InferRhatMax /
+  InferGoalCritic / InferGeoV chain seqHalf (keepHalf=hp); one .to(fp32) at the
+  head. opp_embed cast to trunk dtype. V-dagger still unconditioned. Learn
+  untouched (autocast Forward(..., false)). vs 4630605.
+
+Result (rank 0, skip first Display; 38 iters):
+  Value Pred median **0.58s**  (unchanged vs 4630605)
+  Consume / Learn / Overall **unchanged** (~3.47s / 2.36s / **54.7k/rank**)
+  Policy Entropy **0.758** vs 0.775; policy update mag **0.24** vs 0.30.
+
+Conclusion: No SPS. Collect keepHalf won because InferActions is ~390 small
+  calls/iter (dispatch-bound). Value-pred is ~16 chunks of 12.5k, so the
+  per-module to(fp32) tax was never the 0.58s. Entropy/update mag moved —
+  recommend REVERT unless we want the numerical change. Next is not CUDA graphs
+  for this path.
+  Reverted 2026-08-14 (source + rebuild); cancelled job 4630606. Baseline remains 4630605.
+
+--------------------------------------------------------------------------------
+2026-08-14  jobs 4630607/0608/0609/0610/0613  first scale sweep (invalid SPS)
+--------------------------------------------------------------------------------
+Change:
+  Same delayed-kick AMP pipeline binary as 4630605. sbatch pulsar2_dist_scale.sbatch
+  (exclusive, ntasks-per-node=6, 256 arenas, self-play). Throwaway
+  checkpoints_scale_${N}n. GGL_DIST_SMOKE=1 still set tsPerSave=10e6 *global*
+  timesteps. Auto-save joins the collect worker, so the next iter runs
+  fnCollectIteration() inline (Collect Join Time=0, ~1.5s added to iter wall).
+
+Result (rank 0, skip first Display — DO NOT use as a scaling curve):
+  1-node 4630605: 54.7k  (save every ~50 iters; pipeline intact)
+  5-node 4630613: ~43.0k mean last-20, bimodal 38k / 54k (save every 2 iters)
+  10-node 4630610: 38.3k  (save every iter; pipeline off)
+  20-node 4630609: 36.6k
+  101-node 4630607: 35.4k
+  4630608 duplicate of 101-node, cancelled. Dist Sync stayed ~0.06-0.15s.
+
+Conclusion: Apparent "allreduce tax" was the smoke save interval vs fleet
+  steps/iter. 1-node vs N-node was not the same pipeline. Logged here so we
+  do not treat 35-38k as the scale floor.
+
+--------------------------------------------------------------------------------
+2026-08-14  jobs 4630616/0617  prefix timers (join / obs-stat / versionMgr /
+             snapshot / barrier-glue / Display)
+--------------------------------------------------------------------------------
+Change:
+  Rank-0 Display clocks on the unlabeled prefix of iterTimer. 4630616 join+
+  obs-stat+versionMgr+snapshot; 4630617 also Barrier Glue (traj swap / oppCtx
+  clone / collectReport merge) and previous-iter Display(). Both 5-node,
+  resumed checkpoints_scale_5n. Cancelled after the read.
+
+Result (4630617 last 20, iters 307-326):
+  Barrier Glue ~0.08ms, Display ~0.28ms, Obs Stat Sync ~0, Snapshot ~0.4ms.
+  Collect Join 0.03s mean (0 on slow iters). VersionMgr usually 0, 1.94s spike.
+  Slow ~38k iters: named prefix ~0 but wall = consume + 1.52s = Collection Time.
+  Fast ~54k iters: wall = consume; join leftover 0.03-0.09s.
+
+Conclusion: Hole is inline collect after the save-path join, not MPI. Glue and
+  Display are innocent. Keep the timers.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630618  iterPerSave=40 (was tsPerSave global timesteps)
+--------------------------------------------------------------------------------
+Change:
+  Renamed LearnerConfig tsPerSave -> iterPerSave. Save when
+  totalIterations / iterPerSave crosses (40, 80, ...). Ctor: <=0 means every
+  iter. ExampleMain production 40; GGL_SMOKE 2; GGL_DIST_SMOKE no longer
+  overrides the interval. 5-node, 45 min wall (TIME LIMIT), same knobs as 0605.
+
+Result (rank 0, skip first Display; 646 iters after skip, resumed 5n ckpt
+  ~423-1069; last 20 = iters 1050-1069):
+  Overall last-20 mean **50.7k/rank** med **53.4k**  (was 43.0k mean / 38k-54k)
+  Skip-first mean 50.1k med 53.1k. Fleet last-20 ~1.52M (x30).
+  Learn 2.48s, Dist Sync 0.07s, Collect 2.59s overlapped, Join 0.10s.
+  vs 1-node 4630605 54.7k: **~93%** per rank. Slow outliers are VersionMgr
+  skill eval (one 3.0s -> 30k), not inline collect. Flip gone.
+
+Conclusion: Keep iterPerSave=40. 5-node is pipeline-bound like 1-node plus
+  Learn +0.1s and occasional skill eval.
+
+--------------------------------------------------------------------------------
+2026-08-14  job 4630682  125 nodes / 750 ranks, iterPerSave=40
+--------------------------------------------------------------------------------
+Change:
+  Same binary/knobs as 4630618. sbatch --nodes=125 --ntasks=750, 45 min wall.
+  Throwaway checkpoints_scale_125n. Cancelled after ~4.5 min / 23 Displays
+  (user: wait 30s, measure, cancel). No abort/NCCL.
+
+Result (rank 0, skip first Display; window last 20 = iters 4-23):
+  Overall mean **47.9k/rank** med **49.2k** min 32.8k max 52.7k
+  Learn 2.59s  (was 2.48 on 5-node / 2.37 on 1-node)
+  Dist Sync 0.06s
+  Collect 2.43s overlapped, Join **0** (collect finishes before Learn)
+  VersionMgr **0.24s almost every iter** (5-node usually 0; one 2.31s spike)
+  Fleet ~36.0M (x750). vs 1-node 54.7k: **~88%**. vs 5-node 50.7k: **~95%**.
+  Two dips: skill eval 32.8k, consume 5.5s -> 34.8k. Steady band ~49k.
+
+Conclusion: Pipeline holds at 125 nodes. Leftover vs 5-node is Learn +0.11s
+  and VersionMgr every iter, not Dist Sync / grad allreduce as the story.
+  Do not use the 4630607-0613 table.
+
+--------------------------------------------------------------------------------
+How to compare a new job
+--------------------------------------------------------------------------------
+Need [DIST][COLLECT] lines with nreal, target, ticks, infer_s, env_s, prep_s, record_s,
+collect_s, pool=. Rank-0 means of Overall / Collection / Consumption SPS after skipping
+iter 1. Note numGames, pool size, whether old/nexto chances are zero, pipeline on/off.
+Do not compare Length()-fill collect SPS to fixed-step (overshoot vs exact 200k).
+Do not treat Dist Sync as "NCCL is slow" until per-rank collect times are in the log.
+Do not compare scale jobs that still used tsPerSave as a global-timestep
+interval (4630607-0613): auto-save joined the collect worker every 1-2 iters.
+iterPerSave=40 is the save cadence from 4630618 on.
+Checkpoints belong on scratch-shared, never barn-shared (fileset fills, link fails).

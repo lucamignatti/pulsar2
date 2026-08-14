@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <GigaLearnCPP/Distributed/Session.h>
 
 #include <cuda_runtime.h>
@@ -9,7 +12,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sched.h>
+#include <unistd.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -51,6 +58,8 @@ struct Session::Impl {
 	int local_rank = 0;
 	ncclComm_t comm = nullptr;
 	bool finalize_mpi = false;
+	float* bucket_ws = nullptr;
+	size_t bucket_ws_n = 0;
 };
 
 static cudaStream_t AsCudaStream(Session::Stream stream) {
@@ -71,6 +80,11 @@ Session& Session::operator=(Session&&) noexcept = default;
 Session::~Session() {
 	if (!impl)
 		return;
+	if (impl->bucket_ws) {
+		cudaFree(impl->bucket_ws);
+		impl->bucket_ws = nullptr;
+		impl->bucket_ws_n = 0;
+	}
 	if (impl->comm) {
 		if (impl->world > 1)
 			GGL_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -113,9 +127,63 @@ Session Session::Init(int& argc, char**& argv) {
 		std::cerr << "[rank " << s.impl->rank << "] no CUDA devices\n";
 		MPI_Abort(MPI_COMM_WORLD, 1);
 	}
+	// One physical GPU per local rank. Compute nodes have 6 V100s; the fen may
+	// expose fewer — always trust cudaGetDeviceCount, never a hardcoded 4/6.
+	// Do not set CUDA_VISIBLE_DEVICES here (libtorch will not reliably pick it up).
 	const int dev = (ndev == 1) ? 0 : (node_rank % ndev);
 	GGL_CUDA_CHECK(cudaSetDevice(dev));
 	s.impl->local_rank = dev;
+	{
+		cudaDeviceProp prop;
+		std::memset(&prop, 0, sizeof(prop));
+		GGL_CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+		int runtimeDev = -1;
+		GGL_CUDA_CHECK(cudaGetDevice(&runtimeDev));
+		size_t memFree = 0, memTotal = 0;
+		GGL_CUDA_CHECK(cudaMemGetInfo(&memFree, &memTotal));
+		std::string cpus = "?";
+		{
+			std::ifstream st("/proc/self/status");
+			std::string line;
+			while (std::getline(st, line)) {
+				const char* k = "Cpus_allowed_list:";
+				if (line.compare(0, std::strlen(k), k) == 0) {
+					cpus = line.substr(std::strlen(k));
+					while (!cpus.empty() && (cpus[0] == ' ' || cpus[0] == '\t'))
+						cpus.erase(cpus.begin());
+					break;
+				}
+			}
+		}
+		int gpuNuma = -1;
+		{
+			char pciPath[96];
+			std::snprintf(pciPath, sizeof(pciPath),
+				"/sys/bus/pci/devices/%04x:%02x:%02x.0/numa_node",
+				prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+			std::ifstream nf(pciPath);
+			if (nf)
+				nf >> gpuNuma;
+		}
+		const int cpu = sched_getcpu();
+		const bool mismatch = (gpuNuma == 0 && cpu >= 80) || (gpuNuma == 8 && cpu < 80);
+		std::cout << "[DIST][GPU] rank=" << s.impl->rank
+		          << " pid=" << getpid()
+		          << " node_rank=" << node_rank
+		          << " ndev=" << ndev
+		          << " device=" << dev
+		          << " cudaGetDevice=" << runtimeDev
+		          << " name=" << prop.name
+		          << " pci=" << std::hex << prop.pciDomainID << ":"
+		          << prop.pciBusID << ":" << prop.pciDeviceID << std::dec
+		          << " gpu_numa=" << gpuNuma
+		          << " cpu=" << cpu
+		          << " cpus=" << cpus
+		          << " mem_free_mb=" << (memFree / (1024 * 1024))
+		          << " mem_total_mb=" << (memTotal / (1024 * 1024))
+		          << (mismatch ? " NUMA_MISMATCH" : "")
+		          << std::endl;
+	}
 
 	ncclUniqueId id;
 	std::memset(&id, 0, sizeof(id));
@@ -166,6 +234,11 @@ void Session::min_host(int* buf, size_t n) {
 	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MIN, MPI_COMM_WORLD));
 }
 
+void Session::max_host(int* buf, size_t n) {
+	if (n == 0) return;
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MAX, MPI_COMM_WORLD));
+}
+
 void Session::max_host(double* buf, size_t n) {
 	if (n == 0) return;
 	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD));
@@ -199,6 +272,62 @@ void Session::allreduce_avg_device(float* ptr, size_t n, Stream stream) {
 void Session::bcast_device(float* ptr, size_t n, int root, Stream stream) {
 	if (n == 0 || impl->world <= 1) return;
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root, impl->comm, AsCudaStream(stream)));
+	SyncStream(stream);
+}
+
+void Session::allreduce_avg_grads(const GradRef* grads, size_t nGrads, Stream stream, size_t bucketBytes) {
+	if (!grads || nGrads == 0 || impl->world <= 1)
+		return;
+
+	const size_t bucketFloats = (bucketBytes / sizeof(float) < 1) ? 1 : (bucketBytes / sizeof(float));
+	cudaStream_t cs = AsCudaStream(stream);
+
+	auto ensureWs = [&](size_t n) {
+		if (impl->bucket_ws_n >= n)
+			return;
+		if (impl->bucket_ws)
+			GGL_CUDA_CHECK(cudaFree(impl->bucket_ws));
+		GGL_CUDA_CHECK(cudaMalloc(&impl->bucket_ws, n * sizeof(float)));
+		impl->bucket_ws_n = n;
+	};
+	ensureWs(bucketFloats);
+
+	size_t packed = 0;
+	std::vector<GradRef> pending;
+	pending.reserve(64);
+
+	auto flush = [&]() {
+		if (packed == 0)
+			return;
+		GGL_NCCL_CHECK(ncclAllReduce(impl->bucket_ws, impl->bucket_ws, packed,
+			ncclFloat, ncclAvg, impl->comm, cs));
+		size_t off = 0;
+		for (const GradRef& g : pending) {
+			GGL_CUDA_CHECK(cudaMemcpyAsync(g.ptr, impl->bucket_ws + off,
+				g.n * sizeof(float), cudaMemcpyDeviceToDevice, cs));
+			off += g.n;
+		}
+		pending.clear();
+		packed = 0;
+	};
+
+	for (size_t i = 0; i < nGrads; i++) {
+		const GradRef& g = grads[i];
+		if (!g.ptr || g.n == 0)
+			continue;
+		if (g.n > bucketFloats) {
+			flush();
+			GGL_NCCL_CHECK(ncclAllReduce(g.ptr, g.ptr, g.n, ncclFloat, ncclAvg, impl->comm, cs));
+			continue;
+		}
+		if (packed + g.n > bucketFloats)
+			flush();
+		GGL_CUDA_CHECK(cudaMemcpyAsync(impl->bucket_ws + packed, g.ptr,
+			g.n * sizeof(float), cudaMemcpyDeviceToDevice, cs));
+		pending.push_back(g);
+		packed += g.n;
+	}
+	flush();
 	SyncStream(stream);
 }
 
