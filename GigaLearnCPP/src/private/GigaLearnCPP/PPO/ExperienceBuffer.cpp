@@ -71,8 +71,6 @@ std::vector<GGL::ExperienceTensors> GGL::ExperienceBuffer::GetAllBatchesShuffled
 void GGL::ExperienceBuffer::UploadToDevice() {
 	if (!device.is_cuda() || !data.states.defined())
 		return;
-	if (data.IsOnCUDA())
-		return;
 
 	RG_NO_GRAD;
 	for (auto* t = data.begin(); t != data.end(); t++) {

@@ -158,6 +158,38 @@ TEST(BallProx_2v2_teammate_demo_skips_step_only) {
 	CHECK_NEAR(r.GetReward(sp.cur.players[3], sp.cur, false), expOrange, 1e-6f);
 }
 
+TEST(BallProx_batched_matches_individual_rewards) {
+	StatePair sp(
+		{ Team::BLUE, Team::ORANGE, Team::BLUE, Team::ORANGE },
+		{ Vec(0, -800, 17), Vec(0, 2000, 17), Vec(0, -3500, 17), Vec(0, 3500, 17) },
+		{ Vec(100, -700, 17), Vec(0, 1800, 17), Vec(0, -3500, 17), Vec(0, 3400, 17) },
+		Vec(0, 0, 93), Vec(50, 25, 93),
+		{ false, false, false, false }, { false, false, true, false });
+
+	BallProximityPotentialReward r(GAMMA);
+	auto batched = r.GetAllRewards(sp.cur, false);
+	for (size_t i = 0; i < sp.cur.players.size(); i++)
+		CHECK_NEAR(batched[i], r.GetReward(sp.cur.players[i], sp.cur, false), 1e-6f);
+}
+
+TEST(TeamPressure_batched_matches_individual_rewards) {
+	GameState state = {};
+	state.ball.pos = Vec(0, 0, 93);
+	state.players = {
+		MakePlayer(0, Team::BLUE, Vec(0, -2000, 17)),
+		MakePlayer(1, Team::ORANGE, Vec(0, 5000, 17)),
+		MakePlayer(2, Team::BLUE, Vec(0, -5000, 17)),
+		MakePlayer(3, Team::ORANGE, Vec(0, 4500, 17), true)
+	};
+	state.players[0].vel = Vec(0, 600, 0);
+	state.players[1].vel = Vec(0, -100, 0);
+
+	TeamPressureReward r;
+	auto batched = r.GetAllRewards(state, false);
+	for (size_t i = 0; i < state.players.size(); i++)
+		CHECK_NEAR(batched[i], r.GetReward(state.players[i], state, false), 1e-6f);
+}
+
 TEST(BallProx_2v2_zero_sum_under_wrapper) {
 	StatePair sp(
 		{ Team::BLUE, Team::ORANGE, Team::BLUE, Team::ORANGE },

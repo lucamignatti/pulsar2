@@ -39,6 +39,6 @@ namespace GGL {
 		RLGC::Action InferAction(const RLGC::Player& player, const RLGC::GameState& state, bool deterministic, float temperature = 1, InferDebug* debugOut = nullptr);
 		std::vector<RLGC::Action> BatchInferActions(const std::vector<RLGC::Player>& players, const std::vector<RLGC::GameState>& states, bool deterministic, float temperature = 1, std::vector<InferDebug>* debugOut = nullptr);
 
-		// TODO: Add deconstructor (make sure to free models too)
+		~InferUnit();
 	};
 }

@@ -206,10 +206,11 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 				(torch::cuda::is_available() ? "libtorch cannot access the GPU" : "CUDA is not available to libtorch") << ".\n" <<
 				"Make sure your libtorch comes with CUDA support, and that CUDA is installed properly."
 			)
-		RG_LOG("[DIST][GPU] Learner rank=" << DistRank()
+		std::string pidText;
 #ifndef _WIN32
-			<< " pid=" << getpid()
+		pidText = RS_STR(" pid=" << getpid());
 #endif
+		RG_LOG("[DIST][GPU] Learner rank=" << DistRank() << pidText
 			<< " at::Device=cuda:" << cudaIndex
 			<< " tensor.device=" << tensorDev
 			<< " c10.current=" << (int)c10::cuda::current_device()
@@ -429,7 +430,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 #ifdef RG_CUDA_SUPPORT
 		const int idx = device.index();
 		auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(idx);
-		const auto agg = static_cast<size_t>(c10::cuda::CUDACachingAllocator::StatType::AGGREGATE);
+		constexpr size_t agg = 0; // Aggregate is index 0 across supported LibTorch allocator APIs.
 		RG_LOG("[DIST][GPU] after-models rank=" << DistRank()
 			<< " cuda:" << idx
 			<< " allocated_mb=" << (stats.allocated_bytes[agg].current / (1024 * 1024))
@@ -1026,7 +1027,7 @@ void GGL::Learner::Start() {
 		StartQuitKeyThread(saveQueued, keyPressThread);
 
 		ExperienceBuffer experience = ExperienceBuffer(
-			config.randomSeed + (dist ? dist->rank() + 1 : 1), torch::kCPU);
+			config.randomSeed + (dist ? dist->rank() + 1 : 1), ppo->device);
 
 		int numPlayers = envSet->state.numPlayers;
 
@@ -2569,6 +2570,12 @@ void GGL::Learner::Start() {
 					torch::Tensor tLogProbs = MakePinned1D<float>(combinedTraj.logProbs);
 					torch::Tensor tRewards = MakePinned1D<float>(combinedTraj.rewards);
 					torch::Tensor tTerminals = MakePinned1D<int8_t>(combinedTraj.terminals);
+					// The value read and PPO learn pass consume the same state rows. Upload the
+					// full pinned buffer once and retain it in ExperienceBuffer instead of
+					// transferring every minibatch again during every epoch.
+					torch::Tensor tDeviceStates = ppo->device.is_cuda()
+						? tStates.to(ppo->device, /*non_blocking=*/true)
+						: tStates;
 
 					// States we truncated at (there could be none)
 					torch::Tensor tNextTruncStates;
@@ -2602,15 +2609,11 @@ void GGL::Learner::Start() {
 						// upload and ONE shared_head+critic_trunk forward per chunk.
 						// 2026-08-14: V-dagger min rides the same trunk (unconditioned; opp_embed
 						// stays on critic/goal only). InferVdagMin remains for HullBootstrap.
-						// GGL-2 transfers: pinned tStates, reused GPU chunk, pinned D2H,
-						// one stream sync — not vCrit.cpu() per chunk (that drains).
-						static torch::Tensor gpu_critic_states;
+						// GGL-2 transfers: one full pinned-state upload retained for Learn, pinned
+						// D2H outputs, and one stream sync — not vCrit.cpu() per chunk (that drains).
 						static torch::Tensor pinned_val_preds, pinned_goal_preds, pinned_vdag_preds;
 						static torch::Tensor pinned_trunc_vals;
 						const int64_t n = (int64_t)combinedTraj.Length();
-						const int64_t chunkMax = std::max<int64_t>(1, ppo->config.miniBatchSize);
-						EnsureBuf(gpu_critic_states, { chunkMax, obsSize },
-							torch::TensorOptions().dtype(torch::kFloat32).device(ppo->device));
 						EnsureBufCapacity(pinned_val_preds, n, torch::TensorOptions()
 							.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
 						tValPreds = pinned_val_preds.narrow(0, 0, n);
@@ -2628,10 +2631,8 @@ void GGL::Learner::Start() {
 							int64_t start = i;
 							int64_t end = RS_MIN(i + ppo->config.miniBatchSize, n);
 							int64_t chunk = end - start;
-							gpu_critic_states.narrow(0, 0, chunk).copy_(
-								tStates.slice(0, start, end), /*non_blocking=*/true);
 							torch::Tensor vCrit, vGoal, vVdag;
-							ppo->InferValueFamily(gpu_critic_states.narrow(0, 0, chunk), &vCrit,
+							ppo->InferValueFamily(tDeviceStates.slice(0, start, end), &vCrit,
 								goalCriticOn ? &vGoal : nullptr,
 								config.ppo.vdagEnabled ? &vVdag : nullptr, nullptr);
 							RG_ASSERT(vCrit.size(0) == chunk);
@@ -3607,8 +3608,10 @@ void GGL::Learner::Start() {
 					// Set experience buffer
 					experience.data.actions = tActions;
 					experience.data.logProbs = tLogProbs;
-					experience.data.actionMasks = tActionMasks;
-					experience.data.states = tStates;
+					experience.data.actionMasks = ppo->device.is_cuda()
+						? tActionMasks.to(ppo->device, /*non_blocking=*/true)
+						: tActionMasks;
+					experience.data.states = tDeviceStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
 					report["Headroom/Tgt Set"] = tVdagTargets.defined()
@@ -3666,29 +3669,6 @@ void GGL::Learner::Start() {
 					}
 
 				}
-
-				// Free CUDA cache. GigaLearn-2 does not call emptyCache(). On V100/POWER
-				// cudaFree of the learn-pass pool was a suspected multi-second stall every
-				// iteration. Default ON preserves desktop behavior. Cluster A/B: GGL_EMPTY_CACHE=0.
-#ifdef RG_CUDA_SUPPORT
-				if (ppo->device.is_cuda()) {
-					static const bool doEmptyCache = []() {
-						const char* e = std::getenv("GGL_EMPTY_CACHE");
-						if (!e || !*e)
-							return true;
-						return !(e[0] == '0' || std::string(e) == "false" || std::string(e) == "off");
-					}();
-					static bool loggedEmptyCache = false;
-					if (!loggedEmptyCache) {
-						RG_LOG("GGL_EMPTY_CACHE: " << (doEmptyCache ? "on" : "off"));
-						loggedEmptyCache = true;
-					}
-					Timer emptyCacheTimer = {};
-					if (doEmptyCache)
-						c10::cuda::CUDACachingAllocator::emptyCache();
-					report["Empty Cache Time"] = emptyCacheTimer.Elapsed();
-				}
-#endif
 
 				// Deliberate-practice proposer training: deferred until here (outside the
 				// RG_NO_GRAD "Process timesteps" block above, same reason ppo->Learn() itself is
@@ -3764,6 +3744,10 @@ void GGL::Learner::Start() {
 					if (exitCode != 0 && DistRank() == 0)
 						RG_LOG("Learner: exiting with code " << exitCode
 							<< " (programmatic restart request - the ops wrapper relaunches onto the saved checkpoint)");
+					// Flush W&B while Python is still live. The trainer exits from this frame
+					// by design, so its owning Learner destructor is not reached here.
+					delete metricSender;
+					metricSender = nullptr;
 					exit(exitCode);
 				}
 
@@ -3903,7 +3887,6 @@ void GGL::Learner::Start() {
 						"-Vdag Infer Time",
 						"-Hull Time",
 						"-SIL Time",
-						"-Empty Cache Time",
 						"-Dist Sync Time",
 						"-Gap/Time",
 						"-Reach Read Time",
@@ -3924,10 +3907,17 @@ void GGL::Learner::Start() {
 }
 
 GGL::Learner::~Learner() {
+	if (envSet) {
+		// An async arena step may still own callbacks and state referenced by EnvSet.
+		envSet->Sync();
+		delete envSet;
+		envSet = nullptr;
+	}
 	delete ppo;
 	delete versionMgr;
 	delete metricSender;
 	delete renderSender;
 	delete vizControl;
-	pybind11::finalize_interpreter();
+	delete returnStat;
+	delete obsStat;
 }

@@ -13,12 +13,18 @@ if(NOT CARGO_EXECUTABLE)
         "then re-run cmake. (The pinned toolchain auto-installs on first build.)")
 endif()
 
+if(MSVC)
+    set(RSV3_RUST_LIB_NAME "rocketsim_ffi.lib")
+else()
+    set(RSV3_RUST_LIB_NAME "librocketsim_ffi.a")
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(RSV3_CARGO_PROFILE "dev")
-    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/debug/librocketsim_ffi.a")
+    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/debug/${RSV3_RUST_LIB_NAME}")
 else()
     set(RSV3_CARGO_PROFILE "release")
-    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/release/librocketsim_ffi.a")
+    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/release/${RSV3_RUST_LIB_NAME}")
 endif()
 
 # Always invoke cargo (it is its own fast incremental no-op when clean).
@@ -55,7 +61,12 @@ if(NOT MSVC)
 endif()
 
 target_link_libraries(RocketSimV3 PUBLIC ${RSV3_RUST_LIB})
-if(APPLE)
+if(MSVC)
+    # `cargo rustc -- --print native-static-libs` for the MSVC target. Cargo
+    # cannot propagate these system-library requirements through a bare
+    # staticlib path, so the C++ host must name them explicitly.
+    target_link_libraries(RocketSimV3 PUBLIC kernel32 ntdll userenv ws2_32 dbghelp)
+elseif(APPLE)
     # Rust std runtime deps on macOS
     target_link_libraries(RocketSimV3 PUBLIC "-framework CoreFoundation")
 elseif(UNIX)

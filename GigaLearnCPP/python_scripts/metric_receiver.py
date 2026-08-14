@@ -37,3 +37,9 @@ def init(py_exec_path, project, group, name, id = None):
 def add_metrics(metrics):
 	global wandb_run
 	wandb_run.log(metrics)
+
+def finish():
+	global wandb_run
+	if wandb_run is not None:
+		wandb_run.finish()
+		wandb_run = None

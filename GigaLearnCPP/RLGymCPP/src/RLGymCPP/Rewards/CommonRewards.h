@@ -134,6 +134,31 @@ namespace RLGC {
 
 			return gamma * TeamPhi(state, player.team) - TeamPhi(*state.prev, player.team);
 		}
+
+		/** Computes each team's potential and demo guard once for the full player batch. **/
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			std::vector<float> result(state.players.size(), 0.f);
+			if (!state.prev)
+				return result;
+
+			bool blueValid = true;
+			bool orangeValid = true;
+			for (const Player& p : state.players) {
+				bool& teamValid = p.team == Team::BLUE ? blueValid : orangeValid;
+				if (!p.prev || p.isDemoed != p.prev->isDemoed)
+					teamValid = false;
+			}
+
+			const float blueReward = blueValid
+				? gamma * TeamPhi(state, Team::BLUE) - TeamPhi(*state.prev, Team::BLUE)
+				: 0.f;
+			const float orangeReward = orangeValid
+				? gamma * TeamPhi(state, Team::ORANGE) - TeamPhi(*state.prev, Team::ORANGE)
+				: 0.f;
+			for (size_t i = 0; i < state.players.size(); i++)
+				result[i] = state.players[i].team == Team::BLUE ? blueReward : orangeReward;
+			return result;
+		}
 	};
 
 	// TIME COST (2026-07-16, user-directed): a small constant per-step penalty -
@@ -229,6 +254,32 @@ namespace RLGC {
 					return 0;
 			}
 			return -1;
+		}
+
+		/** Evaluates pressure once per car and reuses the team result for every teammate. **/
+		virtual std::vector<float> GetAllRewards(const GameState& state, bool isFinal) override {
+			bool bluePressuring = false;
+			bool orangePressuring = false;
+			for (const Player& p : state.players) {
+				if (p.isDemoed)
+					continue;
+				Vec to = state.ball.pos - p.pos;
+				float d = to.Length();
+				bool pressuring = d < nearDist
+					|| (d < closeDist && p.vel.Dot(to * (1.f / RS_MAX(d, 1.f))) > closeSpeed);
+				if (p.team == Team::BLUE)
+					bluePressuring |= pressuring;
+				else
+					orangePressuring |= pressuring;
+			}
+
+			std::vector<float> result(state.players.size());
+			for (size_t i = 0; i < state.players.size(); i++) {
+				bool pressuring = state.players[i].team == Team::BLUE
+					? bluePressuring : orangePressuring;
+				result[i] = pressuring ? 0.f : -1.f;
+			}
+			return result;
 		}
 	};
 

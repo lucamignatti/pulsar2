@@ -498,6 +498,7 @@ int main(int argc, char* argv[]) {
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
+	int perfBenchmarkIterations = 0;
 
 	// Per-platform default, deliberately NOT AUTO: the training box must fail LOUDLY if CUDA
 	// goes missing (AUTO would silently fall back to CPU at ~1/100 speed on a driver hiccup),
@@ -1626,6 +1627,35 @@ int main(int argc, char* argv[]) {
 		cfg.gapSensor.enabled = true; // arch parity only; Learn() never runs in render
 	}
 
+	// Reproducible local performance harness. The production network is roughly 25M
+	// parameters, which is larger than needed to expose the allocator, transfer, reward,
+	// and RocketSim costs under test. This keeps the same enabled model family at about
+	// 5-10M parameters, removes unrelated external services/evaluations, and starts from
+	// fresh weights for both sides of an A/B. The learner exits on the following iteration
+	// so the requested number of completed reports are flushed to stdout for comparison.
+	if (const char* b = std::getenv("GGL_PERF_BENCH"); b && b[0] && std::string(b) != "0") {
+		perfBenchmarkIterations = RS_MAX(1, std::atoi(b));
+		cfg.numGames = 256;
+		cfg.ppo.tsPerItr = 100'000;
+		cfg.ppo.batchSize = 100'000;
+		cfg.ppo.miniBatchSize = 25'000;
+		cfg.ppo.sharedHead.layerSizes = { 640, 640, 640 };
+		cfg.ppo.policy.layerSizes = { 384, 384, 384 };
+		cfg.ppo.criticTrunk.layerSizes = { 640, 640, 640 };
+		cfg.ppo.critic.layerSizes = { 640, 640 };
+		cfg.ppo.goalCritic.model.layerSizes = { 640, 640 };
+		cfg.ppo.reachability.phi.layerSizes = { 256, 256, 256 };
+		cfg.ppo.reachability.psi.layerSizes = { 256, 256, 256 };
+		cfg.sendMetrics = false;
+		cfg.skillTracker.enabled = false;
+		cfg.trainAgainstOldVersions = false;
+		cfg.savePolicyVersions = false;
+		cfg.externalOpponent.enabled = false;
+		cfg.checkpointFolder.clear();
+		RG_LOG("GGL_PERF_BENCH: " << perfBenchmarkIterations
+			<< " reported iterations, 256 arenas, 100k rows/iteration, fresh 5-10M model");
+	}
+
 	// Team-mode arena split, decided by the lineage-scoped phase marker (see the
 	// PHASE_B_RATING_TRIGGER comment). Must be set before the Learner is built -
 	// EnvCreateFunc reads these.
@@ -1694,7 +1724,12 @@ int main(int argc, char* argv[]) {
 	// exit(99) -> wrapper relaunches this same binary, which now boots into PHASE B on the
 	// checkpoint just saved. Render mode never sets the callback (no ratings there anyway).
 	if (!cfg.renderMode) {
-		learner->iterationCallback = [](Learner* learner, Report& report) {
+		learner->iterationCallback = [perfBenchmarkIterations](Learner* learner, Report& report) {
+			if (perfBenchmarkIterations > 0
+				&& learner->totalIterations > (uint64_t)perfBenchmarkIterations) {
+				learner->RequestSaveAndExit(0);
+				return;
+			}
 			report["Curriculum/Team Phase"] = g_PhaseB ? 1.0f : 0.0f;
 			report["Curriculum/Phase B Streak"] = (float)g_PhaseBStreak;
 			// Team modes disabled for this lineage (PHASE_B_ENABLED) — never arm the streak,

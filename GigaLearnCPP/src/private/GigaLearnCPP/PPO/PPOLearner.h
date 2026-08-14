@@ -45,6 +45,7 @@ namespace GGL {
 			PPOLearnerConfig config, torch::Device device,
 			Dist::Session* dist = nullptr
 		);
+		~PPOLearner();
 
 		static void MakeModels(
 			bool makeCritic,

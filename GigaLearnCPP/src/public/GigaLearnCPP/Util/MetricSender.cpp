@@ -42,5 +42,11 @@ void GGL::MetricSender::Send(const Report& report) {
 }
 
 GGL::MetricSender::~MetricSender() {
-	
+	try {
+		if (pyMod && py::hasattr(pyMod, "finish"))
+			pyMod.attr("finish")();
+	} catch (std::exception& e) {
+		// Destructors must not terminate a completed training run over telemetry cleanup.
+		RG_LOG("MetricSender: Failed to finish Python metrics run: " << e.what());
+	}
 }

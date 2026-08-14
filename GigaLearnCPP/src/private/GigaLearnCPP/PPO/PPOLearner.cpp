@@ -283,6 +283,13 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	}
 }
 
+GGL::PPOLearner::~PPOLearner() {
+	delete reach;
+	reach = nullptr;
+	models.Free();
+	guidingPolicyModels.Free();
+}
+
 void GGL::PPOLearner::MakeModels(
 	bool makeCritic,
 	int obsSize, int numActions,
@@ -1063,6 +1070,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// _GetSamples, which zips fields POSITIONALLY over ExperienceTensors::begin()/end() — so a
 	// field added later is carried automatically and cannot be silently left at full length,
 	// which is the failure mode a hand-written index_select per field would invite.
+	// Materialize the rollout on the training device once. Every epoch then shuffles
+	// and slices device tensors instead of re-uploading each minibatch.
+	experience.UploadToDevice();
+
 	ExperienceBuffer* learnExp = &experience;
 	ExperienceBuffer filteredExp((int)experience.rng(), device);
 	int64_t learnBatchSize = config.batchSize;
@@ -1077,7 +1088,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (dist && dist->distributed())
 			dist->min_host(&useSubset, 1);
 		if (useSubset) {
-			filteredExp.data = experience._GetSamples(keptIdx.data_ptr<int64_t>(), (size_t)nKept);
+			auto sampleIdx = experience.data.IsOnCUDA()
+				? keptIdx.to(experience.data.states.device())
+				: keptIdx;
+			filteredExp.data = experience._GetSamples(sampleIdx);
 			learnExp = &filteredExp;
 			// One batch holding every kept row; the minibatch loop below splits it by
 			// miniBatchSize exactly as it does the full buffer. Passing config.batchSize here
@@ -1089,8 +1103,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				<< config.miniBatchSize << ") - training on the FULL buffer this iteration");
 		}
 	}
-
-	learnExp->UploadToDevice();
 
 	for (int epoch = 0; epoch < config.epochs; epoch++) {
 
@@ -1132,8 +1144,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			// gradient is the exact mean over the batch's kept rows - filtering changes WHICH
 			// rows teach, not the step size (a per-minibatch mean would instead have scaled the
 			// effective policy LR by the kept fraction, i.e. a silent LR cut disguised as a
-			// selection rule). Mask stays on CPU: the counts below are host-side scalars, so
-			// reading them costs no device sync.
+			// selection rule). The scalar reduction is read once per batch; minibatches keep
+			// the mask on the training device with the rest of the experience.
 			torch::Tensor batchAdvFilter = batch.advFilterMask;
 			float batchKeptRows = (float)curBatchSize;
 			if (batchAdvFilter.defined())
