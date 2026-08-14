@@ -26,14 +26,17 @@
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sched.h>
 #endif
 #include "Util/AvgTracker.h"
 
@@ -275,7 +278,31 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		// intra-op pool (one thread per core) otherwise oversubscribes the machine against
 		// RLGymCPP's own collection thread pool for the many small CPU-side tensor ops
 		// (index_select, blob conversions, .cpu() copies) in the consumption phase. Cap it low.
-		at::set_num_threads(2);
+		// Interop defaults to hardware_concurrency() (160 on dcs) and ignores numactl;
+		// threads still inherit the process affinity, so that is 160-way oversubscribe
+		// of a ~27-CPU slice and blows PAMI's 64 application-thread table. Default 27
+		// matches the NUMA wrapper. Override: GGL_TORCH_INTRA / GGL_TORCH_INTEROP.
+		int intra = 2;
+		int interop = 27;
+		if (const char* e = std::getenv("GGL_TORCH_INTRA"); e && *e)
+			intra = std::atoi(e);
+		if (const char* e = std::getenv("GGL_TORCH_INTEROP"); e && *e)
+			interop = std::atoi(e);
+		if (intra < 1) intra = 1;
+		if (interop < 1) interop = 1;
+		at::set_num_threads(intra);
+		at::set_num_interop_threads(interop);
+		unsigned aff = 0;
+#ifndef _WIN32
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		if (sched_getaffinity(0, sizeof(set), &set) == 0)
+			aff = (unsigned)CPU_COUNT(&set);
+#endif
+		RG_LOG("\tlibtorch threads: intra=" << at::get_num_threads()
+			<< " interop=" << at::get_num_interop_threads()
+			<< " affinity=" << aff
+			<< " hardware_concurrency=" << std::thread::hardware_concurrency());
 	}
 
 	if (config.renderMode) {
@@ -1575,20 +1602,20 @@ void GGL::Learner::Start() {
 		uint64_t prevVersionTimesteps = totalTimesteps;
 
 
-		std::jthread collectThread;
 		float lastDisplayTime = 0.f;
 
 		// Opponent-source RNG. Deliberately NOT RocketSim's Math::RandFloat: that is a
-		// thread_local minstd_rand0 seeded RS_CUR_MS() + hash(thread_id), and fnCollectIteration
-		// runs on a FRESH std::jthread every iteration whose thread_id hash is constant under
-		// glibc stack reuse - so the serve roll was the engine's first draw after a clock reseed,
-		// making it a 127.773 s sawtooth of WALL CLOCK rather than a probability. Measured on run
-		// 434etlix: all 169 Nexto serves fell inside one contiguous 8/40 phase arc with zero
-		// serves in the other 1,575 iterations, realized rate 8.9% against a configured 15%, and
-		// the rate tracked mean iteration time across five runs (3.61 s/iter -> 3.64%, 6.62 -> 8.9%).
-		// One persistent engine, advanced once per iteration, restores a real Bernoulli. Safe
-		// without a lock: only the single live collector touches it, and the barrier joins the
-		// worker before launching the next one.
+		// thread_local minstd_rand0 seeded RS_CUR_MS() + hash(thread_id). The old path spawned a
+		// FRESH std::jthread every iteration whose thread_id hash was constant under glibc stack
+		// reuse - so the serve roll was the engine's first draw after a clock reseed, making it a
+		// 127.773 s sawtooth of WALL CLOCK rather than a probability. Measured on run 434etlix:
+		// all 169 Nexto serves fell inside one contiguous 8/40 phase arc with zero serves in the
+		// other 1,575 iterations, realized rate 8.9% against a configured 15%, and the rate tracked
+		// mean iteration time across five runs (3.61 s/iter -> 3.64%, 6.62 -> 8.9%). One persistent
+		// engine, advanced once per iteration, restores a real Bernoulli. Safe without a lock:
+		// only the single live collector touches it. The collect worker is also one persistent
+		// thread (Spectrum MPI PAMI has a 64-slot application-thread table that does not reuse
+		// IDs; a new jthread every iter died at Overall line 63 on 4630605/699/700).
 		std::mt19937_64 oppRng((uint64_t)config.randomSeed + (uint64_t)DistRank() + 1ULL);
 
 		// The whole per-iteration collection (opponent selection -> env stepping -> episode finalize).
@@ -2387,13 +2414,65 @@ void GGL::Learner::Start() {
 				}
 		};
 
+		// One collect OS thread for the whole run. Kick/join via condvar. Do not
+		// pthread_create a new jthread every iteration (PAMI 64-slot leak).
+		std::mutex collectMu;
+		std::condition_variable collectCv;
+		bool collectKickFlag = false;
+		bool collectStopFlag = false;
+		bool collectIdle = true;
+		bool pipelinedCollectPending = false;
+		std::thread collectThread;
+		auto fnCollectJoin = [&]() {
+			std::unique_lock<std::mutex> lk(collectMu);
+			collectCv.wait(lk, [&] { return collectIdle && !collectKickFlag; });
+		};
+		auto fnCollectKick = [&]() {
+			{
+				std::lock_guard<std::mutex> g(collectMu);
+				collectKickFlag = true;
+				collectIdle = false;
+			}
+			collectCv.notify_one();
+		};
+		auto fnCollectStop = [&]() {
+			fnCollectJoin();
+			{
+				std::lock_guard<std::mutex> g(collectMu);
+				collectStopFlag = true;
+			}
+			collectCv.notify_one();
+			if (collectThread.joinable())
+				collectThread.join();
+		};
+		if (pipelineOn) {
+			collectThread = std::thread([&]() {
+				for (;;) {
+					std::unique_lock<std::mutex> lk(collectMu);
+					collectCv.wait(lk, [&] { return collectKickFlag || collectStopFlag; });
+					if (collectStopFlag)
+						break;
+					collectKickFlag = false;
+					collectIdle = false;
+					lk.unlock();
+					fnCollectIteration();
+					{
+						std::lock_guard<std::mutex> g(collectMu);
+						collectIdle = true;
+					}
+					collectCv.notify_all();
+				}
+			});
+			RG_LOG("Pipelined collect: persistent worker (one pthread for the run)");
+		}
+
 		while (true) {
 			Report report = {};
 
 			bool isFirstIteration = (totalTimesteps == 0);
 
 			// ================= Collection (pipelined orchestration) =================
-			// Sequential mode: collect runs inline right here (worker thread never started).
+			// Sequential mode: collect runs inline (worker thread never started).
 			// Pipelined mode: the worker collected THIS iteration's data during the previous
 			// iteration's Learn(); join it, swap buffers, run the barrier-zone work (including
 			// value-pred), then kick the worker for the NEXT iteration as Learn() starts.
@@ -2401,11 +2480,12 @@ void GGL::Learner::Start() {
 			float collectJoinTime = 0.f;
 			{
 				Timer joinTimer = {};
-				if (collectThread.joinable()) {
-					collectThread.join();
+				if (pipelineOn && pipelinedCollectPending) {
+					fnCollectJoin();
+					pipelinedCollectPending = false;
 					collectJoinTime = joinTimer.Elapsed();
 				} else {
-					fnCollectIteration(); // first iteration, or sequential mode
+					fnCollectIteration(); // first iteration, sequential mode, or after a no-kick save
 				}
 			}
 			report["Collect Join Time"] = collectJoinTime;
@@ -3617,22 +3697,22 @@ void GGL::Learner::Start() {
 				// updates - so what got logged/shaped this iteration reflects the OLD proposer.
 
 				// Learn. Pipelined collect starts here so it overlaps Learn only, not value-pred.
-				if (pipelineOn)
-					collectThread = std::jthread([&]() { fnCollectIteration(); });
+				if (pipelineOn) {
+					fnCollectKick();
+					pipelinedCollectPending = true;
+				}
 				Timer learnTimer = {};
 				ppo->Learn(experience, report, isFirstIteration);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
 
-				// Set metrics
+				// Set metrics. Throughput uses the all-rank step sum (same as Total
+				// Timesteps) over this rank's wall clock. Rank-0 Display/wandb therefore
+				// reports fleet SPS, not per-GPU. After collect/learn collectives the
+				// rank-0 clock already includes stragglers.
 				float consumptionTime = consumptionTimer.Elapsed();
-				report["Collection Time"] = collectionTime;
-				report["Consumption Time"] = consumptionTime;
-				report["Collection Steps/Second"] = stepsCollected / collectionTime;
-				report["Consumption Steps/Second"] = stepsCollected / consumptionTime;
-				// Pipelined: collection overlaps consumption, so summing the two double-counts —
-				// the iteration wall clock is the honest denominator.
-				report["Overall Steps/Second"] = stepsCollected /
-					(pipelineOn ? RS_MAX(1e-6f, iterTimer.Elapsed()) : (collectionTime + consumptionTime));
+				float overallTime = pipelineOn
+					? RS_MAX(1e-6f, iterTimer.Elapsed())
+					: (collectionTime + consumptionTime);
 
 				uint64_t prevTimesteps = totalTimesteps;
 				uint64_t prevIterations = totalIterations;
@@ -3640,6 +3720,11 @@ void GGL::Learner::Start() {
 				if (dist)
 					dist->sum_host(&globalSteps, 1);
 				totalTimesteps += (uint64_t)globalSteps;
+				report["Collection Time"] = collectionTime;
+				report["Consumption Time"] = consumptionTime;
+				report["Collection Steps/Second"] = (float)globalSteps / collectionTime;
+				report["Consumption Steps/Second"] = (float)globalSteps / consumptionTime;
+				report["Overall Steps/Second"] = (float)globalSteps / overallTime;
 				report["Collected Timesteps"] = globalSteps;
 				report["Total Timesteps"] = totalTimesteps;
 				totalIterations++;
@@ -3670,8 +3755,8 @@ void GGL::Learner::Start() {
 				}
 				if (exitFlag) {
 					// Never exit with a collection worker in flight
-					if (collectThread.joinable())
-						collectThread.join();
+					if (pipelineOn)
+						fnCollectStop();
 					if (!config.checkpointFolder.empty())
 						Save();
 					if (dist)
@@ -3694,8 +3779,8 @@ void GGL::Learner::Start() {
 						// is the only structural difference between the save path that has
 						// never produced a corrupt file and the one that produced 15 of them
 						// on 2026-08-07. Joining costs one pipelined iteration per save.
-						if (collectThread.joinable())
-							collectThread.join();
+						if (pipelineOn)
+							fnCollectJoin();
 						Save();
 					}
 				}

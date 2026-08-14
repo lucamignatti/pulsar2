@@ -82,3 +82,6 @@ __pycache__/
 
 # RocketSimV3 cargo build output
 GigaLearnCPP/RLGymCPP/RocketSimV3/target/
+
+# Cluster launch scripts (host-specific); keep them out of git
+*.sbatch

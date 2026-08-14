@@ -1650,6 +1650,9 @@ int main(int argc, char* argv[]) {
 		cfg.trainAgainstOldChance = std::strtof(s, nullptr);
 	if (const char* s = std::getenv("GGL_NEXTO_SERVE_FRAC"); s && *s)
 		cfg.externalOpponent.serveFrac = std::strtof(s, nullptr);
+	// serveFrac 0 still constructed NextoOpponent and fopen'd Luca's laptop path.
+	if (cfg.externalOpponent.serveFrac <= 0.f)
+		cfg.externalOpponent.enabled = false;
 	g_NumGames = cfg.numGames;
 	g_NumArenas2v2 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_2V2) : 0;
 	g_NumArenas3v3 = g_PhaseB ? (int)(cfg.numGames * PHASE_B_FRAC_3V3) : 0;
