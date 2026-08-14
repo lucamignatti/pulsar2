@@ -2662,3 +2662,57 @@ ours on total agreement (7 vs 8 disagreements) and on matched count.
 release-tick jump ordering) plus 1 constant adopted in S45b (ERP 0.10), 6 rejected with
 numbers, 1 undecidable on current data (full-boost pad consumption), 1 premise that does
 not hold for our code (ball-world signed penetration). Nothing remains untested.
+
+## §46 — bSuperSonic READ FROM THE BINARY: our model is exact (2026-08-13)
+
+A community RE thread (relayed; archived in `assets/`) located the supersonic flag write as
+`or ecx,0x20` / `mov [rdi+0x8B8],ebp` / `mov [rdi+0x7F8],ecx` at their RVA `0xECA0D0`.
+That RVA does NOT transfer — their build differs from the one in the Ghidra project — but
+the byte pattern does. Two notes for next time:
+
+- The `rocketsim-fixing` Ghidra project holds an OLD RocketLeague.exe; the live install
+  moved to `~/.local/share/Steam/steamapps/common/rocketleague/` (Aug 10 build, 39.3 MB).
+  `mov [rdi+0x7F8],ecx` (`89 8F F8 07 00 00`) occurs EXACTLY ONCE in it, at `0x140f1bbc0`.
+- No Ghidra import was needed: PE-parse + byte search + `objdump -d -M intel
+  --start-address/--stop-address` read the whole routine in seconds, versus a ~40 MB
+  auto-analysis. Prefer that for a targeted lookup.
+
+Field map (car object in `rdi`): `+0x7F8` = flag bitfield, **bit 0x20 = bSuperSonic**;
+`+0x8B8` = the grace timer (float); `+0x5EC/0x5F0/0x5F4` = the velocity vector;
+`+0x788` -> settings struct with `+0x1A0` = Speed (2200), `+0x1A4` = TurnoffSpeedBuffer
+(100), `+0x1A8` = TurnoffTime (1.0) — the CDO values, confirmed by use.
+
+Decompiled control flow (`0x140f1bb62`-`0x140f1bc1a`):
+
+```
+speed2 = vx^2+vy^2+vz^2
+if speed2 >= Speed^2:                  # 2200^2, NO ground condition anywhere
+    flags |= 0x20                      # set supersonic
+    timer  = 0                         # reset EVERY tick at/above start speed
+elif flags & 0x20:                     # only if currently supersonic
+    timer += dt
+    if timer >= TurnoffTime:      flags &= ~0x20     # expiry checked FIRST
+    elif (Speed-Buffer)^2 > speed2: flags &= ~0x20   # then the 2100 floor
+    # else keep supersonic
+```
+
+**Verdict: RocketSim v3 as we ship it is behaviourally equivalent.** Point by point:
+
+1. **The grace period is timed from dropping below 2200, not from when supersonic began** —
+   the timer is zeroed on every tick at/above start speed. This is exactly the user's
+   2026-08-11 hypothesis, now confirmed at the instruction level rather than inferred from
+   the CDO; our `supersonic_grace_counts_from_band_entry_not_first_start` test encodes it.
+2. **No ground condition exists** — independently re-confirming the S40 revert of S32's
+   grounded-start gate, which had been adopted on external evidence and refuted by the
+   capture's one real demolition.
+3. **Full velocity magnitude**, not a forward projection, gates the flag (ours matches;
+   note the DEMO gate separately needs forward-projected speed, per ShouldDemolish).
+4. Ordering differences are behaviourally inert: RL increments the timer whenever
+   supersonic and below start speed and checks expiry BEFORE the 2100 floor, while we drop
+   immediately below 2100 without incrementing. Both branches clear the flag on the same
+   tick, so no observable difference. RL also leaves the timer dirty when clearing; we zero
+   it — equivalent, because entry always resets.
+
+Nothing to change. Recorded because "no ground gate" and the band-entry timing have each
+been asserted, reverted, and re-asserted on this run from weaker evidence; this is the
+primary source.
