@@ -562,6 +562,109 @@ fn analyze_rlpr() {
         }
     }
 
+    // GGL_JUMPLIFT: when does the car actually LEAVE THE GROUND after a jump press?
+    // Known RocketSim v2 defect: a minimum (3-tick) jump from rest lifted off one tick
+    // early vs the real game. Find real jump presses from a grounded, near-stationary
+    // car, restore the full state there, roll the sim forward WITHOUT resyncing, and
+    // compare the first airborne tick (0 wheels in contact) sim vs real.
+    if std::env::var("GGL_JUMPLIFT").is_ok() {
+        const ROLL: usize = 24;
+        let lag = 2usize;
+        let mut rows: Vec<(i32, i32, usize, usize)> = Vec::new(); // (sim_lift, real_lift, hold_ticks, tick)
+        for i in 4..recording.ticks.len().saturating_sub(ROLL + 4) {
+            let ok = (i - 4..=i + ROLL + 2)
+                .all(|k| recording.ticks[k].car_records.len() == num_cars);
+            if !ok {
+                continue;
+            }
+            for c in 0..num_cars {
+                let jr = |k: usize| recording.ticks[k].car_records[c].prev_controls.jump;
+                // rising edge of the jump input in the control stream
+                if !(jr(i) && !jr(i - 1)) {
+                    continue;
+                }
+                // Reject the kickoff countdown: RL ignores inputs there, so the recorded
+                // jump spam produces phantom "presses" whose real lift-off is just the
+                // countdown ending (this fired 205 bogus events before the filter).
+                let bp: Vec3A = recording.ticks[i].ball_record.pos.into();
+                let bv: Vec3A = recording.ticks[i].ball_record.lin_vel.into();
+                if bp.x.abs() < 1.0 && bp.y.abs() < 1.0 && bv.length_squared() == 0.0 {
+                    continue;
+                }
+                // Require a CLEAN edge: no jump input for the preceding 8 ticks.
+                if (1..=8).any(|b| jr(i - b.min(i))) {
+                    continue;
+                }
+                let cr = &recording.ticks[i].car_records[c];
+                let v: Vec3A = cr.phys.lin_vel.into();
+                let grounded = cr.wheels.iter().filter(|w| w.has_contact).count() == 4;
+                let vmax: f32 = std::env::var("GGL_JUMPLIFT_VMAX").ok().and_then(|x| x.parse().ok()).unwrap_or(150.0);
+                if !grounded || v.length() > vmax {
+                    continue;
+                }
+                // how many ticks is the jump held?
+                let mut hold = 1usize;
+                while hold < 12 && jr(i + hold) {
+                    hold += 1;
+                }
+                // restore at the tick the press first ACTS (press + lag) minus 1
+                let start = i + lag - 1;
+                if start + ROLL + 1 >= recording.ticks.len() {
+                    continue;
+                }
+                let c0: Vec<CarControls> = (0..num_cars)
+                    .map(|q| recording.ticks[start - lag + 1].car_records[q].prev_controls.into())
+                    .collect();
+                set_state_to_record_tick(&mut arena, &car_idcs, &recording.ticks[start], &c0);
+                for (q, &ci) in car_idcs.iter().enumerate() {
+                    let mut cs = *arena.get_car_state(ci);
+                    cs.boost = recording.ticks[start].car_records[q].boost_amount * 100.0;
+                    arena.set_car_state(ci, cs);
+                }
+                let (mut sim_lift, mut real_lift) = (-1i32, -1i32);
+                for k in 0..ROLL {
+                    let ct = (start + k + 1).saturating_sub(lag);
+                    for (q, &ci) in car_idcs.iter().enumerate() {
+                        let mut cs = *arena.get_car_state(ci);
+                        cs.controls = recording.ticks[ct].car_records[q].prev_controls.into();
+                        arena.set_car_state(ci, cs);
+                    }
+                    arena.step_tick();
+                    let sim_air = arena.get_car_state(car_idcs[c]).wheels_with_contact
+                        .iter().filter(|w| **w).count() == 0;
+                    let real_air = recording.ticks[start + k + 1].car_records[c]
+                        .wheels.iter().filter(|w| w.has_contact).count() == 0;
+                    if sim_air && sim_lift < 0 {
+                        sim_lift = k as i32;
+                    }
+                    if real_air && real_lift < 0 {
+                        real_lift = k as i32;
+                    }
+                }
+                // The real car must actually leave the ground promptly; otherwise the
+                // input was ignored or overridden and this is not a jump event.
+                if sim_lift >= 0 && (0..=12).contains(&real_lift) {
+                    rows.push((sim_lift, real_lift, hold, i));
+                }
+            }
+        }
+        let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        let mut hist3: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        for &(s, r, hold, _) in &rows {
+            *hist.entry(s - r).or_default() += 1;
+            if hold <= 3 {
+                *hist3.entry(s - r).or_default() += 1;
+            }
+        }
+        eprintln!("\n=== JUMPLIFT: sim-minus-real first-airborne tick ===");
+        eprintln!("events: {} (all holds)  offset histogram: {hist:?}", rows.len());
+        let n3: usize = hist3.values().sum();
+        eprintln!("minimum jumps (hold <= 3 ticks): {n3}  offset histogram: {hist3:?}");
+        for &(s, r, hold, t) in rows.iter().filter(|r| r.2 <= 3).take(12) {
+            eprintln!("  tick {t:6} hold={hold} sim_lift={s} real_lift={r} diff={}", s - r);
+        }
+    }
+
     eprintln!("skipped {skipped_gaps} gap transitions");
     eprintln!("\n=== per-regime single-tick VELOCITY error (uu/s) ===");
     for (name, stats) in &mut regimes {

@@ -2716,3 +2716,43 @@ elif flags & 0x20:                     # only if currently supersonic
 Nothing to change. Recorded because "no ground gate" and the band-entry timing have each
 been asserted, reverted, and re-asserted on this run from weaker evidence; this is the
 primary source.
+
+## §47 — THE v2 "MINIMUM JUMP LIFTS OFF A TICK EARLY" REPORT (2026-08-13)
+
+Question: RocketSim v2 was reported to leave the ground one tick early versus RLBot on a
+minimum (3-tick) jump from rest. Is that still true in v3 as we ship it?
+
+New instrument `GGL_JUMPLIFT` (analyzer): find real jump presses on a grounded car, restore
+the full state, roll the sim forward 24 ticks WITHOUT resyncing, and compare the first
+airborne tick (0 wheels in contact) sim vs real.
+
+**No systematic early lift-off.** Over 126 grounded jump events the sim-minus-real offset is
+modal at **exactly 0 (68/126 = 54%)**, with only 7 events (5.6%) one tick early and 3 more
+at −2/−3. Were the v2 defect present, −1 would be the mode. Restricted to short holds
+(≤3 ticks, n=68): 0 → 25 events, −1 → 7.
+
+**But the exact scenario is NOT covered, and the capture cannot cover it.** Strong bots are
+essentially never stationary: the whole 7.5-minute capture holds exactly ONE jump from
+near-rest (|v| < 150), and that one matched the real game exactly (offset 0). n=1 is not a
+verdict. The battery could not cover it either — its only from-rest jump segment
+(`transition_flip_off`) starts on a WALL.
+
+Two traps found while building the instrument, both worth keeping:
+- The first run reported 205 "events" with a tidy −16…0 offset ladder. All bogus: it was
+  catching kickoff-countdown jump SPAM (RL ignores inputs there), and every "real lift-off"
+  was the same absolute tick — the countdown ending. Same filter the main loop already
+  applies. A suspiciously regular histogram means the detector, not the physics.
+- Requiring a clean rising edge (no jump input for 8 preceding ticks) and a prompt real
+  lift-off is what separates genuine jumps from input noise.
+
+**Today's S45c jump fix does not touch this.** Re-running the instrument against pre-S45c
+behaviour gives a materially identical histogram (two events shift by one in the far tail).
+That is the expected result: the extra impulse fired on the RELEASE tick, by which point
+the car is already airborne, so it changed jump HEIGHT, not the lift-off TICK.
+
+**Made measurable for the next real-game run**: `jump_min_from_rest` (3-tick hold) and
+`jump_tap_from_rest` (1-tick tap; MIN_TIME still forces 3 ticks) added to
+`research/maneuvers/maneuvers.txt`. They are DORMANT — compare.py scores only segments
+present in both files, so the 80-segment totals are unchanged (verified: fit still 1017.9)
+until a fresh real capture includes them. Sim currently lifts off at tick 6 (z = 31.68) for
+both; the real number is the open quantity.

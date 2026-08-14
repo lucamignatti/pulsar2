@@ -509,3 +509,20 @@ ACT 126  1 0 0 0 0  0 0 0
 SEG no_jump_control 260
 STATE 2800 0 17  0 0 0   2200 0 0   0 0 0   100
 ACT 0    1 0 0 0 0  0 1 0      # identical, but never presses jump: the paired control
+
+# Minimum-jump lift-off timing from REST on flat ground (SIM2REAL_AUDIT S47). RocketSim v2
+# was reported to leave the ground one tick early here versus RLBot. The 120Hz match capture
+# cannot settle it -- strong bots are essentially never stationary, so it holds exactly ONE
+# near-rest jump in 7.5 minutes -- and no existing segment jumps from rest on flat ground.
+# These two are DORMANT until a fresh real capture is recorded: compare.py only scores
+# segments present in both files, so they do not disturb the 80-segment totals until then.
+# jump::MIN_TIME = 0.025 s = exactly 3 ticks at 120 Hz.
+SEG jump_min_from_rest 90
+STATE 0 -2000 17  0 1.5708 0   0 0 0   0 0 0   100
+ACT 0    0 0 0 0 0  1 0 0
+ACT 3    0 0 0 0 0  0 0 0      # released at exactly MIN_TIME
+
+SEG jump_tap_from_rest 90
+STATE 0 -1000 17  0 1.5708 0   0 0 0   0 0 0   100
+ACT 0    0 0 0 0 0  1 0 0
+ACT 1    0 0 0 0 0  0 0 0      # 1-tick tap: MIN_TIME still forces a 3-tick hold
