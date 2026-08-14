@@ -2756,3 +2756,46 @@ the car is already airborne, so it changed jump HEIGHT, not the lift-off TICK.
 present in both files, so the 80-segment totals are unchanged (verified: fit still 1017.9)
 until a fresh real capture includes them. Sim currently lifts off at tick 6 (z = 31.68) for
 both; the real number is the open quantity.
+
+## §48 — SCENARIO TESTS FOR JUMP LIFT-OFF AND PAD PICKUP (2026-08-13)
+
+`rocketsim/tests/jump_and_pads.rs`, 6 tests. Three pin behaviour that is measured and
+settled; three are explicitly TRIPWIRES for behaviour whose real-game value is still open,
+each naming the experiment that would settle it. The distinction is written into the test
+comments so a future reader does not mistake a pin for a proof.
+
+| test | pins | status |
+|---|---|---|
+| `minimum_jump_from_rest_liftoff_tick` | 3-tick jump from rest lifts off at tick 5 | TRIPWIRE (S47: no real value yet) |
+| `one_tick_tap_matches_minimum_jump` | 1-tick tap == 3-tick hold (MIN_TIME floor) | settled by construction |
+| `no_jump_impulse_on_the_release_tick` | minimum-jump apex 94.55 | settled (S45c) |
+| `pad_grant_lands_two_ticks_after_overlap` | grant + cooldown land at overlap+2 | settled (S42, measured 14->55) |
+| `full_boost_car_does_not_consume_the_pad` | max-boost car leaves the pad available | TRIPWIRE (the open question) |
+| `pickup_box_is_centred_on_the_hitbox_not_the_origin` | offset box reaches a pad the origin box misses | settled (S44b) |
+
+The apex thresholds are MEASURED, not guessed: shipped build 94.55, pre-S45c build 100.29
+(hold force applied before deciding). The tolerance pins the former and excludes the latter,
+so re-adding a release-tick impulse fails the test. My first draft asserted an invented
+~60.6 and failed immediately — a useful reminder that a pinned constant has to be read off
+the build, never estimated.
+
+**`pad_full_boost_deny` battery segment added** — the decisive real-game experiment for the
+one open question. Straight line throughout (no steering error to miss the pad with): start
+at (3584, -400) rolling +y with 100 boost, cross the big pad at (3584, 0), brake-and-boost
+to burn the tank, then reverse back across the SAME pad far inside its 10 s cooldown.
+Validated in sim, where it discriminates cleanly: first crossing t=51 at boost 100 with NO
+gain and no cooldown, tank burned to 85, then **+15 on the return pass at t=317**.
+- real shows a gain there  -> pads are NOT consumed at full; our model and its test stand.
+- real shows no gain       -> RL consumes pads at full; invert the model and the tripwire.
+
+All three new segments (`jump_min_from_rest`, `jump_tap_from_rest`, `pad_full_boost_deny`)
+are DORMANT: compare.py scores only segments present in both files, so the 80-segment
+totals are untouched (verified: fit 1017.9 / holdout 1048.2) until a real capture includes
+them. Recording one real battery run answers all three open questions at once.
+
+**Pre-existing failure, not caused by this work:** `rl_comparison_test::case_simple_jump_land`
+fails at i=0 with norm_error 1.3503364. Verified identical at HEAD before any change in this
+session (stash test). It is a recorded fixture that predates the S34-S45 physics work
+(damper ramp, pushback cap, ERP 0.10, jump ordering), so it is stale by construction rather
+than a regression. Left alone deliberately -- regenerating it would overwrite a reference
+whose provenance is not recorded.

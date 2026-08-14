@@ -526,3 +526,18 @@ SEG jump_tap_from_rest 90
 STATE 0 -1000 17  0 1.5708 0   0 0 0   0 0 0   100
 ACT 0    0 0 0 0 0  1 0 0
 ACT 1    0 0 0 0 0  0 0 0      # 1-tick tap: MIN_TIME still forces a 3-tick hold
+
+# FULL-BOOST PAD CONSUMPTION (SIM2REAL_AUDIT S45/S48) -- the one open question in the pad
+# model. We skip the pad at max boost; the "tuned" fork consumes it and denies the boost.
+# The 120Hz capture cannot decide it (a full-boost pickup produces NO boost increase, so it
+# is invisible except through a later DENIED pickup, and the capture holds only 2 such
+# crossings, neither discriminating). This settles it: cross the big pad at (3584, 0) with
+# 100 boost, burn some boost while braking, then reverse back over the SAME pad well inside
+# its 10 s cooldown. Straight line throughout, so there is no steering error to miss with.
+#   second crossing grants ~+100  -> the pad was NOT consumed at full (our model)
+#   second crossing grants 0      -> RL consumes pads at full; invert the model + its test
+SEG pad_full_boost_deny 600
+STATE 3584 -400 17  0 1.5708 0   0 800 0   0 0 0   100
+ACT 0    1 0 0 0 0  0 0 0
+ACT 56   -1 0 0 0 0  0 1 0     # brake + boost: burn the tank without running far
+ACT 110  -1 0 0 0 0  0 0 0     # keep reversing back across the pad
