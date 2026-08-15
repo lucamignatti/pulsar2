@@ -217,13 +217,16 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// full-credit touch pays 80% of a goal every 0.8s without ending the play, so a
 		// juggle is a repeatable near-goal annuity (~a goal's worth per ~15s at the
 		// measured rate, dominant income term by ~20x).
-		// WEIGHT RULE (2026-08-15, user-set): AerialTouch = 4x TouchAccel (ground
-		// touch, 10 above) = 40. Success criteria unchanged: Nexto share lifts off the
-		// 0.32 floor within a few B steps AND the aerial-touch rate settles above the
-		// old ~0.001 floor (keep the mechanic, kill the annuity). Revert = put 120 back
-		// (resume-compatible). AirIntercept 75 left alone deliberately: exact PBRS,
-		// panel ~0, not the farm — one lever at a time.
-		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 40.f },
+		// WEIGHT RULE (2026-08-15, user-set, twice-revised same day): observed air-dribble
+		// reward hacking at 40 on the AiMOS 690-GPU run (bot sustains dribbles for the
+		// per-touch payout, 27% of a goal every 0.8s cooldown). Directive: air should be
+		// only MARGINALLY better than ground and serve the main goal, not be one.
+		// 40 -> 15 = 1.5x TouchAccel (ground touch, 10 above). Success criteria: air
+		// touches persist above the ~0.001 floor while sustained-juggle share falls and
+		// Nexto goal share climbs. Revert = 40 (resume-compatible). AirIntercept 75 left
+		// alone deliberately: exact PBRS, telescopes to ~0 on any closed path — it pays
+		// approach and refunds the whiff, it cannot fund a dribble annuity.
+		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 15.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
@@ -801,6 +804,24 @@ int main(int argc, char* argv[]) {
 	// (200k/12.5k = 16 exact chunks), and costs only GEMM efficiency.
 	// Against losing 1.2B steps and the entire recovery chain, that trade is no longer close.
 	cfg.ppo.miniBatchSize = 12'500;
+
+	// Cadence lever (2026-08-15, for the AiMOS fleet): rows-per-iteration per rank,
+	// overridable without a rebuild. Update cadence scales ~1/tsPerItr until the fixed
+	// per-iteration overheads (dist sync, snapshot, value-pred chunks) dominate — at 690
+	// ranks, 200k/rank meant a 138M-step fleet batch per optimizer update. miniBatchSize
+	// must still divide the result (PPOLearner's ctor hard-fails loud otherwise); it is
+	// clamped down to the override when the override is smaller.
+	if (const char* t = std::getenv("GGL_TS_PER_ITR"); t && *t) {
+		int v = std::atoi(t);
+		if (v > 0) {
+			cfg.ppo.tsPerItr = v;
+			cfg.ppo.batchSize = v;
+			if (cfg.ppo.miniBatchSize > v)
+				cfg.ppo.miniBatchSize = v;
+			RG_LOG("GGL_TS_PER_ITR: " << v << " rows/iter/rank, miniBatch "
+				<< cfg.ppo.miniBatchSize);
+		}
+	}
 
 	// Half inference for collection + GAE value preds. rho/gate evals request fp32 explicitly and
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
