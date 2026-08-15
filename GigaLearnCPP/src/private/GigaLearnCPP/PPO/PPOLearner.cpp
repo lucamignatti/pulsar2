@@ -1076,7 +1076,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 
 	ExperienceBuffer* learnExp = &experience;
 	ExperienceBuffer filteredExp((int)experience.rng(), device);
-	int64_t learnBatchSize = config.batchSize;
+	// Fixed-step collect yields floor(tsPerItr/players)*players rows — always slightly
+	// UNDER batchSize (200k config: 199,680 rows), so the full-buffer path alone yields
+	// ZERO batches from GetAllBatchesShuffled's `startIdx + batchSize <= expSize` test.
+	// Historically the advFilterSubset path masked this on every iteration; the first
+	// iteration where a rank's subset fell below one minibatch (easy at small
+	// GGL_TS_PER_ITR) hit the unclamped fallback and the 0-batch guard killed the fleet
+	// (job 4630792). Clamp so the buffer's actual rows form one full batch — the
+	// minibatch split below already handles arbitrary sizes, exactly as it does nKept.
+	int64_t learnBatchSize = RS_MIN(config.batchSize, experience.data.states.size(0));
 	float dbgSubsetRows = -1.f;
 	if (config.advFilterSubset && experience.data.advFilterMask.defined()) {
 		auto keepCpu = experience.data.advFilterMask.to(torch::kCPU).flatten();
