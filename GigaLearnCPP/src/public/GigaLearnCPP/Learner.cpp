@@ -2761,6 +2761,26 @@ void GGL::Learner::Start() {
 								.dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
 							tVdagPredsFused = pinned_vdag_preds.narrow(0, 0, n);
 						}
+						// GGL_CONSUME_TIMERS: split the value-pred wall into (a) a tiny warm
+						// call — pays the post-StepOptim seqHalf fp16 weight-cache rebuild for
+						// the whole family plus first dispatch — (b) the chunk loop's launch
+						// wall, (c) the stream sync (real GPU drain).
+						static const bool valPredTimers = [] {
+							const char* e = std::getenv("GGL_CONSUME_TIMERS");
+							return e && *e && std::string(e) != "0";
+						}();
+						Timer valWarmTimer = {};
+						if (valPredTimers) {
+							torch::Tensor wc, wg, wv;
+							ppo->InferValueFamily(tDeviceStates.slice(0, 0, RS_MIN((int64_t)2, n)),
+								&wc, goalCriticOn ? &wg : nullptr,
+								config.ppo.vdagEnabled ? &wv : nullptr, nullptr);
+#ifdef RG_CUDA_SUPPORT
+							c10::cuda::getCurrentCUDAStream(ppo->device.index()).synchronize();
+#endif
+						}
+						const double valWarmS = valWarmTimer.Elapsed();
+						Timer valLaunchTimer = {};
 						for (int64_t i = 0; i < n; i += ppo->config.miniBatchSize) {
 							int64_t start = i;
 							int64_t end = RS_MIN(i + ppo->config.miniBatchSize, n);
@@ -2776,9 +2796,14 @@ void GGL::Learner::Start() {
 							if (vVdag.defined())
 								pinned_vdag_preds.slice(0, start, end).copy_(vVdag, /*non_blocking=*/true);
 						}
+						const double valLaunchS = valLaunchTimer.Elapsed();
+						Timer valSyncTimer = {};
 #ifdef RG_CUDA_SUPPORT
 						c10::cuda::getCurrentCUDAStream(ppo->device.index()).synchronize();
 #endif
+						if (valPredTimers)
+							RG_LOG("[VALPRED] warm=" << valWarmS << " launch=" << valLaunchS
+								<< " sync=" << valSyncTimer.Elapsed());
 
 						if (tNextTruncStates.defined()) {
 							// This really just should never happen
