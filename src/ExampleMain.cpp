@@ -210,10 +210,20 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// 50 -> 120, near goal-scale (deliberately < Goal 150). On a fresh run the
 		// drills produce accidental aerial touches from birth; this weight decides
 		// how hard each accident is reinforced during the formative window. Zero-sum,
-		// impulse-scaled, 0.8s cooldown - bounded and unfarmable in sum. ANNEAL LATER:
-		// once aerial-touch share establishes (PULSAR5.md), step back toward 50 so the
-		// mature style isn't permanently air-warped.
-		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 120.f },
+		// impulse-scaled, 0.8s cooldown - bounded and unfarmable in sum.
+		// THE ANNEAL (2026-08-13, user-directed): 120 -> down, forced by measurement
+		// (wandb pkljg9g1): AerialTouch raw income surged ~5x from ~22B while windowed
+		// Nexto goal share collapsed 0.875 -> 0.32 and pinned there — at 120 a
+		// full-credit touch pays 80% of a goal every 0.8s without ending the play, so a
+		// juggle is a repeatable near-goal annuity (~a goal's worth per ~15s at the
+		// measured rate, dominant income term by ~20x).
+		// WEIGHT RULE (2026-08-15, user-set): AerialTouch = 4x TouchAccel (ground
+		// touch, 10 above) = 40. Success criteria unchanged: Nexto share lifts off the
+		// 0.32 floor within a few B steps AND the aerial-touch rate settles above the
+		// old ~0.001 floor (keep the mechanic, kill the annuity). Revert = put 120 back
+		// (resume-compatible). AirIntercept 75 left alone deliberately: exact PBRS,
+		// panel ~0, not the farm — one lever at a time.
+		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 40.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
@@ -559,6 +569,21 @@ int main(int argc, char* argv[]) {
 	// below now carries a "7.0b ts8" line with the back-derivation.
 	cfg.tickSkip = 8;
 	cfg.actionDelay = 0;
+
+	// KICKOFF SCRIPT (2026-08-13, user-directed; KickoffScript.h has the full story).
+	// Mirror self-play settled into a delay-kickoff equilibrium: neither copy goes for
+	// the ball (vs a committed opponent it contests fine - user-verified vs Nexto), so
+	// contested kickoffs vanished from the data AND the mirror-play boot probe read the
+	// deadlock as corruption, quarantining healthy checkpoint windows and rolling the
+	// run back to golden twice (2026-08-12, 2026-08-13; the second cost ~4.4B steps).
+	// On half of kickoff-spawn episodes one random car is script-driven (boost straight
+	// at ball) until first touch, rows suppressed while scripted; the boot probe now
+	// always scripts one car and requires the POLICY to touch. Related conviction:
+	// KickoffRace's 2s window means nothing has EVER paid going first on a kickoff.
+	// Watch KickoffScript/Windows Armed (wandb) - flat 0 with this on means broken.
+	// Revert = 0 (resume-compatible), but note reverting also reverts the probe's
+	// training-side pressure, not the probe itself.
+	cfg.kickoffScriptChance = 0.5f;
 
 	// 6.0 ts1: 1024 -> 128. This is NOT a throughput cut — it is the tickSkip change applied to
 	// the fleet. Each arena now yields 8x more decisions per game-second, so 1024 arenas at ts1

@@ -20,6 +20,7 @@
 #include <private/GigaLearnCPP/PPO/GAE.h>
 #include <private/GigaLearnCPP/PolicyVersionManager.h>
 #include <private/GigaLearnCPP/NextoOpponent.h>
+#include <private/GigaLearnCPP/KickoffScript.h>
 #include <private/GigaLearnCPP/Util/Plasticity.h>
 
 #include "Util/KeyPressDetector.h"
@@ -568,11 +569,18 @@ bool GGL::Learner::BootSanityProbe() {
 	RG_NO_GRAD;
 
 	// Throwaway single arena driven manually (the main EnvSet is reserved for training).
-	// 3 kickoff episodes x 8s; a healthy policy touches the ball nearly every episode
-	// (median ~3.4s across every checkpoint ever tested); the 2026-07-13 scrambled
-	// checkpoint managed 1/10. Pass = touches in >= 2 of 3 episodes.
+	// 3 kickoff episodes x 8s, with ONE car per episode driven by the kickoff script
+	// (2026-08-13): the old mirror probe deadlocked once the policy learned a
+	// delay-kickoff response - neither copy ever went for the ball, and two healthy
+	// checkpoint windows were quarantined as "corrupt" (2026-08-12, 2026-08-13; both
+	// rolled the run back to golden). Against a committed opponent the policy contests
+	// (user-verified vs Nexto), so the pass signal is now: the POLICY (non-scripted)
+	// car touches the ball. A scrambled checkpoint still fails - it cannot chase a
+	// contested ball either. Pass = policy touches in >= 2 of 3 episodes.
 	EnvCreateResult res = envCreateFn(0);
 	Arena* arena = res.arena;
+
+	KickoffScript script(res.actionParser);
 
 	int touchedEpisodes = 0;
 	int stepsPerEp = (int)(8 * 120 / RS_MAX(1, config.tickSkip));
@@ -583,6 +591,11 @@ bool GGL::Learner::BootSanityProbe() {
 		GameState gs = GameState(arena);
 		res.obsBuilder->Reset(gs);
 		auto actions = std::vector<Action>(numPlayers);
+
+		// Alternate which side is scripted; the script drives only until the first
+		// touch (contest resolved), then hands the car back to the policy
+		int scriptedIdx = (script.valid && numPlayers > 1) ? (ep % numPlayers) : -1;
+		bool anyTouch = false;
 
 		for (int step = 0; step < stepsPerEp; step++) {
 			FList obsAll;
@@ -601,6 +614,12 @@ bool GGL::Learner::BootSanityProbe() {
 			ppo->InferActions(tObs, tMasks, &tActs, NULL); // no steer mask: raw policy
 			auto acts = TENSOR_TO_VEC<int>(tActs.cpu());
 
+			if (scriptedIdx >= 0 && !anyTouch) {
+				int scriptAct = script.ChooseAction(gs.players[scriptedIdx], gs);
+				if (scriptAct >= 0)
+					acts[scriptedIdx] = scriptAct;
+			}
+
 			auto carItr = arena->_cars.begin();
 			for (int i = 0; i < numPlayers; i++, carItr++) {
 				actions[i] = res.actionParser->ParseAction(acts[i], gs.players[i], gs);
@@ -609,10 +628,13 @@ bool GGL::Learner::BootSanityProbe() {
 			arena->Step(config.tickSkip);
 			gs.UpdateFromArena(arena, actions, NULL);
 
-			bool touched = false;
-			for (auto& player : gs.players)
-				touched |= player.ballTouchedStep;
-			if (touched) {
+			bool policyTouched = false;
+			for (int i = 0; i < (int)gs.players.size(); i++) {
+				anyTouch |= gs.players[i].ballTouchedStep;
+				if (i != scriptedIdx)
+					policyTouched |= gs.players[i].ballTouchedStep;
+			}
+			if (policyTouched) {
 				touchedEpisodes++;
 				break;
 			}
@@ -797,8 +819,10 @@ void GGL::Learner::Load() {
 			} catch (...) {}
 			if (claimedRating >= config.bootSanityMinRating && !BootSanityProbe())
 				throw std::runtime_error("boot sanity probe failed: a policy rated "
-					+ std::to_string((int)claimedRating) + " cannot touch kickoff balls - "
-					"weights are likely scrambled (GPU-fault-era save)");
+					+ std::to_string((int)claimedRating) + " cannot touch the ball on a "
+					"CONTESTED kickoff (scripted opponent commits) - weights are likely "
+					"scrambled (GPU-fault-era save); a delay-kickoff equilibrium alone "
+					"cannot fail this probe");
 		}
 	};
 
@@ -1378,6 +1402,24 @@ void GGL::Learner::Start() {
 		// Terminal types decided by the parallel per-player pass, consumed by the serial finalize
 		std::vector<int8_t> finalTerminals(numPlayers, 0);
 
+		// -- Kickoff script (2026-08-13; rationale in KickoffScript.h / LearnerConfig) --
+		// Per-arena window state lives OUTSIDE fnCollectIteration because episodes span
+		// iterations, exactly like `trajectories`. ksSuppress gates every per-row append
+		// site for the scripted car; it flips only at the loop-top window update, so the
+		// pre-step and post-step appends of any given step always agree and the per-row
+		// arrays inside a Trajectory stay aligned. Suppression only ever starts at an
+		// episode's first step, so a suppressed player's trajectory is empty by invariant.
+		KickoffScript kickoffScript(envSet->actionParsers[0]);
+		const bool kickoffScriptOn = !render && config.kickoffScriptChance > 0 && kickoffScript.valid;
+		if (!render && config.kickoffScriptChance > 0 && !kickoffScript.valid)
+			RG_LOG("WARNING: kickoffScriptChance > 0 but the action parser is not a DefaultAction - kickoff script disabled");
+		std::vector<int> ksArenaCar(envSet->arenas.size(), -1);  // global player idx, -1 = no window
+		std::vector<int> ksArenaSteps(envSet->arenas.size(), 0);
+		std::vector<uint8_t> ksSuppress(numPlayers, 0);
+		// Hard cap on a window that never sees a touch (script whiffed/bumped): ~5s
+		const int ksWindowMaxSteps = (int)(5 * 120 / RS_MAX(1, config.tickSkip));
+		std::vector<uint8_t> ksPrevTerminals; // loop-top snapshot scratch, hoisted
+
 		// Long-lived across iterations (capacity reused); only contains complete episodes.
 		// Slack covers overbatching: collection finishes the step (and its whole episodes)
 		// after crossing tsPerItr.
@@ -1764,6 +1806,17 @@ void GGL::Learner::Start() {
 				fnBuildOppSplit(oppTeam);
 			}
 
+			// Kickoff script: drop in-flight windows at the iteration boundary (the opponent
+			// source may have changed - a Nexto iteration must not inherit a scripted car).
+			// The cleared car hands back to the policy and its rows resume recording
+			// mid-episode; since nothing was recorded before (suppression starts at episode
+			// start), that is a plain contiguous suffix, not a hidden-reset splice.
+			int ksArmedCount = 0;
+			if (kickoffScriptOn) {
+				std::fill(ksArenaCar.begin(), ksArenaCar.end(), -1);
+				std::fill(ksSuppress.begin(), ksSuppress.end(), (uint8_t)0);
+			}
+
 			// The viewer's opponent models, loaded on demand from the panel's choice and
 			// owned here: this outlives every step because render mode never leaves this
 			// call. Deliberately NOT the version manager's ring — that loads all 32
@@ -1929,8 +1982,53 @@ void GGL::Learner::Start() {
 						// Drop any practice window whose arena is about to reset for a reason
 						// OTHER than the drill itself (terminals still hold the PREVIOUS step's
 						// flags here - Reset() only zeroes them for arenas that actually reset)
+						// Kickoff script: snapshot the pre-Reset terminals - they are the only
+						// "this arena just started a fresh episode" signal, and Reset() zeroes them
+						if (kickoffScriptOn)
+							ksPrevTerminals.assign(envSet->state.terminals.begin(), envSet->state.terminals.end());
 						envSet->Reset();
 						envStepTime += stepTimer.Elapsed();
+
+						// Kickoff-script window update. Runs BEFORE the pre-step appends so
+						// ksSuppress is constant across this entire step. Post-Reset, gameStates
+						// of reset arenas hold the fresh spawn; non-reset arenas still hold last
+						// step's state incl. its ballTouchedStep flags (cleared later by
+						// StepFirstHalf's ResetBeforeStep) - exactly what the end conditions need.
+						if (kickoffScriptOn) {
+							std::uniform_real_distribution<float> ksRoll(0.0f, 1.0f);
+							for (int arenaIdx = 0; arenaIdx < (int)envSet->arenas.size(); arenaIdx++) {
+								// Live window: end on episode reset, first touch (by anyone - the
+								// contest is resolved), or the no-touch timeout
+								if (ksArenaCar[arenaIdx] >= 0) {
+									bool ended = ksPrevTerminals[arenaIdx] != 0;
+									if (!ended) {
+										auto& gs = envSet->state.gameStates[arenaIdx];
+										bool touched = false;
+										for (auto& p : gs.players)
+											touched |= p.ballTouchedStep;
+										ended = touched || ++ksArenaSteps[arenaIdx] > ksWindowMaxSteps;
+									}
+									if (ended) {
+										ksSuppress[ksArenaCar[arenaIdx]] = 0;
+										ksArenaCar[arenaIdx] = -1;
+									}
+								}
+								// Fresh episode on a kickoff spawn: maybe arm. Never on Nexto
+								// iterations (the Nexto/* goal-share series must stay undiluted).
+								if (!oppExternal && ksArenaCar[arenaIdx] < 0 && ksPrevTerminals[arenaIdx]) {
+									auto& gs = envSet->state.gameStates[arenaIdx];
+									if (KickoffScript::IsKickoffSpawn(gs)
+										&& ksRoll(oppRng) < config.kickoffScriptChance) {
+										int slot = (int)(oppRng() % gs.players.size());
+										int globalIdx = envSet->state.arenaPlayerStartIdx[arenaIdx] + slot;
+										ksArenaCar[arenaIdx] = globalIdx;
+										ksArenaSteps[arenaIdx] = 0;
+										ksSuppress[globalIdx] = 1;
+										ksArmedCount++;
+									}
+								}
+							}
+						}
 
 						// Sampled every 4th step: this is a hard-stop debug guard, and any obs-NaN
 						// source persists across steps, so sampling keeps the guarantee while
@@ -2020,6 +2118,8 @@ void GGL::Learner::Start() {
 							Timer prepTimer = {};
 							fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 								int newPlayerIdx = newPlayerIndices[k];
+								if (ksSuppress[newPlayerIdx]) // scripted car: rows are training-poison
+									return;
 								fnAppendObsRow(trajectories[newPlayerIdx].states, newPlayerIdx);
 								fnAppendMaskRow(trajectories[newPlayerIdx].actionMasks, newPlayerIdx);
 
@@ -2182,6 +2282,24 @@ void GGL::Learner::Start() {
 						toVecTime = inferD2hTime;
 						inferTime = inferH2dTime + inferKernTime + inferD2hTime;
 
+						// Kickoff script: replace the scripted car's action index. After the
+						// logprob extraction (the sampled action's logprob is recorded for
+						// bookkeeping but the row is suppressed, so the mismatch never trains)
+						// and before StepSecondHalf parses indices into controls - prevAction
+						// in the next obs therefore describes what the car actually did.
+						if (kickoffScriptOn) {
+							for (int arenaIdx = 0; arenaIdx < (int)envSet->arenas.size(); arenaIdx++) {
+								int globalIdx = ksArenaCar[arenaIdx];
+								if (globalIdx < 0)
+									continue;
+								auto& gs = envSet->state.gameStates[arenaIdx];
+								int slot = globalIdx - envSet->state.arenaPlayerStartIdx[arenaIdx];
+								int scriptAct = kickoffScript.ChooseAction(gs.players[slot], gs);
+								if (scriptAct >= 0)
+									curActions[globalIdx] = scriptAct;
+							}
+						}
+
 						stepTimer.Reset();
 						envSet->StepSecondHalf(curActions, false);
 						envStepTime += stepTimer.Elapsed();
@@ -2297,6 +2415,13 @@ void GGL::Learner::Start() {
 						// bookkeeping. Finalization stays serial — HER uses a shared RNG.
 						fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 							int newPlayerIdx = newPlayerIndices[k];
+							if (ksSuppress[newPlayerIdx]) {
+								// Scripted car: its trajectory is empty by invariant (suppression
+								// only starts at episode start), so there is nothing to terminate
+								// or truncate - and finalize must not append an empty episode
+								finalTerminals[newPlayerIdx] = 0;
+								return;
+							}
 							auto& traj = trajectories[newPlayerIdx];
 							traj.actions.push_back(curActions[newPlayerIdx]);
 							traj.rewards += envSet->state.rewards[newPlayerIdx];
@@ -2357,7 +2482,9 @@ void GGL::Learner::Start() {
 					// Boundary truncate: fixed env-step budget leaves unfinished episodes in
 					// `trajectories`. Mark the last recorded step TRUNCATED so the critic can
 					// bootstrap; do not reset the env (episode continues next iteration in a
-					// fresh Trajectory). Same as pre-a20cce5 GigaLearn-2.
+					// fresh Trajectory). Same as pre-a20cce5 GigaLearn-2. A kickoff-scripted
+					// car's trajectory is empty by invariant, so the Length()==0 skip already
+					// keeps its rows out.
 					if (!render) {
 						for (int newPlayerIdx : newPlayerIndices) {
 							auto& traj = trajectories[newPlayerIdx];
@@ -2376,6 +2503,13 @@ void GGL::Learner::Start() {
 							traj.Clear();
 						}
 					}
+
+					// Kickoff script liveness: windows armed this iteration. Expected ~
+					// (kickoff episodes this iteration) x chance on self-play iterations; a
+					// flat 0 with the feature on means the arming path is broken (the
+					// KickoffRace lesson: a dead mechanism looks identical to a quiet one)
+					if (kickoffScriptOn)
+						collectReport["KickoffScript/Windows Armed"] = (float)ksArmedCount;
 
 					collectReport["Inference Time"] = inferTime;
 					collectReport["Infer H2D Time"] = inferH2dTime;

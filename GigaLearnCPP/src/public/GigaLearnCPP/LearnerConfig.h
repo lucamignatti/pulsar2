@@ -170,6 +170,18 @@ namespace GGL {
 		// (which legitimately can't kick off yet) exempt.
 		bool bootSanityCheckEnabled = true;
 		float bootSanityMinRating = 400.0f;
+		// Kickoff script (2026-08-13, user-directed; see KickoffScript.h for the full
+		// rationale): on this fraction of kickoff-spawn episodes, ONE randomly-chosen car
+		// is driven by a scripted boost-at-ball kickoff until the first touch (or a ~5s
+		// timeout), then handed back to the policy. The scripted car's rows are EXCLUDED
+		// from training while scripted (recording resumes at handover - a contiguous
+		// mid-episode suffix, not a splice). Exists because mirror self-play settled into
+		// a delay-kickoff equilibrium: kickoffs were never contested in the data, and the
+		// boot sanity probe (which plays the mirror) read the deadlock as corruption and
+		// rolled the run back to golden twice. 0 = off. Never applies on Nexto-serve
+		// iterations (the Nexto/* goal-share yardstick must stay undiluted) or in render.
+		// The boot probe itself ALWAYS scripts one car, independent of this knob.
+		float kickoffScriptChance = 0.5f;
 		LearnerDeviceType deviceType = LearnerDeviceType::AUTO; // Auto will use your CUDA GPU if available
 
 		// Allow TF32 tensor-core matmuls on CUDA (Ampere+/Blackwell). libtorch defaults cuBLAS
