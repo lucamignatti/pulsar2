@@ -866,6 +866,12 @@ int main(int argc, char* argv[]) {
 	// grad-enabled forwards (InfoNCE training) always run fp32, so the gate is unaffected.
 	// Dtype is runtime-gated: BF16 on sm_80+ (5080), FP16 on V100 (see GGLHalfPrecType).
 	cfg.ppo.useHalfPrecision = true;
+	// CUDA graphs are opt-in while their cluster throughput A/B is pending. The graph path is
+	// rank-local and covers only the frozen self-play collection forward.
+	if (const char* s = std::getenv("GGL_CUDA_GRAPHS"); s && *s) {
+		cfg.ppo.useCudaGraphs = !(s[0] == '0' || std::string(s) == "false" || std::string(s) == "off");
+		RG_LOG("GGL_CUDA_GRAPHS: " << (cfg.ppo.useCudaGraphs ? "on" : "off"));
+	}
 
 	// 6.1b (2026-08-04, user-directed): bf16 autocast for the LEARN pass, the one throughput
 	// lever that does not trade against the experiment (the alternatives were epochs 2->1,

@@ -356,7 +356,13 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	torch::Tensor obs, torch::Tensor actionMasks,
 	float temperature, bool halfPrec,
 	torch::Tensor steerDelta, torch::Tensor* outRowOk,
-	torch::Tensor precomputedTrunk) {
+	torch::Tensor precomputedTrunk,
+	bool useCudaGraph) {
+
+	if (useCudaGraph)
+		return PolicyCudaGraph::InferPolicyProbs(
+			models, obs, actionMasks, temperature, halfPrec,
+			steerDelta, outRowOk, precomputedTrunk, true);
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -443,10 +449,13 @@ void GGL::PPOLearner::InferActionsFromModels(
 	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor steerDelta) {
+	torch::Tensor steerDelta,
+	bool useCudaGraph) {
 
 	torch::Tensor rowOk;
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta, &rowOk);
+	auto probs = InferPolicyProbsFromModels(
+		models, obs, actionMasks, temperature, halfPrec,
+		steerDelta, &rowOk, {}, useCudaGraph);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -541,7 +550,11 @@ void GGL::PPOLearner::InferActionsLowRankES(ModelSet& models, torch::Tensor obs,
 		*outLogProbs = torch::log(probs).gather(-1, action).flatten();
 }
 
-void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
+void GGL::PPOLearner::InferActions(
+	torch::Tensor obs, torch::Tensor actionMasks,
+	torch::Tensor* outActions, torch::Tensor* outLogProbs,
+	ModelSet* models,
+	bool allowCudaGraph) {
 	ModelSet& m = models ? *models : this->models;
 
 	// Activation steering was removed 2026-07-25 (it had been inert at alpha = 0 since the
@@ -549,7 +562,14 @@ void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks,
 	// path; steerDelta stays as its carrier.
 	torch::Tensor steerDelta = {};
 
-	InferActionsFromModels(m, obs, actionMasks, config.deterministic, config.policyTemperature, config.useHalfPrecision, outActions, outLogProbs, steerDelta);
+	InferActionsFromModels(
+		m, obs, actionMasks, config.deterministic, config.policyTemperature,
+		config.useHalfPrecision, outActions, outLogProbs, steerDelta,
+		config.useCudaGraphs && allowCudaGraph);
+}
+
+GGL::PolicyCudaGraphStats GGL::PPOLearner::GetCudaGraphStats() {
+	return PolicyCudaGraph::GetStats();
 }
 
 torch::Tensor GGL::PPOLearner::ValueTrunk(torch::Tensor obs, bool halfPrec) {

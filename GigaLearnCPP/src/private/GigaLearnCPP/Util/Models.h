@@ -102,8 +102,12 @@ namespace GGL {
 
 		virtual torch::Tensor Forward(torch::Tensor input, bool halfPrec, bool keepHalf = false);
 
-		// Rebuild the fp16 weight cache if outdated (extracted from Forward so custom
-		// module walks — the EGGROLL-ES batched low-rank forward — can share it).
+		// Creates or refreshes the reduced-precision inference mirror IN PLACE (extracted
+		// from Forward so custom module walks — the EGGROLL-ES batched low-rank forward,
+		// the CUDA graph capture — can share it). CUDA graphs retain the mirror's
+		// parameter addresses, so an existing mirror must never be reallocated merely
+		// because the FP32 weights changed — the GGL_FLAT_HALF buffer views guarantee
+		// refreshes are copy_ into stable storage.
 		void RefreshHalfCache();
 		
 		void SetOptimLR(float newLR);
@@ -172,7 +176,7 @@ namespace GGL {
 			return total;
 		}
 
-		virtual ~Model() = default;
+		virtual ~Model();
 	};
 
 	class ModelSet {
@@ -260,7 +264,7 @@ namespace GGL {
 
 		void Free() {
 			for (Model* model : *this) {
-				// `delete model` alone leaks the optimizer (raw pointer, ~Model() is default),
+				// `delete model` alone leaks the optimizer (raw pointer; ~Model only evicts graphs),
 				// and the optimizer's param_groups hold strong Tensor refs to every parameter -
 				// so the whole clone's weights stay pinned on the GPU. At the 25M-step version
 				// cadence the evicted-version + dropped-reference clones leaked ~1GB/h and

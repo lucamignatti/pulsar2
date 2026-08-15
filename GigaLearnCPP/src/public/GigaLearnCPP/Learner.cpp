@@ -11,6 +11,7 @@
 #include <pybind11/embed.h>
 
 #ifdef RG_CUDA_SUPPORT
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -1620,6 +1621,24 @@ void GGL::Learner::Start() {
 			const char* e = std::getenv("GGL_ES_HYBRID");
 			return e && *e && std::string(e) != "0";
 		}();
+		const bool collectionCudaGraphsOn = config.ppo.useCudaGraphs && pipelineOn && ppo->device.is_cuda();
+		if (config.ppo.useCudaGraphs)
+			RG_LOG("CUDA graph collection: " << (collectionCudaGraphsOn ? "on" : "inactive")
+				<< " (rank-local frozen self-play policy only)");
+
+#ifdef RG_CUDA_SUPPORT
+		std::optional<at::cuda::CUDAEvent> collectSnapshotReadyEvent;
+		auto fnRecordSnapshotReady = [&]() {
+			if (!collectionCudaGraphsOn)
+				return;
+			if (!collectSnapshotReadyEvent)
+				collectSnapshotReadyEvent.emplace();
+			collectSnapshotReadyEvent->record(c10::cuda::getCurrentCUDAStream(ppo->device.index()));
+		};
+#else
+		auto fnRecordSnapshotReady = []() {};
+#endif
+
 		// The pipelined worker's frozen model set. With the steering rho-gate on, the reach
 		// heads are snapshotted too - the worker must never read weights Learn is updating.
 		std::vector<const char*> snapshotNames = { "shared_head", "policy" };
@@ -1628,6 +1647,7 @@ void GGL::Learner::Start() {
 			for (const char* nm : snapshotNames)
 				if (ppo->models[nm])
 					collectSnapshot.Add(ppo->models[nm]->MakeClone());
+		fnRecordSnapshotReady();
 		ModelSet* const collectModelsPtr = (pipelineOn || esMode || esHybrid) ? &collectSnapshot : NULL;
 		auto fnSyncSnapshot = [&]() {
 			RG_NO_GRAD;
@@ -1641,6 +1661,7 @@ void GGL::Learner::Start() {
 					to[i].copy_(from[i], true);
 				dst->_seqHalfOutdated = true;
 			}
+			fnRecordSnapshotReady();
 		};
 
 		// ===================== EGGROLL-ES MODE (GGL_ES) =====================
@@ -2032,6 +2053,9 @@ void GGL::Learner::Start() {
 			if (ppo->device.is_cuda())
 				collectStreamGuard.emplace(c10::cuda::getStreamFromPool(
 					/*isHighPriority=*/true, ppo->device.index()));
+			if (collectionCudaGraphsOn && collectSnapshotReadyEvent)
+				collectSnapshotReadyEvent->block(
+					c10::cuda::getCurrentCUDAStream(ppo->device.index()));
 #endif
 			// This iteration's opponent for the non-self team: Nexto, an archived past self, or
 			// (default) the current self. `oppModels` is the opponent's network (null = mirror
@@ -2580,7 +2604,9 @@ void GGL::Learner::Start() {
 								ppo->InferActionsLowRankES(*collectModelsPtr, tdStates,
 									tdActionMasks, esCtx, &tActions, &tLogProbs);
 							else
-								ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr);
+								ppo->InferActions(
+									tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr,
+									/*allowCudaGraph=*/collectionCudaGraphsOn);
 						}
 						inferKernTime += inferTimer.Elapsed();
 
@@ -3023,6 +3049,7 @@ void GGL::Learner::Start() {
 			RG_LOG("Pipelined collect: persistent worker (one pthread for the run)");
 		}
 
+		auto previousCudaGraphStats = PPOLearner::GetCudaGraphStats();
 		// Inner wrapper INSIDE collectThread's scope: without it, an exception unwinding
 		// out of the loop destroys the still-joinable worker thread first, and its
 		// destructor's std::terminate EATS the real error ("terminate called without an
@@ -3087,6 +3114,18 @@ void GGL::Learner::Start() {
 				report["Barrier Glue Time"] = glueTimer.Elapsed();
 			}
 			float collectionTime = collectWallTime;
+			if (collectionCudaGraphsOn) {
+				auto graphStats = PPOLearner::GetCudaGraphStats();
+				report["CUDA Graph/Captures"] = graphStats.captures - previousCudaGraphStats.captures;
+				report["CUDA Graph/Replays"] = graphStats.replays - previousCudaGraphStats.replays;
+				report["CUDA Graph/Fallbacks"] = graphStats.fallbacks - previousCudaGraphStats.fallbacks;
+				report["CUDA Graph/Capture Failures"] = graphStats.captureFailures - previousCudaGraphStats.captureFailures;
+				report["CUDA Graph/Variant Limit Fallbacks"] =
+					graphStats.variantLimitFallbacks - previousCudaGraphStats.variantLimitFallbacks;
+				report["CUDA Graph/Cache Entries"] = graphStats.cacheEntries;
+				report["CUDA Graph/Disabled After OOM"] = graphStats.disabledAfterOom ? 1 : 0;
+				previousCudaGraphStats = graphStats;
+			}
 
 			// ---- BARRIER ZONE (worker idle): shared-resource consumers. In sequential mode these
 			// stay at their original tail call sites; exactly one site is active per mode. Running

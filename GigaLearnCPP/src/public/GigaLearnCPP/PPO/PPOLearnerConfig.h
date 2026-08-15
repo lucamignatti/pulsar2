@@ -199,6 +199,13 @@ namespace GGL {
 		// Dtype is GGLHalfPrecType(): BF16 on sm_80+ (5080), FP16 on V100 (sm_70).
 		bool useHalfPrecision = false;
 
+		/**
+		 * Replay exact-shape CUDA graphs for the frozen self-play collection policy.
+		 * Sampling, training, opponents, evaluation, MPI, and NCCL remain eager. The
+		 * flag is opt-in until numerical and throughput A/Bs pass on the target GPUs.
+		 **/
+		bool useCudaGraphs = false;
+
 		// AUTOCAST FOR THE LEARN PASS (2026-08-04, user-directed "more sps"; FP16 on V100 2026-08-14).
 		// useHalfPrecision above covers only INFERENCE; the learn pass ran strict fp32, and
 		// profiling made it the system bottleneck: the GPU sits at 92-98% and the collect

@@ -1,5 +1,6 @@
 #pragma once
 #include "ExperienceBuffer.h"
+#include "CudaGraphPolicy.h"
 #include <GigaLearnCPP/Util/Report.h>
 #include <GigaLearnCPP/Util/Timer.h>
 #include <GigaLearnCPP/PPO/PPOLearnerConfig.h>
@@ -89,7 +90,11 @@ namespace GGL {
 
 		// If models is null, this->models will be used - which is how the opponent half of a
 		// served iteration is inferred (pass the archived version's ModelSet).
-		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
+		void InferActions(
+			torch::Tensor obs, torch::Tensor actionMasks,
+			torch::Tensor* outActions, torch::Tensor* outLogProbs,
+			ModelSet* models = NULL,
+			bool allowCudaGraph = false);
 
 		// EGGROLL-ES batched low-rank population forward (research/reports/ES_EGGROLL.md).
 		// Each ROW belongs to a population member (rowMember, int64 [rows]); every Linear
@@ -200,14 +205,19 @@ namespace GGL {
 			bool halfPrec,
 			torch::Tensor steerDelta = {},
 			torch::Tensor* outRowOk = nullptr,
-			torch::Tensor precomputedTrunk = {});
+			torch::Tensor precomputedTrunk = {},
+			bool useCudaGraph = false);
 		static void InferActionsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
-			torch::Tensor steerDelta = {}
+			torch::Tensor steerDelta = {},
+			bool useCudaGraph = false
 		);
+
+		/** Process-local CUDA graph telemetry; each MPI rank owns an independent cache. **/
+		static PolicyCudaGraphStats GetCudaGraphStats();
 		// d(x, bank) = min over bank rows of sum_j relu(x_j - bank_j), clamped;
 		// chunked so the [rows, bank, dims] broadcast never materializes at full n.
 		// The 5 wire values for a batch: rawObs feeds the map encoder, trunkOut feeds

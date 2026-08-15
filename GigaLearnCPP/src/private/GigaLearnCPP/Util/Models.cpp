@@ -1,5 +1,6 @@
 #include "Models.h"
 #include "MoE.h"
+#include "../PPO/CudaGraphPolicy.h"
 
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <torch/csrc/api/include/torch/nn/utils/convert_parameters.h>
@@ -255,6 +256,10 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepH
 			? seq->forward(input)
 			: ForwardResidual(seq, residualSpans, input);
 	}
+}
+
+GGL::Model::~Model() {
+	PolicyCudaGraph::Release(this);
 }
 
 // Get sizes of all parameters in a sequence
