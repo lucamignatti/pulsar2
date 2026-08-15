@@ -389,3 +389,48 @@ void GGL::ModelSet::AllReduceGrads(Dist::Session* dist, bool includeExempt) {
 		return;
 	dist->allreduce_avg_grads(refs, streamSrc.defined() ? GGLCurrentCudaStream(streamSrc) : nullptr);
 }
+
+void GGL::ModelSet::StepOptimsSharded(Dist::Session* dist) {
+	if (!dist || !dist->distributed()) {
+		StepOptims();
+		return;
+	}
+	const int world = dist->world(), rank = dist->rank();
+
+	// (param, owner) for every NS-eligible 2D param, in the exact order Muon::step will
+	// count them. The predicate mirrors Muon::step's and is evaluated PRE-step, while the
+	// allreduced (zero-filled) grads are still defined — StepOptim's zero_grad would
+	// otherwise change the eligible set between counting and broadcasting.
+	std::vector<std::pair<torch::Tensor, int>> shard2D;
+	int64_t counter = 0;
+	for (Model* model : *this) {
+		if (model->groupStepExempt)
+			continue;
+		Muon* muon = dynamic_cast<Muon*>(model->optim);
+		if (!muon) {
+			model->StepOptim();
+			continue;
+		}
+		muon->shardRank = rank;
+		muon->shardWorld = world;
+		muon->shardCounter = counter;
+		for (auto& group : muon->param_groups())
+			for (auto& param : group.params()) {
+				auto g = param.grad();
+				if (g.defined() && g.dim() == 2 && g.size(0) > 1 && g.size(1) > 1)
+					shard2D.emplace_back(param, (int)(counter++ % (int64_t)world));
+			}
+		model->StepOptim();
+		// If this fires, the enumeration above no longer mirrors Muon::step's internal
+		// count and ownership is misaligned — params would silently stay stale.
+		RG_ASSERT(muon->shardCounter == counter);
+		muon->shardWorld = 1;
+	}
+
+	for (auto& pr : shard2D) {
+		torch::Tensor& param = pr.first;
+		RG_ASSERT(param.is_cuda() && param.scalar_type() == torch::kFloat && param.is_contiguous());
+		dist->bcast_device(param.data_ptr<float>(), (size_t)param.numel(), pr.second,
+			GGLCurrentCudaStream(param));
+	}
+}

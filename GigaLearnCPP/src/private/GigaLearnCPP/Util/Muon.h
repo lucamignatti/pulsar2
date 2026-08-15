@@ -28,6 +28,17 @@ namespace GGL {
 
 		torch::Tensor step(LossClosure closure = nullptr) override;
 
+		// NS-shard spec, set by ModelSet::StepOptimsSharded before each step and reset after.
+		// When shardWorld > 1, the momentum update still runs for EVERY 2D param (identical
+		// on all ranks — grads are identical post-allreduce — so checkpointed state never
+		// diverges), but the Newton-Schulz orthogonalization + param update run only for
+		// params this rank owns (shardCounter % shardWorld == shardRank); non-owned params
+		// are left stale and MUST be overwritten by the owner's broadcast immediately after.
+		// shardCounter advances across models within one StepOptimsSharded pass so ownership
+		// spreads evenly over the whole non-exempt family.
+		int shardRank = 0, shardWorld = 1;
+		int64_t shardCounter = 0;
+
 	private:
 		struct AdamState {
 			torch::Tensor expAvg, expAvgSq;

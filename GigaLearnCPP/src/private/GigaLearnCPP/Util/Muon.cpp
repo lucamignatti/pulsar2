@@ -74,6 +74,13 @@ torch::Tensor GGL::Muon::step(LossClosure closure) {
 				Tensor buf = static_cast<optim::SGDParamState&>(*stateItr->second).momentum_buffer();
 				buf.mul_(momentum).add_(grad);
 
+				// NS shard (see header): momentum above always runs; the expensive
+				// orthogonalization + apply only on the owning rank.
+				const bool nsOwned = shardWorld <= 1
+					|| (shardCounter++ % (int64_t)shardWorld) == (int64_t)shardRank;
+				if (!nsOwned)
+					continue;
+
 				Tensor update = nesterov ? grad.add(buf, momentum) : buf;
 				update = NewtonSchulz5(update);
 

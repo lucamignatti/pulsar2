@@ -1798,7 +1798,17 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			tClip += clipTimer.Elapsed();
 
 			Timer optStepTimer = {};
-			models.StepOptims();
+			// GGL_MUON_SHARD: Newton-Schulz sharded across ranks + owner broadcast
+			// (bit-identical result; lockstep checksum verifies). Profiled 2026-08-15:
+			// the replicated NS step was 0.27s of a 0.59s Learn at 8.3k rows/rank.
+			static const bool muonShard = [] {
+				const char* e = std::getenv("GGL_MUON_SHARD");
+				return e && *e && std::string(e) != "0";
+			}();
+			if (muonShard && dist && dist->distributed())
+				models.StepOptimsSharded(dist);
+			else
+				models.StepOptims();
 			fnSyncNow();
 			tOptStep += optStepTimer.Elapsed();
 			}

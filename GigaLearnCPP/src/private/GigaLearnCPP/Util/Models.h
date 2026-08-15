@@ -200,6 +200,17 @@ namespace GGL {
 			}
 		}
 
+		// StepOptims with the Muon Newton-Schulz work sharded across ranks. Grads are
+		// identical on every rank after AllReduceGrads, so running the full NS on all of
+		// them is pure redundancy; each rank orthogonalizes only its owned 2D matrices
+		// (round-robin over the whole non-exempt family) and the owners then broadcast
+		// the updated params. Bit-identical to StepOptims() on every rank afterwards —
+		// GGL_DIST_LOCKSTEP_CHECK verifies exactly that for free.
+		// REQUIRES AllReduceGrads(dist) this step (it zero-fills missing grads, making
+		// the eligible-param sets identical across ranks). Falls back to StepOptims()
+		// when not distributed.
+		void StepOptimsSharded(Dist::Session* dist);
+
 		void Save(std::filesystem::path folder, bool saveOptims = true) {
 			for (Model* model : *this)
 				model->Save(folder, saveOptims);
