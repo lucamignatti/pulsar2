@@ -1505,6 +1505,10 @@ int main(int argc, char* argv[]) {
 	// (see epiBlendEnabled): fresh start, not resume, per the recovery doctrine.
 	cfg.checkpointFolder = "checkpoints_7.0b";
 	cfg.metricsRunName = "7.0b-ts8";
+	if (const char* n = std::getenv("GGL_METRICS_RUN_NAME"); n && *n)
+		cfg.metricsRunName = n;
+	if (const char* g = std::getenv("GGL_METRICS_GROUP_NAME"); g && *g)
+		cfg.metricsGroupName = g;
 
 	// Cluster runs need their own wandb identity without a local sed of this file (the
 	// "7.0b-aimos" name on AiMOS was exactly that sed, and it drifts on every pull).
