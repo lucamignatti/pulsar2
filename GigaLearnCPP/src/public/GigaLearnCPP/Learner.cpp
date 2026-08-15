@@ -1587,10 +1587,10 @@ void GGL::Learner::Start() {
 
 
 		// ================= Pipelined collection (config.pipelinedCollection) =================
-		// Overlaps NEXT-iteration experience collection with THIS iteration's Learn() only.
-		// Value-pred / GAE / reach / gap stay in the barrier (worker idle) so InferActions
-		// does not share the GPU with InferValueFamily (4630604: value-pred 0.51→1.01s).
-		// Collect (~1.6s uncontended) still fits behind Learn (~2.1s AMP).
+		// Overlaps NEXT-iteration experience collection with THIS iteration's value-pred + Learn.
+		// Delayed kick (Learn-only) made Join absorb Learn speedups. Value-pred shares the GPU
+		// with collect InferActions again (4630604: 0.51→1.01s); on 20k+32GB that is cheaper
+		// than Join leftover when Learn < collect.
 		// Collapse-safety design (this exact failure mode has killed runs before):
 		//   * The worker NEVER infers from live training weights — it uses `collectSnapshot`, a frozen
 		//     copy synced at the barrier, so a forward can never see half-updated (torn) parameters.
@@ -3140,8 +3140,9 @@ void GGL::Learner::Start() {
 				prevVersionTimesteps = totalTimesteps;
 				if (report.Has(ratingKey))
 					lastEvalRating = (float)report[ratingKey]; // feeds the best-checkpoint archive
-				// Freeze the current policy for the worker. Kick is deferred until Learn()
-				// so value-pred does not share the GPU with collect InferActions.
+				// Freeze the current policy, then kick immediately. Learn-only overlap made
+				// Join absorb Learn speedups (Join ~= max(0, collect-learn)). Overlap
+				// value-pred + Learn so leftover collect can hide in value-pred.
 				Timer snapshotTimer = {};
 				// EGGROLL-ES generation turn, all in the barrier (worker idle):
 				// credit the joined trajectory to the in-flight population, update mu
@@ -3167,6 +3168,8 @@ void GGL::Learner::Start() {
 					}
 				}
 				report["Snapshot Time"] = snapshotTimer.Elapsed();
+				fnCollectKick();
+				pipelinedCollectPending = true;
 			} else {
 				report["VersionMgr Time"] = 0.f;
 				// Sequential ES: same generation turn at the same program point (the
@@ -4388,11 +4391,7 @@ void GGL::Learner::Start() {
 				// pre-update goals/rho computed above for this iteration's shaping/logging, then
 				// updates - so what got logged/shaped this iteration reflects the OLD proposer.
 
-				// Learn. Pipelined collect starts here so it overlaps Learn only, not value-pred.
-				if (pipelineOn) {
-					fnCollectKick();
-					pipelinedCollectPending = true;
-				}
+				// Collect was kicked after snapshot (overlaps value-pred + Learn).
 				Timer learnTimer = {};
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H_learn_start\n");
 				ppo->Learn(experience, report, isFirstIteration);

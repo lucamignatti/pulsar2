@@ -804,7 +804,19 @@ int main(int argc, char* argv[]) {
 	// the one lever that touches it, is mathematically identical under gradient accumulation
 	// (200k/12.5k = 16 exact chunks), and costs only GEMM efficiency.
 	// Against losing 1.2B steps and the entire recovery chain, that trade is no longer close.
+	// 20k on CCNI 32GB V100s (200k/20k = 10 accum chunks). 12.5k was the 16GB-desktop
+	// OOM/corruption cap; measured peak left ~70% of 32GB free. Pair with collect overlapping
+	// value-pred+Learn so a shorter Learn is not absorbed by Collect Join.
+	// PULSAR DIVERGENCE from titan's 20k default: this binary also runs on the 16GB
+	// desktop (the 7.0b trainer restarts unattended via run_trainer.sh), where 20k is
+	// exactly the OOM/corruption exposure 12.5k exists to avoid. Cluster sbatches set
+	// the value explicitly (GGL_MINIBATCH / GGL_MINIBATCH_SIZE both honored; the later
+	// GGL_MINIBATCH block wins when both are set, which is what the fleet uses).
 	cfg.ppo.miniBatchSize = 12'500;
+	if (const char* s = std::getenv("GGL_MINIBATCH_SIZE"); s && *s) {
+		cfg.ppo.miniBatchSize = std::atoll(s);
+		RG_LOG("GGL_MINIBATCH_SIZE: " << cfg.ppo.miniBatchSize);
+	}
 
 	// Cadence lever (2026-08-15, for the AiMOS fleet): rows-per-iteration per rank,
 	// overridable without a rebuild. Update cadence scales ~1/tsPerItr until the fixed
