@@ -1431,6 +1431,11 @@ int main(int argc, char* argv[]) {
 	cfg.checkpointFolder = "checkpoints_7.0b";
 	cfg.metricsRunName = "7.0b-ts8";
 
+	// Cluster runs need their own wandb identity without a local sed of this file (the
+	// "7.0b-aimos" name on AiMOS was exactly that sed, and it drifts on every pull).
+	if (const char* rn = std::getenv("GGL_RUN_NAME"); rn && *rn)
+		cfg.metricsRunName = rn;
+
 	// A smoke MUST NOT be able to masquerade as the real run in wandb. Three sandbox smokes on
 	// 2026-07-25 landed in the shared project under this exact display name, indistinguishable
 	// at a glance from the live lineage. Prefer WANDB_MODE=offline too; this is the backstop for
@@ -1726,6 +1731,10 @@ int main(int argc, char* argv[]) {
 		cfg.trainAgainstOldChance = std::strtof(s, nullptr);
 	if (const char* s = std::getenv("GGL_NEXTO_SERVE_FRAC"); s && *s)
 		cfg.externalOpponent.serveFrac = std::strtof(s, nullptr);
+	// The production modelPath above is this desktop's absolute path; on any other host
+	// (AiMOS) Nexto would RG_ERR_CLOSE at boot without this. Same env NextoEval reads.
+	if (const char* p = std::getenv("GGL_NEXTO_MODEL"); p && *p)
+		cfg.externalOpponent.modelPath = p;
 	// serveFrac 0 still constructed NextoOpponent and fopen'd Luca's laptop path.
 	if (cfg.externalOpponent.serveFrac <= 0.f)
 		cfg.externalOpponent.enabled = false;

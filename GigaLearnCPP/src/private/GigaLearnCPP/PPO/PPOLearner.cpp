@@ -2094,6 +2094,14 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 		if (name.rfind("reach_", 0) == 0)
 			continue;
 
+		// HULL chart nets are training-time-only too (acting reads shared_head + policy).
+		// Keeping them here made the render hot-swap's strict Load() reject checkpoints from
+		// runs that never trained hull (the AiMOS fleet's), stranding the viewer on its boot
+		// checkpoint. Same backward-compatibility argument as vdag: dirs that carry the files
+		// keep them unread.
+		if (name.rfind("hull_", 0) == 0)
+			continue;
+
 		result.Add(model);
 	}
 	return result;
