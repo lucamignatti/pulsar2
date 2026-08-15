@@ -1602,15 +1602,22 @@ void GGL::Learner::Start() {
 		// REVERT: set config.pipelinedCollection = false — the flag-off path is the exact sequential
 		// order and call pattern (inline collect, live models, original tail call sites).
 		const bool pipelineOn = config.pipelinedCollection && !render;
+		// EGGROLL-ES (GGL_ES): declared here because ES forces the snapshot machinery on
+		// even in sequential mode — the perturbation must live on a snapshot, never on mu.
+		// Full ES state and lambdas are below; design: research/reports/ES_EGGROLL.md.
+		const bool esMode = !render && [] {
+			const char* e = std::getenv("GGL_ES");
+			return e && *e && std::string(e) != "0";
+		}();
 		// The pipelined worker's frozen model set. With the steering rho-gate on, the reach
 		// heads are snapshotted too - the worker must never read weights Learn is updating.
 		std::vector<const char*> snapshotNames = { "shared_head", "policy" };
 		ModelSet collectSnapshot;
-		if (pipelineOn)
+		if (pipelineOn || esMode)
 			for (const char* nm : snapshotNames)
 				if (ppo->models[nm])
 					collectSnapshot.Add(ppo->models[nm]->MakeClone());
-		ModelSet* const collectModelsPtr = pipelineOn ? &collectSnapshot : NULL;
+		ModelSet* const collectModelsPtr = (pipelineOn || esMode) ? &collectSnapshot : NULL;
 		auto fnSyncSnapshot = [&]() {
 			RG_NO_GRAD;
 			for (const char* nm : snapshotNames) {
@@ -1624,6 +1631,149 @@ void GGL::Learner::Start() {
 				dst->_seqHalfOutdated = true;
 			}
 		};
+
+		// ===================== EGGROLL-ES MODE (GGL_ES) =====================
+		// Low-rank Evolution Strategies (arXiv 2511.16652) as a forward-only alternative to
+		// PPO. Pre-registration + design + kill criteria: research/reports/ES_EGGROLL.md.
+		// One member per rank per generation: the WORKER SNAPSHOT is perturbed with rank-1
+		// noise (mu itself is never touched — saves/eval/probes always see the clean policy),
+		// every iteration plays vs an unperturbed frozen mu copy, fitness = the member rows'
+		// mean shaped step reward, and the update is reconstructed identically on every rank
+		// from counter-based seeds (only the fitness scalars cross the wire). The existing
+		// lockstep checksum therefore verifies the ES update too. In ES mode the whole PPO
+		// consume phase (value pred / GAE / Learn / aux) is skipped.
+		const float esSigma = [] {
+			const char* e = std::getenv("GGL_ES_SIGMA");
+			return (e && *e) ? std::strtof(e, nullptr) : 0.03f;
+		}();
+		const float esAlpha = [] {
+			const char* e = std::getenv("GGL_ES_ALPHA");
+			return (e && *e) ? std::strtof(e, nullptr) : 1.0f;
+		}();
+		if (esMode)
+			RG_LOG("EGGROLL-ES mode: sigma_rel=" << esSigma << " alpha=" << esAlpha
+				<< " members/gen=" << (dist && dist->distributed() ? dist->world() : 1)
+				<< (pipelineOn ? " (pipelined)" : " (sequential)"));
+		ModelSet esOppModels;
+		if (esMode)
+			for (const char* nm : snapshotNames)
+				if (ppo->models[nm])
+					esOppModels.Add(ppo->models[nm]->MakeClone());
+		auto fnSyncEsOpp = [&]() {
+			RG_NO_GRAD;
+			for (const char* nm : snapshotNames) {
+				Model* dst = esOppModels[nm];
+				if (!dst)
+					continue;
+				auto to = dst->parameters();
+				auto from = ppo->models[nm]->parameters();
+				for (size_t i = 0; i < to.size(); i++)
+					to[i].copy_(from[i], true);
+				dst->_seqHalfOutdated = true;
+			}
+		};
+		uint64_t esGen = 0;
+		bool esInflight = false;
+		std::atomic<uint64_t> esOppTeamFlip{ 0 };
+		float esMyFit = 0.f, esFitMean = 0.f, esFitStd = 0.f, esUpdateNorm = 0.f;
+		// Counter-based seed: any rank can reconstruct any member's noise for any generation.
+		auto fnEsSeed = [&](uint64_t gen, int rankIdx) -> uint64_t {
+			return ((uint64_t)config.randomSeed * 1000003ULL + gen) * 100003ULL + (uint64_t)rankIdx + 1ULL;
+		};
+		// CPU std::normal noise, NOT torch RNG: bit-deterministic across every rank/build,
+		// which the seed-reconstruction correctness depends on.
+		auto fnEsNoise = [](std::mt19937_64& eng, int64_t count) {
+			std::normal_distribution<float> nd(0.f, 1.f);
+			torch::Tensor t = torch::empty({ count }, torch::kFloat32);
+			float* d = t.data_ptr<float>();
+			for (int64_t i = 0; i < count; i++)
+				d[i] = nd(eng);
+			return t;
+		};
+		// Perturb the snapshot's 2D matrices: W += sigma_rel * std(W_mu) * A B^T (rank 1).
+		// Draw order (model order, then parameters() order) MUST match fnEsUpdate's
+		// reconstruction exactly. sigma_l reads mu, which cannot change between this
+		// perturb and the matching update (the update IS the only mu writer).
+		auto fnEsPerturbSnapshot = [&]() {
+			RG_NO_GRAD;
+			std::mt19937_64 eng(fnEsSeed(esGen, DistRank()));
+			for (const char* nm : snapshotNames) {
+				Model* ms = collectSnapshot[nm];
+				Model* mm = ppo->models[nm];
+				if (!ms || !mm)
+					continue;
+				auto ps = ms->parameters();
+				auto pm = mm->parameters();
+				for (size_t i = 0; i < ps.size(); i++) {
+					if (ps[i].dim() != 2 || ps[i].size(0) <= 1 || ps[i].size(1) <= 1)
+						continue;
+					auto A = fnEsNoise(eng, ps[i].size(0)).to(ps[i].device());
+					auto B = fnEsNoise(eng, ps[i].size(1)).to(ps[i].device());
+					float sigmaL = esSigma * pm[i].std().item<float>();
+					ps[i].add_(A.unsqueeze(1) * B.unsqueeze(0), sigmaL);
+				}
+				ms->_seqHalfOutdated = true;
+			}
+		};
+		// Fitness -> z-score -> mu += (alpha * sigma_l / N) * sum_i f_i A_i B_i^T, computed
+		// identically on every rank (fitness vector allreduced, noise from seeds).
+		auto fnEsUpdate = [&]() {
+			RG_NO_GRAD;
+			const int nW = (dist && dist->distributed()) ? dist->world() : 1;
+			double fsum = 0;
+			for (float r : combinedTraj.rewards)
+				fsum += r;
+			esMyFit = combinedTraj.rewards.empty()
+				? 0.f : (float)(fsum / (double)combinedTraj.rewards.size());
+			std::vector<float> fit((size_t)nW, 0.f);
+			fit[(size_t)DistRank()] = esMyFit;
+			if (dist && dist->distributed())
+				dist->sum_host(fit.data(), (size_t)nW);
+			double mean = 0;
+			for (float f : fit)
+				mean += f;
+			mean /= nW;
+			double var = 0;
+			for (float f : fit)
+				var += (f - mean) * (f - mean);
+			esFitMean = (float)mean;
+			esFitStd = (float)std::sqrt(var / nW);
+			esUpdateNorm = 0.f;
+			if (nW < 2 || esFitStd < 1e-8f)
+				return; // degenerate population: no update this generation
+			torch::Tensor fz = torch::tensor(fit, torch::kFloat32);
+			fz = (fz - esFitMean) / esFitStd;
+			std::vector<std::mt19937_64> engs;
+			engs.reserve((size_t)nW);
+			for (int i = 0; i < nW; i++)
+				engs.emplace_back(fnEsSeed(esGen, i));
+			double normSq = 0;
+			for (const char* nm : snapshotNames) {
+				Model* mm = ppo->models[nm];
+				if (!mm)
+					continue;
+				for (auto& p : mm->parameters()) {
+					if (p.dim() != 2 || p.size(0) <= 1 || p.size(1) <= 1)
+						continue;
+					const int64_t m = p.size(0), n = p.size(1);
+					torch::Tensor As = torch::empty({ (int64_t)nW, m }, torch::kFloat32);
+					torch::Tensor Bs = torch::empty({ (int64_t)nW, n }, torch::kFloat32);
+					for (int i = 0; i < nW; i++) {
+						As[i] = fnEsNoise(engs[(size_t)i], m);
+						Bs[i] = fnEsNoise(engs[(size_t)i], n);
+					}
+					float sigmaL = esSigma * p.std().item<float>();
+					auto dW = torch::matmul((As * fz.unsqueeze(1)).t(), Bs).to(p.device());
+					dW.mul_(esAlpha * sigmaL / (float)nW);
+					p.add_(dW);
+					float dn = dW.norm().item<float>();
+					normSq += (double)dn * dn;
+				}
+				mm->_seqHalfOutdated = true;
+			}
+			esUpdateNorm = (float)std::sqrt(normSq);
+		};
+		// ===================== end EGGROLL-ES =====================
 
 		// fnSyncLadderCollect freezes one full wire generation for the NEXT collection
 		// (deep-cloned aux nets + bank embeddings + calibration - the pipelined worker
@@ -1800,6 +1950,15 @@ void GGL::Learner::Start() {
 					tOldIndicesDevice = tOldPlayerIndices;
 				}
 			};
+
+			// EGGROLL-ES: fitness must be measured against the same reference every
+			// generation — the unperturbed current mu (synced at the barrier). Bypass the
+			// opponent roll entirely; alternate sides per generation to halve side bias.
+			if (esMode) {
+				oppExternal = false;
+				oppModels = &esOppModels;
+				oppTeam = Team((int)(esOppTeamFlip.load() & 1));
+			}
 
 			bool oppServed = oppModels || oppExternal;
 			if (oppServed) {
@@ -2685,15 +2844,58 @@ void GGL::Learner::Start() {
 				// Freeze the current policy for the worker. Kick is deferred until Learn()
 				// so value-pred does not share the GPU with collect InferActions.
 				Timer snapshotTimer = {};
+				// EGGROLL-ES generation turn, all in the barrier (worker idle):
+				// credit the joined trajectory to the in-flight perturbation and update mu
+				// BEFORE the snapshot sync, so the next generation samples around mu_{t+1}.
+				if (esMode) {
+					if (esInflight)
+						fnEsUpdate();
+					esGen++;
+				}
 				fnSyncSnapshot();
+				if (esMode) {
+					fnEsPerturbSnapshot();
+					fnSyncEsOpp();
+					esOppTeamFlip++;
+					esInflight = true;
+				}
 				report["Snapshot Time"] = snapshotTimer.Elapsed();
 			} else {
 				report["VersionMgr Time"] = 0.f;
-				report["Snapshot Time"] = 0.f;
+				// Sequential ES: same generation turn at the same program point (the
+				// tail-of-N == top-of-N+1 equivalence the pipelined barrier comment cites).
+				Timer seqSnapshotTimer = {};
+				if (esMode) {
+					if (esInflight)
+						fnEsUpdate();
+					esGen++;
+					fnSyncSnapshot();
+					fnEsPerturbSnapshot();
+					fnSyncEsOpp();
+					esOppTeamFlip++;
+					esInflight = true;
+				}
+				report["Snapshot Time"] = seqSnapshotTimer.Elapsed();
 			}
 
 
 				Timer consumptionTimer = {};
+
+				// EGGROLL-ES consumes nothing: no value pred, no GAE, no Learn, no aux. The
+				// generation turn (fitness -> update -> perturb) already ran in the barrier
+				// zone above; kick the worker and publish the ES panels.
+				if (esMode) {
+					if (pipelineOn) {
+						fnCollectKick();
+						pipelinedCollectPending = true;
+					}
+					report["PPO Learn Time"] = 0.f;
+					report["ES/Gen"] = (float)esGen;
+					report["ES/My Fitness"] = esMyFit;
+					report["ES/Fitness Mean"] = esFitMean;
+					report["ES/Fitness Std"] = esFitStd;
+					report["ES/Update Norm"] = esUpdateNorm;
+				} else {
 
 				// Deliberate-practice proposer: Train() needs gradients, but the whole "Process
 				// timesteps" block below runs under RG_NO_GRAD (like the reachability gate's own
@@ -3863,6 +4065,7 @@ void GGL::Learner::Start() {
 				Timer learnTimer = {};
 				ppo->Learn(experience, report, isFirstIteration);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
+				} // end !esMode (PPO consume phase)
 
 				// Set metrics. Throughput uses the all-rank step sum (same as Total
 				// Timesteps) over this rank's wall clock. Rank-0 Display/wandb therefore
@@ -3961,6 +4164,13 @@ void GGL::Learner::Start() {
 					{
 						"Average Step Reward",
 						"Policy Entropy",
+						"",
+						// EGGROLL-ES panels (GGL_ES runs only; absent keys are skipped)
+						"ES/Gen",
+						"ES/My Fitness",
+						"ES/Fitness Mean",
+						"ES/Fitness Std",
+						"ES/Update Norm",
 						"",
 						"Reach/Beta",
 						"Reach/Gate Mult Mean",
