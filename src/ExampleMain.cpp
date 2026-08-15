@@ -1446,6 +1446,10 @@ int main(int argc, char* argv[]) {
 	// Save every 40 training iterations (not global timesteps — a timestep interval
 	// fires every iter once fleet steps/iter exceed the interval).
 	cfg.iterPerSave = 40;
+	// Cadence seats iterate several times per second; a save every 40 iters then fires
+	// every ~15s and each save joins the collect worker (~1.5s) — a 7-10% wall tax.
+	if (const char* s = std::getenv("GGL_ITER_PER_SAVE"); s && *s && std::atoi(s) > 0)
+		cfg.iterPerSave = std::atoi(s);
 	// GGL_SMOKE: force a real checkpoint round-trip within a few CPU iterations, so the smoke
 	// actually exercises SaveVersions/SaveReferences and the reference_goals persistence rather
 	// than only the in-memory path. MUST live here, AFTER the production assignment above - an
