@@ -15,6 +15,7 @@
 #ifdef RG_CUDA_SUPPORT
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
@@ -88,8 +89,30 @@ namespace {
 		std::optional<c10::cuda::CUDAStream> captureStream;
 		at::cuda::CUDAEvent inputsReady;
 		at::cuda::CUDAEvent graphDone;
-		at::cuda::CUDAGraph graph;
+		// Do not use at::cuda::CUDAGraph on CUDA 11.2 / driver 460. ATen
+		// capture_begin calls cudaStreamGetCaptureInfo(..., pId=nullptr) after
+		// BeginCapture; the 11.2 driver writes through that pointer and SIGSEGVs.
+		cudaGraphExec_t graphExec = nullptr;
+		c10::cuda::MempoolId_t mempoolId{0, 0};
+		int captureDev = -1;
+		bool mempoolHeld = false;
 		bool captured = false;
+
+		~PolicyProbsGraph() {
+			ReleaseGraphResources();
+		}
+
+		void ReleaseGraphResources() {
+			if (graphExec) {
+				cudaGraphExecDestroy(graphExec);
+				graphExec = nullptr;
+			}
+			if (mempoolHeld && captureDev >= 0) {
+				c10::cuda::CUDACachingAllocator::releasePool(captureDev, mempoolId);
+				mempoolHeld = false;
+			}
+			captured = false;
+		}
 
 		PolicyForwardResult Run(
 			GGL::ModelSet& models,
@@ -97,7 +120,6 @@ namespace {
 			torch::Tensor actionMasks,
 			float temperature,
 			bool halfPrec) {
-
 			const int deviceIndex = obs.device().index();
 			c10::cuda::CUDAGuard deviceGuard(obs.device());
 			if (!captureStream)
@@ -106,31 +128,30 @@ namespace {
 				captureStream.emplace(c10::cuda::getStreamFromPool(true, deviceIndex));
 			auto& stream = *captureStream;
 			auto callerStream = c10::cuda::getCurrentCUDAStream(deviceIndex);
-
 			// The collection stream may have just refreshed the half mirror. The capture
 			// stream must observe both that refresh and the current input tensors.
 			inputsReady.record(callerStream);
 			inputsReady.block(stream);
-
 			c10::cuda::CUDAStreamGuard streamGuard(stream.unwrap());
 			bool captureStarted = false;
 			auto endFailedCapture = [&]() {
 				if (!captureStarted)
 					return;
-				try {
-					graph.capture_end();
-				} catch (...) {
-				}
+				cudaGraph_t aborted = nullptr;
+				cudaStreamEndCapture(stream.stream(), &aborted);
+				if (aborted)
+					cudaGraphDestroy(aborted);
 				captureStarted = false;
+				if (mempoolHeld && captureDev >= 0)
+					c10::cuda::CUDACachingAllocator::endAllocateStreamToPool(
+						captureDev, stream.stream());
 			};
-
 			try {
 				if (!captured) {
 					staticObs = torch::empty_like(obs);
 					staticMasks = torch::empty_like(actionMasks);
 					staticObs.copy_(obs, /*non_blocking=*/true);
 					staticMasks.copy_(actionMasks, /*non_blocking=*/true);
-
 					for (int i = 0; i < 3; i++) {
 						auto warm = InferPolicyProbsEager(
 							models, staticObs, staticMasks, temperature, halfPrec,
@@ -142,24 +163,44 @@ namespace {
 					// ordinary caching allocator, not this graph's private memory pool.
 					staticOutput = torch::Tensor();
 					staticRowOk = torch::Tensor();
-
-					graph.capture_begin(at::cuda::graph_pool_handle(), cudaStreamCaptureModeThreadLocal);
+					static std::once_flag rawCaptureLog;
+					std::call_once(rawCaptureLog, []() {
+						RG_LOG("CUDA graphs: raw capture (CUDA 11.2 GetCaptureInfo null pId SIGSEGV)");
+					});
+					captureDev = deviceIndex;
+					mempoolId = at::cuda::graph_pool_handle();
+					c10::cuda::CUDACachingAllocator::beginAllocateStreamToPool(
+						captureDev, stream.stream(), mempoolId);
+					mempoolHeld = true;
+					C10_CUDA_CHECK(cudaStreamBeginCapture(
+						stream.stream(), cudaStreamCaptureModeThreadLocal));
 					captureStarted = true;
+					cudaStreamCaptureStatus status;
+					unsigned long long capId = 0;
+					C10_CUDA_CHECK(cudaStreamGetCaptureInfo(stream.stream(), &status, &capId));
 					auto capturedResult = InferPolicyProbsEager(
 						models, staticObs, staticMasks, temperature, halfPrec,
 						{}, /*deferFiniteCheck=*/true, {});
 					staticOutput = capturedResult.probs;
 					staticRowOk = capturedResult.rowOk;
-					graph.capture_end();
+					cudaGraph_t rawGraph = nullptr;
+					C10_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), &rawGraph));
 					captureStarted = false;
+					c10::cuda::CUDACachingAllocator::endAllocateStreamToPool(
+						captureDev, stream.stream());
+					C10_CUDA_CHECK(cudaGraphInstantiate(&graphExec, rawGraph, NULL, NULL, 0));
+					C10_CUDA_CHECK(cudaGraphDestroy(rawGraph));
 					captured = true;
 					g_graphStats.captures++;
 				} else {
 					staticObs.copy_(obs, /*non_blocking=*/true);
 					staticMasks.copy_(actionMasks, /*non_blocking=*/true);
 				}
-
-				graph.replay();
+				C10_CUDA_CHECK(cudaGraphLaunch(graphExec, stream.stream()));
+				int driverVersion = 0;
+				C10_CUDA_CHECK(cudaDriverGetVersion(&driverVersion));
+				if (driverVersion < 11040)
+					C10_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
 				graphDone.record(stream);
 				graphDone.block(callerStream);
 				g_graphStats.replays++;
