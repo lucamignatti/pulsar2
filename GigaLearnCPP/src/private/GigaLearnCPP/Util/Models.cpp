@@ -120,12 +120,46 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepH
 				for (auto& mod : *seq)
 					seqHalf->push_back(mod.clone());
 				seqHalf->to(RG_HALFPERC_TYPE, true);
+
+				// GGL_FLAT_HALF (default on): re-point every seqHalf param at a view of ONE
+				// flat half buffer, so the per-step refresh below is one cat + one casting
+				// copy_ instead of a .to() temp + copy_ per param. Bit-identical fp16
+				// weights — this is an op-count fix for the ppc64le dispatch tax (measured
+				// 0.36s/iter rebuilding the value family at ~0.2-0.5ms per tensor op;
+				// x86/desktop never noticed). GGL_FLAT_HALF=0 restores the per-param path.
+				static const bool flatHalf = [] {
+					const char* e = std::getenv("GGL_FLAT_HALF");
+					return !(e && *e && std::string(e) == "0");
+				}();
+				if (flatHalf) {
+					auto halfParams = seqHalf->parameters();
+					int64_t total = 0;
+					for (auto& p : halfParams)
+						total += p.numel();
+					if (total > 0) {
+						_flatHalfBuf = torch::empty({ total },
+							torch::TensorOptions().dtype(RG_HALFPERC_TYPE).device(device));
+						int64_t off = 0;
+						for (auto& p : halfParams) {
+							auto slice = _flatHalfBuf.narrow(0, off, p.numel()).view(p.sizes());
+							slice.copy_(p, true);
+							p.set_data(slice);
+							off += p.numel();
+						}
+					}
+				}
+			}
+			if (_flatHalfBuf.defined()) {
+				// One gather of the fp32 params, one casting copy into the flat half store.
+				auto flat32 = torch::nn::utils::parameters_to_vector(seq->parameters());
+				_flatHalfBuf.copy_(flat32, true);
 			} else {
 				auto fromParams = seq->parameters();
 				auto toParams = seqHalf->parameters();
 				for (int i = 0; i < fromParams.size(); i++) {
-					auto scaledParams = fromParams[i].to(RG_HALFPERC_TYPE, true);
-					toParams[i].copy_(scaledParams, true);
+					// copy_ casts across dtypes directly; the old .to() temp doubled the
+					// op count and allocated every refresh.
+					toParams[i].copy_(fromParams[i], true);
 				}
 			}
 		}

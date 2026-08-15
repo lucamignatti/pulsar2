@@ -73,6 +73,9 @@ namespace GGL {
 		torch::Device device;
 		torch::nn::Sequential seq, seqHalf;
 		bool _seqHalfOutdated = true;
+		// GGL_FLAT_HALF: one flat buffer backing every seqHalf param (as views), so the
+		// post-step fp16 refresh is 2 kernels, not 2 per param. See Forward().
+		torch::Tensor _flatHalfBuf;
 		ModelConfig config;
 
 		// Residual block spans over seq's module indices, as (firstModule, lastModule):
