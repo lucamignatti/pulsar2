@@ -2159,7 +2159,18 @@ void GGL::Learner::Start() {
 					ModelSet* newModelsPtr = collectModelsPtr;
 					if (render && !renderBlueModels.map.empty())
 						newModelsPtr = &renderBlueModels;
-					ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+
+					// GGL_OPP_PARALLEL: run the opponent's inference on a side thread,
+					// concurrent with the main policy's. This platform is CPU-dispatch-bound
+					// (~0.15ms/op), so two serial InferActions made opponent iterations
+					// 2.8-3.6x the cost of self-play ones; the GPU work itself is tiny and
+					// interleaves safely on the shared default stream. Each ModelSet is
+					// touched by exactly one thread; tdStates/masks are read-only here.
+					static const bool oppParallel = [] {
+						const char* e = std::getenv("GGL_OPP_PARALLEL");
+						return e && *e && std::string(e) != "0";
+					}();
+					auto fnInferOpp = [&]() {
 							if (oppExternal) {
 								// Nexto reads GameStates directly (its own obs builder), and
 								// returns OUR action-table indices via the checked map. The
@@ -2169,7 +2180,7 @@ void GGL::Learner::Start() {
 								nexto->Act(envSet->state.gameStates, oldVersionPlayerMask,
 									envSet->state.terminals, extActions);
 								auto tExt = torch::tensor(extActions);
-								tOldActions = tExt.index_select(0, tOldPlayerIndices).to(tNewActions.device());
+								tOldActions = tExt.index_select(0, tOldPlayerIndices).to(ppo->device);
 							} else {
 								torch::Tensor tdOldStates = tdStates.index_select(0, idxOld);
 								torch::Tensor tdOldActionMasks = tdActionMasks.index_select(0, idxOld);
@@ -2178,6 +2189,15 @@ void GGL::Learner::Start() {
 							oldModelsPtr = renderOrangeModels.map.empty() ? NULL : &renderOrangeModels;
 						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr);
 							}
+					};
+					if (oppParallel) {
+						std::thread oppThread(fnInferOpp);
+						ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+						oppThread.join();
+					} else {
+						ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+						fnInferOpp();
+					}
 
 							tActions = torch::zeros({ (int64_t)numPlayers }, tNewActions.options());
 							tActions.index_copy_(0, idxNew, tNewActions);

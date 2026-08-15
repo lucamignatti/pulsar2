@@ -461,7 +461,9 @@ void GGL::PPOLearner::InferActionsFromModels(
 			const char* s = std::getenv("GGL_INFER_FINITE_SYNC");
 			return (s && *s) ? std::atoi(s) : 1;
 		}();
-		static int finiteCtr = 0;
+		// atomic: GGL_OPP_PARALLEL runs a second InferActions on a side thread; with
+		// GGL_INFER_FINITE_SYNC=0 (production) this counter is never touched.
+		static std::atomic<int> finiteCtr = 0;
 		if (finiteEvery > 0 && ((++finiteCtr) % finiteEvery) == 0 && !rowOk.all().item<bool>()) {
 			InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta);
 			RG_ERR_CLOSE("InferActionsFromModels: non-finite logits, but the diagnostic rerun did not reproduce them");
