@@ -10,7 +10,9 @@
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <ATen/autocast_mode.h>             // learn-pass autocast (BF16 sm_80+ / FP16 V100)
 #include <torch/version.h>
+#include <torch/cuda.h>                      // GGL_CONSUME_TIMERS synchronize points
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
+#include <public/GigaLearnCPP/Util/Timer.h>
 #include <RLGymCPP/CommonValues.h>
 #include "../Util/Plasticity.h"
 
@@ -1065,6 +1067,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	int metricVdagSteps = 0, metricTwinSteps = 0, metricRhatSteps = 0;
 	int metricReachSteps = 0, metricReachCSSteps = 0;
 
+	// GGL_CONSUME_TIMERS: component profile of the learn pass, for cadence work where
+	// Learn is fixed-cost-dominated at small row counts. The boundary synchronize()s
+	// perturb the thing being measured — debug flag only, never on in production.
+	static const bool consumeTimers = [] {
+		const char* e = std::getenv("GGL_CONSUME_TIMERS");
+		return e && *e && std::string(e) != "0";
+	}();
+	double tShuffle = 0, tFwdBwd = 0, tAllReduce = 0, tClip = 0, tOptStep = 0;
+	auto fnSyncNow = [&] { if (consumeTimers && device.is_cuda()) torch::cuda::synchronize(); };
+
 	// ADVANTAGE FILTERING AS A ROW SUBSET (config.advFilterSubset). Materialize the kept rows
 	// ONCE for the whole Learn call, then run every epoch on them. Built with the buffer's own
 	// _GetSamples, which zips fields POSITIONALLY over ExperienceTensors::begin()/end() — so a
@@ -1117,7 +1129,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// Get randomly-ordered timesteps for PPO
 		dbgVdagRows = experience.data.vdagTargets.defined() ? (float)experience.data.vdagTargets.numel() : -2.f;
 		dbgRhatEntry = experience.data.rhatTargets.defined() ? (float)experience.data.rhatTargets.numel() : -2.f;
+		fnSyncNow();
+		Timer shuffleTimer = {};
 		auto batches = learnExp->GetAllBatchesShuffled(learnBatchSize, config.overbatching);
+		fnSyncNow();
+		tShuffle += shuffleTimer.Elapsed();
 		if (dist && dist->distributed()) {
 			int bc = (int)batches.size();
 			dist->min_host(&bc, 1);
@@ -1693,6 +1709,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			};
 
 			
+			Timer fwdBwdTimer = {};
 			if (device.is_cpu()) {
 				// Just run one minibatch
 				fnRunMinibatch(0, curBatchSize);
@@ -1703,10 +1720,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					fnRunMinibatch(start, stop);
 				}
 			}
+			fnSyncNow();
+			tFwdBwd += fwdBwdTimer.Elapsed();
 
-
+			Timer allReduceTimer = {};
 			if (dist)
 				models.AllReduceGrads(dist, /*includeExempt=*/false);
+			fnSyncNow();
+			tAllReduce += allReduceTimer.Elapsed();
 
 			const bool fp16Amp = config.learnAutocastBF16 && device.is_cuda()
 				&& !GGL::GGLCudaHasBF16();
@@ -1736,6 +1757,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					}
 				}
 
+			Timer clipTimer = {};
 			if (trainPolicy)
 				nn::utils::clip_grad_norm_(models["policy"]->parameters(), 0.5f);
 			if (trainCritic)
@@ -1772,9 +1794,20 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					nn::utils::clip_grad_norm_(reach->psiCarState->parameters(), 0.5f);
 			}
 
+			fnSyncNow();
+			tClip += clipTimer.Elapsed();
+
+			Timer optStepTimer = {};
 			models.StepOptims();
+			fnSyncNow();
+			tOptStep += optStepTimer.Elapsed();
 			}
 		}
+	}
+
+	if (consumeTimers) {
+		RG_LOG("[CONSUME] rank_learn shuffle=" << tShuffle << " fwdbwd=" << tFwdBwd
+			<< " allreduce=" << tAllReduce << " clip=" << tClip << " optstep=" << tOptStep);
 	}
 
 	if (metricPolicySteps > 0) {
