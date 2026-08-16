@@ -457,22 +457,28 @@ extern "C" void ggl_moe_grouped_gemm_f16_dev(
 	GGLK_CUTLASS_CHECK(gemm.run(s));
 }
 
-// ==================== grouped wgrad (ColumnMajor A) ====================
-// dW[e] = A_e^T @ B_e with A row-major [m_e, Ka]: row-major A read as
-// column-major IS A^T (lda = Ka). Per-problem GemmCoord(M=Ka, N, K=m_e).
+// ======================== grouped wgrad (via transpose) ========================
+// dW[e] = A_e^T @ B_e. A ColumnMajor has no legal sm_70 thread map at our tile
+// shape (static asserts in pitch_linear_thread_map), so instead ONE global
+// transpose T = A^T (row-major [Ka, n]) makes every expert's A^T a plain
+// row-major slice: ptr = T + off_e, lda = n. Reuses the proven RowMajor GEMM.
 
-using GglkGemmF16TA = cutlass::gemm::device::GemmGrouped<
-	typename cutlass::gemm::kernel::DefaultGemmGrouped<
-		cutlass::half_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 8,
-		cutlass::half_t, LayoutRM, cutlass::ComplexTransform::kNone, 8,
-		cutlass::half_t, LayoutRM, float,
-		cutlass::arch::OpClassTensorOp, cutlass::arch::Sm70,
-		cutlass::gemm::GemmShape<32, 128, 32>, cutlass::gemm::GemmShape<32, 32, 32>,
-		cutlass::gemm::GemmShape<8, 8, 4>, EpiF16, Swizzle, 2, kSched>::GemmKernel>;
+__global__ void gglk_transpose_f16(const __half* src, __half* dst, int n, int K) {
+	// src [n, K] row-major -> dst [K, n] row-major; 32x32 shared tile.
+	__shared__ __half tile[32][33];
+	int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+	int c = c0 + threadIdx.x, r = r0 + threadIdx.y;
+	if (r < n && c < K)
+		tile[threadIdx.y][threadIdx.x] = src[(size_t)r * K + c];
+	__syncthreads();
+	int tc = r0 + threadIdx.x, tr = c0 + threadIdx.y;   // transposed coords
+	if (tr < K && tc < n)
+		dst[(size_t)tr * n + tc] = tile[threadIdx.x][threadIdx.y];
+}
 
 __global__ void gglk_fill_wgrad_problems(
-	const int* offsets, int E, int Ka, int N,
-	const cutlass::half_t* A, const cutlass::half_t* B, cutlass::half_t* C,
+	const int* offsets, int E, int Ka, int N, int n,
+	const cutlass::half_t* T, const cutlass::half_t* B, cutlass::half_t* C,
 	cutlass::gemm::GemmCoord* problems,
 	cutlass::half_t** pA, cutlass::half_t** pB, cutlass::half_t** pC, cutlass::half_t** pD,
 	GglkLongIndex* ld) {
@@ -482,19 +488,27 @@ __global__ void gglk_fill_wgrad_problems(
 		return;
 	int m = offsets[e + 1] - offsets[e];
 	problems[e] = cutlass::gemm::GemmCoord(Ka, N, m);
-	pA[e] = const_cast<cutlass::half_t*>(A) + (size_t)offsets[e] * Ka;
+	pA[e] = const_cast<cutlass::half_t*>(T) + (size_t)offsets[e];  // [Ka, m], lda = n
 	pB[e] = const_cast<cutlass::half_t*>(B) + (size_t)offsets[e] * N;
 	pC[e] = C + (size_t)e * Ka * N;
 	pD[e] = pC[e];
-	ld[e] = Ka;          // lda: column-major [Ka, m] leading dim
+	ld[e] = n;
 	ld[E + e] = N;
 	ld[2 * E + e] = N;
 	ld[3 * E + e] = N;
 }
 
+namespace {
+	struct WgradScratch {
+		cutlass::half_t* T = nullptr;
+		size_t cap = 0;   // elements
+	};
+	WgradScratch g_wgradT;
+}
+
 extern "C" void ggl_moe_grouped_wgrad_f16_dev(
 	void* ctx, const void* A, const void* B, void* C,
-	const int* offsets, int E, int Ka, int N, void* stream) {
+	const int* offsets, int E, int Ka, int N, int nAssign, void* stream) {
 
 	GemmCtx* c = (GemmCtx*)ctx;
 	cudaStream_t s = (cudaStream_t)stream;
@@ -502,13 +516,24 @@ extern "C" void ggl_moe_grouped_wgrad_f16_dev(
 		fprintf(stderr, "MoEKernels: wgrad E=%d exceeds ctx capacity %d\n", E, c->E);
 		abort();
 	}
+	const int n = nAssign; // == offsets[E]; caller-known, no D2H sync
+	if (n <= 0)
+		return;
+	if ((size_t)n * Ka > g_wgradT.cap) {
+		GGLK_CUDA_CHECK(cudaMalloc(&g_wgradT.T, sizeof(__half) * (size_t)n * Ka * 2));
+		g_wgradT.cap = (size_t)n * Ka * 2;   // grow-only (V100/11.2 trap)
+	}
+	dim3 tb(32, 32);
+	dim3 grid((Ka + 31) / 32, (n + 31) / 32);
+	gglk_transpose_f16<<<grid, tb, 0, s>>>((const __half*)A, (__half*)g_wgradT.T, n, Ka);
+
 	gglk_fill_wgrad_problems<<<(E + 63) / 64, 64, 0, s>>>(
-		offsets, E, Ka, N,
-		(const cutlass::half_t*)A, (const cutlass::half_t*)B, (cutlass::half_t*)C,
+		offsets, E, Ka, N, n,
+		(const cutlass::half_t*)g_wgradT.T, (const cutlass::half_t*)B, (cutlass::half_t*)C,
 		c->d_problems, c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D, c->d_ld);
 
-	static int tbcTA = [] {
-		int t = GglkGemmF16TA::sufficient(nullptr, 0);
+	static int tbcW = [] {
+		int t = GglkGemmF16::sufficient(nullptr, 0);
 		if (t <= 0) {
 			fprintf(stderr, "MoEKernels: wgrad sufficient() returned %d\n", t);
 			abort();
@@ -516,23 +541,23 @@ extern "C" void ggl_moe_grouped_wgrad_f16_dev(
 		return t;
 	}();
 
-	typename GglkGemmF16TA::EpilogueOutputOp::Params epilogue(1.f, 0.f);
-	typename GglkGemmF16TA::Arguments args(
-		c->d_problems, E, tbcTA, epilogue,
+	typename GglkGemmF16::EpilogueOutputOp::Params epilogue(1.f, 0.f);
+	typename GglkGemmF16::Arguments args(
+		c->d_problems, E, tbcW, epilogue,
 		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
 		c->d_ld, c->d_ld + E, c->d_ld + 2 * E, c->d_ld + 3 * E,
 		/*host_problem_sizes=*/nullptr);
 
-	size_t ws = GglkGemmF16TA::get_workspace_size(args);
+	size_t ws = GglkGemmF16::get_workspace_size(args);
 	size_t need = ws + ((size_t)1 << 20);
 	if (need > c->ws_cap) {
-		GGLK_CUDA_CHECK(cudaMalloc(&c->d_workspace, need)); // grow-only (V100/11.2 trap)
+		GGLK_CUDA_CHECK(cudaMalloc(&c->d_workspace, need)); // grow-only
 		c->ws_cap = need;
 	}
 	if (ws > 0)
 		GGLK_CUDA_CHECK(cudaMemsetAsync(c->d_workspace, 0, ws, s));
 
-	GglkGemmF16TA gemm;
+	GglkGemmF16 gemm;
 	GGLK_CUTLASS_CHECK(gemm.initialize(args, c->d_workspace, s));
 	GGLK_CUTLASS_CHECK(gemm.run(s));
 }

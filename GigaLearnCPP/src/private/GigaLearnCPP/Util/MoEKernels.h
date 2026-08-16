@@ -111,6 +111,6 @@ extern "C" {
 	// from DEVICE offsets. fp16 in, fp16 out. 2 launches (fill + persistent kernel).
 	void ggl_moe_grouped_wgrad_f16_dev(
 		void* ctx, const void* A, const void* B, void* C,
-		const int* offsets, int E, int Ka, int N, void* stream);
+		const int* offsets, int E, int Ka, int N, int nAssign, void* stream);
 
 }

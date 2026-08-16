@@ -547,10 +547,10 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		// wgrads: dW1[e] = dHpre_e^T @ X_e -> [h,d]; dW2[e] = dY_e^T @ Hpost_e -> [d,h].
 		auto dW1_16 = torch::empty({ (int64_t)E, h, d }, h16);
 		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
-			dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+			dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, (int)n, s);
 		auto dW2_16 = torch::empty({ (int64_t)E, d, h }, h16);
 		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
-			dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
+			dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, (int)n, s);
 
 		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
 		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).
