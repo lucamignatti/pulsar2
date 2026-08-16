@@ -818,6 +818,17 @@ int main(int argc, char* argv[]) {
 		return GGL::RunMoESelfTest();
 
 
+	// GGL_NO_VERSIONS: disable the version ring + skill tracker. At MoE scale each
+	// archived version holds ~3.6GB of GPU-resident models — the 7.3-moe bring-up
+	// OOM'd right after its second AddVersion (job 4630877). Rating is meaningless
+	// in a run's first hours anyway; Nexto share + entropy are the live metrics.
+	if (const char* nv = std::getenv("GGL_NO_VERSIONS"); nv && *nv && std::string(nv) != "0") {
+		cfg.savePolicyVersions = false;
+		cfg.trainAgainstOldVersions = false;
+		cfg.skillTracker.enabled = false;
+		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
+	}
+
 	// Memory-only lever (mathematically identical, CLAUDE.md): the learn pass chunks
 	// each batch by miniBatchSize with gradient accumulation. The MoE learn backward at
 	// one 8.3k-row chunk held ~16GB of activations (jobs 4630868/69) — smaller chunks
