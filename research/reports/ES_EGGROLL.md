@@ -1,6 +1,28 @@
 # ES_EGGROLL — low-rank Evolution Strategies vs PPO at fleet scale
 
-**Status: PRE-REGISTERED 2026-08-16 (before any ES run). User-directed experiment.**
+**Status: RESULT (CLEAN NEGATIVE) — 2026-08-16 noon. Pre-registered before any run.**
+
+## VERDICT
+
+EGGROLL as specified does not extract match-play fitness signal on this task at
+paper-scale populations. Evidence across two fitness definitions:
+- Shaped fitness, 176,640 members/gen, ~2,650 generations (~465M member-episodes,
+  ~470B env steps): Update Norm pinned at the 1/sqrt(N) noise floor (0.0033) for
+  the entire run; rating flat (0 +/- 1 Elo over 100+ evals).
+- Goal-diff fitness, 39s windows, 900+ generations (~320M member-episodes):
+  identical floor, identical flat rating.
+- Dose-response sanity held throughout (sigma scales update norm and member
+  fitness penalty as expected; member forward plays at mu level), so the
+  machinery measured what it claims to measure.
+Population-scaling baselines (6 and 1,536 members) were also flat, so the
+negative is not population starvation inside the tested range 6 -> 1.8e5.
+Mechanistic reading: a rank-1 weight perturbation at sigma achievable without
+destroying play changes 13-39s match outcomes by less than the kickoff/bounce
+lottery noise, and averaging 1.8e5 members per generation still leaves
+signal-to-noise below extraction threshold. PPO's per-step credit assignment is
+doing load-bearing work that episode-level ES cannot replace on this task at
+this compute scale. The forward-only/fleet-linear infrastructure thesis was
+CONFIRMED (23.5M SPS on 690 GPUs, 2us consume) — the learning thesis was not.
 
 ## Question
 
