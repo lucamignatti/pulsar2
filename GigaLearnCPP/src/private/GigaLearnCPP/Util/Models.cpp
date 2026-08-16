@@ -177,9 +177,27 @@ void GGL::Model::RefreshHalfCache() {
 					toBufs[i].copy_(fromBufs[i], true);
 			}
 			if (_flatHalfBuf.defined()) {
-				// One gather of the fp32 params, one casting copy into the flat half store.
-				auto flat32 = torch::nn::utils::parameters_to_vector(seq->parameters());
-				_flatHalfBuf.copy_(flat32, true);
+				// GROUPED gather+cast into the flat half store. A single
+				// parameters_to_vector materializes a full fp32 temp — 4.2GB for the 1B
+				// MoE trunk, which OOM'd the 32GB V100 (job 4630863). Groups bound the
+				// temp to ~tens of MB while keeping op count ~2 per GROUP, not per param.
+				auto params = seq->parameters();
+				constexpr size_t GROUP = 48;
+				int64_t off = 0;
+				size_t i = 0;
+				while (i < params.size()) {
+					size_t j = std::min(i + GROUP, params.size());
+					std::vector<torch::Tensor> flat;
+					flat.reserve(j - i);
+					int64_t n = 0;
+					for (size_t k = i; k < j; k++) {
+						flat.push_back(params[k].flatten());
+						n += params[k].numel();
+					}
+					_flatHalfBuf.narrow(0, off, n).copy_(torch::cat(flat, 0), true);
+					off += n;
+					i = j;
+				}
 			} else {
 				auto fromParams = seq->parameters();
 				auto toParams = seqHalf->parameters();
