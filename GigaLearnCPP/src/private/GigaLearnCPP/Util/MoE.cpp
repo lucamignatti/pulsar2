@@ -513,7 +513,10 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
 		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
 		const int E = (int)blk->numExperts, k = (int)blk->topK;
-		const int64_t n = R * k;
+		// n from the SAVED buffers: the forward uses ALIGNED segments, so the slot
+		// count is roundup8(R*k) + 8E, not R*k — re-deriving R*k here made every
+		// backward kernel under-cover the layout and indexed gdot out of bounds.
+		const int64_t n = saved[6].size(0); // srcRows
 		auto dev = xn.device();
 		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
 		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
