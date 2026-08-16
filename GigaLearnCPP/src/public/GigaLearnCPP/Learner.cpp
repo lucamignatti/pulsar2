@@ -3031,6 +3031,18 @@ void GGL::Learner::Start() {
 				}
 			}
 			report["Collect Join Time"] = collectJoinTime;
+#ifdef RG_CUDA_SUPPORT
+			// Leak forensics: live allocator bytes, every iteration. The MoE bring-up
+			// OOM'd at ~29GB after N iterations with N scaling inversely with model
+			// size — a growth curve names the leaking phase.
+			if (ppo->device.is_cuda()) {
+				auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(ppo->device.index());
+				report["Mem/Allocated GB"] =
+					(float)(stats.allocated_bytes[0].current / 1073741824.0);
+				report["Mem/Reserved GB"] =
+					(float)(stats.reserved_bytes[0].current / 1073741824.0);
+			}
+#endif
 			report["Display Time"] = lastDisplayTime; // previous iter; this iter's Display is after Overall
 			int stepsCollected = collectSteps;
 			{
@@ -4410,6 +4422,8 @@ void GGL::Learner::Start() {
 						"ES/Fitness Std",
 						"ES/Update Norm",
 						"MoE/Load Entropy",
+						"Mem/Allocated GB",
+						"Mem/Reserved GB",
 						"",
 						"Reach/Beta",
 						"Reach/Gate Mult Mean",
