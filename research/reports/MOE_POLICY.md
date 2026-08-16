@@ -95,3 +95,33 @@ sm_120 stack AND cluster V100/torch-2.1, job 4630856). Hard-established facts:
 - PolicySlots/LinearLayers layer-count theory: dead (only Plasticity survives,
   Learn-side, not reached).
 Current instrument: ASan build (build-asan) to catch the stomping write.
+
+## Build log 2 — root causes found (2026-08-16 morning)
+
+1. **The portable segfault**: the GGL_MOE env block ran BEFORE the production
+   net-size assignments; they clobbered layerSizes while moeBlocks survived ->
+   IsValid() false -> BuildModels silently took the legitimate "no shared head"
+   path -> trunk-less model set, null map entries, first unguarded deref = the
+   gap block. Fixed: block moved after net config + BuildModels now RG_ERR_CLOSEs
+   on a configured-but-invalid MoE trunk. (ASan disproved the heap-stomp theory:
+   clean null-read.)
+2. **26s/clone fp16 builds**: (a) device-less clone() round-trips CUDA params
+   through fresh CPU tensors from reset(); (b) reset() itself ran torch::randn
+   for ~1B CPU gaussians per clone — Cloneable calls reset() on EVERY clone and
+   overwrites the values. Fixed: clone(device) + reset()=registration-only
+   (torch::empty), init in the ctor. Refresh-proper now 263ms (grouped cast; the
+   single parameters_to_vector temp was 4.2GB and OOM'd on its own).
+3. **"terminate called without an active exception" masking everything**: any
+   main-thread exception unwinding Learner::Start with the pipelined worker
+   alive destroyed the joinable collectThread first — its destructor terminates
+   the process BEFORE the outer catch prints. Six debug cycles were spent on
+   masked errors. Fixed: inner unwind guard stops the worker and rethrows;
+   worker body also try/caught.
+4. **Real 1B blocker = memory**: 27-29GB on 31.75GB V100s. Static state
+   (weights+Muon momentum+grads+fp16 cache+snapshot) ~12.6GB at 610M; the rest
+   is learn-pass activations at one 8.3k-row chunk through 6 expert layers.
+   Levers applied: GGL_MOE_EXPERTS=192 (610M/15M active) + GGL_MINIBATCH=2084
+   (grad-accum chunking, mathematically identical) + max_split_size_mb=256.
+   Path back to full 1B (documented, not built): optimizer-state sharding
+   (ZeRO-1 on the expert stacks via the existing Muon shard ownership), fp16
+   master option, snapshot-free sequential collect.
