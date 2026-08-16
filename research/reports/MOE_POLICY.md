@@ -73,3 +73,25 @@ affinities fp32); capacity drops under bursty routing (shared expert is the
 safety net); 1B-param checkpoint size (~8GB with optim state) x rotation — set
 checkpointsToKeep low; offline tooling (load_checkpoint.py) will not parse MoE
 checkpoints without work (explicitly out of scope for noon).
+
+## Build log — the segfault hunt (2026-08-16 overnight)
+
+Symptom: trainer segfaults on iteration 1 with GGL_MOE=1, at the gap-sensor's
+`models["shared_head"]` lookup (Learner.cpp:4134) — CONFIRMED PORTABLE (desktop
+sm_120 stack AND cluster V100/torch-2.1, job 4630856). Hard-established facts:
+- The MoE block itself is clean: fwd/bwd/clone/bias-update selftests pass at 96
+  rows, 25k-row 3-block stacks, and GGL::Model+Sequential GPU phase (30 reps,
+  both contiguous and gathered inputs). `GGL_MOE_SELFTEST=1`.
+- The defensive forward rewrite (static shapes, no bincount/masked_select/
+  index_copy; scatter+trash-row bucketing) did NOT change the crash → the
+  forward's op choice was never the cause.
+- gdb w/ RelWithDebInfo: fault at the map lookup itself; map HEADER healthy
+  (15 nodes), $rdi = the "shared_head" key string → crash walking the rb-tree →
+  a map NODE is stomped: heap corruption with delayed detonation, planted
+  between the last good lookup (value-pred) and the gap block.
+- Dense control on same binary: passes the whole region (then hits the known
+  desktop-only cusolver SVD abort in Plasticity::EffectiveRank — separate,
+  cluster unaffected).
+- PolicySlots/LinearLayers layer-count theory: dead (only Plasticity survives,
+  Learn-side, not reached).
+Current instrument: ASan build (build-asan) to catch the stomping write.
