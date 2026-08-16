@@ -84,6 +84,19 @@ tested; the 1-node jobs become the population-scaling baseline rather than the g
 Also added: an ES-update lockstep checksum (the PPO one lives in Learn(), which ES
 skips) — divergent ranks would otherwise silently corrupt the population.
 
+## AMENDMENT 2 2026-08-16 — paper-scale populations (user-directed)
+
+The paper's scaling figure separates from backprop only at populations 10^4-10^6;
+one-member-per-rank caps at the rank count (6-690), i.e. the figure's lightest
+curves. v2 (`GGL_ES_PER_ARENA`, default on, commit 7181597) makes every ARENA a
+member via the batched low-rank forward (InferActionsLowRankES — the paper's
+"91% of batch inference" trick): population = arenas x ranks. The primary run is
+now 115 nodes x 690 ranks x 256 arenas = **176,640 members/generation** (10^5.2,
+inside the paper's regime). The v1 jobs' flat ratings are recorded as the
+population-scaling baseline, not a verdict on the method. Update math v2: local
+per-layer GEMM over each rank's members, dW allreduce-summed — no cross-rank
+noise determinism needed; lockstep checksum retained.
+
 ## Sweep plan
 
 sigma_rel in {0.01, 0.03, 0.1} as three parallel 1-node jobs (alpha=1 fixed,
