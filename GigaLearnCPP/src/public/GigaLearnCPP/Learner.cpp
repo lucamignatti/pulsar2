@@ -1801,6 +1801,15 @@ void GGL::Learner::Start() {
 			const char* e = std::getenv("GGL_ES_PER_ARENA");
 			return !(e && *e && std::string(e) == "0");
 		}();
+		// GGL_ES_FIT_GOAL: fitness = goal diff only (±1 per goal event, mean over the
+		// window) instead of mean shaped step reward. Rationale (ES_EGGROLL.md amendment 3):
+		// the PBRS terms telescope to endpoint noise over a window-mean, so the shaped
+		// fitness is mostly kickoff/bounce lottery around sparse events anyway — this makes
+		// the sparse objective explicit and drops the lottery the potentials contribute.
+		const bool esFitGoal = esMode && [] {
+			const char* e = std::getenv("GGL_ES_FIT_GOAL");
+			return e && *e && std::string(e) != "0";
+		}();
 		GGL::PPOLearner::EsLowRankCtx esCtx;
 		std::vector<double> esFitSumP;  // per-PLAYER accumulation (no races in the record
 		std::vector<int64_t> esFitCntP; // parallel-for); reduced to per-arena at the barrier
@@ -2798,7 +2807,16 @@ void GGL::Learner::Start() {
 							// EGGROLL-ES per-arena fitness: per-PLAYER cells, so this
 							// parallel-for never races (players are unique per k).
 							if (esPerArena) {
-								esFitSumP[(size_t)newPlayerIdx] += (double)envSet->state.rewards[newPlayerIdx];
+								if (esFitGoal) {
+									auto& egs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
+									if (egs.goalScored) {
+										auto& epl = egs.players[playerSlotIdx[newPlayerIdx]];
+										esFitSumP[(size_t)newPlayerIdx] +=
+											(epl.team != RS_TEAM_FROM_Y(egs.ball.pos.y)) ? 1.0 : -1.0;
+									}
+								} else {
+									esFitSumP[(size_t)newPlayerIdx] += (double)envSet->state.rewards[newPlayerIdx];
+								}
 								esFitCntP[(size_t)newPlayerIdx]++;
 							}
 
