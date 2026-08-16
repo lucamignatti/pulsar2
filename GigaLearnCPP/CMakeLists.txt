@@ -107,6 +107,11 @@ option(GGL_MOE_KERNELS "Build fused MoE CUDA kernels (sm_70, cluster only)" OFF)
 if (GGL_MOE_KERNELS)
 	enable_language(CUDA)
 	set(CMAKE_CUDA_ARCHITECTURES 70)
+	# nvcc 11.2 tops out at C++17; the host project is C++20 and the target-level
+	# standard would otherwise leak into the CUDA dialect ("requires CUDA20").
+	set(CMAKE_CUDA_STANDARD 17)
+	set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+	set_target_properties(GigaLearnCPP PROPERTIES CUDA_STANDARD 17 CUDA_EXTENSIONS ON)
 	set(GGL_CUTLASS_INCLUDE "" CACHE PATH "CUTLASS include directory")
 	if (NOT EXISTS "${GGL_CUTLASS_INCLUDE}/cutlass/cutlass.h")
 		message(FATAL_ERROR "GGL_MOE_KERNELS needs -DGGL_CUTLASS_INCLUDE pointing at a CUTLASS include dir")
