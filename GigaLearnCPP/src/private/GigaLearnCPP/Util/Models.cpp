@@ -384,7 +384,17 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 
 	/////////////////////////////
 
-	if (loadOptim) {
+	// GGL_FRESH_OPTIM: skip optimizer-state load on resume. Muon keys its momentum by
+	// process-local TensorImpl pointers, so deserialized state can never match the new
+	// process's params — the loaded buffers sit ORPHANED next to freshly-allocated ones
+	// (~= a full extra weights-worth of GPU memory at MoE scale, the resumed-hop OOM).
+	// Momentum resets on resume under this flag: a mild warmup hiccup, not a semantics
+	// change (grads/weights are exact).
+	static const bool freshOptim = [] {
+		const char* e = std::getenv("GGL_FRESH_OPTIM");
+		return e && *e && std::string(e) != "0";
+	}();
+	if (loadOptim && !freshOptim) {
 		std::filesystem::path optimPath = GetOptimSavePath(folder);
 
 		if (std::filesystem::exists(optimPath)) {

@@ -828,6 +828,14 @@ int main(int argc, char* argv[]) {
 		cfg.skillTracker.enabled = false;
 		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
 	}
+	// GGL_NO_HEADROOM: composition-critic family + gap sensor + SIL off — the MoE
+	// leak bisect hammer (consume-extras vs core).
+	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
+		cfg.ppo.vdagEnabled = false;
+		cfg.ppo.silEnabled = false;
+		cfg.gapSensor.enabled = false;
+		RG_LOG("GGL_NO_HEADROOM: vdag + SIL + gap sensor disabled");
+	}
 	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
 	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
 	if (const char* nr = std::getenv("GGL_NO_REACH"); nr && *nr && std::string(nr) != "0") {
