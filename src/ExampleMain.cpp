@@ -818,6 +818,13 @@ int main(int argc, char* argv[]) {
 		return GGL::RunMoESelfTest();
 
 
+	// Memory-only lever (mathematically identical, CLAUDE.md): the learn pass chunks
+	// each batch by miniBatchSize with gradient accumulation. The MoE learn backward at
+	// one 8.3k-row chunk held ~16GB of activations (jobs 4630868/69) — smaller chunks
+	// trade a few extra dispatches for GBs of headroom.
+	if (const char* m = std::getenv("GGL_MINIBATCH"); m && *m && std::atoi(m) > 0)
+		cfg.ppo.miniBatchSize = std::atoi(m);
+
 	if (const char* t = std::getenv("GGL_TS_PER_ITR"); t && *t) {
 		int v = std::atoi(t);
 		if (v > 0) {
