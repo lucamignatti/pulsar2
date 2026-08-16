@@ -83,26 +83,42 @@ int GGL::RunMoESelfTest() {
 GGL::MoEBlockImpl::MoEBlockImpl(int64_t dim, int64_t hidden, int64_t numExperts, int64_t topK)
 	: dim(dim), hidden(hidden), numExperts(numExperts), topK(topK) {
 	reset();
+	// Kaiming-ish init scaled like the dense trunk layers; router near-zero so early
+	// selection is ~uniform and the balancing bias starts in control. Lives in the
+	// CONSTRUCTOR, not reset(): Cloneable::clone calls reset() on every clone and then
+	// overwrites the values — a torch::randn init there generated ~1B CPU gaussians per
+	// fp16-cache build (~25s/clone, job 4630866). reset()'s contract is registration.
+	torch::NoGradGuard ng;
+	const double s1 = std::sqrt(2.0 / (double)dim);
+	const double s2 = std::sqrt(2.0 / (double)hidden);
+	routerW.normal_(0.0, 0.01);
+	expertW1.normal_(0.0, s1);
+	expertB1.zero_();
+	expertW2.normal_(0.0, s2);
+	expertB2.zero_();
+	sharedW1.normal_(0.0, s1);
+	sharedB1.zero_();
+	sharedW2.normal_(0.0, s2);
+	sharedB2.zero_();
+	routerBias.zero_();
+	loadAcc.zero_();
 }
 
 void GGL::MoEBlockImpl::reset() {
 	if (dim <= 0)
 		return;
-	// Kaiming-ish init scaled like the dense trunk layers; router near-zero so early
-	// selection is ~uniform and the balancing bias starts in control.
-	const double s1 = std::sqrt(2.0 / (double)dim);
-	const double s2 = std::sqrt(2.0 / (double)hidden);
-	routerW = register_parameter("routerW", torch::randn({ numExperts, dim }) * 0.01);
-	expertW1 = register_parameter("expertW1", torch::randn({ numExperts, hidden, dim }) * s1);
-	expertB1 = register_parameter("expertB1", torch::zeros({ numExperts, hidden }));
-	expertW2 = register_parameter("expertW2", torch::randn({ numExperts, dim, hidden }) * s2);
-	expertB2 = register_parameter("expertB2", torch::zeros({ numExperts, dim }));
-	sharedW1 = register_parameter("sharedW1", torch::randn({ hidden, dim }) * s1);
-	sharedB1 = register_parameter("sharedB1", torch::zeros({ hidden }));
-	sharedW2 = register_parameter("sharedW2", torch::randn({ dim, hidden }) * s2);
-	sharedB2 = register_parameter("sharedB2", torch::zeros({ dim }));
-	routerBias = register_buffer("routerBias", torch::zeros({ numExperts }));
-	loadAcc = register_buffer("loadAcc", torch::zeros({ numExperts }));
+	// Registration ONLY (see ctor note): empty tensors, no expensive init.
+	routerW = register_parameter("routerW", torch::empty({ numExperts, dim }));
+	expertW1 = register_parameter("expertW1", torch::empty({ numExperts, hidden, dim }));
+	expertB1 = register_parameter("expertB1", torch::empty({ numExperts, hidden }));
+	expertW2 = register_parameter("expertW2", torch::empty({ numExperts, dim, hidden }));
+	expertB2 = register_parameter("expertB2", torch::empty({ numExperts, dim }));
+	sharedW1 = register_parameter("sharedW1", torch::empty({ hidden, dim }));
+	sharedB1 = register_parameter("sharedB1", torch::empty({ hidden }));
+	sharedW2 = register_parameter("sharedW2", torch::empty({ dim, hidden }));
+	sharedB2 = register_parameter("sharedB2", torch::empty({ dim }));
+	routerBias = register_buffer("routerBias", torch::empty({ numExperts }));
+	loadAcc = register_buffer("loadAcc", torch::empty({ numExperts }));
 	ln = register_module("ln", torch::nn::LayerNorm(torch::nn::LayerNormOptions({ dim })));
 }
 
