@@ -11,12 +11,6 @@
 #include <ATen/autocast_mode.h>             // learn-pass autocast (BF16 sm_80+ / FP16 V100)
 #include <torch/version.h>
 #include <torch/cuda.h>                      // GGL_CONSUME_TIMERS synchronize points
-#include <ATen/cuda/CUDAGraph.h>             // GGL_CUDA_GRAPH collection-inference capture
-#include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <map>
-#include <memory>
-#include <mutex>
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <public/GigaLearnCPP/Util/Timer.h>
 #include "../Util/MoE.h"
@@ -444,15 +438,15 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	return result.view({ -1, models["policy"]->config.numOutputs }).clamp(ACTION_MIN_PROB, 1);
 }
 
-void GGL::PPOLearner::InferSampleFromModels(
+void GGL::PPOLearner::InferActionsFromModels(
 	ModelSet& models,
 	torch::Tensor obs, torch::Tensor actionMasks,
 	bool deterministic, float temperature, bool halfPrec,
-	torch::Tensor steerDelta,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor* outRowOk) {
+	torch::Tensor steerDelta) {
 
-	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta, outRowOk);
+	torch::Tensor rowOk;
+	auto probs = InferPolicyProbsFromModels(models, obs, actionMasks, temperature, halfPrec, steerDelta, &rowOk);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -467,160 +461,6 @@ void GGL::PPOLearner::InferSampleFromModels(
 		if (outLogProbs)
 			*outLogProbs = logProb.flatten();
 	}
-}
-
-// ==================== GGL_CUDA_GRAPH: graphed collection inference ====================
-// The ppc64le platform bills CPU op DISPATCH (~0.15-0.5ms/op), not GPU time; the MoE
-// collect forward is ~190 dispatches per tick vs ~20 dense, which is the whole 3x SPS gap
-// (see research/reports/MOE_POLICY.md). A CUDA graph replays the captured forward as ONE
-// launch, eliminating dispatch entirely. Capturability was designed in: the MoE bucketing
-// is static-shape (trash row, no boolean compaction) and has no CPU sync when outRowOk is
-// passed. Pointer-stability contract (both verified in source, both load-bearing):
-//   * fnSyncSnapshot updates snapshot weights with copy_ (in place) — never reallocates;
-//   * RefreshHalfCache after first build writes into _flatHalfBuf views in place.
-// So captured weight pointers stay valid across iterations PROVIDED RefreshHalfCache runs
-// eagerly before each replay (replay executes only captured GPU ops — it cannot run the
-// refresh itself). torch::multinomial is safe: capture registers the default CUDA philox
-// generator and each replay advances its offset (fresh randomness per replay).
-namespace {
-	struct GraphedInfer {
-		std::unique_ptr<at::cuda::CUDAGraph> graph;
-		torch::Tensor obsIn, masksIn;                     // static inputs, copy_ before replay
-		torch::Tensor actionsOut, logProbsOut, rowOkOut;  // static outputs, cloned after replay
-		int warmups = 0;   // eager runs before capture (cublas workspaces, allocator, cudnn)
-		bool broken = false;
-	};
-	// One graph per (model set, batch rows, sampling mode): self-play serves all rows,
-	// opponent-served iterations serve half, so 2-3 keys per set in practice.
-	struct GraphInferKey {
-		const void* models; int64_t rows; bool det;
-		bool operator<(const GraphInferKey& o) const {
-			return std::tie(models, rows, det) < std::tie(o.models, o.rows, o.det);
-		}
-	};
-	std::map<GraphInferKey, GraphedInfer> g_inferGraphs;
-	std::mutex g_inferGraphsMutex;
-	int g_capturedGraphCount = 0;
-	bool g_inferGraphsDisabled = false;
-}
-
-bool GGL::PPOLearner::TryGraphedInfer(
-	ModelSet& models,
-	torch::Tensor obs, torch::Tensor actionMasks,
-	bool deterministic, float temperature, bool halfPrec,
-	torch::Tensor steerDelta,
-	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor* outRowOk) {
-
-	static const bool enabled = [] {
-		const char* e = std::getenv("GGL_CUDA_GRAPH");
-		return e && *e && std::string(e) != "0";
-	}();
-	if (!enabled || g_inferGraphsDisabled)
-		return false;
-	if (!obs.is_cuda() || steerDelta.defined() || torch::GradMode::is_enabled())
-		return false;
-
-	std::lock_guard<std::mutex> lk(g_inferGraphsMutex);
-	GraphedInfer& gi = g_inferGraphs[{ &models, obs.size(0), deterministic }];
-	if (gi.broken)
-		return false;
-
-	// The barrier's snapshot sync marks half caches dirty; the refresh must happen OUTSIDE
-	// the graph so replay reads the new weights through the same flat-buffer pointers.
-	if (halfPrec)
-		for (const char* nm : { "shared_head", "policy" })
-			if (models[nm])
-				models[nm]->RefreshHalfCache();
-
-	auto fnReadOutputs = [&]() {
-		if (outActions)
-			*outActions = gi.actionsOut.clone();
-		if (outLogProbs && gi.logProbsOut.defined())
-			*outLogProbs = gi.logProbsOut.clone();
-		if (outRowOk)
-			*outRowOk = gi.rowOkOut.defined() ? gi.rowOkOut.clone() : torch::Tensor();
-	};
-
-	if (gi.graph) {
-		gi.obsIn.copy_(obs, true);
-		gi.masksIn.copy_(actionMasks, true);
-		gi.graph->replay();
-		fnReadOutputs();
-		return true;
-	}
-
-	// Hotness filter: capture only shapes that recur (the per-tick collect batches). Shape
-	// CHURN is real — skill-tracker eval batches shrink as their games finish, minting a new
-	// (models,rows) key per shrink — and the first smoke burned all 16 graph slots on eval
-	// stragglers, then disabled itself. 20 eager sightings first means one-off and slow-drip
-	// shapes never earn a graph; the collect shapes hit 20 within the first iteration. The
-	// warmups double as the cublas/allocator warmup capture wants anyway.
-	if (gi.warmups < 20) {
-		gi.warmups++;
-		return false; // caller runs eager; also builds the fp16 flat cache on the first call
-	}
-	// Each captured graph pins a private memory pool sized by its batch, so cap the count.
-	// Past the cap, NEW shapes just stay eager — existing graphs keep replaying (the first
-	// smoke's global-disable here threw away the two hot collect graphs over eval noise).
-	if (g_capturedGraphCount >= 16)
-		return false;
-
-	try {
-		// Everything on a side stream: capture REQUIRES a non-default stream, and the
-		// pre-capture warmup must run there too so cublas allocates its per-stream
-		// workspaces before capture begins.
-		gi.obsIn = obs.clone();
-		gi.masksIn = actionMasks.clone();
-		at::cuda::getCurrentCUDAStream().synchronize(); // clones/weights done before side stream reads
-		{
-			auto stream = at::cuda::getStreamFromPool();
-			c10::cuda::CUDAStreamGuard sg(stream);
-			torch::Tensor a, lp, ok;
-			InferSampleFromModels(models, gi.obsIn, gi.masksIn, deterministic, temperature,
-				halfPrec, {}, &a, &lp, &ok);
-			stream.synchronize();
-			gi.graph = std::make_unique<at::cuda::CUDAGraph>();
-			// ThreadLocal, NOT the Global default: pipelined collection captures on the
-			// worker thread while the main thread's learn pass is issuing cudaMalloc etc.,
-			// and Global mode invalidates the capture on ANY thread's unsafe API call —
-			// which would trip the permanent eager fallback on the fleet.
-			gi.graph->capture_begin({ 0, 0 }, cudaStreamCaptureModeThreadLocal);
-			InferSampleFromModels(models, gi.obsIn, gi.masksIn, deterministic, temperature,
-				halfPrec, {}, &gi.actionsOut, &gi.logProbsOut, &gi.rowOkOut);
-			gi.graph->capture_end();
-			stream.synchronize();
-		}
-		g_capturedGraphCount++;
-		RG_LOG("GGL_CUDA_GRAPH: captured infer graph (rows=" << obs.size(0)
-			<< ", det=" << deterministic << ", graphs=" << g_capturedGraphCount << ")");
-		// Replay once for THIS call's obs (capture itself consumed the static inputs).
-		gi.obsIn.copy_(obs, true);
-		gi.masksIn.copy_(actionMasks, true);
-		gi.graph->replay();
-		fnReadOutputs();
-		return true;
-	} catch (const std::exception& e) {
-		RG_LOG("GGL_CUDA_GRAPH: capture FAILED (" << e.what() << "), permanent eager fallback");
-		gi.graph.reset();
-		gi.broken = true;
-		g_inferGraphsDisabled = true;
-		return false;
-	}
-}
-
-void GGL::PPOLearner::InferActionsFromModels(
-	ModelSet& models,
-	torch::Tensor obs, torch::Tensor actionMasks,
-	bool deterministic, float temperature, bool halfPrec,
-	torch::Tensor* outActions, torch::Tensor* outLogProbs,
-	torch::Tensor steerDelta) {
-
-	torch::Tensor rowOk;
-	if (!TryGraphedInfer(models, obs, actionMasks, deterministic, temperature, halfPrec,
-			steerDelta, outActions, outLogProbs, &rowOk))
-		InferSampleFromModels(models, obs, actionMasks, deterministic, temperature, halfPrec,
-			steerDelta, outActions, outLogProbs, &rowOk);
 
 	// Deferred non-finite verdict. Sanitizer above keeps multinomial safe. The .item() is a
 	// blocking CUDA sync; collection immediately .cpu()'s the actions anyway, so this is a

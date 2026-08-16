@@ -208,30 +208,6 @@ namespace GGL {
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
 			torch::Tensor steerDelta = {}
 		);
-		// The capturable core of InferActionsFromModels: trunk -> logits -> sanitize ->
-		// softmax -> sample. No CPU sync anywhere inside (outRowOk carries the deferred
-		// non-finite verdict out). GGL_CUDA_GRAPH replays exactly this region.
-		static void InferSampleFromModels(
-			ModelSet& models,
-			torch::Tensor obs, torch::Tensor actionMasks,
-			bool deterministic, float temperature, bool halfPrec,
-			torch::Tensor steerDelta,
-			torch::Tensor* outActions, torch::Tensor* outLogProbs,
-			torch::Tensor* outRowOk
-		);
-		// GGL_CUDA_GRAPH=1: replay the collection forward as ONE captured CUDA graph
-		// instead of ~20 (dense) / ~190 (MoE) individually dispatched ops. Returns false
-		// (caller runs eager) while warming up, on any non-capturable call (CPU device,
-		// grad mode, steerDelta, unseen shape past the cache cap), or permanently after a
-		// capture failure.
-		static bool TryGraphedInfer(
-			ModelSet& models,
-			torch::Tensor obs, torch::Tensor actionMasks,
-			bool deterministic, float temperature, bool halfPrec,
-			torch::Tensor steerDelta,
-			torch::Tensor* outActions, torch::Tensor* outLogProbs,
-			torch::Tensor* outRowOk
-		);
 		// d(x, bank) = min over bank rows of sum_j relu(x_j - bank_j), clamped;
 		// chunked so the [rows, bank, dims] broadcast never materializes at full n.
 		// The 5 wire values for a batch: rawObs feeds the map encoder, trunkOut feeds
