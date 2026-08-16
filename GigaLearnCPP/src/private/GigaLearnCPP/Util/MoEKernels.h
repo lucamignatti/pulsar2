@@ -78,4 +78,39 @@ extern "C" {
 		const float* gates, const int* srcRows, void* out,
 		int n, int D, void* stream);
 
+	// ==================== learn path (Stage 1b, MOE_SPEED.md) ====================
+
+	// dY[i,:] = dOut[srcRows[i],:] * gates[i], fp16 in/out, 1 launch.
+	void ggl_moe_gather_scale_f16(
+		const void* dOut, const int* srcRows, const float* gates,
+		void* dY, int n, int d, void* stream);
+
+	// dB[expertId[i],:] += rows of src (fp32 accumulator, caller zeroes), 1 launch.
+	void ggl_moe_segment_sum_f16to32(
+		const void* src, const int* expertId, float* dB,
+		int n, int d, void* stream);
+
+	// dHpre[i,:] = dH[i,:] * (Hpost[i,:] > 0 ? 1 : slope), fp16, in place on dH.
+	void ggl_moe_leaky_bwd_f16(
+		void* dH, const void* hPost, int n, int H, float slope, void* stream);
+
+	// gdot[i] = sum_c dOut[srcRows[i],c] * (y[i,c] + b[expertId[i],c]), fp32 out.
+	void ggl_moe_gate_dot_f16(
+		const void* dOut, const void* y, const void* b,
+		const int* expertId, const int* srcRows,
+		float* gdot, int n, int d, void* stream);
+
+	// dxn[srcRows[i],:] += dX[i,:] (fp16 atomics, no gate/bias), 1 launch.
+	void ggl_moe_scatter_add_f16(
+		const void* dX, const int* srcRows, void* dxn,
+		int n, int d, void* stream);
+
+	// Grouped wgrad: for expert e, C[e] = A_e^T @ B_e where A/B are the expert-sorted
+	// assignment buffers (A [n,Ka] rows off[e]..off[e+1], read column-major = A^T) and
+	// C is the [E, Ka, N] gradient stack. Per-problem K = the expert's row count, read
+	// from DEVICE offsets. fp16 in, fp16 out. 2 launches (fill + persistent kernel).
+	void ggl_moe_grouped_wgrad_f16_dev(
+		void* ctx, const void* A, const void* B, void* C,
+		const int* offsets, int E, int Ka, int N, void* stream);
+
 }

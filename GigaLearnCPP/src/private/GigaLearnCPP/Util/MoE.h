@@ -70,7 +70,21 @@ namespace GGL {
 		};
 		std::map<int64_t, FastScratch> _scratchByRows;
 		void* _gemmCtx = nullptr;                // ggl_moe_ctx_create, grow-only
+
+		// Stage 1b learn path (GGL_MOE_CUTLASS_LEARN): custom autograd routed-FFN with
+		// grouped GEMMs. fp16 weight caches for the LEARN side (fp32 master params),
+		// invalidated by the params' tensor version counters (bumped by optimizer
+		// in-place updates) — weights change twice per iteration, the fn runs ~6x.
+		int learnFastForce = -1;                 // -1 = env, 0 = off, 1 = on (selftest)
+		torch::Tensor _lw1, _lw1T, _lw2, _lw2T;  // fp16 [E,h,d],[E,d,h],[E,d,h],[E,h,d]
+		torch::Tensor _lb1, _lb2, _lBias;        // fp16 [E,h],[E,d],[E]
+		uint64_t _lwVer1 = ~0ull, _lwVer2 = ~0ull;
+		void* _gemmCtxLearn = nullptr;
 	};
+
+	// Stage 1b custom autograd routed-FFN (research/reports/MOE_SPEED.md). Takes the
+	// LN output; LN, shared expert, and the residual stay in ordinary autograd.
+	torch::Tensor MoERoutedFFNApply(MoEBlockImpl* blk, torch::Tensor xn);
 	TORCH_MODULE(MoEBlock);
 
 	int RunMoESelfTest();

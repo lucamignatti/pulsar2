@@ -1,0 +1,183 @@
+{
+  "checkpoint": 401596416000,
+  "seed": 20260816,
+  "n_rows": 120000,
+  "n_anchors": 12000,
+  "bank_m": 64,
+  "tau": 0.02,
+  "slices": [
+    {
+      "slice": "primary",
+      "n_cells": {
+        "feas_unatt": 376,
+        "feas_att": 352,
+        "infeas_unatt": 2553,
+        "infeas_att": 856
+      },
+      "cell_means": {
+        "KD": {
+          "feas_unatt": 0.6599710583686829,
+          "feas_att": 0.9356897473335266,
+          "infeas_unatt": 0.5687733292579651,
+          "infeas_att": 0.7393130660057068
+        },
+        "KD_bankmean": {
+          "feas_unatt": 0.40299680829048157,
+          "feas_att": 0.6366315484046936,
+          "infeas_unatt": 0.29494768381118774,
+          "infeas_att": 0.4595734775066376
+        },
+        "rho_can": {
+          "feas_unatt": -8.42003059387207,
+          "feas_att": -5.595991611480713,
+          "infeas_unatt": -8.859021186828613,
+          "infeas_att": -5.486638069152832
+        },
+        "neg_rho_do": {
+          "feas_unatt": 9.080001831054688,
+          "feas_att": 6.531681537628174,
+          "infeas_unatt": 9.427794456481934,
+          "infeas_att": 6.225951194763184
+        },
+        "c_taken": {
+          "feas_unatt": -9.069050788879395,
+          "feas_att": -6.5357346534729,
+          "infeas_unatt": -9.426051139831543,
+          "infeas_att": -6.225854396820068
+        },
+        "H": {
+          "feas_unatt": 3.0357143878936768,
+          "feas_att": 3.005362033843994,
+          "infeas_unatt": 3.1562821865081787,
+          "infeas_att": 2.771897315979004
+        },
+        "neg_d_now_rate": {
+          "feas_unatt": -862.5550561372112,
+          "feas_att": -882.4278181365771,
+          "infeas_unatt": -4476.917740959456,
+          "infeas_att": -2021.549654548416
+        }
+      },
+      "auc": {
+        "KD": {
+          "S1_feasunatt_vs_infeasunatt": 0.5677551031112671,
+          "S2_feasunatt_vs_feasatt": 0.355053186416626
+        },
+        "KD_bankmean": {
+          "S1_feasunatt_vs_infeasunatt": 0.6173171401023865,
+          "S2_feasunatt_vs_feasatt": 0.32505741715431213
+        },
+        "rho_can": {
+          "S1_feasunatt_vs_infeasunatt": 0.545242965221405,
+          "S2_feasunatt_vs_feasatt": 0.22078245878219604
+        },
+        "neg_rho_do": {
+          "S1_feasunatt_vs_infeasunatt": 0.4680830240249634,
+          "S2_feasunatt_vs_feasatt": 0.7576311826705933
+        },
+        "c_taken": {
+          "S1_feasunatt_vs_infeasunatt": 0.533826470375061,
+          "S2_feasunatt_vs_feasatt": 0.24530041217803955
+        },
+        "H": {
+          "S1_feasunatt_vs_infeasunatt": 0.40352505445480347,
+          "S2_feasunatt_vs_feasatt": 0.5017831325531006
+        },
+        "neg_d_now_rate": {
+          "S1_feasunatt_vs_infeasunatt": 1.0,
+          "S2_feasunatt_vs_feasatt": 0.5153227756286267
+        }
+      }
+    },
+    {
+      "slice": "full",
+      "n_cells": {
+        "feas_unatt": 1191,
+        "feas_att": 830,
+        "infeas_unatt": 3727,
+        "infeas_att": 1143
+      },
+      "cell_means": {
+        "KD": {
+          "feas_unatt": 0.6295939087867737,
+          "feas_att": 0.7853236198425293,
+          "infeas_unatt": 0.561150848865509,
+          "infeas_att": 0.7219875454902649
+        },
+        "KD_bankmean": {
+          "feas_unatt": 0.3946813941001892,
+          "feas_att": 0.517059326171875,
+          "infeas_unatt": 0.29249459505081177,
+          "infeas_att": 0.4449482858181
+        },
+        "rho_can": {
+          "feas_unatt": -8.300000190734863,
+          "feas_att": -7.22422456741333,
+          "infeas_unatt": -8.814079284667969,
+          "infeas_att": -6.2172932624816895
+        },
+        "neg_rho_do": {
+          "feas_unatt": 8.929594039916992,
+          "feas_att": 8.00954818725586,
+          "infeas_unatt": 9.37523078918457,
+          "infeas_att": 6.9392805099487305
+        },
+        "c_taken": {
+          "feas_unatt": -8.926156997680664,
+          "feas_att": -8.019519805908203,
+          "infeas_unatt": -9.375038146972656,
+          "infeas_att": -6.940550327301025
+        },
+        "H": {
+          "feas_unatt": 3.092670440673828,
+          "feas_att": 3.0189321041107178,
+          "infeas_unatt": 3.1714844703674316,
+          "infeas_att": 2.803394317626953
+        },
+        "neg_d_now_rate": {
+          "feas_unatt": -803.7874043994497,
+          "feas_att": -845.187844535427,
+          "infeas_unatt": -3805.791793733589,
+          "infeas_att": -1946.5787041305434
+        }
+      },
+      "auc": {
+        "KD": {
+          "S1_feasunatt_vs_infeasunatt": 0.5564086437225342,
+          "S2_feasunatt_vs_feasatt": 0.4210474193096161
+        },
+        "KD_bankmean": {
+          "S1_feasunatt_vs_infeasunatt": 0.5871931910514832,
+          "S2_feasunatt_vs_feasatt": 0.40509292483329773
+        },
+        "rho_can": {
+          "S1_feasunatt_vs_infeasunatt": 0.5564756989479065,
+          "S2_feasunatt_vs_feasatt": 0.39202451705932617
+        },
+        "neg_rho_do": {
+          "S1_feasunatt_vs_infeasunatt": 0.45160454511642456,
+          "S2_feasunatt_vs_feasatt": 0.5935884714126587
+        },
+        "c_taken": {
+          "S1_feasunatt_vs_infeasunatt": 0.5494071841239929,
+          "S2_feasunatt_vs_feasatt": 0.4087240695953369
+        },
+        "H": {
+          "S1_feasunatt_vs_infeasunatt": 0.42521238327026367,
+          "S2_feasunatt_vs_feasatt": 0.5343084931373596
+        },
+        "neg_d_now_rate": {
+          "S1_feasunatt_vs_infeasunatt": 1.0,
+          "S2_feasunatt_vs_feasatt": 0.5358876311290502
+        }
+      }
+    }
+  ],
+  "S3_spearman_KD_H": -0.12602845846750174,
+  "kd_summary": {
+    "mean": 0.68137127161026,
+    "p90": 1.3301384449005127,
+    "rho_can_mean": -7.235177040100098,
+    "rho_do_mean": -7.916548252105713
+  }
+}

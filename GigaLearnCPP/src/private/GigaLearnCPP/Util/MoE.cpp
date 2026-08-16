@@ -125,6 +125,46 @@ int GGL::RunMoESelfTest() {
 		RG_LOG("  block fwd 777 rows: eager " << eagerMs << " ms, fast " << fastMs
 			<< " ms (" << (eagerMs / fastMs) << "x)");
 	}
+	// Stage 1b gate: LEARN-path grad parity vs eager autograd, per param family.
+	// fp32 eager vs fp16-compute custom -> tolerance 3e-2. cf=8 so eager drops nothing.
+	if (torch::cuda::device_count() > 0 && ggl_moe_kernels_available()) {
+		RG_LOG("MoE selftest: CUTLASS learn-path grad parity...");
+		auto dev = torch::Device(torch::kCUDA, 0);
+		auto lb = GGL::MoEBlock(1024, 512, 128, 4);
+		lb->capacityFactor = 8.f;
+		{
+			torch::NoGradGuard ng0;
+			lb->routerW.mul_(10.0);
+		}
+		lb->to(dev);
+		auto xl = (torch::randn({ 777, 1024 }, dev) * 0.5).set_requires_grad(true);
+		auto fnGrads = [&](int force) {
+			lb->learnFastForce = force;
+			if (xl.grad().defined()) xl.mutable_grad() = torch::Tensor();
+			for (auto& pr : lb->parameters())
+				if (pr.grad().defined()) pr.mutable_grad() = torch::Tensor();
+			auto yl = lb->forward(xl);
+			yl.sum().backward();
+			std::vector<torch::Tensor> g;
+			g.push_back(xl.grad().clone());
+			for (auto& pr : { lb->routerW, lb->expertW1, lb->expertB1, lb->expertW2, lb->expertB2 })
+				g.push_back(pr.grad().defined() ? pr.grad().clone() : torch::zeros_like(pr));
+			return g;
+		};
+		auto gRef = fnGrads(0);
+		auto gFast = fnGrads(1);
+		const char* names[] = { "dx", "routerW", "expertW1", "expertB1", "expertW2", "expertB2" };
+		bool ok = true;
+		for (size_t i = 0; i < gRef.size(); i++) {
+			float rel = (gFast[i] - gRef[i]).norm().item<float>()
+				/ std::max(gRef[i].norm().item<float>(), 1e-6f);
+			RG_LOG("  grad parity " << names[i] << " relRMS=" << rel);
+			if (!(rel < 3e-2f))
+				ok = false;
+		}
+		if (!ok)
+			RG_ERR_CLOSE("MoE CUTLASS LEARN-path grad parity FAILED (see relRMS above)");
+	}
 #endif
 	RG_LOG("MoE selftest OK");
 	return 0;
@@ -185,6 +225,23 @@ torch::Tensor GGL::MoEBlockImpl::forward(torch::Tensor x) {
 		if (on && !torch::GradMode::is_enabled() && x.is_cuda()
 			&& x.scalar_type() == torch::kHalf && ggl_moe_kernels_available())
 			return ForwardFast(x);
+	}
+	// Stage 1b learn path: custom autograd routed-FFN (grouped GEMM fwd + dgrad +
+	// wgrad). fp32 grad-enabled CUDA only. LN/shared/residual stay in autograd.
+	{
+		static const int envLearnOn = [] {
+			const char* e = std::getenv("GGL_MOE_CUTLASS_LEARN");
+			return (e && *e && std::string(e) != "0") ? 1 : 0;
+		}();
+		int on = learnFastForce >= 0 ? learnFastForce : envLearnOn;
+		if (on && torch::GradMode::is_enabled() && x.is_cuda() && x.requires_grad()
+			&& x.scalar_type() == torch::kFloat && ggl_moe_kernels_available()) {
+			auto xn = ln->forward(x);
+			auto routed = GGL::MoERoutedFFNApply(this, xn);
+			auto hs = torch::leaky_relu(torch::addmm(sharedB1, xn, sharedW1.t()), 0.01);
+			auto ys = torch::addmm(sharedB2, hs, sharedW2.t());
+			return x + routed + ys;
+		}
 	}
 #endif
 	const int64_t R = x.size(0);
@@ -351,6 +408,177 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 	auto hs = torch::leaky_relu(torch::addmm(sharedB1, xn, sharedW1.t()), 0.01);
 	auto ys = torch::addmm(sharedB2, hs, sharedW2.t());
 	return x + sc.out + ys;
+}
+#endif
+
+#ifdef GGL_MOE_KERNELS
+// ==================== Stage 1b: custom autograd routed-FFN ====================
+// Forward mirrors ForwardFast (exact-M grouped GEMMs, no capacity drops); backward
+// is grouped dgrad/wgrad + segment sums + a gate-grad chain. LN, shared expert and
+// the residual stay OUTSIDE in ordinary autograd. All GEMM compute fp16 (tensor
+// cores); returned grads fp32 so accumulation/AMP-unscale are unchanged.
+namespace {
+
+struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
+	static torch::Tensor forward(
+		torch::autograd::AutogradContext* ctx,
+		torch::Tensor xn,
+		torch::Tensor routerW, torch::Tensor expertW1, torch::Tensor expertB1,
+		torch::Tensor expertW2, torch::Tensor expertB2, torch::Tensor routerBias,
+		int64_t blkPtr) {
+
+		auto* blk = reinterpret_cast<GGL::MoEBlockImpl*>(blkPtr);
+		void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
+		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
+		const int E = (int)blk->numExperts, k = (int)blk->topK;
+		const int64_t n = R * k;
+		auto dev = xn.device();
+		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
+		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
+		auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
+
+		// fp16 learn-side weight caches, invalidated by the fp32 params' version
+		// counters (optimizer steps are in-place).
+		uint64_t v1 = expertW1.unsafeGetTensorImpl()->version_counter().current_version();
+		uint64_t v2 = expertW2.unsafeGetTensorImpl()->version_counter().current_version();
+		if (blk->_lwVer1 != v1 || blk->_lwVer2 != v2 || !blk->_lw1.defined()) {
+			torch::NoGradGuard ng;
+			blk->_lw1 = expertW1.detach().to(torch::kHalf).contiguous();
+			blk->_lw1T = expertW1.detach().transpose(1, 2).to(torch::kHalf).contiguous();
+			blk->_lw2 = expertW2.detach().to(torch::kHalf).contiguous();
+			blk->_lw2T = expertW2.detach().transpose(1, 2).to(torch::kHalf).contiguous();
+			blk->_lb1 = expertB1.detach().to(torch::kHalf).contiguous();
+			blk->_lb2 = expertB2.detach().to(torch::kHalf).contiguous();
+			blk->_lBias = routerBias.detach().to(torch::kHalf).contiguous();
+			blk->_lwVer1 = v1;
+			blk->_lwVer2 = v2;
+		}
+		if (!blk->_gemmCtxLearn)
+			blk->_gemmCtxLearn = ggl_moe_ctx_create(E);
+
+		auto logits = torch::mm(xn, routerW.t()).contiguous();          // fp32 [R,E]
+		auto counts = torch::empty({ 2LL * E }, i32);
+		auto offsets = torch::empty({ (int64_t)E + 1 }, i32);
+		auto rowExp = torch::empty({ n }, i32);
+		auto rowGate = torch::empty({ n }, f32);
+		auto srcRows = torch::empty({ n }, i32);
+		auto expertId = torch::empty({ n }, i32);
+		auto gates = torch::empty({ n }, f32);
+		ggl_moe_route_plan_f16(logits.data_ptr(), blk->_lBias.data_ptr(),
+			(int)R, E, k, counts.data_ptr<int>(), offsets.data_ptr<int>(),
+			rowExp.data_ptr<int>(), rowGate.data_ptr<float>(),
+			srcRows.data_ptr<int>(), expertId.data_ptr<int>(), gates.data_ptr<float>(), s);
+
+		auto xn16 = xn.to(torch::kHalf);
+		auto packed = torch::empty({ n, d }, h16);
+		auto hid = torch::empty({ n, h }, h16);
+		auto y = torch::empty({ n, d }, h16);
+		ggl_moe_gather_f16(xn16.data_ptr(), srcRows.data_ptr<int>(),
+			packed.data_ptr(), (int)n, (int)d, s);
+		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, packed.data_ptr(),
+			blk->_lw1T.data_ptr(), hid.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
+		ggl_moe_bias_leaky_f16(hid.data_ptr(), blk->_lb1.data_ptr(),
+			expertId.data_ptr<int>(), (int)n, (int)h, 0.01f, s);
+		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, hid.data_ptr(),
+			blk->_lw2T.data_ptr(), y.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+		auto out16 = torch::zeros({ R, d }, h16);
+		ggl_moe_scatter_bias_gate_f16(y.data_ptr(), blk->_lb2.data_ptr(),
+			expertId.data_ptr<int>(), gates.data_ptr<float>(),
+			srcRows.data_ptr<int>(), out16.data_ptr(), (int)n, (int)d, s);
+
+		// Learn-side load tracking for the aux-free balancing update.
+		{
+			torch::NoGradGuard ng;
+			blk->loadAcc.add_(counts.narrow(0, 0, E).to(blk->loadAcc.scalar_type()));
+		}
+
+		ctx->save_for_backward({ xn, logits, packed, hid, y,
+			offsets, srcRows, expertId, gates, routerW });
+		ctx->saved_data["blk"] = blkPtr;
+		return out16.to(torch::kFloat);
+	}
+
+	static torch::autograd::tensor_list backward(
+		torch::autograd::AutogradContext* ctx, torch::autograd::tensor_list gradOut) {
+
+		auto saved = ctx->get_saved_variables();
+		auto xn = saved[0], logits = saved[1], packed = saved[2], hid = saved[3], y = saved[4];
+		auto offsets = saved[5], srcRows = saved[6], expertId = saved[7], gates = saved[8];
+		auto routerW = saved[9];
+		auto* blk = reinterpret_cast<GGL::MoEBlockImpl*>(ctx->saved_data["blk"].toInt());
+		void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
+		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
+		const int E = (int)blk->numExperts, k = (int)blk->topK;
+		const int64_t n = R * k;
+		auto dev = xn.device();
+		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
+		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
+
+		auto dOut16 = gradOut[0].to(torch::kHalf).contiguous();
+
+		// Gate-grad first (needs y before dY overwrites nothing — buffers separate).
+		auto gdot = torch::empty({ n }, f32);
+		ggl_moe_gate_dot_f16(dOut16.data_ptr(), y.data_ptr(), blk->_lb2.data_ptr(),
+			expertId.data_ptr<int>(), srcRows.data_ptr<int>(),
+			gdot.data_ptr<float>(), (int)n, (int)d, s);
+
+		// dY = gather(dOut)*gate; dB2 = segsum(dY); dH = dY @ W2; leaky bwd;
+		// dB1 = segsum(dHpre); dX = dHpre @ W1; dxn_expert = scatter(dX).
+		auto dY = torch::empty({ n, d }, h16);
+		ggl_moe_gather_scale_f16(dOut16.data_ptr(), srcRows.data_ptr<int>(),
+			gates.data_ptr<float>(), dY.data_ptr(), (int)n, (int)d, s);
+		auto dB2 = torch::zeros({ (int64_t)E, d }, f32);
+		ggl_moe_segment_sum_f16to32(dY.data_ptr(), expertId.data_ptr<int>(),
+			dB2.data_ptr<float>(), (int)n, (int)d, s);
+		auto dH = torch::empty({ n, h }, h16);
+		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(),
+			blk->_lw2.data_ptr(), dH.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
+		ggl_moe_leaky_bwd_f16(dH.data_ptr(), hid.data_ptr(), (int)n, (int)h, 0.01f, s);
+		auto dB1 = torch::zeros({ (int64_t)E, h }, f32);
+		ggl_moe_segment_sum_f16to32(dH.data_ptr(), expertId.data_ptr<int>(),
+			dB1.data_ptr<float>(), (int)n, (int)h, s);
+		auto dX = torch::empty({ n, d }, h16);
+		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(),
+			blk->_lw1.data_ptr(), dX.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+		auto dxn16 = torch::zeros({ R, d }, h16);
+		ggl_moe_scatter_add_f16(dX.data_ptr(), srcRows.data_ptr<int>(),
+			dxn16.data_ptr(), (int)n, (int)d, s);
+
+		// wgrads: dW1[e] = dHpre_e^T @ X_e -> [h,d]; dW2[e] = dY_e^T @ Hpost_e -> [d,h].
+		auto dW1_16 = torch::empty({ (int64_t)E, h, d }, h16);
+		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
+			dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+		auto dW2_16 = torch::empty({ (int64_t)E, d, h }, h16);
+		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
+			dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
+
+		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
+		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).
+		auto srcL = srcRows.to(torch::kLong);
+		auto expL = expertId.to(torch::kLong);
+		auto selLogit = logits.index({ srcL, expL });                    // [n] fp32
+		auto a = torch::sigmoid(selLogit);
+		auto S = torch::zeros({ R }, f32).index_add(0, srcL, a);
+		auto Srow = S.index_select(0, srcL).clamp_min(1e-9);
+		auto dotRow = torch::zeros({ R }, f32).index_add(0, srcL, gdot * gates.to(f32));
+		auto dA = gdot / Srow - dotRow.index_select(0, srcL) / Srow;
+		auto dLogitSel = dA * a * (1.0 - a);
+		auto dLogits = torch::zeros_like(logits);
+		dLogits.index_put_({ srcL, expL }, dLogitSel, /*accumulate=*/true);
+		auto dRouterW = torch::mm(dLogits.t(), xn);                      // [E,d] fp32
+		auto dxn = dxn16.to(torch::kFloat) + torch::mm(dLogits, routerW);
+
+		return { dxn, dRouterW,
+			dW1_16.to(torch::kFloat), dB1, dW2_16.to(torch::kFloat), dB2,
+			torch::Tensor(), torch::Tensor() };
+	}
+};
+
+} // namespace
+
+torch::Tensor GGL::MoERoutedFFNApply(GGL::MoEBlockImpl* blk, torch::Tensor xn) {
+	return MoERoutedFFN::apply(xn, blk->routerW, blk->expertW1, blk->expertB1,
+		blk->expertW2, blk->expertB2, blk->routerBias, (int64_t)(intptr_t)blk);
 }
 #endif
 

@@ -224,6 +224,122 @@ extern "C" void ggl_moe_scatter_bias_gate_f16(
 		(__half*)out, n, D);
 }
 
+// ===================== learn-path elementwise kernels =====================
+
+__global__ void gglk_gather_scale_f16(
+	const __half* dOut, const int* srcRows, const float* gates,
+	__half* dY, int n, int d) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* src = dOut + (size_t)srcRows[i] * d;
+	__half* dst = dY + (size_t)i * d;
+	float g = gates[i];
+	for (int c = threadIdx.x; c < d; c += blockDim.x)
+		dst[c] = __float2half(__half2float(src[c]) * g);
+}
+
+extern "C" void ggl_moe_gather_scale_f16(
+	const void* dOut, const int* srcRows, const float* gates,
+	void* dY, int n, int d, void* stream) {
+	if (n <= 0) return;
+	gglk_gather_scale_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)dOut, srcRows, gates, (__half*)dY, n, d);
+}
+
+__global__ void gglk_segment_sum_f16to32(
+	const __half* src, const int* expertId, float* dB, int n, int d) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* row = src + (size_t)i * d;
+	float* dst = dB + (size_t)expertId[i] * d;
+	for (int c = threadIdx.x; c < d; c += blockDim.x)
+		atomicAdd(&dst[c], __half2float(row[c]));
+}
+
+extern "C" void ggl_moe_segment_sum_f16to32(
+	const void* src, const int* expertId, float* dB, int n, int d, void* stream) {
+	if (n <= 0) return;
+	gglk_segment_sum_f16to32<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)src, expertId, dB, n, d);
+}
+
+__global__ void gglk_leaky_bwd_f16(
+	__half* dH, const __half* hPost, int n, int H, float slope) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	__half* row = dH + (size_t)i * H;
+	const __half* hp = hPost + (size_t)i * H;
+	for (int c = threadIdx.x; c < H; c += blockDim.x) {
+		float v = __half2float(row[c]);
+		// leaky is sign-preserving, so post-activation sign == pre-activation sign
+		if (!(__half2float(hp[c]) > 0.f))
+			v *= slope;
+		row[c] = __float2half(v);
+	}
+}
+
+extern "C" void ggl_moe_leaky_bwd_f16(
+	void* dH, const void* hPost, int n, int H, float slope, void* stream) {
+	if (n <= 0) return;
+	gglk_leaky_bwd_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(__half*)dH, (const __half*)hPost, n, H, slope);
+}
+
+__global__ void gglk_gate_dot_f16(
+	const __half* dOut, const __half* y, const __half* b,
+	const int* expertId, const int* srcRows, float* gdot, int n, int d) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* go = dOut + (size_t)srcRows[i] * d;
+	const __half* yr = y + (size_t)i * d;
+	const __half* br = b + (size_t)expertId[i] * d;
+	__shared__ float acc[128];
+	float part = 0.f;
+	for (int c = threadIdx.x; c < d; c += blockDim.x)
+		part += __half2float(go[c]) * (__half2float(yr[c]) + __half2float(br[c]));
+	acc[threadIdx.x] = part;
+	__syncthreads();
+	for (int w = 64; w > 0; w >>= 1) {
+		if (threadIdx.x < w)
+			acc[threadIdx.x] += acc[threadIdx.x + w];
+		__syncthreads();
+	}
+	if (threadIdx.x == 0)
+		gdot[i] = acc[0];
+}
+
+extern "C" void ggl_moe_gate_dot_f16(
+	const void* dOut, const void* y, const void* b,
+	const int* expertId, const int* srcRows,
+	float* gdot, int n, int d, void* stream) {
+	if (n <= 0) return;
+	gglk_gate_dot_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)dOut, (const __half*)y, (const __half*)b,
+		expertId, srcRows, gdot, n, d);
+}
+
+__global__ void gglk_scatter_add_f16(
+	const __half* dX, const int* srcRows, __half* dxn, int n, int d) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* row = dX + (size_t)i * d;
+	__half* dst = dxn + (size_t)srcRows[i] * d;
+	for (int c = threadIdx.x; c < d; c += blockDim.x)
+		atomicAdd(&dst[c], row[c]);
+}
+
+extern "C" void ggl_moe_scatter_add_f16(
+	const void* dX, const int* srcRows, void* dxn, int n, int d, void* stream) {
+	if (n <= 0) return;
+	gglk_scatter_add_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)dX, srcRows, (__half*)dxn, n, d);
+}
+
 // ========================= CUTLASS grouped GEMM ==========================
 // Bench-proven sm_70 configuration: fp16 tensor-core 8x8x4, small-M tile
 // 32x128x32 (collect batches average m = R*k/E, tens of rows — the small tile
@@ -337,6 +453,86 @@ extern "C" void ggl_moe_grouped_gemm_f16_dev(
 		GGLK_CUDA_CHECK(cudaMemsetAsync(c->d_workspace, 0, ws, s));
 
 	GglkGemmF16 gemm;
+	GGLK_CUTLASS_CHECK(gemm.initialize(args, c->d_workspace, s));
+	GGLK_CUTLASS_CHECK(gemm.run(s));
+}
+
+// ==================== grouped wgrad (ColumnMajor A) ====================
+// dW[e] = A_e^T @ B_e with A row-major [m_e, Ka]: row-major A read as
+// column-major IS A^T (lda = Ka). Per-problem GemmCoord(M=Ka, N, K=m_e).
+
+using GglkGemmF16TA = cutlass::gemm::device::GemmGrouped<
+	typename cutlass::gemm::kernel::DefaultGemmGrouped<
+		cutlass::half_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 8,
+		cutlass::half_t, LayoutRM, cutlass::ComplexTransform::kNone, 8,
+		cutlass::half_t, LayoutRM, float,
+		cutlass::arch::OpClassTensorOp, cutlass::arch::Sm70,
+		cutlass::gemm::GemmShape<32, 128, 32>, cutlass::gemm::GemmShape<32, 32, 32>,
+		cutlass::gemm::GemmShape<8, 8, 4>, EpiF16, Swizzle, 2, kSched>::GemmKernel>;
+
+__global__ void gglk_fill_wgrad_problems(
+	const int* offsets, int E, int Ka, int N,
+	const cutlass::half_t* A, const cutlass::half_t* B, cutlass::half_t* C,
+	cutlass::gemm::GemmCoord* problems,
+	cutlass::half_t** pA, cutlass::half_t** pB, cutlass::half_t** pC, cutlass::half_t** pD,
+	GglkLongIndex* ld) {
+
+	int e = blockIdx.x * blockDim.x + threadIdx.x;
+	if (e >= E)
+		return;
+	int m = offsets[e + 1] - offsets[e];
+	problems[e] = cutlass::gemm::GemmCoord(Ka, N, m);
+	pA[e] = const_cast<cutlass::half_t*>(A) + (size_t)offsets[e] * Ka;
+	pB[e] = const_cast<cutlass::half_t*>(B) + (size_t)offsets[e] * N;
+	pC[e] = C + (size_t)e * Ka * N;
+	pD[e] = pC[e];
+	ld[e] = Ka;          // lda: column-major [Ka, m] leading dim
+	ld[E + e] = N;
+	ld[2 * E + e] = N;
+	ld[3 * E + e] = N;
+}
+
+extern "C" void ggl_moe_grouped_wgrad_f16_dev(
+	void* ctx, const void* A, const void* B, void* C,
+	const int* offsets, int E, int Ka, int N, void* stream) {
+
+	GemmCtx* c = (GemmCtx*)ctx;
+	cudaStream_t s = (cudaStream_t)stream;
+	if (E > c->E) {
+		fprintf(stderr, "MoEKernels: wgrad E=%d exceeds ctx capacity %d\n", E, c->E);
+		abort();
+	}
+	gglk_fill_wgrad_problems<<<(E + 63) / 64, 64, 0, s>>>(
+		offsets, E, Ka, N,
+		(const cutlass::half_t*)A, (const cutlass::half_t*)B, (cutlass::half_t*)C,
+		c->d_problems, c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D, c->d_ld);
+
+	static int tbcTA = [] {
+		int t = GglkGemmF16TA::sufficient(nullptr, 0);
+		if (t <= 0) {
+			fprintf(stderr, "MoEKernels: wgrad sufficient() returned %d\n", t);
+			abort();
+		}
+		return t;
+	}();
+
+	typename GglkGemmF16TA::EpilogueOutputOp::Params epilogue(1.f, 0.f);
+	typename GglkGemmF16TA::Arguments args(
+		c->d_problems, E, tbcTA, epilogue,
+		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
+		c->d_ld, c->d_ld + E, c->d_ld + 2 * E, c->d_ld + 3 * E,
+		/*host_problem_sizes=*/nullptr);
+
+	size_t ws = GglkGemmF16TA::get_workspace_size(args);
+	size_t need = ws + ((size_t)1 << 20);
+	if (need > c->ws_cap) {
+		GGLK_CUDA_CHECK(cudaMalloc(&c->d_workspace, need)); // grow-only (V100/11.2 trap)
+		c->ws_cap = need;
+	}
+	if (ws > 0)
+		GGLK_CUDA_CHECK(cudaMemsetAsync(c->d_workspace, 0, ws, s));
+
+	GglkGemmF16TA gemm;
 	GGLK_CUTLASS_CHECK(gemm.initialize(args, c->d_workspace, s));
 	GGLK_CUTLASS_CHECK(gemm.run(s));
 }
