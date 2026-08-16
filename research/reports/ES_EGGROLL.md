@@ -97,6 +97,20 @@ population-scaling baseline, not a verdict on the method. Update math v2: local
 per-layer GEMM over each rank's members, dW allreduce-summed — no cross-rank
 noise determinism needed; lockstep checksum retained.
 
+## AMENDMENT 3 2026-08-16 evening — overnight decision rule (pre-registered)
+
+Paper-scale run (176,640 members) at gen ~620: Update Norm pinned at the 1/sqrt(N)
+noise floor (0.0033), fitness mean stable, rating flat — machinery verified, no
+extracted signal. Deadline: verdict by noon 2026-08-17. Automated decision at
+generation >= 14,000 (~12h): KEEP the current config iff last-200 Update Norm >
+0.005 (1.5x floor) OR rating > +30; otherwise the remaining hops are replaced by
+the strongest single fitness lever: GGL_ES_FIT_GOAL=1 (goal-diff-only fitness —
+the window-mean shaped fitness telescopes its PBRS terms to endpoint lottery) with
+GGL_TS_PER_ITR=300000 (39s windows), same mu lineage. If the goal-fitness hops are
+also floored by noon, the verdict is a CLEAN NEGATIVE at paper scale: EGGROLL as
+specified does not extract match-play fitness signal on this task at 10^5 members,
+across two fitness definitions and sigma dose-response evidence.
+
 ## Sweep plan
 
 sigma_rel in {0.01, 0.03, 0.1} as three parallel 1-node jobs (alpha=1 fixed,
