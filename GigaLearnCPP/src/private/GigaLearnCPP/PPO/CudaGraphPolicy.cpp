@@ -21,6 +21,31 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/util/Exception.h>
 #include <cuda_runtime_api.h>
+#include <torch/version.h>
+
+// Libtorch 2.1 (the cluster) scopes graph-pool allocation by (device, stream);
+// 2.4+ (the desktop) renamed it to beginAllocateToPool with a stream filter.
+namespace {
+	inline void GglBeginAllocateToPool(
+		int dev, cudaStream_t stream, c10::cuda::MempoolId_t pool) {
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+		c10::cuda::CUDACachingAllocator::beginAllocateToPool(dev, pool,
+			[stream](cudaStream_t s) { return s == stream; });
+#else
+		c10::cuda::CUDACachingAllocator::beginAllocateStreamToPool(dev, stream, pool);
+#endif
+	}
+	inline void GglEndAllocateToPool(
+		int dev, cudaStream_t stream, c10::cuda::MempoolId_t pool) {
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+		(void)stream;
+		c10::cuda::CUDACachingAllocator::endAllocateToPool(dev, pool);
+#else
+		(void)pool;
+		c10::cuda::CUDACachingAllocator::endAllocateStreamToPool(dev, stream);
+#endif
+	}
+}
 #endif
 
 namespace {
@@ -143,8 +168,7 @@ namespace {
 					cudaGraphDestroy(aborted);
 				captureStarted = false;
 				if (mempoolHeld && captureDev >= 0)
-					c10::cuda::CUDACachingAllocator::endAllocateStreamToPool(
-						captureDev, stream.stream());
+					GglEndAllocateToPool(captureDev, stream.stream(), mempoolId);
 			};
 			try {
 				if (!captured) {
@@ -169,8 +193,7 @@ namespace {
 					});
 					captureDev = deviceIndex;
 					mempoolId = at::cuda::graph_pool_handle();
-					c10::cuda::CUDACachingAllocator::beginAllocateStreamToPool(
-						captureDev, stream.stream(), mempoolId);
+					GglBeginAllocateToPool(captureDev, stream.stream(), mempoolId);
 					mempoolHeld = true;
 					C10_CUDA_CHECK(cudaStreamBeginCapture(
 						stream.stream(), cudaStreamCaptureModeThreadLocal));
@@ -186,8 +209,7 @@ namespace {
 					cudaGraph_t rawGraph = nullptr;
 					C10_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), &rawGraph));
 					captureStarted = false;
-					c10::cuda::CUDACachingAllocator::endAllocateStreamToPool(
-						captureDev, stream.stream());
+					GglEndAllocateToPool(captureDev, stream.stream(), mempoolId);
 					C10_CUDA_CHECK(cudaGraphInstantiate(&graphExec, rawGraph, NULL, NULL, 0));
 					C10_CUDA_CHECK(cudaGraphDestroy(rawGraph));
 					captured = true;
