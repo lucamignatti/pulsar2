@@ -818,30 +818,17 @@ int main(int argc, char* argv[]) {
 		return GGL::RunMoESelfTest();
 
 
-	// GGL_NO_VERSIONS: disable the version ring + skill tracker. At MoE scale each
-	// archived version holds ~3.6GB of GPU-resident models — the 7.3-moe bring-up
-	// OOM'd right after its second AddVersion (job 4630877). Rating is meaningless
-	// in a run's first hours anyway; Nexto share + entropy are the live metrics.
-	if (const char* nv = std::getenv("GGL_NO_VERSIONS"); nv && *nv && std::string(nv) != "0") {
-		cfg.savePolicyVersions = false;
-		cfg.trainAgainstOldVersions = false;
-		cfg.skillTracker.enabled = false;
-		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
-	}
-	// GGL_NO_HEADROOM: composition-critic family + gap sensor + SIL off — the MoE
-	// leak bisect hammer (consume-extras vs core).
-	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
-		cfg.ppo.vdagEnabled = false;
-		cfg.ppo.silEnabled = false;
-		cfg.gapSensor.enabled = false;
-		RG_LOG("GGL_NO_HEADROOM: vdag + SIL + gap sensor disabled");
-	}
-	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
-	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
-	if (const char* nr = std::getenv("GGL_NO_REACH"); nr && *nr && std::string(nr) != "0") {
-		cfg.ppo.reachability.enabled = false;
-		RG_LOG("GGL_NO_REACH: reachability disabled");
-	}
+	// GGL_NO_VERSIONS: moved BELOW the production skillTracker / trainAgainstOldVersions
+	// assignments (2026-08-16) — it lived here first and was silently CLOBBERED by them:
+	// the config-order trap, second instance (the first cost the GGL_MOE block a portable
+	// segfault). The clobber kept the version ring saving AND loading on the 7.3-moe
+	// lineage; 4 GPU-resident versions were the +6.2GB resume-vs-fresh delta that OOM'd
+	// every resumed hop and exhausted two full chains at checkpoint 51.9M.
+	// GGL_NO_HEADROOM / GGL_NO_REACH moved to the LATE OVERRIDES section near the end
+	// of config (2026-08-16): both were silently clobbered here by later production
+	// assignments (reachability at its production enable, SIL/gapSensor likewise) —
+	// so every "NO_REACH"/"NO_HEADROOM" run banner-claimed features off that were ON.
+	// Config-order trap, instances #3 and #4.
 
 	// Memory-only lever (mathematically identical, CLAUDE.md): the learn pass chunks
 	// each batch by miniBatchSize with gradient accumulation. The MoE learn backward at
@@ -1417,6 +1404,19 @@ int main(int argc, char* argv[]) {
 	cfg.trainAgainstOldVersions = true;
 	cfg.trainAgainstOldChance = 0.30f;
 
+	// GGL_NO_VERSIONS: disable the version ring + skill tracker. At MoE scale each
+	// archived version holds ~3.6GB of GPU-resident models — the 7.3-moe bring-up
+	// OOM'd right after its second AddVersion (job 4630877), and the RESUME path
+	// re-loads the whole saved ring (+6.2GB steady, the hop-chain killer). Rating is
+	// meaningless in a run's first hours anyway; Nexto share + entropy are the live
+	// metrics. MUST stay below the production assignments above (config-order trap).
+	if (const char* nv = std::getenv("GGL_NO_VERSIONS"); nv && *nv && std::string(nv) != "0") {
+		cfg.savePolicyVersions = false;
+		cfg.trainAgainstOldVersions = false;
+		cfg.skillTracker.enabled = false;
+		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
+	}
+
 	// GGL_SMOKE re-application (MUST live here, after the production assignments above - the
 	// smoke block higher up runs first and would be clobbered). At production cadence a version
 	// is archived every 25M steps and the reference battery runs every 64 iterations, so a short
@@ -1784,6 +1784,26 @@ int main(int argc, char* argv[]) {
 		cfg.checkpointFolder.clear();
 		RG_LOG("GGL_PERF_BENCH: " << perfBenchmarkIterations
 			<< " reported iterations, 256 arenas, 100k rows/iteration, fresh 5-10M model");
+	}
+
+	// ===================== LATE ENV OVERRIDES (config-order trap) =====================
+	// These must run AFTER every production assignment of the flags they clear.
+	// Four instances of the trap so far (GGL_MOE segfault, GGL_NO_VERSIONS +6.2GB
+	// resume OOM, GGL_NO_REACH and GGL_NO_HEADROOM silently inert). If you add an env
+	// override, put it HERE unless you have checked there is no later assignment.
+	// GGL_NO_HEADROOM: composition-critic family + gap sensor + SIL off — the MoE
+	// leak bisect hammer (consume-extras vs core).
+	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
+		cfg.ppo.vdagEnabled = false;
+		cfg.ppo.silEnabled = false;
+		cfg.gapSensor.enabled = false;
+		RG_LOG("GGL_NO_HEADROOM: vdag + SIL + gap sensor disabled");
+	}
+	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
+	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
+	if (const char* nr = std::getenv("GGL_NO_REACH"); nr && *nr && std::string(nr) != "0") {
+		cfg.ppo.reachability.enabled = false;
+		RG_LOG("GGL_NO_REACH: reachability disabled");
 	}
 
 	// Team-mode arena split, decided by the lineage-scoped phase marker (see the
