@@ -548,13 +548,24 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		ggl_moe_scatter_add_f16(dX.data_ptr(), srcRows.data_ptr<int>(),
 			dxn16.data_ptr(), (int)n, (int)d, s);
 
+		// Bisect hook (sanitizer triage): 1 = skip wgrads, 2 = also skip dgrad GEMMs.
+		static const int bisect = [] {
+			const char* e = std::getenv("GGL_MOE_LEARN_BISECT");
+			return (e && *e) ? std::atoi(e) : 0;
+		}();
 		// wgrads: dW1[e] = dHpre_e^T @ X_e -> [h,d]; dW2[e] = dY_e^T @ Hpost_e -> [d,h].
 		auto dW1_16 = torch::empty({ (int64_t)E, h, d }, h16);
-		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
-			dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, (int)n, s);
+		if (bisect < 1)
+			ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
+				dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, (int)n, s);
+		else
+			dW1_16.zero_();
 		auto dW2_16 = torch::empty({ (int64_t)E, d, h }, h16);
-		ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
-			dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, (int)n, s);
+		if (bisect < 1)
+			ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
+				dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, (int)n, s);
+		else
+			dW2_16.zero_();
 
 		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
 		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).
