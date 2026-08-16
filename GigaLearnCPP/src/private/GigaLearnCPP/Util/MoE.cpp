@@ -268,6 +268,14 @@ torch::Tensor GGL::MoEBlockImpl::forward(torch::Tensor x) {
 
 #ifdef GGL_MOE_KERNELS
 torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
+	// One-time activation proof: the env is read lazily inside forward, so without
+	// this line nothing in the boot log distinguishes fast-path-on from silently-eager
+	// (the exact ambiguity the config-order trap taught us to close).
+	static std::once_flag activeLog;
+	std::call_once(activeLog, [&] {
+		RG_LOG("MoE CUTLASS fast path ACTIVE (E=" << numExperts << ", k=" << topK
+			<< ", hidden=" << hidden << ")");
+	});
 	void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
 	const int64_t R = x.size(0);
 	const int64_t n = R * topK;
