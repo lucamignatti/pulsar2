@@ -156,6 +156,15 @@ place weight caches) so graphs and the CUTLASS path compose.
       parity gate PASSED (3e-4), 3.41× block forward.
 - [x] titan-graphs merge (raw capture) + pointer-stability for composition.
 - [x] **Fleet flip: GGL_MOE_CUTLASS=1 live on chain 4631318+** (7.3-moe-b3).
-- [ ] Measure fleet SPS vs the 89k baseline; then flip GGL_CUDA_GRAPHS=1 on top.
-- [ ] Stage 2 (NCCL EP) design review + a2a microbench inter-node.
+- [x] Fleet measurements (2026-08-16 evening, jobs 4631318/26/34/42):
+      CUTLASS collect infer 8.0→5.6ms/tick, SPS 89k→99k — then the run became
+      LEARN-BOUND (collect 0.9s hides under learn 1.5s; iteration ~2.0s), so
+      graphs bought zero SPS (and the <11.4 post-replay sync worsened collect
+      latency 0.55→0.76s) → GGL_CUDA_GRAPHS parked OFF, code stays ready.
+      Learn breakdown (GGL_CONSUME_TIMERS): fwdbwd 0.77 / optstep 0.39 /
+      allreduce 0.32. GGL_MINIBATCH 926→2778 halved fwdbwd (0.37s), learn
+      1.50→1.28s, **SPS ~105k**, mem 10.4GB. Now the top items are
+      allreduce 0.49 + optstep 0.39 (incl. the 1.6GB owner-bcast) — BOTH are
+      exactly what Stage 2 EP eliminates by construction. EP is next.
+- [ ] Stage 2 (NCCL EP) design review + a2a microbench inter-node → build.
 - [ ] Stage 3 (async experts) pre-registration.
