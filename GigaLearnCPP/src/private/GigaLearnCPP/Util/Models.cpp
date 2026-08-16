@@ -142,8 +142,12 @@ void GGL::Model::RefreshHalfCache() {
 			const bool firstBuild = (seqHalf->size() == 0);
 
 			if (seqHalf->size() == 0) {
+				// clone(device), NOT clone(): Cloneable's reset() creates fresh CPU tensors,
+				// so a device-less clone of a CUDA model round-trips every param through the
+				// host — and the CPU-side fp32->fp16 cast of the 1B MoE trunk took 26 SECONDS
+				// per build (job 4630865). With the device passed, the whole build is on-GPU.
 				for (auto& mod : *seq)
-					seqHalf->push_back(mod.clone());
+					seqHalf->push_back(mod.clone(device));
 				seqHalf->to(RG_HALFPERC_TYPE, true);
 
 				// GGL_FLAT_HALF (default on): re-point every seqHalf param at a view of ONE
