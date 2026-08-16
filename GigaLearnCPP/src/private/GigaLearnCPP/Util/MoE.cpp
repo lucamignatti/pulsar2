@@ -551,7 +551,11 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto dB2 = torch::zeros({ (int64_t)E, d }, f32);
 		ggl_moe_segment_sum_f16to32(dY.data_ptr(), expertId.data_ptr<int>(),
 			dB2.data_ptr<float>(), (int)n, (int)d, s);
-		auto dH = torch::empty({ n, h }, h16);
+		// zeros, NOT empty: the dgrad GEMM writes only rows inside expert segments;
+		// the tail beyond offsets[E] would stay uninitialized garbage and the B1
+		// segment-sum (which has no pad guard — pads are zero BY VALUE) swept NaNs
+		// into expert 0 (grad-parity run 4631409, refNorm 447 vs fast NaN).
+		auto dH = torch::zeros({ n, h }, h16);
 		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(),
 			blk->_lw2.data_ptr(), dH.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
 		ggl_moe_leaky_bwd_f16(dH.data_ptr(), hid.data_ptr(), (int)n, (int)h, 0.01f, s);
