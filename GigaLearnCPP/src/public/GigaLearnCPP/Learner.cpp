@@ -3078,6 +3078,7 @@ void GGL::Learner::Start() {
 
 
 				Timer consumptionTimer = {};
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] A_consume_start\n");
 
 				// EGGROLL-ES consumes nothing: no value pred, no GAE, no Learn, no aux. The
 				// generation turn (fitness -> update -> perturb) already ran in the barrier
@@ -3106,6 +3107,7 @@ void GGL::Learner::Start() {
 				// weights); only its regression pair differs.
 
 				{ // Process timesteps
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] B_process_block\n");
 					RG_NO_GRAD;
 
 					// Make and transpose tensors
@@ -3145,6 +3147,7 @@ void GGL::Learner::Start() {
 					report["Collected Timesteps"] = stepsCollected;
 					
 					Timer valPredTimer = {};
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] C_valpred_start\n");
 					torch::Tensor tValPreds;
 					torch::Tensor tTruncValPreds;
 					// Filled by the fused GPU loop below alongside tValPreds — see the note
@@ -3245,6 +3248,7 @@ void GGL::Learner::Start() {
 					}
 
 					// Secondary goal-critic value predictions (same minibatching pattern).
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] D_valpred_done\n");
 					torch::Tensor tGoalValPreds, tGoalTruncValPreds;
 					if (goalCriticOn) {
 						if (ppo->device.is_cpu()) {
@@ -3598,6 +3602,7 @@ void GGL::Learner::Start() {
 						config.ppo.gaeGamma, config.ppo.gaeLambda, returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange
 					);
 					report["GAE Time"] = gaeTimer.Elapsed();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E_gae_done\n");
 					report["Clipped Reward Portion"] = rewClipPortion;
 
 					// Value explained-variance vs the quantity V actually regresses (GAE
@@ -3615,6 +3620,7 @@ void GGL::Learner::Start() {
 							.item<float>();
 						ppo->valueEvEma = 0.95f * ppo->valueEvEma + 0.05f * RS_MAX(0.f, ev);
 						report["Value/EV"] = ev;
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E1_ev\n");
 						report["Value/EV Returns"] = 1.f
 							- ((retF - vpEv).var() / (retF.var() + 1e-8f)).item<float>();
 					}
@@ -3694,6 +3700,7 @@ void GGL::Learner::Start() {
 							}
 						}
 						report["Vdag Infer Time"] = vdagInferTimer.Elapsed();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E2_vdaginfer\n");
 						auto vdagN = torch::cat({ vdag.slice(0, 1, nR), z1 });
 						// ===== HULL OPERATOR (EPSILON_CRITIC.md s7; PPOLearnerConfig::hullEnabled)
 						// Relax the bootstrap: max over the real next state and hullK candidates
@@ -3820,6 +3827,7 @@ void GGL::Learner::Start() {
 						// std of the CENTRED potential difference, not of the injection that
 						// survives the clamp — so read the dose HERE, not from beta.
 						report["Headroom/Inj Std Ratio"] = inj.std().item<float>() / RS_MAX(sExt, 1e-8f);
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E3_inj\n");
 
 						tAdvantages = tAdvantages + inj.view_as(tAdvantages);
 						// THEORY targets: the scaled reward that LANDED on each arrival state.
@@ -3911,11 +3919,14 @@ void GGL::Learner::Start() {
 							report["SIL/Mean W"] = nConv > 0
 								? tSilWeights.sum().item<float>() / nConv : 0.f;
 							report["SIL Time"] = silTimer.Elapsed();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] F_sil_done\n");
 						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E4_vdagmean\n");
 						report["Headroom/H Mean"] = tH.mean().item<float>();
 						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
 						report["Headroom/Inj Abs Mean"] = inj.abs().mean().item<float>();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G1_headroom_done\n");
 					}
 
 					if (returnStat) {
@@ -3931,6 +3942,7 @@ void GGL::Learner::Start() {
 					if (returnStat)
 						returnStat->SyncAcrossRanks(dist);
 					report["Dist Sync Time"] = distSyncTimer.Elapsed();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G2_distsync\n");
 					report["GAE/Avg Return"] = tReturns.abs().mean().item<float>();
 					report["GAE/Avg Advantage"] = rawAdvAbsMean; // pre-injection (see above)
 					report["GAE/Avg Val Target"] = tTargetVals.abs().mean().item<float>();
@@ -3989,6 +4001,7 @@ void GGL::Learner::Start() {
 					{
 						float postAdvAbsMean = tAdvantages.abs().mean().item<float>();
 						report["GAE/Avg Advantage Post-Inj"] = postAdvAbsMean;
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G3_goalcritic_done\n");
 						if (rawAdvAbsMean > 1e-8f)
 							report["GAE/Injected Frac"] = (postAdvAbsMean - rawAdvAbsMean) / rawAdvAbsMean;
 					}
@@ -4086,6 +4099,7 @@ void GGL::Learner::Start() {
 					// literally zero), std-floored beta_eff, clamped +-3 sigma_ext.
 					// Value/expectile targets were computed BEFORE any injection (the
 					// sensor never measures its own payments).
+					if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G4_pre_gap\n");
 					int doGap = (gapSensor && (int64_t)combinedTraj.Length() > 0 && tTargetVals.defined()) ? 1 : 0;
 					if (DistActive())
 						dist->min_host(&doGap, 1);
@@ -4114,11 +4128,15 @@ void GGL::Learner::Start() {
 									torch::Tensor h2;
 									{
 										RG_NO_GRAD;
-										h2 = ppo->models["shared_head"]->Forward(
-											tStates.index_select(0, idx).to(ppo->device, true), false);
+										if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H0_pre_fwd idx=%ld\n", (long)idx.numel());
+										auto gapIn = tStates.index_select(0, idx).to(ppo->device, true);
+										if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H0a_upload_done\n");
+										h2 = ppo->models["shared_head"]->Forward(gapIn, false);
+										if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H0b_fwd_done\n");
 									}
 									if (!gapSensor->exp)
 										gapSensor->Build(h2.size(1), ppo->device, gc.lr);
+								if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H1_h2_and_build\n");
 									gapSensor->optim->zero_grad();
 									auto pred = gapSensor->exp->forward(h2).flatten();
 									auto u = tTgt.index_select(0, idx).to(ppo->device) - pred;
@@ -4126,6 +4144,7 @@ void GGL::Learner::Start() {
 										torch::full_like(u, gc.tau), torch::full_like(u, 1.f - gc.tau));
 									auto loss = (w * u * u).mean();
 									loss.backward();
+								if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H2_backward\n");
 									lossSum += loss.item<float>(); lossN++;
 								} else if (gapSensor->exp && gapSensor->optim) {
 									gapSensor->optim->zero_grad();
@@ -4145,8 +4164,10 @@ void GGL::Learner::Start() {
 								}
 								if (gapSensor->optim)
 									gapSensor->optim->step();
+								if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H3_step\n");
 							}
 							gapSensor->updates++;
+								if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H4_loop_done\n");
 							if (lossN > 0)
 								report["Gap/Loss"] = lossSum / lossN;
 						}
@@ -4184,6 +4205,7 @@ void GGL::Learner::Start() {
 						}
 
 						report["Gap/Time"] = gapTimer.Elapsed();
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G_gap_done\n");
 					}
 
 					// Set experience buffer
@@ -4263,6 +4285,7 @@ void GGL::Learner::Start() {
 					pipelinedCollectPending = true;
 				}
 				Timer learnTimer = {};
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H_learn_start\n");
 				ppo->Learn(experience, report, isFirstIteration);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
 				} // end !esMode (PPO consume phase)
@@ -4372,6 +4395,7 @@ void GGL::Learner::Start() {
 						"ES/Fitness Mean",
 						"ES/Fitness Std",
 						"ES/Update Norm",
+						"MoE/Load Entropy",
 						"",
 						"Reach/Beta",
 						"Reach/Gate Mult Mean",

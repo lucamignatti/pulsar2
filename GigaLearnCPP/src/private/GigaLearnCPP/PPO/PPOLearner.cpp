@@ -13,6 +13,7 @@
 #include <torch/cuda.h>                      // GGL_CONSUME_TIMERS synchronize points
 #include <public/GigaLearnCPP/Util/AvgTracker.h>
 #include <public/GigaLearnCPP/Util/Timer.h>
+#include "../Util/MoE.h"
 #include <RLGymCPP/CommonValues.h>
 #include "../Util/Plasticity.h"
 
@@ -1881,6 +1882,24 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	if (consumeTimers) {
 		RG_LOG("[CONSUME] rank_learn shuffle=" << tShuffle << " fwdbwd=" << tFwdBwd
 			<< " allreduce=" << tAllReduce << " clip=" << tClip << " optstep=" << tOptStep);
+	}
+
+	// MoE router maintenance (research/reports/MOE_POLICY.md): DSv3 aux-free balancing
+	// bias update from this learn pass's accumulated expert load, once per iteration.
+	// Identical on every rank (loadAcc comes from identical... NO — loads are rank-local.
+	// The bias is a BUFFER, not allreduced; small per-rank drift is acceptable for v1 and
+	// the collect-side routing it shapes is rank-local anyway. Panel = mean load entropy
+	// (1 = perfectly balanced; collapse toward 0 = router collapse, the classic failure).
+	if (models["shared_head"]) {
+		float entSum = 0.f;
+		int nMoe = 0;
+		for (size_t i = 0; i < models["shared_head"]->seq->size(); i++)
+			if (auto moe = std::dynamic_pointer_cast<GGL::MoEBlockImpl>(models["shared_head"]->seq->ptr(i))) {
+				entSum += moe->UpdateRouterBias(1e-3f);
+				nMoe++;
+			}
+		if (nMoe > 0)
+			report["MoE/Load Entropy"] = entSum / (float)nMoe;
 	}
 
 	if (metricPolicySteps > 0) {

@@ -40,8 +40,21 @@ namespace GGL {
 		// that walks seq looking for Linears (PSD::LinearLayers, PolicySlots) still works.
 		bool addResiduals = false;
 
+		// DeepSeek-V3-style MoE trunk (research/reports/MOE_POLICY.md). When moeBlocks > 0
+		// the model is: Linear(numInputs -> layerSizes[0]) embed + LN + Act, then
+		// moeBlocks x MoEBlock(dim=layerSizes[0], moeHidden, moeExperts, moeTopK)
+		// (each block is pre-LN residual internally), then LN, then the output layer.
+		// layerSizes must have exactly one entry (the trunk width). Incompatible with
+		// addResiduals (blocks carry their own skips).
+		int moeBlocks = 0;
+		int moeExperts = 0;
+		int moeTopK = 0;
+		int moeHidden = 0;
+
 		bool IsValid() const {
-			return !layerSizes.empty();
+			return !layerSizes.empty()
+				&& (moeBlocks == 0 || (moeExperts > 0 && moeTopK > 0 && moeHidden > 0
+					&& layerSizes.size() == 1 && !addResiduals));
 		}
 	};
 

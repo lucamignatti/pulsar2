@@ -1,4 +1,5 @@
 #include "Models.h"
+#include "MoE.h"
 
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <torch/csrc/api/include/torch/nn/utils/convert_parameters.h>
@@ -23,6 +24,27 @@ GGL::Model::Model(
 			if (size != config.layerSizes[0])
 				RG_ERR_CLOSE("Model \"" << modelName << "\": addResiduals requires uniform layerSizes, got "
 					<< size << " among " << config.layerSizes[0] << "-wide layers");
+	}
+
+	// MoE trunk path (see PartialModelConfig::moeBlocks): embed -> MoE blocks -> LN.
+	if (config.moeBlocks > 0) {
+		const int64_t d = (int64_t)config.layerSizes[0];
+		seq->push_back(torch::nn::Linear(config.numInputs, d));
+		if (config.addLayerNorm)
+			seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ d })));
+		AddActivationFunc(seq, config.activationType);
+		for (int b = 0; b < config.moeBlocks; b++)
+			seq->push_back(GGL::MoEBlock((int64_t)d, (int64_t)config.moeHidden,
+				(int64_t)config.moeExperts, (int64_t)config.moeTopK));
+		seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ d })));
+		if (config.addOutputLayer)
+			seq->push_back(torch::nn::Linear(d, config.numOutputs));
+		else
+			this->config.numOutputs = (int)d;
+		register_module("seq", seq);
+		seq->to(device);
+		optim = MakeOptimizer(config.optimType, this->parameters(), 0);
+		return;
 	}
 
 	int lastSize = config.numInputs;
@@ -70,6 +92,8 @@ GGL::Model::Model(
 torch::Tensor GGL::ForwardSeqModule(const std::shared_ptr<torch::nn::Module>& mod, torch::Tensor x) {
 	if (auto lin = std::dynamic_pointer_cast<torch::nn::LinearImpl>(mod))
 		return lin->forward(x);
+	if (auto moe = std::dynamic_pointer_cast<GGL::MoEBlockImpl>(mod))
+		return moe->forward(x);
 	if (auto ln = std::dynamic_pointer_cast<torch::nn::LayerNormImpl>(mod))
 		return ln->forward(x);
 	if (auto act = std::dynamic_pointer_cast<torch::nn::LeakyReLUImpl>(mod))
@@ -142,6 +166,15 @@ void GGL::Model::RefreshHalfCache() {
 						}
 					}
 				}
+			}
+			// Buffers are NOT covered by the flat param store — the MoE router's selection
+			// bias lives in a buffer and drifts every learn pass; without this the collect
+			// side would route on the birth bias forever.
+			{
+				auto fromBufs = seq->buffers();
+				auto toBufs = seqHalf->buffers();
+				for (size_t i = 0; i < fromBufs.size() && i < toBufs.size(); i++)
+					toBufs[i].copy_(fromBufs[i], true);
 			}
 			if (_flatHalfBuf.defined()) {
 				// One gather of the fp32 params, one casting copy into the flat half store.
@@ -455,7 +488,10 @@ void GGL::ModelSet::StepOptimsSharded(Dist::Session* dist) {
 		for (auto& group : muon->param_groups())
 			for (auto& param : group.params()) {
 				auto g = param.grad();
-				if (g.defined() && g.dim() == 2 && g.size(0) > 1 && g.size(1) > 1)
+				// Predicate MUST mirror Muon::step's NS-eligible test (2D matrices and
+				// 3D MoE expert stacks) or the shard counters misalign.
+				if (g.defined() && ((g.dim() == 2 && g.size(0) > 1 && g.size(1) > 1)
+					|| (g.dim() == 3 && g.size(1) > 1 && g.size(2) > 1)))
 					shard2D.emplace_back(param, (int)(counter++ % (int64_t)world));
 			}
 		model->StepOptim();
