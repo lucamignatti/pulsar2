@@ -384,7 +384,7 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 	torch::mm_out(sc.logits32, xn.to(torch::kFloat), _routerW32.t());
 
 	ggl_moe_route_plan_f16(
-		sc.logits32.data_ptr(), routerBias.data_ptr(), (int)R, E, (int)topK,
+		sc.logits32.data_ptr(), routerBias.data_ptr(), (int)R, E, (int)topK, /*align=*/0,
 		sc.counts.data_ptr<int>(), sc.offsets.data_ptr<int>(),
 		sc.rowExp.data_ptr<int>(), sc.rowGate.data_ptr<float>(),
 		sc.srcRows.data_ptr<int>(), sc.expertId.data_ptr<int>(),
@@ -431,7 +431,11 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
 		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
 		const int E = (int)blk->numExperts, k = (int)blk->topK;
-		const int64_t n = R * k;
+		const int64_t nReal = R * k;
+		// Aligned segments: each expert's slot range rounds to 8 (wgrad fp16 tensor-op
+		// pointer/K alignment). Buffers sized to the bound; pad slots carry srcRows=-1
+		// and contribute exact zeros end to end.
+		const int64_t n = ((nReal + 7) & ~7LL) + 8LL * E;
 		auto dev = xn.device();
 		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
 		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
@@ -459,13 +463,13 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto logits = torch::mm(xn, routerW.t()).contiguous();          // fp32 [R,E]
 		auto counts = torch::empty({ 2LL * E }, i32);
 		auto offsets = torch::empty({ (int64_t)E + 1 }, i32);
-		auto rowExp = torch::empty({ n }, i32);
-		auto rowGate = torch::empty({ n }, f32);
+		auto rowExp = torch::empty({ nReal }, i32);
+		auto rowGate = torch::empty({ nReal }, f32);
 		auto srcRows = torch::empty({ n }, i32);
 		auto expertId = torch::empty({ n }, i32);
 		auto gates = torch::empty({ n }, f32);
 		ggl_moe_route_plan_f16(logits.data_ptr(), blk->_lBias.data_ptr(),
-			(int)R, E, k, counts.data_ptr<int>(), offsets.data_ptr<int>(),
+			(int)R, E, k, /*align=*/1, counts.data_ptr<int>(), offsets.data_ptr<int>(),
 			rowExp.data_ptr<int>(), rowGate.data_ptr<float>(),
 			srcRows.data_ptr<int>(), expertId.data_ptr<int>(), gates.data_ptr<float>(), s);
 
@@ -554,14 +558,19 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 
 		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
 		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).
-		auto srcL = srcRows.to(torch::kLong);
-		auto expL = expertId.to(torch::kLong);
+		// Pad slots (srcRows = -1) are excluded from the gate/router chain.
+		auto realMask = srcRows.ge(0);
+		auto realIdx = torch::nonzero(realMask).flatten();
+		auto srcL = srcRows.index_select(0, realIdx).to(torch::kLong);
+		auto expL = expertId.index_select(0, realIdx).to(torch::kLong);
+		auto gdotR = gdot.index_select(0, realIdx);
+		auto gatesR = gates.index_select(0, realIdx);
 		auto selLogit = logits.index({ srcL, expL });                    // [n] fp32
 		auto a = torch::sigmoid(selLogit);
 		auto S = torch::zeros({ R }, f32).index_add(0, srcL, a);
 		auto Srow = S.index_select(0, srcL).clamp_min(1e-9);
-		auto dotRow = torch::zeros({ R }, f32).index_add(0, srcL, gdot * gates.to(f32));
-		auto dA = gdot / Srow - dotRow.index_select(0, srcL) / Srow;
+		auto dotRow = torch::zeros({ R }, f32).index_add(0, srcL, gdotR * gatesR);
+		auto dA = gdotR / Srow - dotRow.index_select(0, srcL) / Srow;
 		auto dLogitSel = dA * a * (1.0 - a);
 		auto dLogits = torch::zeros_like(logits);
 		dLogits.index_put_({ srcL, expL }, dLogitSel, /*accumulate=*/true);

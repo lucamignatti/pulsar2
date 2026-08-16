@@ -40,9 +40,14 @@ extern "C" {
 	//   expertId      int32 [n] assignment -> expert
 	//   gates         float [n] normalized gate weight
 	// 4 launches (memset, topk+count, scan, place).
+	// alignSegments != 0: per-expert segment starts round up to 8 (fp16 tensor-op
+	// pointer/K alignment for the LEARN-path wgrad). Pad slots get srcRows = -1 /
+	// gates = 0 (pre-initialized here); callers must size the assignment buffers
+	// to nBound = roundup8(R*k) + 8*E and launch the per-assignment kernels over
+	// nBound — every kernel below guards srcRows < 0.
 	void ggl_moe_route_plan_f16(
 		const void* logits, const void* selBias,
-		int R, int E, int k,
+		int R, int E, int k, int alignSegments,
 		int* countsCursors, int* offsets,
 		int* rowExpScratch, float* rowGateScratch,
 		int* srcRows, int* expertId, float* gates,

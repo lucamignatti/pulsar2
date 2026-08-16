@@ -103,6 +103,30 @@ offsets/srcRows/expertId/gates. Backward:
 - GATE: selftest grad-parity vs eager autograd (grad relRMS per param family)
   before any fleet flip — same doctrine as the inference parity gate.
 
+STATUS 2026-08-16 night: implemented + cluster-compiling; inference gates still
+green (3.2e-4, 3.35x). Grad-parity run 4631402 FAILED with "CUDA error:
+misaligned address" — root-caused: the wgrad grouped GEMM slices the transposed
+assignment buffer at `T + offsets[e]` (arbitrary token counts) and uses
+per-problem K = m_e, but the fp16 tensor-op template requires 8-ELEMENT
+alignment on A pointers and K. (Forward GEMMs are immune: their offsets scale
+by d/h which are ÷8; that is why inference parity passes.) Also fixed en route:
+ColumnMajor-A has no legal sm_70 thread map at our tile — wgrad now transposes
+once globally and uses the proven RowMajor template with lda = n.
+NEXT STEP (exact): learn-path routing plan emits 8-ALIGNED per-expert segments —
+scan kernel rounds each expert's segment start up to 8, pad slots get
+srcRows = -1 / gates = 0, gather kernels write zero rows for -1, scatter/segsum
+kernels skip -1; collect fast path keeps the unpadded layout (flag on
+ggl_moe_route_plan). Pad rows are zero through the whole chain so wgrad picks up
+exact zeros. Then re-run the grad-parity gate (4631402's config).
+
+Muon-shard-under-APPO VERDICT (task #1, trial 4631380): DEADLOCK — 25 min,
+ver=0 on all collectors, zero updates. The per-param learner-group bcasts in
+StepOptimsSharded interleave against the collector weight-publish collectives
+on a different NCCL comm (multi-comm ordering hazard). GGL_MUON_SHARD stays
+OFF in async mode (annotated in pulsar2_asyncmoe_luca.sbatch); owner-local NS
+via EP (task #3) is the correct optimizer-cost fix under APPO — it needs no
+mid-step collective at all.
+
 ## Stage 2 — NCCL expert parallelism (user-directed)
 
 Each of a node's 6 V100s owns E/6 = ~21 experts per block (fixed assignment);

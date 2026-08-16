@@ -89,8 +89,9 @@ __global__ void gglk_route_topk(
 		rowGate[(size_t)r * k + j] *= inv;
 }
 
-// Single-block exclusive scan counts -> offsets (E <= 512).
-__global__ void gglk_scan_offsets(const int* counts, int* offsets, int E) {
+// Single-block exclusive scan counts -> offsets (E <= 512). alignUp rounds each
+// expert's segment to 8 slots (learn-path wgrad alignment; see header).
+__global__ void gglk_scan_offsets(const int* counts, int* offsets, int E, int alignUp) {
 	__shared__ int sh[513];
 	int t = threadIdx.x;
 	if (t <= E)
@@ -100,6 +101,8 @@ __global__ void gglk_scan_offsets(const int* counts, int* offsets, int E) {
 		int acc = 0;
 		for (int e = 0; e <= E; e++) {
 			int c = sh[e];
+			if (alignUp)
+				c = (c + 7) & ~7;
 			offsets[e] = acc;
 			acc += c;
 		}
@@ -126,7 +129,7 @@ __global__ void gglk_place(
 
 extern "C" void ggl_moe_route_plan_f16(
 	const void* logits, const void* selBias,
-	int R, int E, int k,
+	int R, int E, int k, int alignSegments,
 	int* countsCursors, int* offsets,
 	int* rowExpScratch, float* rowGateScratch,
 	int* srcRows, int* expertId, float* gates,
@@ -141,10 +144,17 @@ extern "C" void ggl_moe_route_plan_f16(
 	int* counts = countsCursors;
 	int* cursors = countsCursors + E;
 	GGLK_CUDA_CHECK(cudaMemsetAsync(countsCursors, 0, sizeof(int) * 2 * (size_t)E, s));
+	if (alignSegments) {
+		// Pad slots must pre-exist as skippable: srcRows = -1 (0xFF bytes), gates = 0.
+		int nBound = ((n + 7) & ~7) + 8 * E;
+		GGLK_CUDA_CHECK(cudaMemsetAsync(srcRows, 0xFF, sizeof(int) * (size_t)nBound, s));
+		GGLK_CUDA_CHECK(cudaMemsetAsync(gates, 0, sizeof(float) * (size_t)nBound, s));
+		GGLK_CUDA_CHECK(cudaMemsetAsync(expertId, 0, sizeof(int) * (size_t)nBound, s));
+	}
 	gglk_route_topk<<<(R + 127) / 128, 128, 0, s>>>(
 		(const float*)logits, (const __half*)selBias, R, E, k,
 		counts, rowExpScratch, rowGateScratch);
-	gglk_scan_offsets<<<1, E + 1, 0, s>>>(counts, offsets, E);
+	gglk_scan_offsets<<<1, E + 1, 0, s>>>(counts, offsets, E, alignSegments);
 	gglk_place<<<(n + 127) / 128, 128, 0, s>>>(
 		rowExpScratch, rowGateScratch, offsets, cursors, n, k,
 		srcRows, expertId, gates);
@@ -157,8 +167,14 @@ __global__ void gglk_gather_f16(
 	int i = blockIdx.x;
 	if (i >= n)
 		return;
-	const __half* src = x + (size_t)srcRows[i] * d;
+	int sr = srcRows[i];
 	__half* dst = packed + (size_t)i * d;
+	if (sr < 0) { // aligned-segment pad slot: zero row (wgrad sees exact zeros)
+		for (int c = threadIdx.x; c < d; c += blockDim.x)
+			dst[c] = __float2half(0.f);
+		return;
+	}
+	const __half* src = x + (size_t)sr * d;
 	for (int c = threadIdx.x; c < d; c += blockDim.x)
 		dst[c] = src[c];
 }
@@ -203,9 +219,12 @@ __global__ void gglk_scatter_bias_gate_f16(
 	int i = blockIdx.x;
 	if (i >= n)
 		return;
+	int sr = srcRows[i];
+	if (sr < 0)
+		return;
 	const __half* ye = y + (size_t)i * D;
 	const __half* be = b + (size_t)expertId[i] * D;
-	__half* dst = out + (size_t)srcRows[i] * D;
+	__half* dst = out + (size_t)sr * D;
 	float g = gates[i];
 	for (int c = threadIdx.x; c < D; c += blockDim.x) {
 		float v = (__half2float(ye[c]) + __half2float(be[c])) * g;
@@ -232,8 +251,14 @@ __global__ void gglk_gather_scale_f16(
 	int i = blockIdx.x;
 	if (i >= n)
 		return;
-	const __half* src = dOut + (size_t)srcRows[i] * d;
+	int sr = srcRows[i];
 	__half* dst = dY + (size_t)i * d;
+	if (sr < 0) { // pad slot: exact zeros into every downstream product
+		for (int c = threadIdx.x; c < d; c += blockDim.x)
+			dst[c] = __float2half(0.f);
+		return;
+	}
+	const __half* src = dOut + (size_t)sr * d;
 	float g = gates[i];
 	for (int c = threadIdx.x; c < d; c += blockDim.x)
 		dst[c] = __float2half(__half2float(src[c]) * g);
@@ -294,6 +319,11 @@ __global__ void gglk_gate_dot_f16(
 	int i = blockIdx.x;
 	if (i >= n)
 		return;
+	if (srcRows[i] < 0) {
+		if (threadIdx.x == 0)
+			gdot[i] = 0.f;
+		return;
+	}
 	const __half* go = dOut + (size_t)srcRows[i] * d;
 	const __half* yr = y + (size_t)i * d;
 	const __half* br = b + (size_t)expertId[i] * d;
@@ -327,8 +357,11 @@ __global__ void gglk_scatter_add_f16(
 	int i = blockIdx.x;
 	if (i >= n)
 		return;
+	int sr = srcRows[i];
+	if (sr < 0)
+		return;
 	const __half* row = dX + (size_t)i * d;
-	__half* dst = dxn + (size_t)srcRows[i] * d;
+	__half* dst = dxn + (size_t)sr * d;
 	for (int c = threadIdx.x; c < d; c += blockDim.x)
 		atomicAdd(&dst[c], row[c]);
 }
