@@ -518,6 +518,11 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
 		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
 
+		static const int dbg = [] {
+			const char* e = std::getenv("GGL_MOE_LEARN_BISECT");
+			return (e && *e) ? std::atoi(e) : 0;
+		}();
+		if (dbg) RG_LOG("[LEARN-BWD] enter R=" << R << " n=" << n);
 		auto dOut16 = gradOut[0].to(torch::kHalf).contiguous();
 
 		// Gate-grad first (needs y before dY overwrites nothing — buffers separate).
@@ -569,6 +574,7 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 
 		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
 		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).
+		if (dbg) { torch::cuda::synchronize(); RG_LOG("[LEARN-BWD] dgrad+wgrad done"); }
 		// Pad slots (srcRows = -1) are excluded from the gate/router chain.
 		auto realMask = srcRows.ge(0);
 		auto realIdx = torch::nonzero(realMask).flatten();
@@ -585,6 +591,7 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto dLogitSel = dA * a * (1.0 - a);
 		auto dLogits = torch::zeros_like(logits);
 		dLogits.index_put_({ srcL, expL }, dLogitSel, /*accumulate=*/true);
+		if (dbg) { torch::cuda::synchronize(); RG_LOG("[LEARN-BWD] gate chain done"); }
 		auto dRouterW = torch::mm(dLogits.t(), xn);                      // [E,d] fp32
 		auto dxn = dxn16.to(torch::kFloat) + torch::mm(dLogits, routerW);
 
