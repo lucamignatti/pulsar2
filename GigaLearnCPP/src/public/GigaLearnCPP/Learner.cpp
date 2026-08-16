@@ -3003,6 +3003,11 @@ void GGL::Learner::Start() {
 			RG_LOG("Pipelined collect: persistent worker (one pthread for the run)");
 		}
 
+		// Inner wrapper INSIDE collectThread's scope: without it, an exception unwinding
+		// out of the loop destroys the still-joinable worker thread first, and its
+		// destructor's std::terminate EATS the real error ("terminate called without an
+		// active exception" — six 1B-MoE bring-up cycles before this was understood).
+		try {
 		while (true) {
 			Report report = {};
 
@@ -4523,7 +4528,13 @@ void GGL::Learner::Start() {
 				);
 				lastDisplayTime = displayTimer.Elapsed();
 		}
-		
+		} catch (...) {
+			RG_LOG("Learner: exception with pipelined worker active - stopping worker to surface it");
+			if (pipelineOn)
+				fnCollectStop();
+			throw;
+		}
+
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("Exception thrown during main learner loop: " << e.what());
 	}
