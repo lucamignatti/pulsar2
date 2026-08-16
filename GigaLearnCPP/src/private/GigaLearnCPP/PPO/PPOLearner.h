@@ -90,6 +90,22 @@ namespace GGL {
 		// If models is null, this->models will be used - which is how the opponent half of a
 		// served iteration is inferred (pass the archived version's ModelSet).
 		void InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models = NULL);
+
+		// EGGROLL-ES batched low-rank population forward (research/reports/ES_EGGROLL.md).
+		// Each ROW belongs to a population member (rowMember, int64 [rows]); every Linear
+		// layer l of shared_head then policy adds sigma[l] * ((x_in . B_l[m]) * A_l[m]) on
+		// top of the shared base GEMM - the paper's trick that makes 10^4-10^6 members cost
+		// ~one batched inference. A_l is [members, out], B_l is [members, in]; layer order
+		// = Linear order walking shared_head then policy (residual spans honored). Masking
+		// and sampling semantics match InferActionsFromModels (non-finite rows sanitized).
+		struct EsLowRankCtx {
+			torch::Tensor rowMember;                  // [rows] int64, on device
+			std::vector<torch::Tensor> A, B;          // per Linear layer, on device
+			std::vector<float> sigma;                 // per Linear layer scale
+		};
+		void InferActionsLowRankES(ModelSet& models, torch::Tensor obs,
+			torch::Tensor actionMasks, const EsLowRankCtx& ctx,
+			torch::Tensor* outActions, torch::Tensor* outLogProbs);
 		// The value-side body: main trunk, then the critic trunk if one is configured. EVERY value
 		// head (critic, goal critic, V-dagger twins, r-hat twins) reads this, so they all see the
 		// same features and the trunks are forwarded once per call instead of once per head.

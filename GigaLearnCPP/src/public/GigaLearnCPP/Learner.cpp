@@ -1789,6 +1789,156 @@ void GGL::Learner::Start() {
 				}
 			}
 		};
+
+		// ---- v2: PER-ARENA MEMBERS (GGL_ES_PER_ARENA, default ON) ----
+		// The paper's population regime is 10^4-10^6; one member per RANK caps at the rank
+		// count (6-690) — the light useless curves in its scaling figure. Per-arena members
+		// use the batched low-rank forward (InferActionsLowRankES): every arena is its own
+		// member, so population = arenas/rank x ranks (256 x 690 = 176k at full fleet).
+		// No cross-rank noise determinism needed: each rank GEMMs its local members'
+		// contribution and the ΔW is allreduce-summed.
+		const bool esPerArena = esMode && [] {
+			const char* e = std::getenv("GGL_ES_PER_ARENA");
+			return !(e && *e && std::string(e) == "0");
+		}();
+		GGL::PPOLearner::EsLowRankCtx esCtx;
+		std::vector<double> esFitSumP;  // per-PLAYER accumulation (no races in the record
+		std::vector<int64_t> esFitCntP; // parallel-for); reduced to per-arena at the barrier
+		if (esPerArena) {
+			esFitSumP.assign((size_t)numPlayers, 0.0);
+			esFitCntP.assign((size_t)numPlayers, 0);
+		}
+		// Fresh noise stacks for the next generation: per Linear layer of shared_head then
+		// policy (2D params of a Sequential are exactly its Linear weights, in seq order —
+		// the same order InferActionsLowRankES consumes them).
+		auto fnEsBuildNoise = [&]() {
+			RG_NO_GRAD;
+			const int64_t nMembers = (int64_t)envSet->arenas.size();
+			esCtx.A.clear();
+			esCtx.B.clear();
+			esCtx.sigma.clear();
+			for (const char* nm : snapshotNames) {
+				Model* mm = ppo->models[nm];
+				if (!mm)
+					continue;
+				for (auto& p : mm->parameters()) {
+					if (p.dim() != 2 || p.size(0) <= 1 || p.size(1) <= 1)
+						continue;
+					esCtx.A.push_back(torch::randn({ nMembers, p.size(0) },
+						torch::TensorOptions().dtype(torch::kFloat32).device(p.device())));
+					esCtx.B.push_back(torch::randn({ nMembers, p.size(1) },
+						torch::TensorOptions().dtype(torch::kFloat32).device(p.device())));
+					esCtx.sigma.push_back(esSigma * p.std().item<float>());
+				}
+			}
+		};
+		// Fitness -> global z-score -> ΔW = Σ_m f_m A_m B_m^T (one local GEMM per layer,
+		// allreduce-summed across ranks), applied to mu.
+		auto fnEsUpdateArena = [&]() {
+			RG_NO_GRAD;
+			const int64_t nArenas = (int64_t)envSet->arenas.size();
+			std::vector<double> f((size_t)nArenas, 0.0);
+			std::vector<int64_t> cnt((size_t)nArenas, 0);
+			for (int p = 0; p < numPlayers; p++) {
+				f[(size_t)playerArenaIdx[p]] += esFitSumP[(size_t)p];
+				cnt[(size_t)playerArenaIdx[p]] += esFitCntP[(size_t)p];
+			}
+			double s = 0, ss = 0;
+			int64_t nValid = 0;
+			for (int64_t a = 0; a < nArenas; a++) {
+				if (cnt[(size_t)a] <= 0)
+					continue;
+				f[(size_t)a] /= (double)cnt[(size_t)a];
+				s += f[(size_t)a];
+				ss += f[(size_t)a] * f[(size_t)a];
+				nValid++;
+			}
+			float glob[3] = { (float)s, (float)ss, (float)nValid };
+			if (dist && dist->distributed())
+				dist->sum_host(glob, 3);
+			const double N = (double)glob[2];
+			if (N < 2)
+				return;
+			const double mean = glob[0] / N;
+			const double var = RS_MAX(0.0, (double)glob[1] / N - mean * mean);
+			esFitMean = (float)mean;
+			esFitStd = (float)std::sqrt(var);
+			esMyFit = nValid > 0 ? (float)(s / nValid) : 0.f; // this rank's member mean
+			esUpdateNorm = 0.f;
+			if (esFitStd < 1e-8f)
+				return;
+			std::vector<float> fz((size_t)nArenas, 0.f);
+			for (int64_t a = 0; a < nArenas; a++)
+				if (cnt[(size_t)a] > 0)
+					fz[(size_t)a] = (float)((f[(size_t)a] - mean) / esFitStd);
+			auto tFz = torch::tensor(fz, torch::kFloat32).to(ppo->device).unsqueeze(1);
+			double normSq = 0;
+			size_t li = 0;
+			for (const char* nm : snapshotNames) {
+				Model* mm = ppo->models[nm];
+				if (!mm)
+					continue;
+				for (auto& p : mm->parameters()) {
+					if (p.dim() != 2 || p.size(0) <= 1 || p.size(1) <= 1)
+						continue;
+					RG_ASSERT(li < esCtx.A.size());
+					// [out,members] x [members,in]; members with no rows have fz=0
+					auto dW = torch::matmul(esCtx.A[li].t(), esCtx.B[li] * tFz).contiguous();
+					if (dist && dist->distributed()) {
+						Dist::Session::Stream st = nullptr;
+#ifdef RG_CUDA_SUPPORT
+						if (dW.is_cuda())
+							st = (Dist::Session::Stream)c10::cuda::getCurrentCUDAStream(
+								dW.device().index()).stream();
+#endif
+						dist->allreduce_sum_device(dW.data_ptr<float>(), (size_t)dW.numel(), st);
+					}
+					p.add_(dW, esAlpha * esCtx.sigma[li] / (float)N);
+					float dn = dW.norm().item<float>() * esAlpha * esCtx.sigma[li] / (float)N;
+					normSq += (double)dn * dn;
+					li++;
+				}
+				mm->_seqHalfOutdated = true;
+			}
+			esUpdateNorm = (float)std::sqrt(normSq);
+			if (dist && dist->distributed()) {
+				static const bool chk = [] {
+					const char* e = std::getenv("GGL_DIST_LOCKSTEP_CHECK");
+					return e && *e && std::string(e) != "0";
+				}();
+				if (chk) {
+					float sum = ppo->models["policy"]->CopyParams().sum().item<float>();
+					float root = sum;
+					dist->bcast_host(&root, sizeof(root), 0);
+					if (std::abs(sum - root) > 1e-2f)
+						RG_ERR_CLOSE("ES(arena) lockstep mismatch rank " << dist->rank()
+							<< " policy-sum " << sum << " vs root " << root);
+				}
+			}
+		};
+		// One generation turn at the barrier, shared by the pipelined and sequential paths.
+		auto fnEsGenerationTurn = [&]() {
+			if (esInflight) {
+				if (esPerArena)
+					fnEsUpdateArena();
+				else
+					fnEsUpdate();
+			}
+			esGen++;
+			fnSyncSnapshot();
+			if (esPerArena)
+				fnEsBuildNoise(); // snapshot stays clean mu; deltas are functional per-row
+			else
+				fnEsPerturbSnapshot();
+			fnSyncEsOpp();
+			esOppTeamFlip++;
+			esInflight = true;
+		};
+		// The very first collect runs inline BEFORE any barrier — arm generation 0's
+		// noise here or the low-rank forward asserts on an empty ctx. (Gen 0's fitness
+		// is discarded by esInflight=false at the first barrier, matching v1.)
+		if (esPerArena)
+			fnEsBuildNoise();
 		// ===================== end EGGROLL-ES =====================
 
 		// fnSyncLadderCollect freezes one full wire generation for the NEXT collection
@@ -1979,6 +2129,20 @@ void GGL::Learner::Start() {
 			bool oppServed = oppModels || oppExternal;
 			if (oppServed) {
 				fnBuildOppSplit(oppTeam);
+			}
+
+			// EGGROLL-ES per-arena members: row k of the member-side batch belongs to the
+			// member (= arena) of player newPlayerIndices[k]. Built once per iteration
+			// (the split is fixed for the iteration); also reset the fitness cells.
+			if (esPerArena) {
+				std::fill(esFitSumP.begin(), esFitSumP.end(), 0.0);
+				std::fill(esFitCntP.begin(), esFitCntP.end(), (int64_t)0);
+				std::vector<int64_t> rm;
+				rm.reserve(newPlayerIndices.size());
+				for (int idx : newPlayerIndices)
+					rm.push_back((int64_t)playerArenaIdx[idx]);
+				esCtx.rowMember = torch::tensor(rm, torch::TensorOptions().dtype(torch::kInt64))
+					.to(ppo->device);
 			}
 
 			// Kickoff script: drop in-flight windows at the iteration boundary (the opponent
@@ -2365,12 +2529,21 @@ void GGL::Learner::Start() {
 						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr);
 							}
 					};
+					auto fnInferMain = [&]() {
+						// ES per-arena members ride the batched low-rank forward; every
+						// other mode (PPO, ES v1, render) takes the plain path.
+						if (esPerArena)
+							ppo->InferActionsLowRankES(*newModelsPtr, tdNewStates,
+								tdNewActionMasks, esCtx, &tNewActions, &tLogProbs);
+						else
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+					};
 					if (oppParallel) {
 						std::thread oppThread(fnInferOpp);
-						ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+						fnInferMain();
 						oppThread.join();
 					} else {
-						ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+						fnInferMain();
 						fnInferOpp();
 					}
 
@@ -2622,6 +2795,13 @@ void GGL::Learner::Start() {
 							traj.rewards += envSet->state.rewards[newPlayerIdx];
 							traj.logProbs += newLogProbs[k];
 
+							// EGGROLL-ES per-arena fitness: per-PLAYER cells, so this
+							// parallel-for never races (players are unique per k).
+							if (esPerArena) {
+								esFitSumP[(size_t)newPlayerIdx] += (double)envSet->state.rewards[newPlayerIdx];
+								esFitCntP[(size_t)newPlayerIdx]++;
+							}
+
 							if (goalCriticOn) {
 								auto& gs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
 								float gr = 0;
@@ -2861,36 +3041,20 @@ void GGL::Learner::Start() {
 				// so value-pred does not share the GPU with collect InferActions.
 				Timer snapshotTimer = {};
 				// EGGROLL-ES generation turn, all in the barrier (worker idle):
-				// credit the joined trajectory to the in-flight perturbation and update mu
-				// BEFORE the snapshot sync, so the next generation samples around mu_{t+1}.
-				if (esMode) {
-					if (esInflight)
-						fnEsUpdate();
-					esGen++;
-				}
-				fnSyncSnapshot();
-				if (esMode) {
-					fnEsPerturbSnapshot();
-					fnSyncEsOpp();
-					esOppTeamFlip++;
-					esInflight = true;
-				}
+				// credit the joined trajectory to the in-flight population, update mu
+				// BEFORE the snapshot sync, then arm the next generation's noise.
+				if (esMode)
+					fnEsGenerationTurn();
+				else
+					fnSyncSnapshot();
 				report["Snapshot Time"] = snapshotTimer.Elapsed();
 			} else {
 				report["VersionMgr Time"] = 0.f;
 				// Sequential ES: same generation turn at the same program point (the
 				// tail-of-N == top-of-N+1 equivalence the pipelined barrier comment cites).
 				Timer seqSnapshotTimer = {};
-				if (esMode) {
-					if (esInflight)
-						fnEsUpdate();
-					esGen++;
-					fnSyncSnapshot();
-					fnEsPerturbSnapshot();
-					fnSyncEsOpp();
-					esOppTeamFlip++;
-					esInflight = true;
-				}
+				if (esMode)
+					fnEsGenerationTurn();
 				report["Snapshot Time"] = seqSnapshotTimer.Elapsed();
 			}
 
@@ -2911,6 +3075,8 @@ void GGL::Learner::Start() {
 					report["ES/Fitness Mean"] = esFitMean;
 					report["ES/Fitness Std"] = esFitStd;
 					report["ES/Update Norm"] = esUpdateNorm;
+					report["ES/Members"] = (float)((esPerArena ? (int64_t)envSet->arenas.size() : 1)
+						* (int64_t)((dist && dist->distributed()) ? dist->world() : 1));
 				} else {
 
 				// Deliberate-practice proposer: Train() needs gradients, but the whole "Process
@@ -4183,6 +4349,7 @@ void GGL::Learner::Start() {
 						"",
 						// EGGROLL-ES panels (GGL_ES runs only; absent keys are skipped)
 						"ES/Gen",
+						"ES/Members",
 						"ES/My Fitness",
 						"ES/Fitness Mean",
 						"ES/Fitness Std",

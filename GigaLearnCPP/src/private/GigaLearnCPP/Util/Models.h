@@ -101,6 +101,10 @@ namespace GGL {
 		);
 
 		virtual torch::Tensor Forward(torch::Tensor input, bool halfPrec, bool keepHalf = false);
+
+		// Rebuild the fp16 weight cache if outdated (extracted from Forward so custom
+		// module walks — the EGGROLL-ES batched low-rank forward — can share it).
+		void RefreshHalfCache();
 		
 		void SetOptimLR(float newLR);
 

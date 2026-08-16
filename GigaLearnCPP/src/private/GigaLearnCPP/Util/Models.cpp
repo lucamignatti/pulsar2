@@ -106,13 +106,7 @@ static torch::Tensor ForwardResidual(
 	return x;
 }
 
-torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepHalf) {
-
-	if (torch::GradMode::is_enabled())
-		halfPrec = false;
-
-	if (halfPrec) {
-
+void GGL::Model::RefreshHalfCache() {
 		if (_seqHalfOutdated) {
 			_seqHalfOutdated = false;
 
@@ -163,6 +157,16 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepH
 				}
 			}
 		}
+}
+
+torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepHalf) {
+
+	if (torch::GradMode::is_enabled())
+		halfPrec = false;
+
+	if (halfPrec) {
+
+		RefreshHalfCache();
 
 		auto halfParams = seqHalf->parameters();
 		const auto halfType = halfParams.empty() ? RG_HALFPERC_TYPE : halfParams[0].scalar_type();

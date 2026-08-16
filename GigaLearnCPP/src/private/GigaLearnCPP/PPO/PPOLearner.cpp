@@ -471,6 +471,67 @@ void GGL::PPOLearner::InferActionsFromModels(
 	}
 }
 
+void GGL::PPOLearner::InferActionsLowRankES(ModelSet& models, torch::Tensor obs,
+	torch::Tensor actionMasks, const EsLowRankCtx& ctx,
+	torch::Tensor* outActions, torch::Tensor* outLogProbs) {
+
+	RG_NO_GRAD;
+	const bool hp = config.useHalfPrecision && device.is_cuda();
+	constexpr float ACTION_MIN_PROB = 1e-11f;
+	constexpr float ACTION_DISABLED_LOGIT = -1e10f;
+
+	torch::Tensor x = obs;
+	int li = 0; // Linear cursor across shared_head then policy — MUST match ctx build order
+	for (const char* nm : { "shared_head", "policy" }) {
+		Model* m = models[nm];
+		if (!m)
+			continue;
+		torch::nn::Sequential& sq = hp ? (m->RefreshHalfCache(), m->seqHalf) : m->seq;
+		if (hp) {
+			auto ps = sq->parameters();
+			if (!ps.empty() && x.scalar_type() != ps[0].scalar_type())
+				x = x.to(ps[0].scalar_type());
+		}
+		std::vector<torch::Tensor> saved(m->residualSpans.size());
+		for (int i = 0; i < (int)sq->size(); i++) {
+			for (int s = 0; s < (int)m->residualSpans.size(); s++)
+				if (m->residualSpans[s].first == i)
+					saved[s] = x;
+			torch::Tensor xin = x;
+			auto modPtr = sq->ptr(i);
+			x = GGL::ForwardSeqModule(modPtr, x);
+			if (std::dynamic_pointer_cast<torch::nn::LinearImpl>(modPtr)) {
+				RG_ASSERT((size_t)li < ctx.A.size());
+				// y += sigma_l * (x_in . B_l[m]) * A_l[m], the rank-1 member delta.
+				auto Ag = ctx.A[(size_t)li].index_select(0, ctx.rowMember).to(x.scalar_type());
+				auto Bg = ctx.B[(size_t)li].index_select(0, ctx.rowMember).to(xin.scalar_type());
+				auto u = (xin * Bg).sum(-1, /*keepdim=*/true);
+				x = x + (u * Ag) * ctx.sigma[(size_t)li];
+				li++;
+			}
+			for (int s = 0; s < (int)m->residualSpans.size(); s++)
+				if (m->residualSpans[s].second == i && saved[s].defined())
+					x = x + saved[s];
+		}
+	}
+	RG_ASSERT((size_t)li == ctx.A.size()); // every noise layer consumed exactly once
+
+	torch::Tensor logits = x;
+	if (logits.scalar_type() != torch::kFloat)
+		logits = logits.to(torch::kFloat);
+	// Same non-finite sanitize as the hot InferActions path: bad rows -> uniform logits.
+	auto rowOk = logits.isfinite().all(-1, /*keepdim=*/true);
+	logits = torch::where(rowOk, logits, torch::zeros_like(logits));
+	auto probs = torch::softmax(
+		logits + ACTION_DISABLED_LOGIT * actionMasks.to(torch::kBool).logical_not(), -1)
+		.clamp(ACTION_MIN_PROB, 1);
+	auto action = torch::multinomial(probs, 1, true);
+	if (outActions)
+		*outActions = action.flatten();
+	if (outLogProbs)
+		*outLogProbs = torch::log(probs).gather(-1, action).flatten();
+}
+
 void GGL::PPOLearner::InferActions(torch::Tensor obs, torch::Tensor actionMasks, torch::Tensor* outActions, torch::Tensor* outLogProbs, ModelSet* models) {
 	ModelSet& m = models ? *models : this->models;
 
