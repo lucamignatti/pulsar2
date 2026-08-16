@@ -4,6 +4,39 @@
 #ifdef GGL_MOE_KERNELS
 #include "MoEKernels.h"
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/autocast_mode.h>
+#include <torch/version.h>
+
+namespace {
+	// The custom routed-FFN manages precision EXPLICITLY (fp32 routing, fp16 GEMMs).
+	// The fleet's learn pass wraps forwards in autocast, which intercepted the
+	// router mm and emitted fp16 logits that the route-plan kernel then read as
+	// fp32 — 2x past the buffer, an illegal access that crash-looped the chain
+	// (jobs 4631411-417; the selftest never saw it because it runs autocast-free).
+	struct AutocastOffScope {
+		bool prev = false;
+		AutocastOffScope() {
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+			prev = at::autocast::is_autocast_enabled(at::kCUDA);
+			if (prev)
+				at::autocast::set_autocast_enabled(at::kCUDA, false);
+#else
+			prev = at::autocast::is_enabled();
+			if (prev)
+				at::autocast::set_enabled(false);
+#endif
+		}
+		~AutocastOffScope() {
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+			if (prev)
+				at::autocast::set_autocast_enabled(at::kCUDA, true);
+#else
+			if (prev)
+				at::autocast::set_enabled(true);
+#endif
+		}
+	};
+}
 #endif
 
 using namespace torch;
@@ -173,6 +206,30 @@ int GGL::RunMoESelfTest() {
 		}
 		if (!ok)
 			RG_ERR_CLOSE("MoE CUTLASS LEARN-path grad parity FAILED (see relRMS above)");
+		// Autocast coverage: the fleet learn pass runs under AMP, which is exactly
+		// how the fp16-logits illegal access escaped the autocast-free gate above.
+		{
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+			at::autocast::set_autocast_dtype(at::kCUDA, torch::kHalf);
+			at::autocast::set_autocast_enabled(at::kCUDA, true);
+#else
+			at::autocast::set_autocast_gpu_dtype(torch::kHalf);
+			at::autocast::set_enabled(true);
+#endif
+			auto gAmp = fnGrads(1);
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+			at::autocast::set_autocast_enabled(at::kCUDA, false);
+#else
+			at::autocast::set_enabled(false);
+#endif
+			at::autocast::clear_cache();
+			bool fin = true;
+			for (auto& g : gAmp)
+				fin = fin && g.isfinite().all().item<bool>();
+			RG_LOG("  autocast learn-path grads finite=" << fin);
+			if (!fin)
+				RG_ERR_CLOSE("MoE CUTLASS LEARN-path under autocast produced non-finite grads");
+		}
 	}
 #endif
 	RG_LOG("MoE selftest OK");
@@ -436,6 +493,7 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		torch::Tensor expertW2, torch::Tensor expertB2, torch::Tensor routerBias,
 		int64_t blkPtr) {
 
+		AutocastOffScope acOff; // see the struct comment: explicit precision only
 		auto* blk = reinterpret_cast<GGL::MoEBlockImpl*>(blkPtr);
 		void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
 		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
