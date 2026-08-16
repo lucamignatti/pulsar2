@@ -2983,7 +2983,16 @@ void GGL::Learner::Start() {
 					collectKickFlag = false;
 					collectIdle = false;
 					lk.unlock();
-					fnCollectIteration();
+					// A worker-thread exception otherwise dies as "terminate called without
+					// an active exception" with zero diagnostics — this exact silence has now
+					// cost two debugging sessions (Nexto memory note; the 1B MoE bring-up).
+					try {
+						fnCollectIteration();
+					} catch (const std::exception& e) {
+						RG_LOG("FATAL: collect worker exception: " << e.what());
+						fflush(stdout); fflush(stderr);
+						std::abort();
+					}
 					{
 						std::lock_guard<std::mutex> g(collectMu);
 						collectIdle = true;

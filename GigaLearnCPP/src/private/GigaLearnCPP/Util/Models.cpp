@@ -133,6 +133,13 @@ static torch::Tensor ForwardResidual(
 void GGL::Model::RefreshHalfCache() {
 		if (_seqHalfOutdated) {
 			_seqHalfOutdated = false;
+			// GGL_CONSUME_TIMERS: refresh cost breakdown (the 1B MoE read 26s/iter here)
+			static const bool refTimers = [] {
+				const char* e = std::getenv("GGL_CONSUME_TIMERS");
+				return e && *e && std::string(e) != "0";
+			}();
+			auto tRef0 = std::chrono::steady_clock::now();
+			const bool firstBuild = (seqHalf->size() == 0);
 
 			if (seqHalf->size() == 0) {
 				for (auto& mod : *seq)
@@ -206,6 +213,12 @@ void GGL::Model::RefreshHalfCache() {
 					// op count and allocated every refresh.
 					toParams[i].copy_(fromParams[i], true);
 				}
+			}
+			if (refTimers) {
+				double ms = std::chrono::duration<double, std::milli>(
+					std::chrono::steady_clock::now() - tRef0).count();
+				fprintf(stderr, "[HALFREFRESH] model=%s firstBuild=%d nParams=%zu ms=%.1f\n",
+					modelName, (int)firstBuild, seq->parameters().size(), ms);
 			}
 		}
 }
