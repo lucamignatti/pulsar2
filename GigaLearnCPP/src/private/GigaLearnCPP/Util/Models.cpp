@@ -9,6 +9,9 @@
 #include <c10/cuda/CUDAStream.h>
 #endif
 
+// See MoE.h: the MoE fast path keys its transposed-weight caches on this counter.
+std::atomic<uint64_t> GGL::g_halfRefreshEpoch{ 0 };
+
 GGL::Model::Model(
 	const char* modelName,
 	ModelConfig config,
@@ -224,6 +227,9 @@ void GGL::Model::RefreshHalfCache() {
 				fprintf(stderr, "[HALFREFRESH] model=%s firstBuild=%d nParams=%zu ms=%.1f\n",
 					modelName, (int)firstBuild, seq->parameters().size(), ms);
 			}
+			// The fp16 weights just changed in place; MoE fast-path transposed caches
+			// key on this (rebuild once per refresh, not per tick).
+			g_halfRefreshEpoch.fetch_add(1, std::memory_order_release);
 		}
 }
 

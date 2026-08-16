@@ -1,0 +1,72 @@
+#pragma once
+#include <cstdint>
+
+// GGL_MOE_KERNELS — fused MoE collect-forward kernels for the V100 fleet
+// (research/reports/MOE_SPEED.md Stage 1). Pure CUDA + CUTLASS behind a C ABI:
+// this header is includable from torch-side .cpp without any CUDA headers
+// (streams pass as void*). Compiled ONLY when the CMake option GGL_MOE_KERNELS
+// is ON — the AiMOS cluster build. Desktop CUDA cannot even target sm_70, and
+// keeps the torch baddbmm path.
+//
+// Everything here exists to cut LAUNCH COUNT (the ppc64le dispatch tax,
+// ~0.15-0.5ms/op) and padded-GEMM waste: routing plan in 4 launches instead of
+// ~15 torch ops, exact-M CUTLASS grouped GEMMs (kDeviceOnly schedule — problem
+// sizes read on DEVICE, no host sync of routing counts anywhere).
+
+extern "C" {
+
+	// 1 when the kernels were compiled in AND the runtime device is sm_70-capable.
+	int ggl_moe_kernels_available();
+
+	// Persistent per-callsite scratch for the grouped GEMM (device problem/pointer
+	// tables + CUTLASS workspace). GROW-ONLY by design: freeing grouped scratch
+	// after a successful GEMM produced sticky illegal-access errors on V100 /
+	// CUDA 11.2 (measured in moe-bench; see moe_cutlass_reset there).
+	void* ggl_moe_ctx_create(int maxExperts);
+
+	// Routing plan from raw router logits (fp16 [R,E]) + selection bias (fp16 [E]):
+	// DSv3 semantics matched to MoEBlockImpl::forward — selection by
+	// sigmoid(logit)+bias, gate = sigmoid(logit) of the selected experts,
+	// renormalized over the k picks. Outputs, in expert-sorted assignment order
+	// (n = R*k assignments):
+	//   countsCursors int32 [2E] scratch (zeroed internally)
+	//   offsets       int32 [E+1] exclusive scan of per-expert counts
+	//   srcRows       int32 [n] assignment -> source row
+	//   expertId      int32 [n] assignment -> expert
+	//   gates         float [n] normalized gate weight
+	// 4 launches (memset, topk+count, scan, place).
+	void ggl_moe_route_plan_f16(
+		const void* logits, const void* selBias,
+		int R, int E, int k,
+		int* countsCursors, int* offsets,
+		int* srcRows, int* expertId, float* gates,
+		void* stream);
+
+	// packed[i,:] = x[srcRows[i],:], fp16, 1 launch.
+	void ggl_moe_gather_f16(
+		const void* x, const int* srcRows, void* packed,
+		int n, int d, void* stream);
+
+	// Exact-M grouped GEMM, fp16 tensor-core (sm_70 8x8x4):
+	// for expert e: C[offsets[e]:offsets[e+1], N] = A[...,K] @ B[e]  (B row-major [K,N]
+	// per expert, i.e. the TRANSPOSED weight stack, contiguous [E,K,N]).
+	// offsets is DEVICE memory; problem descriptors are filled by a device kernel
+	// (1 launch) + the persistent grouped kernel (1 launch). Zero-count experts
+	// contribute zero tiles. 2 launches total.
+	void ggl_moe_grouped_gemm_f16_dev(
+		void* ctx, const void* A, const void* B, void* C,
+		const int* offsets, int E, int K, int N, void* stream);
+
+	// h[i,:] = leaky_relu(h[i,:] + b[expertId[i],:], slope), fp16, 1 launch.
+	void ggl_moe_bias_leaky_f16(
+		void* h, const void* b, const int* expertId,
+		int n, int H, float slope, void* stream);
+
+	// out[srcRows[i],:] += (y[i,:] + b[expertId[i],:]) * gates[i]  (fp16 atomics),
+	// 1 launch. out must be zeroed by the caller.
+	void ggl_moe_scatter_bias_gate_f16(
+		const void* y, const void* b, const int* expertId,
+		const float* gates, const int* srcRows, void* out,
+		int n, int D, void* stream);
+
+}

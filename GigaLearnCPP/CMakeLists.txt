@@ -98,6 +98,29 @@ if (NOT APPLE)
 	target_compile_definitions(GigaLearnCPP PRIVATE -DRG_CUDA_SUPPORT)
 endif()
 
+# GGL_MOE_KERNELS (research/reports/MOE_SPEED.md Stage 1): fused MoE routing +
+# sm_70 CUTLASS grouped GEMM for the collect forward. CLUSTER BUILDS ONLY — the
+# desktop's CUDA 13 cannot even target sm_70, and the desktop keeps the baddbmm
+# path. Needs -DGGL_CUTLASS_INCLUDE=<cutlass>/include (on AiMOS:
+# barn-shared/pytorch/third_party/cutlass/include).
+option(GGL_MOE_KERNELS "Build fused MoE CUDA kernels (sm_70, cluster only)" OFF)
+if (GGL_MOE_KERNELS)
+	enable_language(CUDA)
+	set(CMAKE_CUDA_ARCHITECTURES 70)
+	set(GGL_CUTLASS_INCLUDE "" CACHE PATH "CUTLASS include directory")
+	if (NOT EXISTS "${GGL_CUTLASS_INCLUDE}/cutlass/cutlass.h")
+		message(FATAL_ERROR "GGL_MOE_KERNELS needs -DGGL_CUTLASS_INCLUDE pointing at a CUTLASS include dir")
+	endif()
+	target_sources(GigaLearnCPP PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src/private/GigaLearnCPP/Util/MoEKernels.cu)
+	set_source_files_properties(
+		${CMAKE_CURRENT_SOURCE_DIR}/src/private/GigaLearnCPP/Util/MoEKernels.cu
+		PROPERTIES INCLUDE_DIRECTORIES "${GGL_CUTLASS_INCLUDE}"
+		COMPILE_OPTIONS "--expt-relaxed-constexpr")
+	target_compile_definitions(GigaLearnCPP PRIVATE -DGGL_MOE_KERNELS)
+	set_target_properties(GigaLearnCPP PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()
+
 # Set C++ version to 20
 set_target_properties(GigaLearnCPP PROPERTIES LINKER_LANGUAGE CXX)
 set_target_properties(GigaLearnCPP PROPERTIES CXX_STANDARD 20)

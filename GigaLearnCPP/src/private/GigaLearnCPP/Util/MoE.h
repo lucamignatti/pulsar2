@@ -2,8 +2,14 @@
 #include "../FrameworkTorch.h"
 #include <torch/nn/cloneable.h>
 #include <torch/nn/modules/normalization.h>
+#include <atomic>
 
 namespace GGL {
+
+	// Bumped by Model::RefreshHalfCache after every in-place fp16 weight refresh.
+	// The MoE fast path keys its transposed-weight caches on it (rebuild once per
+	// refresh, not per tick). Defined in Models.cpp.
+	extern std::atomic<uint64_t> g_halfRefreshEpoch;
 
 	// DeepSeek-V3-style MoE block for the policy trunk (research/reports/MOE_POLICY.md):
 	//   x + SharedExpert(LN(x)) + TopK-routed fine-grained experts(LN(x))
@@ -39,6 +45,20 @@ namespace GGL {
 		// accumulator decays. Returns the normalized load entropy (1 = perfectly
 		// balanced) for the MoE/* panels.
 		float UpdateRouterBias(float gamma);
+
+		// GGL_MOE_KERNELS fast path (research/reports/MOE_SPEED.md Stage 1): fused
+		// routing + exact-M CUTLASS grouped GEMMs, fp16 no-grad only — the learn pass
+		// always takes the autograd baddbmm path above. Selected in forward() by env
+		// GGL_MOE_CUTLASS (fastPathForce overrides for the selftest parity check).
+		// Members are NOT registered: Cloneable's clone() default-constructs + reset(),
+		// so every clone starts with empty caches and builds its own lazily.
+		int fastPathForce = -1;                  // -1 = env, 0 = off, 1 = on
+		torch::Tensor ForwardFast(torch::Tensor x);
+		uint64_t _wCacheEpoch = ~0ull;
+		torch::Tensor _w1T, _w2T;                // fp16 [E, d, h], [E, h, d] contiguous
+		torch::Tensor _scCounts, _scOffsets, _scSrcRows, _scExpertId, _scGates;
+		torch::Tensor _scPacked, _scHid, _scOut; // fp16 assignment buffers
+		void* _gemmCtx = nullptr;                // ggl_moe_ctx_create, grow-only
 	};
 	TORCH_MODULE(MoEBlock);
 

@@ -1,0 +1,366 @@
+// GGL_MOE_KERNELS — see MoEKernels.h and research/reports/MOE_SPEED.md.
+// Grouped-GEMM template configuration lifted from the proven moe-bench
+// (~/scratch-shared/moe-bench/src/moe_cutlass.cu on AiMOS), adapted from
+// host-side problem fill to DEVICE-side fill so no routing count ever crosses
+// to the host (a D2H sync would re-pay the dispatch tax this file removes).
+// Compiles with nvcc 11.2 / sm_70 exactly like the bench does.
+
+#include "MoEKernels.h"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+#ifndef CUTLASS_ENABLE_F16C
+#define CUTLASS_ENABLE_F16C 0
+#endif
+
+#include "cutlass/cutlass.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
+#include "cutlass/layout/matrix.h"
+#include "cutlass/numeric_types.h"
+
+#include <cstdio>
+#include <cstdlib>
+
+#define GGLK_CUDA_CHECK(stmt)                                                  \
+	do {                                                                       \
+		cudaError_t err__ = (stmt);                                            \
+		if (err__ != cudaSuccess) {                                            \
+			fprintf(stderr, "MoEKernels CUDA error %s:%d: %s\n", __FILE__,     \
+				__LINE__, cudaGetErrorString(err__));                          \
+			abort();                                                           \
+		}                                                                      \
+	} while (0)
+
+#define GGLK_CUTLASS_CHECK(status)                                             \
+	do {                                                                       \
+		cutlass::Status st__ = (status);                                       \
+		if (st__ != cutlass::Status::kSuccess) {                               \
+			fprintf(stderr, "MoEKernels CUTLASS error %s:%d: %s\n", __FILE__,  \
+				__LINE__, cutlassGetStatusString(st__));                       \
+			abort();                                                           \
+		}                                                                      \
+	} while (0)
+
+// ============================== routing plan ==============================
+
+// One thread per row: fp32 sigmoid over E fp16 logits, top-k selection by
+// (affinity + selection bias) with gates from the RAW affinity (DSv3: the bias
+// steers selection only, never the mixture weights), renormalized. Per-row
+// results land in rowExp/rowGate; counts accumulate for the scan.
+// E is small (128 live); a k*E scan per thread is cheap next to one dispatch.
+__global__ void gglk_route_topk(
+	const __half* logits, const __half* selBias,
+	int R, int E, int k,
+	int* counts, int* rowExp, float* rowGate) {
+
+	int r = blockIdx.x * blockDim.x + threadIdx.x;
+	if (r >= R)
+		return;
+	const __half* row = logits + (size_t)r * E;
+	bool taken[512]; // E <= 512 enforced host-side
+	for (int e = 0; e < E; e++)
+		taken[e] = false;
+	float gateSum = 0.f;
+	for (int j = 0; j < k; j++) {
+		int best = -1;
+		float bestScore = -1e30f;
+		for (int e = 0; e < E; e++) {
+			if (taken[e])
+				continue;
+			float aff = 1.f / (1.f + __expf(-__half2float(row[e])));
+			float score = aff + __half2float(selBias[e]);
+			if (score > bestScore) {
+				bestScore = score;
+				best = e;
+			}
+		}
+		taken[best] = true;
+		float aff = 1.f / (1.f + __expf(-__half2float(row[best])));
+		rowExp[(size_t)r * k + j] = best;
+		rowGate[(size_t)r * k + j] = aff;
+		gateSum += aff;
+		atomicAdd(&counts[best], 1);
+	}
+	float inv = 1.f / fmaxf(gateSum, 1e-9f);
+	for (int j = 0; j < k; j++)
+		rowGate[(size_t)r * k + j] *= inv;
+}
+
+// Single-block exclusive scan counts -> offsets (E <= 512).
+__global__ void gglk_scan_offsets(const int* counts, int* offsets, int E) {
+	__shared__ int sh[513];
+	int t = threadIdx.x;
+	if (t <= E)
+		sh[t] = (t < E) ? counts[t] : 0;
+	__syncthreads();
+	if (t == 0) {
+		int acc = 0;
+		for (int e = 0; e <= E; e++) {
+			int c = sh[e];
+			offsets[e] = acc;
+			acc += c;
+		}
+	}
+}
+
+// One thread per assignment: claim a slot in expert-sorted order via a
+// per-expert cursor. Order within an expert is arbitrary (atomics), which is
+// fine — the combine is a commutative sum.
+__global__ void gglk_place(
+	const int* rowExp, const float* rowGate, const int* offsets,
+	int* cursors, int n, int k,
+	int* srcRows, int* expertId, float* gates) {
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	int e = rowExp[i];
+	int slot = offsets[e] + atomicAdd(&cursors[e], 1);
+	srcRows[slot] = i / k;
+	expertId[slot] = e;
+	gates[slot] = rowGate[i];
+}
+
+// Route-plan scratch: rowExp/rowGate live here so the caller only manages the
+// expert-sorted outputs. Grow-only (see header).
+namespace {
+	struct RoutePlanScratch {
+		int cap = 0;
+		int* rowExp = nullptr;
+		float* rowGate = nullptr;
+	};
+	RoutePlanScratch g_route;
+}
+
+extern "C" void ggl_moe_route_plan_f16(
+	const void* logits, const void* selBias,
+	int R, int E, int k,
+	int* countsCursors, int* offsets,
+	int* srcRows, int* expertId, float* gates,
+	void* stream) {
+
+	if (E > 512) {
+		fprintf(stderr, "MoEKernels: E=%d exceeds the 512 routing limit\n", E);
+		abort();
+	}
+	cudaStream_t s = (cudaStream_t)stream;
+	int n = R * k;
+	if (n > g_route.cap) {
+		// deliberately never freed (grow-only)
+		GGLK_CUDA_CHECK(cudaMalloc(&g_route.rowExp, sizeof(int) * (size_t)n * 2));
+		GGLK_CUDA_CHECK(cudaMalloc(&g_route.rowGate, sizeof(float) * (size_t)n * 2));
+		g_route.cap = n * 2;
+	}
+	int* counts = countsCursors;
+	int* cursors = countsCursors + E;
+	GGLK_CUDA_CHECK(cudaMemsetAsync(countsCursors, 0, sizeof(int) * 2 * (size_t)E, s));
+	gglk_route_topk<<<(R + 127) / 128, 128, 0, s>>>(
+		(const __half*)logits, (const __half*)selBias, R, E, k,
+		counts, g_route.rowExp, g_route.rowGate);
+	gglk_scan_offsets<<<1, E + 1, 0, s>>>(counts, offsets, E);
+	gglk_place<<<(n + 127) / 128, 128, 0, s>>>(
+		g_route.rowExp, g_route.rowGate, offsets, cursors, n, k,
+		srcRows, expertId, gates);
+}
+
+// ============================ gather / epilogues ============================
+
+__global__ void gglk_gather_f16(
+	const __half* x, const int* srcRows, __half* packed, int n, int d) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* src = x + (size_t)srcRows[i] * d;
+	__half* dst = packed + (size_t)i * d;
+	for (int c = threadIdx.x; c < d; c += blockDim.x)
+		dst[c] = src[c];
+}
+
+extern "C" void ggl_moe_gather_f16(
+	const void* x, const int* srcRows, void* packed, int n, int d, void* stream) {
+	if (n <= 0)
+		return;
+	gglk_gather_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)x, srcRows, (__half*)packed, n, d);
+}
+
+__global__ void gglk_bias_leaky_f16(
+	__half* h, const __half* b, const int* expertId, int n, int H, float slope) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* be = b + (size_t)expertId[i] * H;
+	__half* row = h + (size_t)i * H;
+	for (int c = threadIdx.x; c < H; c += blockDim.x) {
+		float v = __half2float(row[c]) + __half2float(be[c]);
+		row[c] = __float2half(v > 0.f ? v : v * slope);
+	}
+}
+
+extern "C" void ggl_moe_bias_leaky_f16(
+	void* h, const void* b, const int* expertId, int n, int H, float slope, void* stream) {
+	if (n <= 0)
+		return;
+	gglk_bias_leaky_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(__half*)h, (const __half*)b, expertId, n, H, slope);
+}
+
+__global__ void gglk_scatter_bias_gate_f16(
+	const __half* y, const __half* b, const int* expertId,
+	const float* gates, const int* srcRows, __half* out, int n, int D) {
+	int i = blockIdx.x;
+	if (i >= n)
+		return;
+	const __half* ye = y + (size_t)i * D;
+	const __half* be = b + (size_t)expertId[i] * D;
+	__half* dst = out + (size_t)srcRows[i] * D;
+	float g = gates[i];
+	for (int c = threadIdx.x; c < D; c += blockDim.x) {
+		float v = (__half2float(ye[c]) + __half2float(be[c])) * g;
+		atomicAdd(&dst[c], __float2half(v)); // fp16 atomicAdd: sm_70+
+	}
+}
+
+extern "C" void ggl_moe_scatter_bias_gate_f16(
+	const void* y, const void* b, const int* expertId,
+	const float* gates, const int* srcRows, void* out,
+	int n, int D, void* stream) {
+	if (n <= 0)
+		return;
+	gglk_scatter_bias_gate_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
+		(const __half*)y, (const __half*)b, expertId, gates, srcRows,
+		(__half*)out, n, D);
+}
+
+// ========================= CUTLASS grouped GEMM ==========================
+// Bench-proven sm_70 configuration: fp16 tensor-core 8x8x4, small-M tile
+// 32x128x32 (collect batches average m = R*k/E, tens of rows — the small tile
+// is permanently correct here; the bench's large-tile variant is for m >= ~256).
+// kDeviceOnly schedule: the persistent kernel walks d_problems on device, so a
+// zero-count expert contributes zero tiles and the launch config is static.
+
+using LayoutRM = cutlass::layout::RowMajor;
+using Swizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+constexpr auto kSched = cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly;
+using EpiF16 = cutlass::epilogue::thread::LinearCombination<cutlass::half_t, 8, float, float>;
+
+using GglkGemmF16 = cutlass::gemm::device::GemmGrouped<
+	typename cutlass::gemm::kernel::DefaultGemmGrouped<
+		cutlass::half_t, LayoutRM, cutlass::ComplexTransform::kNone, 8, cutlass::half_t,
+		LayoutRM, cutlass::ComplexTransform::kNone, 8, cutlass::half_t, LayoutRM, float,
+		cutlass::arch::OpClassTensorOp, cutlass::arch::Sm70,
+		cutlass::gemm::GemmShape<32, 128, 32>, cutlass::gemm::GemmShape<32, 32, 32>,
+		cutlass::gemm::GemmShape<8, 8, 4>, EpiF16, Swizzle, 2, kSched>::GemmKernel>;
+
+using GglkLongIndex = typename LayoutRM::Stride::LongIndex;
+
+namespace {
+	struct GemmCtx {
+		int E = 0;
+		cutlass::gemm::GemmCoord* d_problems = nullptr;
+		cutlass::half_t** d_ptr_A = nullptr;
+		cutlass::half_t** d_ptr_B = nullptr;
+		cutlass::half_t** d_ptr_C = nullptr;
+		cutlass::half_t** d_ptr_D = nullptr;
+		GglkLongIndex* d_ld = nullptr;   // [4E]: lda, ldb, ldc, ldd
+		void* d_workspace = nullptr;
+		size_t ws_cap = 0;
+		int tbc = 0;
+	};
+}
+
+extern "C" void* ggl_moe_ctx_create(int maxExperts) {
+	GemmCtx* c = new GemmCtx();
+	c->E = maxExperts;
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_problems, sizeof(cutlass::gemm::GemmCoord) * (size_t)maxExperts));
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_ptr_A, sizeof(void*) * (size_t)maxExperts));
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_ptr_B, sizeof(void*) * (size_t)maxExperts));
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_ptr_C, sizeof(void*) * (size_t)maxExperts));
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_ptr_D, sizeof(void*) * (size_t)maxExperts));
+	GGLK_CUDA_CHECK(cudaMalloc(&c->d_ld, sizeof(GglkLongIndex) * 4 * (size_t)maxExperts));
+	// Static persistent-kernel threadblock count (no per-problem host info in
+	// device-only mode; the bench uses the same fallback).
+	c->tbc = GglkGemmF16::sufficient(nullptr, 0);
+	if (c->tbc <= 0) {
+		fprintf(stderr, "MoEKernels: GemmGrouped::sufficient() returned %d\n", c->tbc);
+		abort();
+	}
+	return c;
+}
+
+// Fill problem descriptors + pointer tables from device offsets. One thread
+// per expert.
+__global__ void gglk_fill_problems(
+	const int* offsets, int E, int K, int N,
+	const cutlass::half_t* A, const cutlass::half_t* B, cutlass::half_t* C,
+	cutlass::gemm::GemmCoord* problems,
+	cutlass::half_t** pA, cutlass::half_t** pB, cutlass::half_t** pC, cutlass::half_t** pD,
+	GglkLongIndex* ld) {
+
+	int e = blockIdx.x * blockDim.x + threadIdx.x;
+	if (e >= E)
+		return;
+	int m = offsets[e + 1] - offsets[e];
+	problems[e] = cutlass::gemm::GemmCoord(m, N, K);
+	pA[e] = const_cast<cutlass::half_t*>(A) + (size_t)offsets[e] * K;
+	pB[e] = const_cast<cutlass::half_t*>(B) + (size_t)e * K * N;
+	pC[e] = C + (size_t)offsets[e] * N;
+	pD[e] = pC[e];
+	ld[e] = K;
+	ld[E + e] = N;
+	ld[2 * E + e] = N;
+	ld[3 * E + e] = N;
+}
+
+extern "C" void ggl_moe_grouped_gemm_f16_dev(
+	void* ctx, const void* A, const void* B, void* C,
+	const int* offsets, int E, int K, int N, void* stream) {
+
+	GemmCtx* c = (GemmCtx*)ctx;
+	cudaStream_t s = (cudaStream_t)stream;
+	if (E > c->E) {
+		fprintf(stderr, "MoEKernels: E=%d exceeds ctx capacity %d\n", E, c->E);
+		abort();
+	}
+	gglk_fill_problems<<<(E + 63) / 64, 64, 0, s>>>(
+		offsets, E, K, N,
+		(const cutlass::half_t*)A, (const cutlass::half_t*)B, (cutlass::half_t*)C,
+		c->d_problems, c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D, c->d_ld);
+
+	typename GglkGemmF16::EpilogueOutputOp::Params epilogue(1.f, 0.f);
+	typename GglkGemmF16::Arguments args(
+		c->d_problems, E, c->tbc, epilogue,
+		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
+		c->d_ld, c->d_ld + E, c->d_ld + 2 * E, c->d_ld + 3 * E,
+		/*host_problem_sizes=*/nullptr);
+
+	size_t ws = GglkGemmF16::get_workspace_size(args);
+	size_t need = ws + ((size_t)1 << 20);
+	if (need > c->ws_cap) {
+		// grow-only: never free the old workspace (V100/11.2 sticky-error trap)
+		GGLK_CUDA_CHECK(cudaMalloc(&c->d_workspace, need));
+		c->ws_cap = need;
+	}
+	if (ws > 0)
+		GGLK_CUDA_CHECK(cudaMemsetAsync(c->d_workspace, 0, ws, s));
+
+	GglkGemmF16 gemm;
+	GGLK_CUTLASS_CHECK(gemm.initialize(args, c->d_workspace, s));
+	GGLK_CUTLASS_CHECK(gemm.run(s));
+}
+
+extern "C" int ggl_moe_kernels_available() {
+	static int avail = [] {
+		int dev = 0;
+		if (cudaGetDevice(&dev) != cudaSuccess)
+			return 0;
+		cudaDeviceProp p;
+		if (cudaGetDeviceProperties(&p, dev) != cudaSuccess)
+			return 0;
+		return (p.major == 7 && p.minor == 0) ? 1 : 0; // built for sm_70 exactly
+	}();
+	return avail;
+}

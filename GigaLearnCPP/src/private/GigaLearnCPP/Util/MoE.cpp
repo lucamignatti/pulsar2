@@ -1,6 +1,10 @@
 #include "MoE.h"
 #include "Models.h"
 #include <torch/cuda.h>
+#ifdef GGL_MOE_KERNELS
+#include "MoEKernels.h"
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 using namespace torch;
 
@@ -76,6 +80,52 @@ int GGL::RunMoESelfTest() {
 		}
 		RG_LOG("MoE selftest: GPU model phase OK");
 	}
+#ifdef GGL_MOE_KERNELS
+	// Fast-path parity + speed (MOE_SPEED.md Stage 1 gate): the CUTLASS forward must
+	// match the eager baddbmm forward on identical fp16 inputs before it may serve
+	// the fleet. capacityFactor is raised so the eager path drops nothing (the fast
+	// path never drops), making the comparison exact up to fp16 rounding; routerW is
+	// boosted so selection is decisive (at raw init all 128 affinities are near-ties
+	// and fp16-vs-fp32 logit rounding would flip selections spuriously).
+	if (torch::cuda::device_count() > 0 && ggl_moe_kernels_available()) {
+		RG_LOG("MoE selftest: CUTLASS fast-path parity (live dims 1024/512/128/4)...");
+		auto dev = torch::Device(torch::kCUDA, 0);
+		auto pb = GGL::MoEBlock(1024, 512, 128, 4);
+		pb->capacityFactor = 8.f;
+		{
+			torch::NoGradGuard ng0;
+			pb->routerW.mul_(100.0);
+		}
+		pb->to(dev);
+		pb->to(torch::kHalf);
+		auto xp = (torch::randn({ 777, 1024 }, dev) * 0.5).to(torch::kHalf);
+		torch::NoGradGuard ng;
+		pb->fastPathForce = 0;
+		auto yRef = pb->forward(xp).to(torch::kFloat);
+		pb->fastPathForce = 1;
+		auto yFast = pb->forward(xp).to(torch::kFloat);
+		float rel = (yFast - yRef).norm().item<float>()
+			/ std::max(yRef.norm().item<float>(), 1e-6f);
+		RG_LOG("  parity relRMS=" << rel);
+		if (!(rel < 2e-2f))
+			RG_ERR_CLOSE("MoE CUTLASS fast-path parity FAILED: relRMS=" << rel);
+		auto fnTime = [&](int force) {
+			pb->fastPathForce = force;
+			for (int rep = 0; rep < 3; rep++)
+				pb->forward(xp);
+			torch::cuda::synchronize();
+			auto t0 = std::chrono::steady_clock::now();
+			for (int rep = 0; rep < 20; rep++)
+				pb->forward(xp);
+			torch::cuda::synchronize();
+			return std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - t0).count() / 20.0;
+		};
+		double eagerMs = fnTime(0), fastMs = fnTime(1);
+		RG_LOG("  block fwd 777 rows: eager " << eagerMs << " ms, fast " << fastMs
+			<< " ms (" << (eagerMs / fastMs) << "x)");
+	}
+#endif
 	RG_LOG("MoE selftest OK");
 	return 0;
 }
@@ -123,6 +173,20 @@ void GGL::MoEBlockImpl::reset() {
 }
 
 torch::Tensor GGL::MoEBlockImpl::forward(torch::Tensor x) {
+#ifdef GGL_MOE_KERNELS
+	// Fast path: fused routing + exact-M CUTLASS grouped GEMMs (MOE_SPEED.md Stage 1).
+	// no-grad fp16 CUDA only — exactly the collect forward; learn keeps autograd baddbmm.
+	{
+		static const int envOn = [] {
+			const char* e = std::getenv("GGL_MOE_CUTLASS");
+			return (e && *e && std::string(e) != "0") ? 1 : 0;
+		}();
+		int on = fastPathForce >= 0 ? fastPathForce : envOn;
+		if (on && !torch::GradMode::is_enabled() && x.is_cuda()
+			&& x.scalar_type() == torch::kHalf && ggl_moe_kernels_available())
+			return ForwardFast(x);
+	}
+#endif
 	const int64_t R = x.size(0);
 	auto xn = ln->forward(x);
 
@@ -201,6 +265,71 @@ torch::Tensor GGL::MoEBlockImpl::forward(torch::Tensor x) {
 
 	return x + out + ys;
 }
+
+#ifdef GGL_MOE_KERNELS
+torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
+	void* s = (void*)at::cuda::getCurrentCUDAStream().stream();
+	const int64_t R = x.size(0);
+	const int64_t n = R * topK;
+	const int E = (int)numExperts;
+
+	auto xn = ln->forward(x);                              // fp16
+	auto logits = torch::matmul(xn, routerW.t());          // fp16 [R,E], fp32 accum
+
+	RG_ASSERT(routerBias.scalar_type() == torch::kHalf);   // half-clone buffers only
+
+	// Transposed weight caches, CUTLASS layout (B row-major [K,N] per expert).
+	// The half clone's params are refreshed IN PLACE once per iteration; the epoch
+	// counter is the only signal that happened.
+	uint64_t ep = g_halfRefreshEpoch.load(std::memory_order_acquire);
+	if (ep != _wCacheEpoch || !_w1T.defined()) {
+		torch::NoGradGuard ng;
+		_w1T = expertW1.transpose(1, 2).contiguous();      // [E, d, h]
+		_w2T = expertW2.transpose(1, 2).contiguous();      // [E, h, d]
+		_wCacheEpoch = ep;
+	}
+
+	auto iopts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+	if (!_scPacked.defined() || _scPacked.size(0) < n) {
+		_scCounts = torch::empty({ 2 * numExperts }, iopts);
+		_scOffsets = torch::empty({ numExperts + 1 }, iopts);
+		_scSrcRows = torch::empty({ n }, iopts);
+		_scExpertId = torch::empty({ n }, iopts);
+		_scGates = torch::empty({ n },
+			torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+		_scPacked = torch::empty({ n, dim }, x.options());
+		_scHid = torch::empty({ n, hidden }, x.options());
+		_scOut = torch::empty({ n, dim }, x.options());
+	}
+	if (!_gemmCtx)
+		_gemmCtx = ggl_moe_ctx_create(E);
+
+	ggl_moe_route_plan_f16(
+		logits.data_ptr(), routerBias.data_ptr(), (int)R, E, (int)topK,
+		_scCounts.data_ptr<int>(), _scOffsets.data_ptr<int>(),
+		_scSrcRows.data_ptr<int>(), _scExpertId.data_ptr<int>(),
+		_scGates.data_ptr<float>(), s);
+	ggl_moe_gather_f16(xn.data_ptr(), _scSrcRows.data_ptr<int>(),
+		_scPacked.data_ptr(), (int)n, (int)dim, s);
+	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, _scPacked.data_ptr(), _w1T.data_ptr(),
+		_scHid.data_ptr(), _scOffsets.data_ptr<int>(), E, (int)dim, (int)hidden, s);
+	ggl_moe_bias_leaky_f16(_scHid.data_ptr(), expertB1.data_ptr(),
+		_scExpertId.data_ptr<int>(), (int)n, (int)hidden, 0.01f, s);
+	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, _scHid.data_ptr(), _w2T.data_ptr(),
+		_scOut.data_ptr(), _scOffsets.data_ptr<int>(), E, (int)hidden, (int)dim, s);
+	auto out = torch::zeros_like(xn);
+	ggl_moe_scatter_bias_gate_f16(_scOut.data_ptr(), expertB2.data_ptr(),
+		_scExpertId.data_ptr<int>(), _scGates.data_ptr<float>(),
+		_scSrcRows.data_ptr<int>(), out.data_ptr(), (int)n, (int)dim, s);
+
+	// Load tracking for the aux-free balancing panel/update (counts came free).
+	loadAcc.add_(_scCounts.narrow(0, 0, numExperts).to(loadAcc.scalar_type()));
+
+	auto hs = torch::leaky_relu(torch::addmm(sharedB1, xn, sharedW1.t()), 0.01);
+	auto ys = torch::addmm(sharedB2, hs, sharedW2.t());
+	return x + out + ys;
+}
+#endif
 
 float GGL::MoEBlockImpl::UpdateRouterBias(float gamma) {
 	NoGradGuard ng;
