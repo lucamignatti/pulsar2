@@ -122,11 +122,40 @@ trunk step. Direction (needs its own pre-registration before build):
   advantage sign. Measurement before machinery: A/B a 2-expert-async pilot
   against the sync run before fleet-wide.
 
+## Amendment 2026-08-16: graphs are BACK on the table (titan-graphs merge)
+
+The "cluster-dead" verdict above was half right: the segfault is ATen's
+`capture_begin` passing a null pId into `cudaStreamGetCaptureInfo` (driver 460
+writes through it). The `titan-graphs` branch (w451/jcooley972) root-caused it
+and captures with RAW driver APIs while keeping torch's graph mempool
+(`beginAllocateStreamToPool`), graphs only the deterministic probs forward
+(multinomial stays eager — raw capture cannot advance philox), syncs after
+replay on drivers < 11.4, and evicts graphs from Model destructors. Merged
+(commits 8aeae82 + 882e2ac + compat fixes), desktop-validated pipelined
+(66 iters, captures + replays, stable entropy). Env: `GGL_CUDA_GRAPHS`.
+CUTLASS scratch/caches were made pointer-stable (per-shape scratch, copy_-in-
+place weight caches) so graphs and the CUTLASS path compose.
+
+## Parity + speed result (Stage 1 gate, V100, 2026-08-16)
+
+- First run FAILED honestly at relRMS 0.114: the fast path routed on fp16-rounded
+  logits (eager routes fp32) and the test's x100 router boost saturated sigmoids
+  into topk ties. Fixed: fp32 router matmul (cached fp32 router weights).
+- **PASS: relRMS 3.16e-4** (fp16 noise). **Block forward 777 rows: eager 2.82ms →
+  fast 0.83ms (3.41×)**.
+- Also fixed en route: the config-order trap had silently clobbered
+  GGL_NO_VERSIONS / GGL_NO_REACH / GGL_NO_HEADROOM (see ExampleMain's LATE
+  OVERRIDES section) — the clobbered version ring reloading on resume (+6.2GB)
+  was what OOM'd every resumed hop and exhausted two chains; the saved ring is
+  quarantined at `checkpoints_moe2_luca/policy_versions_quarantine_20260816`.
+
 ## Execution state
 
 - [x] Bench numbers read into the record (this doc + memory).
-- [x] Graphs desktop-kept / cluster-dead verdict, fleet pinned =0.
-- [ ] Stage 1 build: MoEKernels.{h,cu}, CMake gate, MoE.cpp fast path, selftest
-      parity, 1-node speed measure, fleet flip.
-- [ ] Stage 2 design review + a2a microbench inter-node.
-- [ ] Stage 3 pre-registration.
+- [x] Stage 1 build: MoEKernels.{h,cu}, CMake gate (`GGL_MOE_KERNELS`), fast path,
+      parity gate PASSED (3e-4), 3.41× block forward.
+- [x] titan-graphs merge (raw capture) + pointer-stability for composition.
+- [x] **Fleet flip: GGL_MOE_CUTLASS=1 live on chain 4631318+** (7.3-moe-b3).
+- [ ] Measure fleet SPS vs the 89k baseline; then flip GGL_CUDA_GRAPHS=1 on top.
+- [ ] Stage 2 (NCCL EP) design review + a2a microbench inter-node.
+- [ ] Stage 3 (async experts) pre-registration.
