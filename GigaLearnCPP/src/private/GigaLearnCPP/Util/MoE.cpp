@@ -174,7 +174,9 @@ torch::Tensor GGL::MoEBlockImpl::forward(torch::Tensor x) {
 		.index_select(0, slots);                                  // [nAssign, d]
 	auto wAll = (gateW.flatten() * keepF.to(gateW.dtype())).unsqueeze(1).to(yAll.dtype());
 	auto out = torch::zeros_like(xn);
-	out = out.index_add(0, rowIdx, yAll * wAll);                  // differentiable
+	// autocast keeps LN (and thus xn/out) fp32 while the bmm outputs are bf16/fp16 —
+	// index_add requires matching dtypes, so cast the contribution to out's type.
+	out = out.index_add(0, rowIdx, (yAll * wAll).to(out.scalar_type())); // differentiable
 
 	// Shared expert: dense safety net for capacity drops, always active.
 	auto hs = torch::leaky_relu(

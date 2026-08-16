@@ -817,31 +817,6 @@ int main(int argc, char* argv[]) {
 	if (const char* st = std::getenv("GGL_MOE_SELFTEST"); st && *st && std::string(st) != "0")
 		return GGL::RunMoESelfTest();
 
-	// DeepSeek-V3-style MoE trunk (research/reports/MOE_POLICY.md). GGL_MOE=1 swaps the
-	// shared trunk for embed + moeBlocks x MoEBlock and shrinks the policy head to one
-	// dense layer off the trunk. Defaults: 1.01B total / ~18M active. The value family
-	// stays dense. Cluster-only at full size (1B fp32 + Muon state needs ~12GB).
-	if (const char* m = std::getenv("GGL_MOE"); m && *m && std::string(m) != "0") {
-		auto envInt = [](const char* n, int d) {
-			const char* e = std::getenv(n);
-			return (e && *e) ? std::atoi(e) : d;
-		};
-		const int width = envInt("GGL_MOE_WIDTH", 1024);
-		cfg.ppo.sharedHead.layerSizes = { width };
-		cfg.ppo.sharedHead.addResiduals = false;
-		cfg.ppo.sharedHead.moeBlocks = envInt("GGL_MOE_BLOCKS", 6);
-		cfg.ppo.sharedHead.moeExperts = envInt("GGL_MOE_EXPERTS", 320);
-		cfg.ppo.sharedHead.moeTopK = envInt("GGL_MOE_TOPK", 4);
-		cfg.ppo.sharedHead.moeHidden = envInt("GGL_MOE_HIDDEN", 256);
-		cfg.ppo.policy.layerSizes = { 512 };
-		cfg.ppo.policy.addResiduals = false;
-		const double expertP = 2.0 * (double)width * cfg.ppo.sharedHead.moeHidden;
-		RG_LOG("GGL_MOE: trunk " << cfg.ppo.sharedHead.moeBlocks << "x" << cfg.ppo.sharedHead.moeExperts
-			<< " experts (top-" << cfg.ppo.sharedHead.moeTopK << " + shared), width " << width
-			<< ", ~" << (uint64_t)(expertP * cfg.ppo.sharedHead.moeExperts * cfg.ppo.sharedHead.moeBlocks / 1e6)
-			<< "M expert params total, ~" << (uint64_t)(expertP * (cfg.ppo.sharedHead.moeTopK + 1)
-				* cfg.ppo.sharedHead.moeBlocks / 1e6) << "M active");
-	}
 
 	if (const char* t = std::getenv("GGL_TS_PER_ITR"); t && *t) {
 		int v = std::atoi(t);
@@ -1151,6 +1126,36 @@ int main(int argc, char* argv[]) {
 	// lines first - they are the least-supported part of this change.
 	cfg.ppo.reachability.phi.layerSizes = { 384, 384, 384 };
 	cfg.ppo.reachability.psi.layerSizes = { 384, 384, 384 };
+
+	// NOTE placed AFTER the dense net-size assignments above: an earlier position let
+	// the production trunk config clobber layerSizes while moeBlocks survived, making
+	// the config invalid and BuildModels silently skip shared_head (the 2026-08-16
+	// overnight segfault — first unguarded trunk deref was the gap block).
+	// DeepSeek-V3-style MoE trunk (research/reports/MOE_POLICY.md). GGL_MOE=1 swaps the
+	// shared trunk for embed + moeBlocks x MoEBlock and shrinks the policy head to one
+	// dense layer off the trunk. Defaults: 1.01B total / ~18M active. The value family
+	// stays dense. Cluster-only at full size (1B fp32 + Muon state needs ~12GB).
+	if (const char* m = std::getenv("GGL_MOE"); m && *m && std::string(m) != "0") {
+		auto envInt = [](const char* n, int d) {
+			const char* e = std::getenv(n);
+			return (e && *e) ? std::atoi(e) : d;
+		};
+		const int width = envInt("GGL_MOE_WIDTH", 1024);
+		cfg.ppo.sharedHead.layerSizes = { width };
+		cfg.ppo.sharedHead.addResiduals = false;
+		cfg.ppo.sharedHead.moeBlocks = envInt("GGL_MOE_BLOCKS", 6);
+		cfg.ppo.sharedHead.moeExperts = envInt("GGL_MOE_EXPERTS", 320);
+		cfg.ppo.sharedHead.moeTopK = envInt("GGL_MOE_TOPK", 4);
+		cfg.ppo.sharedHead.moeHidden = envInt("GGL_MOE_HIDDEN", 256);
+		cfg.ppo.policy.layerSizes = { 512 };
+		cfg.ppo.policy.addResiduals = false;
+		const double expertP = 2.0 * (double)width * cfg.ppo.sharedHead.moeHidden;
+		RG_LOG("GGL_MOE: trunk " << cfg.ppo.sharedHead.moeBlocks << "x" << cfg.ppo.sharedHead.moeExperts
+			<< " experts (top-" << cfg.ppo.sharedHead.moeTopK << " + shared), width " << width
+			<< ", ~" << (uint64_t)(expertP * cfg.ppo.sharedHead.moeExperts * cfg.ppo.sharedHead.moeBlocks / 1e6)
+			<< "M expert params total, ~" << (uint64_t)(expertP * (cfg.ppo.sharedHead.moeTopK + 1)
+				* cfg.ppo.sharedHead.moeBlocks / 1e6) << "M active");
+	}
 	cfg.ppo.reachability.lr = 3e-4f;
 
 	// Speed knob kept from the post-good-era "speed 2" commit (2211cce): larger rho-read chunks

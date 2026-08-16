@@ -309,6 +309,14 @@ void GGL::PPOLearner::MakeModels(
 	fullCriticConfig.numInputs = obsSize;
 	fullCriticConfig.numOutputs = 1;
 
+	// A configured-but-invalid MoE trunk must fail LOUDLY: IsValid()==false here
+	// otherwise means "no shared head", and the trainer runs trunk-less with null
+	// map entries until the first unguarded lookup segfaults (2026-08-16).
+	if (sharedHeadConfig.moeBlocks > 0 && !sharedHeadConfig.IsValid())
+		RG_ERR_CLOSE("sharedHead: moeBlocks=" << sharedHeadConfig.moeBlocks
+			<< " but the config is invalid (layerSizes must be exactly 1 entry,"
+			<< " addResiduals off, expert/topK/hidden > 0) - refusing to silently"
+			<< " build a trunk-less model set");
 	if (sharedHeadConfig.IsValid()) {
 
 		ModelConfig fullSharedHeadConfig = sharedHeadConfig;
@@ -2087,9 +2095,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// column-norm count and stays every iteration.
 		{
 			report["Plasticity/Policy Dead Units"] = Plasticity::DeadUnitFraction(models["policy"]);
+			// GGL_NO_PLASTICITY skips the SVD panels — the desktop's CUDA-13/12.4
+			// franken-stack dlopen-fails in cusolver (cluster unaffected).
+			static const bool noPlast = [] {
+				const char* e = std::getenv("GGL_NO_PLASTICITY");
+				return e && *e && std::string(e) != "0";
+			}();
 			constexpr uint64_t EFFRANK_EVERY = 32;
 			static uint64_t effRankTick = 0;   // telemetry cadence only; Learn() has no counter
-			if ((effRankTick++ % EFFRANK_EVERY) == 0) {
+			if ((effRankTick++ % EFFRANK_EVERY) == 0 && !noPlast) {
 				auto lins = Plasticity::LinearLayers(models["policy"]);
 				if (!lins.empty())
 					report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);

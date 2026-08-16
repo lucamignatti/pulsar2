@@ -3078,7 +3078,7 @@ void GGL::Learner::Start() {
 
 
 				Timer consumptionTimer = {};
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] A_consume_start\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] A_consume_start sh=%p\n", (void*)ppo->models["shared_head"]);
 
 				// EGGROLL-ES consumes nothing: no value pred, no GAE, no Learn, no aux. The
 				// generation turn (fitness -> update -> perturb) already ran in the barrier
@@ -3248,7 +3248,7 @@ void GGL::Learner::Start() {
 					}
 
 					// Secondary goal-critic value predictions (same minibatching pattern).
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] D_valpred_done\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] D_valpred_done sh=%p\n", (void*)ppo->models["shared_head"]);
 					torch::Tensor tGoalValPreds, tGoalTruncValPreds;
 					if (goalCriticOn) {
 						if (ppo->device.is_cpu()) {
@@ -3602,7 +3602,7 @@ void GGL::Learner::Start() {
 						config.ppo.gaeGamma, config.ppo.gaeLambda, returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange
 					);
 					report["GAE Time"] = gaeTimer.Elapsed();
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E_gae_done\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E_gae_done sh=%p\n", (void*)ppo->models["shared_head"]);
 					report["Clipped Reward Portion"] = rewClipPortion;
 
 					// Value explained-variance vs the quantity V actually regresses (GAE
@@ -3700,7 +3700,7 @@ void GGL::Learner::Start() {
 							}
 						}
 						report["Vdag Infer Time"] = vdagInferTimer.Elapsed();
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E2_vdaginfer\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E2_vdaginfer sh=%p\n", (void*)ppo->models["shared_head"]);
 						auto vdagN = torch::cat({ vdag.slice(0, 1, nR), z1 });
 						// ===== HULL OPERATOR (EPSILON_CRITIC.md s7; PPOLearnerConfig::hullEnabled)
 						// Relax the bootstrap: max over the real next state and hullK candidates
@@ -3922,11 +3922,11 @@ void GGL::Learner::Start() {
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] F_sil_done\n");
 						}
 						report["Headroom/Vdag Mean"] = vdag.mean().item<float>();
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E4_vdagmean\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] E4_vdagmean sh=%p\n", (void*)ppo->models["shared_head"]);
 						report["Headroom/H Mean"] = tH.mean().item<float>();
 						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
 						report["Headroom/Inj Abs Mean"] = inj.abs().mean().item<float>();
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G1_headroom_done\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G1_headroom_done sh=%p\n", (void*)ppo->models["shared_head"]);
 					}
 
 					if (returnStat) {
@@ -4001,7 +4001,7 @@ void GGL::Learner::Start() {
 					{
 						float postAdvAbsMean = tAdvantages.abs().mean().item<float>();
 						report["GAE/Avg Advantage Post-Inj"] = postAdvAbsMean;
-				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G3_goalcritic_done\n");
+				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G3_goalcritic_done sh=%p\n", (void*)ppo->models["shared_head"]);
 						if (rawAdvAbsMean > 1e-8f)
 							report["GAE/Injected Frac"] = (postAdvAbsMean - rawAdvAbsMean) / rawAdvAbsMean;
 					}
@@ -4099,7 +4099,7 @@ void GGL::Learner::Start() {
 					// literally zero), std-floored beta_eff, clamped +-3 sigma_ext.
 					// Value/expectile targets were computed BEFORE any injection (the
 					// sensor never measures its own payments).
-					if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G4_pre_gap\n");
+					if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G4_pre_gap sh=%p\n", (void*)ppo->models["shared_head"]);
 					int doGap = (gapSensor && (int64_t)combinedTraj.Length() > 0 && tTargetVals.defined()) ? 1 : 0;
 					if (DistActive())
 						dist->min_host(&doGap, 1);
