@@ -80,6 +80,29 @@ Key mechanics:
 - Desktop builds keep `GGL_MOE_KERNELS=OFF` (CUDA 13 cannot even target sm_70);
   the baddbmm path remains the only desktop path.
 
+## Stage 1b — CUTLASS autograd learn path (approved 2026-08-16, task #2)
+
+Make learner compute scale with ACTIVE params: a custom `torch::autograd::Function`
+replacing the eager padded-bmm routed-FFN (LN, shared expert, residual stay in
+torch autograd around it). Forward reuses the collect kernels (route plan, gather,
+grouped GEMMs, bias+leaky, gated scatter), saving packed X, post-activation H,
+offsets/srcRows/expertId/gates. Backward:
+- dY = gather(dOut, srcRows) * gate  (1 kernel)
+- dB2 = per-expert segment sum of dY (atomic fp32 [E,d] kernel); dB1 likewise
+- dH = grouped GEMM(dY, expertW2 as-is [E,d,h] — already the right layout);
+  leaky mask from sign(H) (post-activation sign == pre-activation sign)
+- dX_packed = grouped GEMM(dHpre, expertW1 as-is [E,h,d]); scatter-add to dxn
+- wgrads NEED ONE NEW INSTANTIATION: GemmGrouped with LayoutA=ColumnMajor —
+  row-major X [m,h] read as column-major IS X^T with lda=h, so
+  dW1[e] = dHpre_e^T @ X_e lands directly in expertW1's [h,d] layout
+  (M=h, N=d, K=m_e), same for dW2. No transposes materialized.
+- gate grad: per-assignment dot(dOut[src], y+b2) kernel; the tiny [R,k]
+  gate->logit chain + router wgrad stay in torch (3 small ops).
+- Precision: fp32 params cast to fp16 inside forward (~50ms/iter total at 6
+  calls), backward returns fp32 grads so accumulation/AMP-unscale is unchanged.
+- GATE: selftest grad-parity vs eager autograd (grad relRMS per param family)
+  before any fleet flip — same doctrine as the inference parity gate.
+
 ## Stage 2 — NCCL expert parallelism (user-directed)
 
 Each of a node's 6 V100s owns E/6 = ~21 experts per block (fixed assignment);
@@ -91,10 +114,20 @@ return the same way. Bench says intra-node comm is ~free. Design points:
   a2a back. Per-rank expert weights shrink 6× → the 32GB ceiling lifts ~6× on
   expert params: the **1B-total model fits** (a 1B/6 ≈ 170M expert slice + dense
   trunk + optimizer per GPU).
-- **Learn**: dispatch stays the same in backward — each owner accumulates grads
-  ONLY for its experts (no allreduce over expert params at all; router/dense
-  stay data-parallel). This replaces the current "every rank holds every expert +
-  full allreduce" scheme; expert-grad traffic drops to the token a2a itself.
+- **Learn (APPO-shaped, approved 2026-08-16, task #3)**: EP lives on the LEARNER
+  GROUP. Each learner owns E/nL experts; the MoE learn forward does an NCCL
+  all-to-all on the learner group (tokens to owners, expert outputs back; the
+  backward reverses it), so an owned expert's grads complete owner-local —
+  NO expert-grad allreduce exists at all, and NS/optimizer state shrink to the
+  owned slice. The learner-group allreduce shrinks to dense trunk + router +
+  heads (~4M params). Lift the a2a mechanics from moe-bench `moe_ep.cpp`.
+  Session already routes collectives to the learner group under async routing
+  (group_rank/group_world added 2026-08-16 — global-rank sharding would have
+  assigned owners to collector ranks that never step).
+  Sequencing: AFTER Stage 1b (a2a wraps the grouped-GEMM path, not the eager one).
+- **Publish (task #4)**: expert-delta publishing — per-expert version counters in
+  WeightDoubleBuffer, collectors pull only changed experts + periodic full-net
+  resync. Cuts the 800MB/publish; prerequisite for Stage 3 per-expert async.
 - **Inter-node EP** is an experiment, not a default: bench measured intra-node
   NVLink; inter-node IB latency per a2a needs measuring first (pre-register a
   threshold: EP pays if a2a < 20% of the expert GEMM time it parallelizes).
