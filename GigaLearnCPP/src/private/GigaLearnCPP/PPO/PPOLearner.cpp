@@ -1176,7 +1176,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// which is the failure mode a hand-written index_select per field would invite.
 	// Materialize the rollout on the training device once. Every epoch then shuffles
 	// and slices device tensors instead of re-uploading each minibatch.
+	Timer uploadTimer = {};
 	experience.UploadToDevice();
+	report["PPO/Upload Time"] = uploadTimer.Elapsed();
 
 	ExperienceBuffer* learnExp = &experience;
 	ExperienceBuffer filteredExp((int)experience.rng(), device);
@@ -1189,14 +1191,16 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	// (job 4630792). Clamp so the buffer's actual rows form one full batch — the
 	// minibatch split below already handles arbitrary sizes, exactly as it does nKept.
 	int64_t learnBatchSize = RS_MIN(config.batchSize, experience.data.states.size(0));
+	double tOptim = 0, tStepOk = 0; // async-path step timers (APPO merge)
 	float dbgSubsetRows = -1.f;
 	if (config.advFilterSubset && experience.data.advFilterMask.defined()) {
 		auto keepCpu = experience.data.advFilterMask.to(torch::kCPU).flatten();
 		auto keptIdx = torch::nonzero(keepCpu > 0.5f).flatten().to(torch::kLong).contiguous();
 		int64_t nKept = keptIdx.numel();
-		// Guard the degenerate end: a subset smaller than one minibatch would make the batch
-		// loop below produce nothing and the iteration would silently not train.
-		int useSubset = (nKept >= (int64_t)config.miniBatchSize) ? 1 : 0;
+		// Async shards can be ~2133 rows; requiring a full miniBatchSize (12500) would
+		// never subset. DDP keeps the minibatch floor so a tiny keep-set cannot empty Learn.
+		int64_t subsetFloor = (dist && dist->n_collectors() > 0) ? 8 : (int64_t)config.miniBatchSize;
+		int useSubset = (nKept >= subsetFloor) ? 1 : 0;
 		if (dist && dist->distributed())
 			dist->min_host(&useSubset, 1);
 		if (useSubset) {
@@ -1211,8 +1215,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			learnBatchSize = nKept;
 			dbgSubsetRows = (float)nKept;
 		} else {
-			RG_LOG("AdvFilterSubset: only " << nKept << " kept rows (< miniBatchSize "
-				<< config.miniBatchSize << ") - training on the FULL buffer this iteration");
+			RG_LOG("AdvFilterSubset: only " << nKept << " kept rows (< floor "
+				<< subsetFloor << ") - training on the FULL buffer this iteration");
 		}
 	}
 
@@ -1805,19 +1809,28 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			if (device.is_cpu()) {
 				// Just run one minibatch
 				fnRunMinibatch(0, curBatchSize);
+				if (onMinibatchEnd)
+					onMinibatchEnd();
 			} else {
 				for (int64_t mbs = 0; mbs < curBatchSize; mbs += config.miniBatchSize) {
 					int64_t start = mbs;
 					int64_t stop = RS_MIN(start + config.miniBatchSize, curBatchSize);
 					fnRunMinibatch(start, stop);
+					if (onMinibatchEnd)
+						onMinibatchEnd();
 				}
 			}
 			fnSyncNow();
 			tFwdBwd += fwdBwdTimer.Elapsed();
 
 			Timer allReduceTimer = {};
-			if (dist)
+			if (dist) {
 				models.AllReduceGrads(dist, /*includeExempt=*/false);
+				// APPO: lets the async learner overlap the NEXT fragment's H2D with the
+				// optimizer step; a no-op (unset) on the synchronous path.
+				if (onMinibatchEnd)
+					onMinibatchEnd();
+			}
 			fnSyncNow();
 			tAllReduce += allReduceTimer.Elapsed();
 
@@ -1829,8 +1842,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			int stepOk = 1;
 			if (fp16Amp && !AmpGradsFinite(models))
 				stepOk = 0;
-			if (dist && dist->distributed())
+			if (dist && dist->distributed()) {
+				Timer soTimer = {};
 				dist->min_host(&stepOk, 1);
+				tStepOk += soTimer.Elapsed();
+			}
 
 			if (!stepOk) {
 				ampSkipCount++;
@@ -1885,10 +1901,15 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				if (reach->psiCarState)
 					nn::utils::clip_grad_norm_(reach->psiCarState->parameters(), 0.5f);
 			}
+			tClip += clipTimer.Elapsed();
 
 			fnSyncNow();
 			tClip += clipTimer.Elapsed();
 
+			// APPO hook: the async learner publishes weights right before the step
+			// swaps them (double-buffer flip). No-op when unset (synchronous path).
+			if (onBeforeStepOptims)
+				onBeforeStepOptims();
 			Timer optStepTimer = {};
 			// GGL_MUON_SHARD: Newton-Schulz sharded across ranks + owner broadcast
 			// (bit-identical result; lockstep checksum verifies). Profiled 2026-08-15:
@@ -1902,8 +1923,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			else
 				models.StepOptims();
 			fnSyncNow();
+			tOptim += optStepTimer.Elapsed();
 			tOptStep += optStepTimer.Elapsed();
+			if (onMinibatchEnd)
+				onMinibatchEnd();
 			}
+			if (onEpochEnd)
+				onEpochEnd(stepOk);
 		}
 	}
 
@@ -2114,6 +2140,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		// canary, not a per-step signal, so it runs on a cadence now. Dead Units is a cheap
 		// column-norm count and stays every iteration.
 		{
+			Timer plasTimer = {};
 			report["Plasticity/Policy Dead Units"] = Plasticity::DeadUnitFraction(models["policy"]);
 			// GGL_NO_PLASTICITY skips the SVD panels — the desktop's CUDA-13/12.4
 			// franken-stack dlopen-fails in cusolver (cluster unaffected).
@@ -2133,8 +2160,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
 				}
 			}
+			report["Plasticity Time"] = plasTimer.Elapsed();
 		}
 	}
+
+	report["PPO/AllReduce Time"] = (float)tAllReduce;
+	report["PPO/Clip Time"] = (float)tClip;
+	report["PPO/Optim Time"] = (float)tOptim;
+	report["PPO/StepOk Min Time"] = (float)tStepOk;
 
 }
 

@@ -246,5 +246,15 @@ namespace GGL {
 
 		// External fixed opponent (Nexto); additive and default-OFF
 		ExternalOpponentConfig externalOpponent = {};
+
+		bool asyncEnabled = false;
+		int asyncNLearners = 0;
+		int asyncFragmentTicks = 390;
+		int asyncFifoMaxRowMult = 3;
+		int asyncMaxPolicyLag = 16;
+		// 0 = 160k × nL (weak scale). Set GGL_ASYNC_GLOBAL_BATCH to pin (e.g. 800k).
+		int64_t asyncGlobalBatchSize = 0;
+		int asyncHerLookahead = 45;
+		bool asyncMidTrajPull = true;
 	};
 }

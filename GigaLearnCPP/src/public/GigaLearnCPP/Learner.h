@@ -134,6 +134,7 @@ namespace GGL {
 		Learner(RLGC::EnvCreateFn envCreateFunc, LearnerConfig config, StepCallbackFn stepCallback = NULL,
 			Dist::Session* dist = nullptr);
 		void Start();
+		void StartAsync();
 
 
 		void StartQuitKeyThread(std::atomic<bool>& quitPressed, std::thread& outThread);

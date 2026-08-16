@@ -56,10 +56,24 @@ struct Session::Impl {
 	int rank = 0;
 	int world = 1;
 	int local_rank = 0;
+	int nL = 1;
+	int nC = 0;
+	bool async_routing = false;
 	ncclComm_t comm = nullptr;
+	ncclComm_t learners_nccl = nullptr;
+	ncclComm_t weights_nccl = nullptr;
+	MPI_Comm learners_mpi = MPI_COMM_NULL;
+	MPI_Comm collectors_mpi = MPI_COMM_NULL;
+	MPI_Comm weights_mpi = MPI_COMM_NULL;
 	bool finalize_mpi = false;
 	float* bucket_ws = nullptr;
 	size_t bucket_ws_n = 0;
+};
+
+struct SessionHelpers {
+	static MPI_Comm HostCommOrAbort(Session::Impl* impl, const char* what);
+	static int HostGroup(Session::Impl* impl);
+	static ncclComm_t DeviceComm(Session::Impl* impl);
 };
 
 static cudaStream_t AsCudaStream(Session::Stream stream) {
@@ -71,6 +85,24 @@ static void SyncStream(Session::Stream stream) {
 		GGL_CUDA_CHECK(cudaDeviceSynchronize());
 	else
 		GGL_CUDA_CHECK(cudaStreamSynchronize(AsCudaStream(stream)));
+}
+
+static MPI_Request* AsReq(Session::CollectiveRequest* r) {
+	static_assert(sizeof(MPI_Request) <= Session::CollectiveRequest::kStorage,
+		"CollectiveRequest storage too small for MPI_Request");
+	return reinterpret_cast<MPI_Request*>(r->storage);
+}
+
+static bool EnvTruthy(const char* name) {
+	const char* e = std::getenv(name);
+	return e && e[0] && std::strcmp(e, "0") != 0;
+}
+
+static void FreeIfSplit(MPI_Comm& c) {
+	if (c != MPI_COMM_NULL && c != MPI_COMM_WORLD) {
+		GGL_MPI_CHECK(MPI_Comm_free(&c));
+		c = MPI_COMM_NULL;
+	}
 }
 
 Session::Session() = default;
@@ -85,6 +117,17 @@ Session::~Session() {
 		impl->bucket_ws = nullptr;
 		impl->bucket_ws_n = 0;
 	}
+	if (impl->weights_nccl) {
+		ncclCommDestroy(impl->weights_nccl);
+		impl->weights_nccl = nullptr;
+	}
+	if (impl->learners_nccl) {
+		ncclCommDestroy(impl->learners_nccl);
+		impl->learners_nccl = nullptr;
+	}
+	FreeIfSplit(impl->weights_mpi);
+	FreeIfSplit(impl->learners_mpi);
+	FreeIfSplit(impl->collectors_mpi);
 	if (impl->comm) {
 		if (impl->world > 1)
 			GGL_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -97,6 +140,30 @@ Session::~Session() {
 		if (!flag)
 			MPI_Finalize();
 	}
+}
+
+MPI_Comm SessionHelpers::HostCommOrAbort(Session::Impl* impl, const char* what) {
+	if (impl->async_routing && impl->nC > 0) {
+		if (impl->learners_mpi == MPI_COMM_NULL) {
+			std::cerr << "[rank " << impl->rank << "] " << what
+			          << ": collectors must not enter Learners collectives\n";
+			MPI_Abort(MPI_COMM_WORLD, 1);
+		}
+		return impl->learners_mpi;
+	}
+	return MPI_COMM_WORLD;
+}
+
+int SessionHelpers::HostGroup(Session::Impl* impl) {
+	if (impl->async_routing && impl->nC > 0)
+		return impl->nL;
+	return impl->world;
+}
+
+ncclComm_t SessionHelpers::DeviceComm(Session::Impl* impl) {
+	if (impl->async_routing && impl->nC > 0)
+		return impl->learners_nccl;
+	return impl->comm;
 }
 
 Session Session::Init(int& argc, char**& argv) {
@@ -185,6 +252,23 @@ Session Session::Init(int& argc, char**& argv) {
 		          << std::endl;
 	}
 
+	s.impl->nL = s.impl->world;
+	s.impl->nC = 0;
+	if (EnvTruthy("GGL_ASYNC")) {
+		const char* nl = std::getenv("GGL_ASYNC_N_LEARNERS");
+		if (!nl || !nl[0]) {
+			std::cerr << "[DIST] GGL_ASYNC=1 requires GGL_ASYNC_N_LEARNERS\n";
+			MPI_Abort(MPI_COMM_WORLD, 1);
+		}
+		s.impl->nL = std::atoi(nl);
+		s.impl->nC = s.impl->world - s.impl->nL;
+		if (s.impl->nL < 1 || s.impl->nC < 1) {
+			std::cerr << "[DIST] GGL_ASYNC_N_LEARNERS=" << s.impl->nL
+			          << " world=" << s.impl->world << " need 1<=nL<world\n";
+			MPI_Abort(MPI_COMM_WORLD, 1);
+		}
+	}
+
 	ncclUniqueId id;
 	std::memset(&id, 0, sizeof(id));
 	if (s.impl->rank == 0)
@@ -192,12 +276,45 @@ Session Session::Init(int& argc, char**& argv) {
 	GGL_MPI_CHECK(MPI_Bcast(&id, static_cast<int>(sizeof(id)), MPI_BYTE, 0, MPI_COMM_WORLD));
 	GGL_NCCL_CHECK(ncclCommInitRank(&s.impl->comm, s.impl->world, id, s.impl->rank));
 
+	if (s.impl->nC > 0) {
+		const int r = s.impl->rank;
+		const int nL = s.impl->nL;
+		const int nC = s.impl->nC;
+		int lcolor = (r < nL) ? 1 : MPI_UNDEFINED;
+		int ccolor = (r >= nL) ? 2 : MPI_UNDEFINED;
+		int wcolor = (r == 0 || r >= nL) ? 3 : MPI_UNDEFINED;
+		GGL_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, lcolor, r, &s.impl->learners_mpi));
+		GGL_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, ccolor, r, &s.impl->collectors_mpi));
+		GGL_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, wcolor, r, &s.impl->weights_mpi));
+
+		if (s.impl->learners_mpi != MPI_COMM_NULL) {
+			ncclUniqueId lid;
+			std::memset(&lid, 0, sizeof(lid));
+			if (r == 0)
+				GGL_NCCL_CHECK(ncclGetUniqueId(&lid));
+			GGL_MPI_CHECK(MPI_Bcast(&lid, static_cast<int>(sizeof(lid)), MPI_BYTE, 0, s.impl->learners_mpi));
+			GGL_NCCL_CHECK(ncclCommInitRank(&s.impl->learners_nccl, nL, lid, r));
+		}
+		if (s.impl->weights_mpi != MPI_COMM_NULL) {
+			ncclUniqueId wid;
+			std::memset(&wid, 0, sizeof(wid));
+			if (r == 0)
+				GGL_NCCL_CHECK(ncclGetUniqueId(&wid));
+			GGL_MPI_CHECK(MPI_Bcast(&wid, static_cast<int>(sizeof(wid)), MPI_BYTE, 0, s.impl->weights_mpi));
+			const int wnccl = (r == 0) ? 0 : (1 + (r - nL));
+			GGL_NCCL_CHECK(ncclCommInitRank(&s.impl->weights_nccl, 1 + nC, wid, wnccl));
+		}
+	}
+
 	if (s.impl->rank == 0) {
 		std::cout << "[DIST] NCCL comm up  world=" << s.impl->world
+		          << " nL=" << s.impl->nL << " nC=" << s.impl->nC
 		          << "  (self-test next)" << std::endl;
 	}
 
 	s.RunSelfTest();
+	if (s.impl->nC > 0)
+		s.RunAsyncSelfTest();
 	return s;
 }
 
@@ -205,80 +322,206 @@ int Session::rank() const { return impl->rank; }
 int Session::world() const { return impl->world; }
 int Session::local_rank() const { return impl->local_rank; }
 
+bool Session::is_learner() const { return impl->nC == 0 || impl->rank < impl->nL; }
+bool Session::is_collector() const { return impl->nC > 0 && impl->rank >= impl->nL; }
+int Session::n_learners() const { return impl->nL; }
+int Session::n_collectors() const { return impl->nC; }
+int Session::learner_rank() const {
+	return is_learner() ? impl->rank : -1;
+}
+int Session::collector_rank() const {
+	return is_collector() ? (impl->rank - impl->nL) : -1;
+}
+int Session::dest_learner_world(uint64_t fragment_id) const {
+	const int c = collector_rank();
+	if (c < 0) {
+		std::cerr << "[rank " << impl->rank << "] dest_learner_world on non-collector\n";
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	}
+	return static_cast<int>((static_cast<uint64_t>(c) + fragment_id) % static_cast<uint64_t>(impl->nL));
+}
+
+void Session::enable_async_routing() {
+	if (impl->nC > 0)
+		impl->async_routing = true;
+}
+
 void Session::barrier() {
 	GGL_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+}
+void Session::barrier_world() { barrier(); }
+
+void Session::barrier_learners() {
+	if (impl->learners_mpi == MPI_COMM_NULL)
+		return;
+	GGL_MPI_CHECK(MPI_Barrier(impl->learners_mpi));
+}
+
+void Session::ibarrier_learners(CollectiveRequest* req) {
+	if (!req)
+		return;
+	if (impl->learners_mpi == MPI_COMM_NULL) {
+		int done = 1;
+		std::memcpy(req->storage, &done, sizeof(done));
+		return;
+	}
+	GGL_MPI_CHECK(MPI_Ibarrier(impl->learners_mpi, AsReq(req)));
+}
+
+bool Session::test_request(CollectiveRequest* req) {
+	if (!req)
+		return true;
+	if (impl->learners_mpi == MPI_COMM_NULL)
+		return true;
+	int done = 0;
+	GGL_MPI_CHECK(MPI_Test(AsReq(req), &done, MPI_STATUS_IGNORE));
+	return done != 0;
 }
 
 void Session::sum_host(int* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_SUM, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_SUM,
+		SessionHelpers::HostCommOrAbort(impl.get(), "sum_host")));
 }
-
 void Session::sum_host(int64_t* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT64_T, MPI_SUM, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT64_T, MPI_SUM,
+		SessionHelpers::HostCommOrAbort(impl.get(), "sum_host")));
 }
-
 void Session::sum_host(float* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_FLOAT, MPI_SUM,
+		SessionHelpers::HostCommOrAbort(impl.get(), "sum_host")));
 }
-
 void Session::sum_host(double* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_DOUBLE, MPI_SUM,
+		SessionHelpers::HostCommOrAbort(impl.get(), "sum_host")));
 }
-
 void Session::min_host(int* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MIN,
+		SessionHelpers::HostCommOrAbort(impl.get(), "min_host")));
 }
-
+void Session::imin_host(int* buf, size_t n, CollectiveRequest* req) {
+	if (!req)
+		return;
+	if (n == 0) {
+		MPI_Request r = MPI_REQUEST_NULL;
+		std::memcpy(req->storage, &r, sizeof(r));
+		return;
+	}
+	GGL_MPI_CHECK(MPI_Iallreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MIN,
+		SessionHelpers::HostCommOrAbort(impl.get(), "imin_host"), AsReq(req)));
+}
+void Session::min_host_learners(int* buf, size_t n) {
+	if (n == 0 || impl->learners_mpi == MPI_COMM_NULL) return;
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MIN,
+		impl->learners_mpi));
+}
 void Session::max_host(int* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MAX, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MAX,
+		SessionHelpers::HostCommOrAbort(impl.get(), "max_host")));
 }
-
 void Session::max_host(double* buf, size_t n) {
 	if (n == 0) return;
-	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD));
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_DOUBLE, MPI_MAX,
+		SessionHelpers::HostCommOrAbort(impl.get(), "max_host")));
 }
-
 void Session::avg_host(float* buf, size_t n) {
-	if (n == 0 || impl->world <= 1) return;
+	const int g = SessionHelpers::HostGroup(impl.get());
+	if (n == 0 || g <= 1) return;
 	sum_host(buf, n);
-	const float inv = 1.0f / static_cast<float>(impl->world);
+	const float inv = 1.0f / static_cast<float>(g);
 	for (size_t i = 0; i < n; ++i)
 		buf[i] *= inv;
 }
-
 void Session::bcast_host(void* buf, size_t nbytes, int root) {
 	if (nbytes == 0) return;
 	GGL_MPI_CHECK(MPI_Bcast(buf, static_cast<int>(nbytes), MPI_BYTE, root, MPI_COMM_WORLD));
 }
+void Session::bcast_host_learners(void* buf, size_t nbytes, int root) {
+	if (nbytes == 0 || impl->learners_mpi == MPI_COMM_NULL) return;
+	GGL_MPI_CHECK(MPI_Bcast(buf, static_cast<int>(nbytes), MPI_BYTE, root, impl->learners_mpi));
+}
+void Session::sum_host_world(int* buf, size_t n) {
+	if (n == 0) return;
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_SUM, MPI_COMM_WORLD));
+}
+void Session::max_host_world(int* buf, size_t n) {
+	if (n == 0) return;
+	GGL_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, static_cast<int>(n), MPI_INT, MPI_MAX, MPI_COMM_WORLD));
+}
 
 void Session::allreduce_sum_device(float* ptr, size_t n, Stream stream) {
-	if (n == 0 || impl->world <= 1) return;
-	GGL_NCCL_CHECK(ncclAllReduce(ptr, ptr, n, ncclFloat, ncclSum, impl->comm, AsCudaStream(stream)));
+	if (n == 0 || SessionHelpers::HostGroup(impl.get()) <= 1) return;
+	GGL_NCCL_CHECK(ncclAllReduce(ptr, ptr, n, ncclFloat, ncclSum, SessionHelpers::DeviceComm(impl.get()), AsCudaStream(stream)));
 	SyncStream(stream);
 }
-
 void Session::allreduce_avg_device(float* ptr, size_t n, Stream stream) {
-	if (n == 0 || impl->world <= 1) return;
-	GGL_NCCL_CHECK(ncclAllReduce(ptr, ptr, n, ncclFloat, ncclAvg, impl->comm, AsCudaStream(stream)));
+	if (n == 0 || SessionHelpers::HostGroup(impl.get()) <= 1) return;
+	GGL_NCCL_CHECK(ncclAllReduce(ptr, ptr, n, ncclFloat, ncclAvg, SessionHelpers::DeviceComm(impl.get()), AsCudaStream(stream)));
 	SyncStream(stream);
 }
-
 void Session::bcast_device(float* ptr, size_t n, int root, Stream stream) {
 	if (n == 0 || impl->world <= 1) return;
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root, impl->comm, AsCudaStream(stream)));
 	SyncStream(stream);
 }
+void Session::bcast_weights(float* ptr, size_t n, Stream stream, bool wait) {
+	if (n == 0 || !impl->weights_nccl) return;
+	cudaStream_t s = AsCudaStream(stream);
+	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, 0, impl->weights_nccl, s));
+	if (wait)
+		GGL_CUDA_CHECK(cudaStreamSynchronize(s));
+}
+
+void Session::send_host(void* p, size_t nbytes, int dest_world, int tag) {
+	GGL_MPI_CHECK(MPI_Send(p, static_cast<int>(nbytes), MPI_BYTE, dest_world, tag, MPI_COMM_WORLD));
+}
+void Session::ssend_host(void* p, size_t nbytes, int dest_world, int tag) {
+	GGL_MPI_CHECK(MPI_Ssend(p, static_cast<int>(nbytes), MPI_BYTE, dest_world, tag, MPI_COMM_WORLD));
+}
+void Session::isend_host(void* p, size_t nbytes, int dest_world, int tag, CollectiveRequest* req) {
+	if (!req)
+		return;
+	GGL_MPI_CHECK(MPI_Isend(p, static_cast<int>(nbytes), MPI_BYTE, dest_world, tag, MPI_COMM_WORLD, AsReq(req)));
+}
+void Session::recv_host(void* p, size_t nbytes, int src_world, int tag) {
+	const int src = (src_world == kAnySource) ? MPI_ANY_SOURCE : src_world;
+	GGL_MPI_CHECK(MPI_Recv(p, static_cast<int>(nbytes), MPI_BYTE, src, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+}
+bool Session::iprobe_host(int src_world_or_any, int tag, size_t* nbytesOut, int* srcOut) {
+	int flag = 0;
+	MPI_Status st;
+	const int src = (src_world_or_any == kAnySource) ? MPI_ANY_SOURCE : src_world_or_any;
+	GGL_MPI_CHECK(MPI_Iprobe(src, tag, MPI_COMM_WORLD, &flag, &st));
+	if (!flag)
+		return false;
+	if (nbytesOut) {
+		int count = 0;
+		GGL_MPI_CHECK(MPI_Get_count(&st, MPI_BYTE, &count));
+		*nbytesOut = static_cast<size_t>(count);
+	}
+	if (srcOut)
+		*srcOut = st.MPI_SOURCE;
+	return true;
+}
+
+bool Session::test_host(CollectiveRequest* req) {
+	if (!req)
+		return true;
+	int done = 0;
+	GGL_MPI_CHECK(MPI_Test(AsReq(req), &done, MPI_STATUS_IGNORE));
+	return done != 0;
+}
 
 void Session::allreduce_avg_grads(const GradRef* grads, size_t nGrads, Stream stream, size_t bucketBytes) {
-	if (!grads || nGrads == 0 || impl->world <= 1)
+	if (!grads || nGrads == 0 || SessionHelpers::HostGroup(impl.get()) <= 1)
 		return;
 
+	ncclComm_t nc = SessionHelpers::DeviceComm(impl.get());
 	const size_t bucketFloats = (bucketBytes / sizeof(float) < 1) ? 1 : (bucketBytes / sizeof(float));
 	cudaStream_t cs = AsCudaStream(stream);
 
@@ -300,7 +543,7 @@ void Session::allreduce_avg_grads(const GradRef* grads, size_t nGrads, Stream st
 		if (packed == 0)
 			return;
 		GGL_NCCL_CHECK(ncclAllReduce(impl->bucket_ws, impl->bucket_ws, packed,
-			ncclFloat, ncclAvg, impl->comm, cs));
+			ncclFloat, ncclAvg, nc, cs));
 		size_t off = 0;
 		for (const GradRef& g : pending) {
 			GGL_CUDA_CHECK(cudaMemcpyAsync(g.ptr, impl->bucket_ws + off,
@@ -317,7 +560,7 @@ void Session::allreduce_avg_grads(const GradRef* grads, size_t nGrads, Stream st
 			continue;
 		if (g.n > bucketFloats) {
 			flush();
-			GGL_NCCL_CHECK(ncclAllReduce(g.ptr, g.ptr, g.n, ncclFloat, ncclAvg, impl->comm, cs));
+			GGL_NCCL_CHECK(ncclAllReduce(g.ptr, g.ptr, g.n, ncclFloat, ncclAvg, nc, cs));
 			continue;
 		}
 		if (packed + g.n > bucketFloats)
@@ -328,7 +571,62 @@ void Session::allreduce_avg_grads(const GradRef* grads, size_t nGrads, Stream st
 		packed += g.n;
 	}
 	flush();
-	SyncStream(stream);
+	// Caller (clip_grad / AmpGradsFinite / epoch hook) stream-syncs when it needs the
+	// reduced grads. CPU-sync here blocked fragment drain during ~30ms of NCCL.
+}
+
+void Session::RunAsyncSelfTest() {
+	const int r = rank();
+	auto fail = [&](const std::string& msg) {
+		std::cerr << "[rank " << r << "] ASYNC SELFTEST FAILED: " << msg << std::endl;
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	};
+
+	if (is_learner()) {
+		int v = learner_rank();
+		min_host_learners(&v, 1);
+		if (v != 0)
+			fail("min_host_learners learner_rank");
+	}
+
+	if (impl->weights_nccl) {
+		std::vector<float> h(1024, 0.f);
+		if (r == 0) {
+			for (int i = 0; i < 1024; ++i)
+				h[i] = 0.5f * static_cast<float>(i);
+		}
+		float* d = nullptr;
+		GGL_CUDA_CHECK(cudaMalloc(&d, h.size() * sizeof(float)));
+		GGL_CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice));
+		bcast_weights(d, h.size(), nullptr);
+		GGL_CUDA_CHECK(cudaMemcpy(h.data(), d, h.size() * sizeof(float), cudaMemcpyDeviceToHost));
+		GGL_CUDA_CHECK(cudaFree(d));
+		if (is_collector()) {
+			for (int i = 0; i < 1024; ++i) {
+				if (std::abs(h[i] - 0.5f * static_cast<float>(i)) > 1e-4f)
+					fail("weights bcast pattern");
+			}
+		}
+	}
+
+	if (is_collector() && collector_rank() == 0) {
+		std::vector<float> blob(4096);
+		for (size_t i = 0; i < blob.size(); ++i)
+			blob[i] = static_cast<float>(i) * 0.001f;
+		send_host(blob.data(), blob.size() * sizeof(float), dest_learner_world(0), TAG_FRAGMENT);
+	}
+	if (r == 0) {
+		std::vector<float> blob(4096, -1.f);
+		recv_host(blob.data(), blob.size() * sizeof(float), kAnySource, TAG_FRAGMENT);
+		for (size_t i = 0; i < blob.size(); ++i) {
+			if (std::abs(blob[i] - static_cast<float>(i) * 0.001f) > 1e-4f)
+				fail("fragment ping");
+		}
+	}
+
+	barrier_world();
+	if (r == 0)
+		std::cout << "[DIST] ASYNC SELFTEST PASSED nL=" << impl->nL << " nC=" << impl->nC << std::endl;
 }
 
 void Session::RunSelfTest() {

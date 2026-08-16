@@ -512,6 +512,7 @@ int main(int argc, char* argv[]) {
 
 	// Make configuration for the learner
 	LearnerConfig cfg = {};
+	// PULSAR keeps the GGL_PERF_BENCH harness titan removed in the APPO commit.
 	int perfBenchmarkIterations = 0;
 
 	// Per-platform default, deliberately NOT AUTO: the training box must fail LOUDLY if CUDA
@@ -804,13 +805,11 @@ int main(int argc, char* argv[]) {
 	// the one lever that touches it, is mathematically identical under gradient accumulation
 	// (200k/12.5k = 16 exact chunks), and costs only GEMM efficiency.
 	// Against losing 1.2B steps and the entire recovery chain, that trade is no longer close.
-	// 20k on CCNI 32GB V100s (200k/20k = 10 accum chunks). 12.5k was the 16GB-desktop
-	// OOM/corruption cap; measured peak left ~70% of 32GB free. Pair with collect overlapping
-	// value-pred+Learn so a shorter Learn is not absorbed by Collect Join.
-	// PULSAR DIVERGENCE from titan's 20k default: this binary also runs on the 16GB
-	// desktop (the 7.0b trainer restarts unattended via run_trainer.sh), where 20k is
-	// exactly the OOM/corruption exposure 12.5k exists to avoid. Cluster sbatches set
-	// the value explicitly (GGL_MINIBATCH / GGL_MINIBATCH_SIZE both honored; the later
+	// Titan runs 20k on its 32GB V100s (200k/20k = 10 accum chunks; measured peak left
+	// ~70% of 32GB free). PULSAR DIVERGENCE: this binary also runs on the 16GB desktop
+	// (the 7.0b trainer restarts unattended via run_trainer.sh), where 20k is exactly
+	// the OOM/corruption exposure 12.5k exists to avoid. Cluster sbatches set the value
+	// explicitly (GGL_MINIBATCH / GGL_MINIBATCH_SIZE both honored; the later
 	// GGL_MINIBATCH block wins when both are set, which is what the fleet uses).
 	cfg.ppo.miniBatchSize = 12'500;
 	if (const char* s = std::getenv("GGL_MINIBATCH_SIZE"); s && *s) {
@@ -913,6 +912,11 @@ int main(int argc, char* argv[]) {
 	}
 
 	cfg.ppo.epochs = 2;
+	if (const char* e = std::getenv("GGL_PPO_EPOCHS"); e && *e) {
+		int n = std::atoi(e);
+		if (n >= 1)
+			cfg.ppo.epochs = n;
+	}
 	// 6.0 ts1: 0.035 -> 0.004375 (= 0.035/8), the same /8 the other rate-derived per-step
 	// quantities took. Entropy regularization is a RATE — nats per unit time, not per
 	// decision — so a coefficient tuned at 15 Hz applies 8x more entropy pressure per
@@ -1214,7 +1218,13 @@ int main(int argc, char* argv[]) {
 
 	// Muon for the dense nets (RMS-matched, Adam LRs transfer). Reachability heads stay Adam:
 	// contrastive InfoNCE embeddings train poorly under orthogonalized updates.
+	// GGL_OPTIM=adam|muon (default muon) for A/B; Reach stays Adam either way.
 	auto optim = ModelOptimType::MUON;
+	if (const char* o = std::getenv("GGL_OPTIM"); o && *o) {
+		std::string s(o);
+		if (s == "adam" || s == "ADAM" || s == "Adam")
+			optim = ModelOptimType::ADAM;
+	}
 	cfg.ppo.policy.optimType = optim;
 	cfg.ppo.critic.optimType = optim;
 	cfg.ppo.criticTrunk.optimType = optim;
@@ -1226,6 +1236,7 @@ int main(int argc, char* argv[]) {
 	// by mirroring the critic's config. NOTE this is a real change, not a cleanup: the LRs here
 	// were chosen as Adam LRs that transfer to Muon RMS-matched, so it lands with the cold start.
 	cfg.ppo.goalCritic.model.optimType = optim;
+	RG_LOG("PPO dense optim=" << (optim == ModelOptimType::ADAM ? "Adam" : "Muon"));
 
 	auto activation = ModelActivationType::LEAKY_RELU;
 	cfg.ppo.policy.activationType = activation;
@@ -1886,6 +1897,49 @@ int main(int argc, char* argv[]) {
 			<< " numGames=" << cfg.numGames);
 	}
 
+	if (const char* a = std::getenv("GGL_ASYNC"); a && a[0] && std::string(a) != "0") {
+		cfg.asyncEnabled = true;
+		cfg.pipelinedCollection = false;
+		if (const char* n = std::getenv("GGL_ASYNC_N_LEARNERS"); n && *n)
+			cfg.asyncNLearners = std::atoi(n);
+		if (const char* n = std::getenv("GGL_ASYNC_GLOBAL_BATCH"); n && *n)
+			cfg.asyncGlobalBatchSize = std::atoll(n);
+		else {
+			int nL = cfg.asyncNLearners > 0 ? cfg.asyncNLearners : dist.n_learners();
+			int64_t local = 160000;
+			if (const char* l = std::getenv("GGL_ASYNC_LOCAL_BATCH"); l && *l)
+				local = std::atoll(l);
+			if (local < 1)
+				local = 160000;
+			cfg.asyncGlobalBatchSize = local * (int64_t)(nL > 0 ? nL : 1);
+		}
+		if (const char* n = std::getenv("GGL_ASYNC_FRAGMENT_TICKS"); n && *n)
+			cfg.asyncFragmentTicks = std::atoi(n);
+		if (const char* n = std::getenv("GGL_ASYNC_MAX_POLICY_LAG"); n && *n)
+			cfg.asyncMaxPolicyLag = std::atoi(n);
+		if (const char* n = std::getenv("GGL_ASYNC_FIFO"); n && *n)
+			cfg.asyncFifoMaxRowMult = std::atoi(n);
+		cfg.asyncMidTrajPull = true;
+		// Rank 0 learner keeps Elo eval EnvSets. Other ranks skip them (VRAM + no wandb).
+		if (!(dist.is_learner() && dist.rank() == 0))
+			cfg.skillTracker.enabled = false;
+		// Learners are VRAM-dieted (numGames=1). 12.5k was a DDP save-corruption hedge at
+		// ~13/15 GiB; async learners sit ~1.3/5.7 GiB on 32GB V100s. Same accumulated math.
+		// Collectors never Learn; leave their miniBatchSize at the DDP default so Infer
+		// workspace / allocator behavior stays at the 906k-collect baseline (4631034).
+		if (dist.is_learner())
+			cfg.ppo.miniBatchSize = 40'000;
+		if (dist.is_collector())
+			cfg.trainAgainstOldVersions = true;
+		RG_LOG("GGL_ASYNC: nL=" << cfg.asyncNLearners
+			<< " globalBatch=" << cfg.asyncGlobalBatchSize
+			<< " T=" << cfg.asyncFragmentTicks
+			<< " midTraj=" << cfg.asyncMidTrajPull
+			<< " epochs=" << cfg.ppo.epochs
+			<< " miniBatch=" << cfg.ppo.miniBatchSize
+			<< " role=" << (dist.is_learner() ? "learner" : "collector"));
+	}
+
 	Learner* learner = new Learner(EnvCreateFunc, cfg, StepCallback, &dist);
 
 	// The automatic PHASE A -> PHASE B flip. Runs at the tail of every iteration; ratings
@@ -1894,12 +1948,7 @@ int main(int argc, char* argv[]) {
 	// exit(99) -> wrapper relaunches this same binary, which now boots into PHASE B on the
 	// checkpoint just saved. Render mode never sets the callback (no ratings there anyway).
 	if (!cfg.renderMode) {
-		learner->iterationCallback = [perfBenchmarkIterations](Learner* learner, Report& report) {
-			if (perfBenchmarkIterations > 0
-				&& learner->totalIterations > (uint64_t)perfBenchmarkIterations) {
-				learner->RequestSaveAndExit(0);
-				return;
-			}
+		learner->iterationCallback = [](Learner* learner, Report& report) {
 			report["Curriculum/Team Phase"] = g_PhaseB ? 1.0f : 0.0f;
 			report["Curriculum/Phase B Streak"] = (float)g_PhaseBStreak;
 			// Team modes disabled for this lineage (PHASE_B_ENABLED) — never arm the streak,

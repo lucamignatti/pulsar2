@@ -268,6 +268,15 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	// iteration; the same shadowing family as the Model ctor bug fixed in 155c2da).
 	this->config = config;
 
+	if (dist && this->config.asyncEnabled) {
+		this->config.pipelinedCollection = false;
+		config.pipelinedCollection = false;
+		if (dist->is_learner()) {
+			this->config.numGames = 1;
+			config.numGames = 1;
+		}
+	}
+
 	// Apply the TF32 matmul policy on CUDA (inert elsewhere) — without this the dense MLPs
 	// run strict fp32 and never touch the Ampere+/Blackwell tensor-core path
 	if (device.is_cuda()) {
@@ -399,13 +408,16 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	// External fixed opponent (Nexto): fail LOUD at boot if the model is missing -
 	// a mid-run lazy failure would silently turn serve iterations into self-play
-	if (config.externalOpponent.enabled && !config.renderMode)
+	if (config.externalOpponent.enabled && !config.renderMode
+		&& !(dist && config.asyncEnabled))
 		nexto = std::make_shared<NextoOpponent>(config.externalOpponent.modelPath, device);
 
-	if (config.skillTracker.enabled || config.trainAgainstOldVersions)
+	if ((config.skillTracker.enabled || config.trainAgainstOldVersions)
+		&& !(dist && config.asyncEnabled && DistRank() != 0))
 		config.savePolicyVersions = true;
 
-	if (config.savePolicyVersions && !config.renderMode) {
+	if (config.savePolicyVersions && !config.renderMode
+		&& !(dist && config.asyncEnabled && DistRank() != 0)) {
 		if (config.checkpointFolder.empty())
 			RG_ERR_CLOSE("Cannot save/load old policy versions with no checkpoint save folder");
 		versionMgr = new PolicyVersionManager(
@@ -420,7 +432,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		Load();
 
 	if (versionMgr)
-		versionMgr->dist = dist;
+		versionMgr->dist = (config.asyncEnabled ? nullptr : dist);
 
 	if (dist && dist->distributed()) {
 		ppo->models.BroadcastParameters(dist);
@@ -440,7 +452,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 #endif
 	}
 
-	if (config.savePolicyVersions && !config.renderMode) {
+	if (versionMgr) {
 		if (config.checkpointFolder.empty())
 			RG_ERR_CLOSE("Cannot save/load old policy versions with no checkpoint save folder");
 		auto models = ppo->GetPolicyModels();
@@ -662,7 +674,9 @@ void GGL::Learner::Save() {
 		RG_ERR_CLOSE("Learner::Save(): Cannot save because config.checkpointSaveFolder is not set");
 
 	// Fold per-rank Nexto increments into a shared cumulative before rank 0 writes.
-	if (nexto && DistActive()) {
+	// Async already reduced this Learn's header deltas on the Learners pool; summing
+	// again here would multiply the fleet total by nL.
+	if (nexto && DistActive() && !(config.asyncEnabled && dist && dist->n_collectors() > 0)) {
 		int64_t dF = (int64_t)nextoGoalsFor - nextoLoadedFor;
 		int64_t dA = (int64_t)nextoGoalsAgainst - nextoLoadedAgainst;
 		int64_t dS = (int64_t)nextoServeIters - nextoLoadedServes;
@@ -1036,6 +1050,11 @@ void GGL::Learner::Start() {
 
 	if (render)
 		RG_LOG("\t(Render mode enabled)");
+
+	if (config.asyncEnabled) {
+		StartAsync();
+		return;
+	}
 
 	// Render-mode live reload: follow the newest checkpoint a separate training process writes, so
 	// the viewer tracks the model as it learns. Starts at the checkpoint loaded in the constructor

@@ -12,6 +12,7 @@
 #include <torch/optim/adam.h>
 #include <torch/nn/modules/loss.h>
 #include <torch/nn/modules/container/sequential.h>
+#include <functional>
 
 #include "ExperienceBuffer.h"
 
@@ -46,7 +47,6 @@ namespace GGL {
 			PPOLearnerConfig config, torch::Device device,
 			Dist::Session* dist = nullptr
 		);
-		~PPOLearner();
 
 		static void MakeModels(
 			bool makeCritic,
@@ -228,7 +228,13 @@ namespace GGL {
 		int ampGoodEpochs = 0;
 		int ampSkipCount = 0;
 
+		uint64_t policyVersion = 0;
+		std::function<void()> onMinibatchEnd;
+		std::function<void()> onBeforeStepOptims;
+		std::function<void(bool stepOk)> onEpochEnd;
+
 		void Learn(ExperienceBuffer& experience, Report& report, bool isFirstIteration);
+		~PPOLearner();
 
 		void SaveTo(std::filesystem::path folderPath);
 		// Re-read the just-written checkpoint and diff it against the live weights.

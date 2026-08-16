@@ -71,6 +71,9 @@ std::vector<GGL::ExperienceTensors> GGL::ExperienceBuffer::GetAllBatchesShuffled
 void GGL::ExperienceBuffer::UploadToDevice() {
 	if (!device.is_cuda() || !data.states.defined())
 		return;
+	// Do not early-out on states.is_cuda(): LearnPrep may already have states/masks on GPU
+	// while advantages and the rest are still host. IsOnCUDA() is states-only, and a mixed
+	// buffer plus GPU randperm then index_selects CPU fields with a CUDA index.
 
 	RG_NO_GRAD;
 	for (auto* t = data.begin(); t != data.end(); t++) {

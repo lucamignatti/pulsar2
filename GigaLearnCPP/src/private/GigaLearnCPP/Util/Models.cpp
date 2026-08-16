@@ -58,7 +58,7 @@ GGL::Model::Model(
 	for (int i = 0; i < numLayers; i++) {
 
 		// Open a 2-layer residual block at layer i. Never at the stem (i=0, which changes width
-		// from numInputs), and only when layer i+1 exists to pair with - a trailing odd laye
+		// from numInputs), and only when layer i+1 exists to pair with - a trailing odd layer
 		// stays plain, so {W} and {W,W} are unaffected by addResiduals.
 		if (config.addResiduals && blockRemaining == 0 && i >= 1 && (i + 1) < numLayers) {
 			blockRemaining = 2;
@@ -241,6 +241,8 @@ torch::Tensor GGL::Model::Forward(torch::Tensor input, bool halfPrec, bool keepH
 
 	if (halfPrec) {
 
+		// (Their branch inlined an older per-param refresh here; RefreshHalfCache is
+		// the superset — flat-half buffer, grouped cast, MoE buffer copies, epoch bump.)
 		RefreshHalfCache();
 
 		auto halfParams = seqHalf->parameters();
@@ -425,7 +427,7 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 	// The bf16 inference mirror must be rebuilt from the weights just loaded. StepOptim sets this
 	// and so does the collect-snapshot sync — but Load did NOT, so any Model that had already
 	// served one half-precision forward kept serving its PRE-LOAD weights forever, silently.
-	// Boot resume is unaffected (load precedes the first forward). The live victim is rende
+	// Boot resume is unaffected (load precedes the first forward). The live victim is render
 	// mode's checkpoint hot-swap, which loads into already-used models: the viewer would keep
 	// showing the OLD policy while logging the new checkpoint's timestep.
 	_seqHalfOutdated = true;
