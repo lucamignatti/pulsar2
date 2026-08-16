@@ -1609,15 +1609,26 @@ void GGL::Learner::Start() {
 			const char* e = std::getenv("GGL_ES");
 			return e && *e && std::string(e) != "0";
 		}();
+		// GGL_ES_HYBRID: EGGROLL alongside PPO. Per-arena rank-1 parameter noise on
+		// collection (structured parameter-space exploration; PPO ratios stay exact
+		// because every member's logprobs are stored from its own perturbed forward)
+		// + the ES fitness update applied to mu on opponent-served iterations, where
+		// arena fitness vs a fixed opponent is well-defined (self-play fitness is
+		// degenerate: both teams carry the same perturbation). The ES_EGGROLL.md clean
+		// negative applies to ES ALONE; this tests ES as an auxiliary channel.
+		const bool esHybrid = !esMode && !render && [] {
+			const char* e = std::getenv("GGL_ES_HYBRID");
+			return e && *e && std::string(e) != "0";
+		}();
 		// The pipelined worker's frozen model set. With the steering rho-gate on, the reach
 		// heads are snapshotted too - the worker must never read weights Learn is updating.
 		std::vector<const char*> snapshotNames = { "shared_head", "policy" };
 		ModelSet collectSnapshot;
-		if (pipelineOn || esMode)
+		if (pipelineOn || esMode || esHybrid)
 			for (const char* nm : snapshotNames)
 				if (ppo->models[nm])
 					collectSnapshot.Add(ppo->models[nm]->MakeClone());
-		ModelSet* const collectModelsPtr = (pipelineOn || esMode) ? &collectSnapshot : NULL;
+		ModelSet* const collectModelsPtr = (pipelineOn || esMode || esHybrid) ? &collectSnapshot : NULL;
 		auto fnSyncSnapshot = [&]() {
 			RG_NO_GRAD;
 			for (const char* nm : snapshotNames) {
@@ -1801,6 +1812,9 @@ void GGL::Learner::Start() {
 			const char* e = std::getenv("GGL_ES_PER_ARENA");
 			return !(e && *e && std::string(e) == "0");
 		}();
+		// Noise machinery active in ES mode (per-arena) OR hybrid mode.
+		const bool esNoiseOn = (esMode && esPerArena) || esHybrid;
+		std::atomic<int> esOppServedFlag{ 0 }; // worker-set: joined iter had an opp split
 		// GGL_ES_FIT_GOAL: fitness = goal diff only (±1 per goal event, mean over the
 		// window) instead of mean shaped step reward. Rationale (ES_EGGROLL.md amendment 3):
 		// the PBRS terms telescope to endpoint noise over a window-mean, so the shaped
@@ -1813,7 +1827,7 @@ void GGL::Learner::Start() {
 		GGL::PPOLearner::EsLowRankCtx esCtx;
 		std::vector<double> esFitSumP;  // per-PLAYER accumulation (no races in the record
 		std::vector<int64_t> esFitCntP; // parallel-for); reduced to per-arena at the barrier
-		if (esPerArena) {
+		if (esNoiseOn) {
 			esFitSumP.assign((size_t)numPlayers, 0.0);
 			esFitCntP.assign((size_t)numPlayers, 0);
 		}
@@ -1946,7 +1960,7 @@ void GGL::Learner::Start() {
 		// The very first collect runs inline BEFORE any barrier — arm generation 0's
 		// noise here or the low-rank forward asserts on an empty ctx. (Gen 0's fitness
 		// is discarded by esInflight=false at the first barrier, matching v1.)
-		if (esPerArena)
+		if (esNoiseOn)
 			fnEsBuildNoise();
 		// ===================== end EGGROLL-ES =====================
 
@@ -2143,7 +2157,9 @@ void GGL::Learner::Start() {
 			// EGGROLL-ES per-arena members: row k of the member-side batch belongs to the
 			// member (= arena) of player newPlayerIndices[k]. Built once per iteration
 			// (the split is fixed for the iteration); also reset the fitness cells.
-			if (esPerArena) {
+			if (esNoiseOn) {
+				if (esHybrid)
+					esOppServedFlag.store(oppServed ? 1 : 0);
 				std::fill(esFitSumP.begin(), esFitSumP.end(), 0.0);
 				std::fill(esFitCntP.begin(), esFitCntP.end(), (int64_t)0);
 				std::vector<int64_t> rm;
@@ -2541,7 +2557,7 @@ void GGL::Learner::Start() {
 					auto fnInferMain = [&]() {
 						// ES per-arena members ride the batched low-rank forward; every
 						// other mode (PPO, ES v1, render) takes the plain path.
-						if (esPerArena)
+						if (esNoiseOn)
 							ppo->InferActionsLowRankES(*newModelsPtr, tdNewStates,
 								tdNewActionMasks, esCtx, &tNewActions, &tLogProbs);
 						else
@@ -2560,7 +2576,11 @@ void GGL::Learner::Start() {
 							tActions.index_copy_(0, idxNew, tNewActions);
 							tActions.index_copy_(0, idxOld, tOldActions.to(tNewActions.dtype()));
 						} else {
-							ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr);
+							if (esNoiseOn && collectModelsPtr)
+								ppo->InferActionsLowRankES(*collectModelsPtr, tdStates,
+									tdActionMasks, esCtx, &tActions, &tLogProbs);
+							else
+								ppo->InferActions(tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr);
 						}
 						inferKernTime += inferTimer.Elapsed();
 
@@ -2806,7 +2826,7 @@ void GGL::Learner::Start() {
 
 							// EGGROLL-ES per-arena fitness: per-PLAYER cells, so this
 							// parallel-for never races (players are unique per k).
-							if (esPerArena) {
+							if (esNoiseOn) {
 								if (esFitGoal) {
 									auto& egs = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]];
 									if (egs.goalScored) {
@@ -3089,8 +3109,24 @@ void GGL::Learner::Start() {
 				// BEFORE the snapshot sync, then arm the next generation's noise.
 				if (esMode)
 					fnEsGenerationTurn();
-				else
+				else {
+					// HYBRID turn: ES update (opp-served fitness only) BEFORE the snapshot
+					// sync so the next generation samples around the post-update mu; fresh
+					// noise armed after.
+					if (esHybrid && esInflight && esOppServedFlag.load())
+						fnEsUpdateArena();
 					fnSyncSnapshot();
+					if (esHybrid) {
+						esGen++;
+						fnEsBuildNoise();
+						esInflight = true;
+						report["ES/Gen"] = (float)esGen;
+						report["ES/My Fitness"] = esMyFit;
+						report["ES/Fitness Mean"] = esFitMean;
+						report["ES/Fitness Std"] = esFitStd;
+						report["ES/Update Norm"] = esUpdateNorm;
+					}
+				}
 				report["Snapshot Time"] = snapshotTimer.Elapsed();
 			} else {
 				report["VersionMgr Time"] = 0.f;
@@ -3099,6 +3135,14 @@ void GGL::Learner::Start() {
 				Timer seqSnapshotTimer = {};
 				if (esMode)
 					fnEsGenerationTurn();
+				else if (esHybrid) {
+					if (esInflight && esOppServedFlag.load())
+						fnEsUpdateArena();
+					fnSyncSnapshot();
+					esGen++;
+					fnEsBuildNoise();
+					esInflight = true;
+				}
 				report["Snapshot Time"] = seqSnapshotTimer.Elapsed();
 			}
 
