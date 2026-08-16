@@ -52,14 +52,14 @@
 // results land in rowExp/rowGate; counts accumulate for the scan.
 // E is small (128 live); a k*E scan per thread is cheap next to one dispatch.
 __global__ void gglk_route_topk(
-	const __half* logits, const __half* selBias,
+	const float* logits, const __half* selBias,
 	int R, int E, int k,
 	int* counts, int* rowExp, float* rowGate) {
 
 	int r = blockIdx.x * blockDim.x + threadIdx.x;
 	if (r >= R)
 		return;
-	const __half* row = logits + (size_t)r * E;
+	const float* row = logits + (size_t)r * E;
 	bool taken[512]; // E <= 512 enforced host-side
 	for (int e = 0; e < E; e++)
 		taken[e] = false;
@@ -70,7 +70,7 @@ __global__ void gglk_route_topk(
 		for (int e = 0; e < E; e++) {
 			if (taken[e])
 				continue;
-			float aff = 1.f / (1.f + __expf(-__half2float(row[e])));
+			float aff = 1.f / (1.f + __expf(-row[e]));
 			float score = aff + __half2float(selBias[e]);
 			if (score > bestScore) {
 				bestScore = score;
@@ -78,7 +78,7 @@ __global__ void gglk_route_topk(
 			}
 		}
 		taken[best] = true;
-		float aff = 1.f / (1.f + __expf(-__half2float(row[best])));
+		float aff = 1.f / (1.f + __expf(-row[best]));
 		rowExp[(size_t)r * k + j] = best;
 		rowGate[(size_t)r * k + j] = aff;
 		gateSum += aff;
@@ -124,21 +124,11 @@ __global__ void gglk_place(
 	gates[slot] = rowGate[i];
 }
 
-// Route-plan scratch: rowExp/rowGate live here so the caller only manages the
-// expert-sorted outputs. Grow-only (see header).
-namespace {
-	struct RoutePlanScratch {
-		int cap = 0;
-		int* rowExp = nullptr;
-		float* rowGate = nullptr;
-	};
-	RoutePlanScratch g_route;
-}
-
 extern "C" void ggl_moe_route_plan_f16(
 	const void* logits, const void* selBias,
 	int R, int E, int k,
 	int* countsCursors, int* offsets,
+	int* rowExpScratch, float* rowGateScratch,
 	int* srcRows, int* expertId, float* gates,
 	void* stream) {
 
@@ -148,21 +138,15 @@ extern "C" void ggl_moe_route_plan_f16(
 	}
 	cudaStream_t s = (cudaStream_t)stream;
 	int n = R * k;
-	if (n > g_route.cap) {
-		// deliberately never freed (grow-only)
-		GGLK_CUDA_CHECK(cudaMalloc(&g_route.rowExp, sizeof(int) * (size_t)n * 2));
-		GGLK_CUDA_CHECK(cudaMalloc(&g_route.rowGate, sizeof(float) * (size_t)n * 2));
-		g_route.cap = n * 2;
-	}
 	int* counts = countsCursors;
 	int* cursors = countsCursors + E;
 	GGLK_CUDA_CHECK(cudaMemsetAsync(countsCursors, 0, sizeof(int) * 2 * (size_t)E, s));
 	gglk_route_topk<<<(R + 127) / 128, 128, 0, s>>>(
-		(const __half*)logits, (const __half*)selBias, R, E, k,
-		counts, g_route.rowExp, g_route.rowGate);
+		(const float*)logits, (const __half*)selBias, R, E, k,
+		counts, rowExpScratch, rowGateScratch);
 	gglk_scan_offsets<<<1, E + 1, 0, s>>>(counts, offsets, E);
 	gglk_place<<<(n + 127) / 128, 128, 0, s>>>(
-		g_route.rowExp, g_route.rowGate, offsets, cursors, n, k,
+		rowExpScratch, rowGateScratch, offsets, cursors, n, k,
 		srcRows, expertId, gates);
 }
 
@@ -206,6 +190,11 @@ extern "C" void ggl_moe_bias_leaky_f16(
 		return;
 	gglk_bias_leaky_f16<<<n, 128, 0, (cudaStream_t)stream>>>(
 		(__half*)h, (const __half*)b, expertId, n, H, slope);
+}
+
+extern "C" void ggl_moe_zero_f16(void* p, int64_t count, void* stream) {
+	GGLK_CUDA_CHECK(cudaMemsetAsync(p, 0, sizeof(__half) * (size_t)count,
+		(cudaStream_t)stream));
 }
 
 __global__ void gglk_scatter_bias_gate_f16(

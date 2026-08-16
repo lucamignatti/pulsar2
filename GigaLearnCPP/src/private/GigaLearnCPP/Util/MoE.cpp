@@ -94,7 +94,7 @@ int GGL::RunMoESelfTest() {
 		pb->capacityFactor = 8.f;
 		{
 			torch::NoGradGuard ng0;
-			pb->routerW.mul_(100.0);
+			pb->routerW.mul_(10.0);
 		}
 		pb->to(dev);
 		pb->to(torch::kHalf);
@@ -274,60 +274,75 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 	const int E = (int)numExperts;
 
 	auto xn = ln->forward(x);                              // fp16
-	auto logits = torch::matmul(xn, routerW.t());          // fp16 [R,E], fp32 accum
 
 	RG_ASSERT(routerBias.scalar_type() == torch::kHalf);   // half-clone buffers only
 
-	// Transposed weight caches, CUTLASS layout (B row-major [K,N] per expert).
-	// The half clone's params are refreshed IN PLACE once per iteration; the epoch
-	// counter is the only signal that happened.
+	// Weight caches in CUTLASS layout. copy_ INTO EXISTING STORAGE on refresh:
+	// a CUDA graph captured over this path holds these pointers, and the half
+	// clone's params are themselves refreshed in place once per iteration.
 	uint64_t ep = g_halfRefreshEpoch.load(std::memory_order_acquire);
-	if (ep != _wCacheEpoch || !_w1T.defined()) {
+	if (!_w1T.defined()) {
 		torch::NoGradGuard ng;
 		_w1T = expertW1.transpose(1, 2).contiguous();      // [E, d, h]
 		_w2T = expertW2.transpose(1, 2).contiguous();      // [E, h, d]
+		_routerW32 = routerW.to(torch::kFloat);            // routing is fp32 (parity with eager)
+		_wCacheEpoch = ep;
+	} else if (ep != _wCacheEpoch) {
+		torch::NoGradGuard ng;
+		_w1T.copy_(expertW1.transpose(1, 2), true);
+		_w2T.copy_(expertW2.transpose(1, 2), true);
+		_routerW32.copy_(routerW, true);
 		_wCacheEpoch = ep;
 	}
 
-	auto iopts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
-	if (!_scPacked.defined() || _scPacked.size(0) < n) {
-		_scCounts = torch::empty({ 2 * numExperts }, iopts);
-		_scOffsets = torch::empty({ numExperts + 1 }, iopts);
-		_scSrcRows = torch::empty({ n }, iopts);
-		_scExpertId = torch::empty({ n }, iopts);
-		_scGates = torch::empty({ n },
-			torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-		_scPacked = torch::empty({ n, dim }, x.options());
-		_scHid = torch::empty({ n, hidden }, x.options());
-		_scOut = torch::empty({ n, dim }, x.options());
+	// Per-shape persistent scratch (see MoE.h for why per-shape).
+	FastScratch& sc = _scratchByRows[R];
+	if (!sc.packed.defined()) {
+		auto iopts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+		auto fopts = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+		sc.counts = torch::empty({ 2 * numExperts }, iopts);
+		sc.offsets = torch::empty({ numExperts + 1 }, iopts);
+		sc.rowExp = torch::empty({ n }, iopts);
+		sc.rowGate = torch::empty({ n }, fopts);
+		sc.srcRows = torch::empty({ n }, iopts);
+		sc.expertId = torch::empty({ n }, iopts);
+		sc.gates = torch::empty({ n }, fopts);
+		sc.logits32 = torch::empty({ R, numExperts }, fopts);
+		sc.packed = torch::empty({ n, dim }, x.options());
+		sc.hid = torch::empty({ n, hidden }, x.options());
+		sc.out = torch::empty({ R, dim }, x.options());
 	}
 	if (!_gemmCtx)
 		_gemmCtx = ggl_moe_ctx_create(E);
 
+	// fp32 router logits, written into the persistent buffer (mm_out: no alloc).
+	torch::mm_out(sc.logits32, xn.to(torch::kFloat), _routerW32.t());
+
 	ggl_moe_route_plan_f16(
-		logits.data_ptr(), routerBias.data_ptr(), (int)R, E, (int)topK,
-		_scCounts.data_ptr<int>(), _scOffsets.data_ptr<int>(),
-		_scSrcRows.data_ptr<int>(), _scExpertId.data_ptr<int>(),
-		_scGates.data_ptr<float>(), s);
-	ggl_moe_gather_f16(xn.data_ptr(), _scSrcRows.data_ptr<int>(),
-		_scPacked.data_ptr(), (int)n, (int)dim, s);
-	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, _scPacked.data_ptr(), _w1T.data_ptr(),
-		_scHid.data_ptr(), _scOffsets.data_ptr<int>(), E, (int)dim, (int)hidden, s);
-	ggl_moe_bias_leaky_f16(_scHid.data_ptr(), expertB1.data_ptr(),
-		_scExpertId.data_ptr<int>(), (int)n, (int)hidden, 0.01f, s);
-	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, _scHid.data_ptr(), _w2T.data_ptr(),
-		_scOut.data_ptr(), _scOffsets.data_ptr<int>(), E, (int)hidden, (int)dim, s);
-	auto out = torch::zeros_like(xn);
-	ggl_moe_scatter_bias_gate_f16(_scOut.data_ptr(), expertB2.data_ptr(),
-		_scExpertId.data_ptr<int>(), _scGates.data_ptr<float>(),
-		_scSrcRows.data_ptr<int>(), out.data_ptr(), (int)n, (int)dim, s);
+		sc.logits32.data_ptr(), routerBias.data_ptr(), (int)R, E, (int)topK,
+		sc.counts.data_ptr<int>(), sc.offsets.data_ptr<int>(),
+		sc.rowExp.data_ptr<int>(), sc.rowGate.data_ptr<float>(),
+		sc.srcRows.data_ptr<int>(), sc.expertId.data_ptr<int>(),
+		sc.gates.data_ptr<float>(), s);
+	ggl_moe_gather_f16(xn.data_ptr(), sc.srcRows.data_ptr<int>(),
+		sc.packed.data_ptr(), (int)n, (int)dim, s);
+	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, sc.packed.data_ptr(), _w1T.data_ptr(),
+		sc.hid.data_ptr(), sc.offsets.data_ptr<int>(), E, (int)dim, (int)hidden, s);
+	ggl_moe_bias_leaky_f16(sc.hid.data_ptr(), expertB1.data_ptr(),
+		sc.expertId.data_ptr<int>(), (int)n, (int)hidden, 0.01f, s);
+	ggl_moe_grouped_gemm_f16_dev(_gemmCtx, sc.hid.data_ptr(), _w2T.data_ptr(),
+		sc.packed.data_ptr(), sc.offsets.data_ptr<int>(), E, (int)hidden, (int)dim, s);
+	ggl_moe_zero_f16(sc.out.data_ptr(), (int64_t)R * dim, s);
+	ggl_moe_scatter_bias_gate_f16(sc.packed.data_ptr(), expertB2.data_ptr(),
+		sc.expertId.data_ptr<int>(), sc.gates.data_ptr<float>(),
+		sc.srcRows.data_ptr<int>(), sc.out.data_ptr(), (int)n, (int)dim, s);
 
 	// Load tracking for the aux-free balancing panel/update (counts came free).
-	loadAcc.add_(_scCounts.narrow(0, 0, numExperts).to(loadAcc.scalar_type()));
+	loadAcc.add_(sc.counts.narrow(0, 0, numExperts).to(loadAcc.scalar_type()));
 
 	auto hs = torch::leaky_relu(torch::addmm(sharedB1, xn, sharedW1.t()), 0.01);
 	auto ys = torch::addmm(sharedB2, hs, sharedW2.t());
-	return x + out + ys;
+	return x + sc.out + ys;
 }
 #endif
 

@@ -24,13 +24,18 @@ extern "C" {
 	// CUDA 11.2 (measured in moe-bench; see moe_cutlass_reset there).
 	void* ggl_moe_ctx_create(int maxExperts);
 
-	// Routing plan from raw router logits (fp16 [R,E]) + selection bias (fp16 [E]):
+	// Routing plan from raw router logits (FP32 [R,E] — the eager path routes on fp32
+	// logits, and fp16 rounding before top-k flips boundary selections) + selection
+	// bias (fp16 [E]):
 	// DSv3 semantics matched to MoEBlockImpl::forward — selection by
 	// sigmoid(logit)+bias, gate = sigmoid(logit) of the selected experts,
 	// renormalized over the k picks. Outputs, in expert-sorted assignment order
 	// (n = R*k assignments):
 	//   countsCursors int32 [2E] scratch (zeroed internally)
 	//   offsets       int32 [E+1] exclusive scan of per-expert counts
+	//   rowScratch    int32 [n] + float [n] caller-owned per-row scratch — CALLER
+	//                 owned (not a library global) so CUDA-graph capture never sees
+	//                 a reallocating pointer; see rowExpScratch/rowGateScratch.
 	//   srcRows       int32 [n] assignment -> source row
 	//   expertId      int32 [n] assignment -> expert
 	//   gates         float [n] normalized gate weight
@@ -39,6 +44,7 @@ extern "C" {
 		const void* logits, const void* selBias,
 		int R, int E, int k,
 		int* countsCursors, int* offsets,
+		int* rowExpScratch, float* rowGateScratch,
 		int* srcRows, int* expertId, float* gates,
 		void* stream);
 
@@ -61,6 +67,9 @@ extern "C" {
 	void ggl_moe_bias_leaky_f16(
 		void* h, const void* b, const int* expertId,
 		int n, int H, float slope, void* stream);
+
+	// Zero an fp16 buffer (cudaMemsetAsync — cheaper than a torch zero_ dispatch).
+	void ggl_moe_zero_f16(void* p, int64_t count, void* stream);
 
 	// out[srcRows[i],:] += (y[i,:] + b[expertId[i],:]) * gates[i]  (fp16 atomics),
 	// 1 launch. out must be zeroed by the caller.

@@ -3,6 +3,7 @@
 #include <torch/nn/cloneable.h>
 #include <torch/nn/modules/normalization.h>
 #include <atomic>
+#include <map>
 
 namespace GGL {
 
@@ -54,10 +55,20 @@ namespace GGL {
 		// so every clone starts with empty caches and builds its own lazily.
 		int fastPathForce = -1;                  // -1 = env, 0 = off, 1 = on
 		torch::Tensor ForwardFast(torch::Tensor x);
+		// Weight caches for the CUTLASS layout, refreshed by copy_ INTO THE SAME
+		// STORAGE each epoch — CUDA-graph capture bakes in device pointers, so a
+		// refresh must never reallocate (same law as the flat fp16 buffer).
 		uint64_t _wCacheEpoch = ~0ull;
 		torch::Tensor _w1T, _w2T;                // fp16 [E, d, h], [E, h, d] contiguous
-		torch::Tensor _scCounts, _scOffsets, _scSrcRows, _scExpertId, _scGates;
-		torch::Tensor _scPacked, _scHid, _scOut; // fp16 assignment buffers
+		torch::Tensor _routerW32;                // fp32 [E, d] (routing is fp32; see .h of kernels)
+		// PER-SHAPE scratch: a captured graph for batch shape A must keep its exact
+		// buffers when shape B arrives — a shared grow-on-demand buffer would leave
+		// shape A's graph reading freed storage after B's realloc.
+		struct FastScratch {
+			torch::Tensor counts, offsets, rowExp, rowGate, srcRows, expertId, gates;
+			torch::Tensor logits32, packed, hid, out;
+		};
+		std::map<int64_t, FastScratch> _scratchByRows;
 		void* _gemmCtx = nullptr;                // ggl_moe_ctx_create, grow-only
 	};
 	TORCH_MODULE(MoEBlock);
