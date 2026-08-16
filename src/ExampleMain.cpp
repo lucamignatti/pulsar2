@@ -828,6 +828,12 @@ int main(int argc, char* argv[]) {
 		cfg.skillTracker.enabled = false;
 		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
 	}
+	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
+	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
+	if (const char* nr = std::getenv("GGL_NO_REACH"); nr && *nr && std::string(nr) != "0") {
+		cfg.ppo.reachability.enabled = false;
+		RG_LOG("GGL_NO_REACH: reachability disabled");
+	}
 
 	// Memory-only lever (mathematically identical, CLAUDE.md): the learn pass chunks
 	// each batch by miniBatchSize with gradient accumulation. The MoE learn backward at
