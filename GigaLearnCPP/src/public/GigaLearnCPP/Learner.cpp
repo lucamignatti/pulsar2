@@ -1772,6 +1772,22 @@ void GGL::Learner::Start() {
 				mm->_seqHalfOutdated = true;
 			}
 			esUpdateNorm = (float)std::sqrt(normSq);
+			// PPOLearner's lockstep checksum lives in Learn(), which ES skips — verify the
+			// seed-reconstructed update here instead, or rank divergence is silent garbage.
+			if (dist && dist->distributed()) {
+				static const bool chk = [] {
+					const char* e = std::getenv("GGL_DIST_LOCKSTEP_CHECK");
+					return e && *e && std::string(e) != "0";
+				}();
+				if (chk) {
+					float sum = ppo->models["policy"]->CopyParams().sum().item<float>();
+					float root = sum;
+					dist->bcast_host(&root, sizeof(root), 0);
+					if (std::abs(sum - root) > 1e-2f)
+						RG_ERR_CLOSE("ES lockstep mismatch rank " << dist->rank()
+							<< " policy-sum " << sum << " vs root " << root);
+				}
+			}
 		};
 		// ===================== end EGGROLL-ES =====================
 

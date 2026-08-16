@@ -69,6 +69,21 @@ is never touched. Killing the experiment = scancel. The code is env-gated and
 default-off; the shared binary keeps byte-identical PPO behavior with GGL_ES
 unset (compile-checked, and the live chain's hop restarts exercise it).
 
+## AMENDMENT 2026-08-16 (~1h into the sweep, BEFORE any verdict)
+
+Observed: all three sigma jobs mechanically clean (1,300+ generations each, zero
+errors, update norms scale with sigma, member fitness slightly negative = perturbations
+behaviorally meaningful) but Rating/1v1 flat after ~800M steps each. Identified
+confound, declared before the 24h gate matures: **population starvation** — 6
+members/generation is far below anything in the ES literature for policies this size,
+so a small-scale sanity failure would not distinguish "EGGROLL doesn't work here" from
+"population too small". Amendment: add a population axis — one 24-node job (144
+members/gen, sigma=0.03) launched alongside the unchanged 1-node sweep. The sanity
+gate (fitness/rating slope, kickoff competence, 24h) applies to the LARGEST population
+tested; the 1-node jobs become the population-scaling baseline rather than the gate.
+Also added: an ES-update lockstep checksum (the PPO one lives in Learn(), which ES
+skips) — divergent ranks would otherwise silently corrupt the population.
+
 ## Sweep plan
 
 sigma_rel in {0.01, 0.03, 0.1} as three parallel 1-node jobs (alpha=1 fixed,
