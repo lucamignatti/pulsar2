@@ -138,13 +138,16 @@ int GGL::RunMoESelfTest() {
 		}
 		lb->to(dev);
 		auto xl = (torch::randn({ 777, 1024 }, dev) * 0.5).set_requires_grad(true);
+		// Random upstream grad: y.sum() (all-ones dOut) makes the B1 reference a
+		// heavily sign-cancelled near-zero sum, so relRMS divided fp16 noise by ~0.
+		auto upG = torch::randn({ 777, 1024 }, dev);
 		auto fnGrads = [&](int force) {
 			lb->learnFastForce = force;
 			if (xl.grad().defined()) xl.mutable_grad() = torch::Tensor();
 			for (auto& pr : lb->parameters())
 				if (pr.grad().defined()) pr.mutable_grad() = torch::Tensor();
 			auto yl = lb->forward(xl);
-			yl.sum().backward();
+			yl.backward(upG);
 			std::vector<torch::Tensor> g;
 			g.push_back(xl.grad().clone());
 			for (auto& pr : { lb->routerW, lb->expertW1, lb->expertB1, lb->expertW2, lb->expertB2 })
@@ -156,9 +159,15 @@ int GGL::RunMoESelfTest() {
 		const char* names[] = { "dx", "routerW", "expertW1", "expertB1", "expertW2", "expertB2" };
 		bool ok = true;
 		for (size_t i = 0; i < gRef.size(); i++) {
-			float rel = (gFast[i] - gRef[i]).norm().item<float>()
-				/ std::max(gRef[i].norm().item<float>(), 1e-6f);
-			RG_LOG("  grad parity " << names[i] << " relRMS=" << rel);
+			float refN = gRef[i].norm().item<float>();
+			// Cancellation-robust denominator: a reference whose entries nearly cancel
+			// (bias grads) cannot be the yardstick for fp16 elementwise noise.
+			float den = std::max(refN,
+				std::max(gFast[i].norm().item<float>() * 0.5f,
+					1e-4f * std::sqrt((float)gRef[i].numel())));
+			float rel = (gFast[i] - gRef[i]).norm().item<float>() / std::max(den, 1e-6f);
+			RG_LOG("  grad parity " << names[i] << " relRMS=" << rel
+				<< " (refNorm=" << refN << ")");
 			if (!(rel < 3e-2f))
 				ok = false;
 		}
