@@ -223,5 +223,31 @@ place weight caches) so graphs and the CUTLASS path compose.
       1.50→1.28s, **SPS ~105k**, mem 10.4GB. Now the top items are
       allreduce 0.49 + optstep 0.39 (incl. the 1.6GB owner-bcast) — BOTH are
       exactly what Stage 2 EP eliminates by construction. EP is next.
-- [ ] Stage 2 (NCCL EP) design review + a2a microbench inter-node → build.
-- [ ] Stage 3 (async experts) pre-registration.
+- [x] Stage 1b SHIPPED (2026-08-17): grad-parity green all 6 families incl. an
+      UNDER-AUTOCAST pass (the fleet's AMP intercepted the router mm → fp16
+      logits read as fp32 → illegal access, jobs 4631411-17; AutocastOffScope
+      now pins precision inside the custom fn). Fleet: fwdbwd 0.37→0.32s,
+      SPS ~105k→115-128k, entropy healthy. MoE-APPO remeasured: 171k→190k
+      (2 nodes; dense 600k — gap 3.2x, all in optstep 0.39 + allreduce 0.33 +
+      publish, ALL total-param costs).
+- [ ] Stage 2 (EP) IN PROGRESS — build order, each gated:
+      A. DONE (d9089b9): Session::allgather_host_group +
+         alltoall_rows_f16_group on the learner group (lifted from moe-bench;
+         self-traffic = local copy).
+      B. EP mode in MoERoutedFFN (env GGL_MOE_EP): after the route plan, host-
+         allgather per-expert counts; owner o owns experts [o*E/nL,(o+1)*E/nL);
+         a2a packed rows (+expertId localized to the owner's slice) to owners;
+         owners run the SAME grouped-GEMM chain on their slice for ALL learners'
+         tokens; a2a y back. Backward mirrors (dY a2a to owners; owners compute
+         dgrad/wgrad — wgrad for owned experts completes LOCALLY; dX a2a back).
+         nL=1 must degenerate to the current path bit-for-bit (selftest gate).
+      C. Owner-sliced optimizer: Muon steps only param.narrow(0, own0, ownN) of
+         3D stacks (per-param epSlice fields); AllReduceGrads EXCLUDES dim-3
+         expert params under EP; post-step fp32 slice bcast per owner AT THE
+         ALLREDUCE CALL SITE (that lane provably coexists with publishes — the
+         per-param mid-step bcasts are what deadlocked Muon-shard; v2 = task #4
+         removes the replication entirely).
+      D. 2-node MoE-APPO trial: target learner SPS >> 190k; then scale nL.
+- [ ] Stage 3 (async experts) pre-registration — also the lever that cuts
+      per-expert NS FREQUENCY (parity with dense optimizer cost at ~16 sync
+      learners, or fewer with async expert cadence).
