@@ -524,7 +524,9 @@ void GGL::ModelSet::StepOptimsSharded(Dist::Session* dist) {
 		StepOptims();
 		return;
 	}
-	const int world = dist->world(), rank = dist->rank();
+	// group_*, not world/rank: under APPO async routing the collectives run on the
+	// learner group, and ownership must partition over the SAME set (see Session.h).
+	const int world = dist->group_world(), rank = dist->group_rank();
 
 	// (param, owner) for every NS-eligible 2D param, in the exact order Muon::step will
 	// count them. The predicate mirrors Muon::step's and is evaluated PRE-step, while the

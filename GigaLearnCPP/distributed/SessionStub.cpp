@@ -32,6 +32,8 @@ Session Session::Init(int& argc, char**& argv) {
 
 int Session::rank() const { return impl->rank; }
 int Session::world() const { return impl->world; }
+int Session::group_rank() const { return 0; }
+int Session::group_world() const { return 1; }
 int Session::local_rank() const { return impl->local_rank; }
 
 bool Session::is_learner() const { return true; }

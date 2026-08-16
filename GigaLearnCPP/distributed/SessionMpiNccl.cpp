@@ -320,6 +320,13 @@ Session Session::Init(int& argc, char**& argv) {
 
 int Session::rank() const { return impl->rank; }
 int Session::world() const { return impl->world; }
+// Learners occupy ranks 0..nL-1, so a learner's group rank equals its global rank.
+int Session::group_rank() const {
+	return (impl->async_routing && impl->nC > 0) ? impl->rank : impl->rank;
+}
+int Session::group_world() const {
+	return (impl->async_routing && impl->nC > 0) ? impl->nL : impl->world;
+}
 int Session::local_rank() const { return impl->local_rank; }
 
 bool Session::is_learner() const { return impl->nC == 0 || impl->rank < impl->nL; }

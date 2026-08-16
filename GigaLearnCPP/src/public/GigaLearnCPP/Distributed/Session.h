@@ -57,6 +57,14 @@ public:
 	int collector_rank() const;    // 0..nC-1 or -1
 	int dest_learner_world(uint64_t fragment_id) const;
 
+	// The rank/size of the COLLECTIVE GROUP this rank's allreduce/bcast actually run
+	// on: the learner group under async routing, the world otherwise. Anything that
+	// partitions work by rank ownership around a collective (Muon NS sharding) MUST
+	// use these — global rank/world under async routing would assign owners to
+	// collector ranks that never step, silently leaving their params stale.
+	int group_rank() const;
+	int group_world() const;
+
 	void enable_async_routing();
 
 	void barrier();
