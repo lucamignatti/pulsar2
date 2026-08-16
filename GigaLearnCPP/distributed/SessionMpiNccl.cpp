@@ -476,6 +476,52 @@ void Session::bcast_device(float* ptr, size_t n, int root, Stream stream) {
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root, impl->comm, AsCudaStream(stream)));
 	SyncStream(stream);
 }
+void Session::allgather_host_group(const int* send, int* recv, int perRank) {
+	MPI_Comm c = SessionHelpers::HostCommOrAbort(impl.get(), "allgather_host_group");
+	GGL_MPI_CHECK(MPI_Allgather(const_cast<int*>(send), perRank, MPI_INT,
+		recv, perRank, MPI_INT, c));
+}
+
+void Session::alltoall_rows_f16_group(
+	const void* send, void* recv,
+	const int* sendRows, const int* sendDisp,
+	const int* recvRows, const int* recvDisp,
+	int width, Stream stream) {
+
+	const int P = SessionHelpers::HostGroup(impl.get());
+	const int r0 = group_rank();
+	cudaStream_t cs = AsCudaStream(stream);
+	auto byteOff = [&](int row) { return (size_t)row * (size_t)width * 2; };
+	// Self-traffic as a local device copy (send-to-self inside an NCCL group was
+	// unreliable on this stack; measured in moe-bench).
+	if (sendRows[r0] > 0) {
+		GGL_CUDA_CHECK(cudaMemcpyAsync(
+			reinterpret_cast<char*>(recv) + byteOff(recvDisp[r0]),
+			reinterpret_cast<const char*>(send) + byteOff(sendDisp[r0]),
+			byteOff(sendRows[r0]), cudaMemcpyDeviceToDevice, cs));
+	}
+	if (P > 1) {
+		ncclComm_t comm = SessionHelpers::DeviceComm(impl.get());
+		GGL_NCCL_CHECK(ncclGroupStart());
+		for (int r = 0; r < P; r++) {
+			if (r == r0)
+				continue;
+			size_t sc = (size_t)sendRows[r] * (size_t)width;
+			size_t rc = (size_t)recvRows[r] * (size_t)width;
+			if (sc > 0)
+				GGL_NCCL_CHECK(ncclSend(
+					reinterpret_cast<const char*>(send) + byteOff(sendDisp[r]),
+					sc, ncclHalf, r, comm, cs));
+			if (rc > 0)
+				GGL_NCCL_CHECK(ncclRecv(
+					reinterpret_cast<char*>(recv) + byteOff(recvDisp[r]),
+					rc, ncclHalf, r, comm, cs));
+		}
+		GGL_NCCL_CHECK(ncclGroupEnd());
+	}
+	SyncStream(stream);
+}
+
 void Session::bcast_weights(float* ptr, size_t n, Stream stream, bool wait) {
 	if (n == 0 || !impl->weights_nccl) return;
 	cudaStream_t s = AsCudaStream(stream);

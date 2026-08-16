@@ -65,6 +65,19 @@ public:
 	int group_rank() const;
 	int group_world() const;
 
+	// Expert-parallel learn support (MOE_SPEED.md Stage 2). Both run on the GROUP
+	// (learner group under async routing): a host allgather for routing counts and
+	// a variable-row fp16 device all-to-all (row counts/displacements are HOST
+	// arrays of group_world() entries; self-traffic is a local device copy —
+	// send-to-self inside an NCCL group was unreliable on this stack, measured in
+	// moe-bench).
+	void allgather_host_group(const int* send, int* recv, int perRank);
+	void alltoall_rows_f16_group(
+		const void* send, void* recv,
+		const int* sendRows, const int* sendDisp,
+		const int* recvRows, const int* recvDisp,
+		int width, Stream stream = nullptr);
+
 	void enable_async_routing();
 
 	void barrier();

@@ -34,6 +34,18 @@ int Session::rank() const { return impl->rank; }
 int Session::world() const { return impl->world; }
 int Session::group_rank() const { return 0; }
 int Session::group_world() const { return 1; }
+void Session::allgather_host_group(const int* send, int* recv, int perRank) {
+	for (int i = 0; i < perRank; i++) recv[i] = send[i];
+}
+void Session::alltoall_rows_f16_group(
+	const void* send, void* recv,
+	const int* sendRows, const int* sendDisp,
+	const int* recvRows, const int* recvDisp, int width, Stream) {
+	(void)sendDisp;
+	if (sendRows[0] > 0)
+		std::memcpy(recv, send, (size_t)sendRows[0] * (size_t)width * 2);
+	(void)recvRows; (void)recvDisp;
+}
 int Session::local_rank() const { return impl->local_rank; }
 
 bool Session::is_learner() const { return true; }
