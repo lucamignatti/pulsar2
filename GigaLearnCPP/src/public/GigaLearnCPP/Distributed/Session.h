@@ -74,6 +74,11 @@ public:
 	// Broadcast on the GROUP comm (learner group under async routing). bcast_device
 	// uses the WORLD comm — wrong for anything only learners execute.
 	void bcast_device_group(float* ptr, size_t n, int root = 0, Stream stream = nullptr);
+	// Batch many collectives into ONE NCCL group. The EP replication issues nL
+	// broadcasts per expert param; ungrouped that is 1152 collectives/iteration at
+	// 96 ranks (optstep 5.7s). Grouped, NCCL pipelines them as one operation.
+	void group_begin();
+	void group_end(Stream stream = nullptr);
 	void allgather_host_group(const int* send, int* recv, int perRank);
 	void alltoall_rows_f16_group(
 		const void* send, void* recv,

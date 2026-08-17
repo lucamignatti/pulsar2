@@ -548,6 +548,9 @@ void GGL::ModelSet::ReplicateExpertSlices(Dist::Session* dist) {
 		return;
 	const auto& params = GGL::MoEExpertParams();
 	torch::NoGradGuard ng;
+	// ONE NCCL group for every (param, owner) broadcast — ungrouped this was nL per
+	// param (1152 collectives/iteration at 96 ranks, optstep 5.7s).
+	dist->group_begin();
 	// Deterministic order: param-major, then owner — every rank issues the exact
 	// same broadcast sequence.
 	for (auto& p : params) {
@@ -560,12 +563,14 @@ void GGL::ModelSet::ReplicateExpertSlices(Dist::Session* dist) {
 		for (int o = 0; o < nL; o++) {
 			const int st = o * per;
 			const int cn = (o == nL - 1) ? (E - st) : per;
-			auto slice = p.narrow(0, st, cn).contiguous();
+			// Broadcast IN PLACE on the param's own slice: .contiguous() on a
+			// narrow of dim 0 is already contiguous, and a temp would need a copy
+			// back per owner — which cannot be batched into the group.
+			auto slice = p.narrow(0, st, cn);
 			dist->bcast_device_group(slice.data_ptr<float>(), (size_t)slice.numel(), o);
-			if (dist->group_rank() != o)
-				p.narrow(0, st, cn).copy_(slice);
 		}
 	}
+	dist->group_end();
 }
 
 void GGL::ModelSet::StepOptimsSharded(Dist::Session* dist) {

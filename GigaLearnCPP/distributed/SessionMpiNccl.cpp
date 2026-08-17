@@ -476,6 +476,16 @@ void Session::bcast_device(float* ptr, size_t n, int root, Stream stream) {
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root, impl->comm, AsCudaStream(stream)));
 	SyncStream(stream);
 }
+void Session::group_begin() {
+	if (SessionHelpers::HostGroup(impl.get()) <= 1) return;
+	GGL_NCCL_CHECK(ncclGroupStart());
+}
+void Session::group_end(Stream stream) {
+	if (SessionHelpers::HostGroup(impl.get()) <= 1) return;
+	GGL_NCCL_CHECK(ncclGroupEnd());
+	SyncStream(stream);
+}
+
 void Session::bcast_device_group(float* ptr, size_t n, int root, Stream stream) {
 	// GROUP-scoped broadcast: bcast_device() uses the WORLD comm, and under async
 	// routing collectors are members of it but never call this — the whole job
@@ -483,7 +493,8 @@ void Session::bcast_device_group(float* ptr, size_t n, int root, Stream stream) 
 	if (n == 0 || SessionHelpers::HostGroup(impl.get()) <= 1) return;
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root,
 		SessionHelpers::DeviceComm(impl.get()), AsCudaStream(stream)));
-	SyncStream(stream);
+	// No SyncStream: callers that batch (group_begin/end) sync once at the end,
+	// and NCCL is stream-ordered for everyone else.
 }
 
 void Session::allgather_host_group(const int* send, int* recv, int perRank) {
