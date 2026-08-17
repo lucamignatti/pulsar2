@@ -60,9 +60,15 @@ void GGL::SetMoEExpertParallel(GGL::Dist::Session* session) {
 }
 
 bool GGL::MoEExpertParallelOn() {
-	// Armed only with a real multi-rank learner group; nL == 1 degenerates to the
-	// ordinary Stage 1b path (the desktop-testable correctness gate).
-	return g_epSession != nullptr && g_epSession->group_world() > 1;
+	// Armed only on LEARNERS with a real multi-rank learner group. Collectors also
+	// construct a PPOLearner (they need the nets for inference), and group_world()
+	// reports the learner-group size on every rank — so without the is_learner()
+	// term collectors entered the learner-only collectives and aborted the job
+	// ("collectors must not enter Learners collectives", trial 4631480).
+	// nL == 1 degenerates to the ordinary Stage 1b path (the selftest gate).
+	return g_epSession != nullptr
+		&& g_epSession->is_learner()
+		&& g_epSession->group_world() > 1;
 }
 
 GGL::Dist::Session* GGL::MoEExpertParallelSession() { return g_epSession; }
