@@ -34,6 +34,7 @@ int Session::rank() const { return impl->rank; }
 int Session::world() const { return impl->world; }
 int Session::group_rank() const { return 0; }
 int Session::group_world() const { return 1; }
+void Session::bcast_device_group(float*, size_t, int, Stream) {}
 void Session::allgather_host_group(const int* send, int* recv, int perRank) {
 	for (int i = 0; i < perRank; i++) recv[i] = send[i];
 }

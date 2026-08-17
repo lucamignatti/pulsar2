@@ -476,6 +476,16 @@ void Session::bcast_device(float* ptr, size_t n, int root, Stream stream) {
 	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root, impl->comm, AsCudaStream(stream)));
 	SyncStream(stream);
 }
+void Session::bcast_device_group(float* ptr, size_t n, int root, Stream stream) {
+	// GROUP-scoped broadcast: bcast_device() uses the WORLD comm, and under async
+	// routing collectors are members of it but never call this — the whole job
+	// hangs (EP trial 4631481: fragments flowing, ver=0 for 24 minutes).
+	if (n == 0 || SessionHelpers::HostGroup(impl.get()) <= 1) return;
+	GGL_NCCL_CHECK(ncclBroadcast(ptr, ptr, n, ncclFloat, root,
+		SessionHelpers::DeviceComm(impl.get()), AsCudaStream(stream)));
+	SyncStream(stream);
+}
+
 void Session::allgather_host_group(const int* send, int* recv, int perRank) {
 	MPI_Comm c = SessionHelpers::HostCommOrAbort(impl.get(), "allgather_host_group");
 	GGL_MPI_CHECK(MPI_Allgather(const_cast<int*>(send), perRank, MPI_INT,

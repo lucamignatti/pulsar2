@@ -561,7 +561,7 @@ void GGL::ModelSet::ReplicateExpertSlices(Dist::Session* dist) {
 			const int st = o * per;
 			const int cn = (o == nL - 1) ? (E - st) : per;
 			auto slice = p.narrow(0, st, cn).contiguous();
-			dist->bcast_device(slice.data_ptr<float>(), (size_t)slice.numel(), o);
+			dist->bcast_device_group(slice.data_ptr<float>(), (size_t)slice.numel(), o);
 			if (dist->group_rank() != o)
 				p.narrow(0, st, cn).copy_(slice);
 		}

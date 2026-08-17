@@ -71,6 +71,9 @@ public:
 	// arrays of group_world() entries; self-traffic is a local device copy —
 	// send-to-self inside an NCCL group was unreliable on this stack, measured in
 	// moe-bench).
+	// Broadcast on the GROUP comm (learner group under async routing). bcast_device
+	// uses the WORLD comm — wrong for anything only learners execute.
+	void bcast_device_group(float* ptr, size_t n, int root = 0, Stream stream = nullptr);
 	void allgather_host_group(const int* send, int* recv, int perRank);
 	void alltoall_rows_f16_group(
 		const void* send, void* recv,
