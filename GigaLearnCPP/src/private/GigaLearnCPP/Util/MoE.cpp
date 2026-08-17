@@ -684,8 +684,18 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 			blk->_lwVer1 = v1;
 			blk->_lwVer2 = v2;
 		}
-		if (!blk->_gemmCtxLearn)
-			blk->_gemmCtxLearn = ggl_moe_ctx_create(E);
+		if (!blk->_gemmCtxLearn) {
+			// Under EP the problem list is (rank x ownedExpert), so it can EXCEED E:
+			// the last owner absorbs the division remainder (E=320, nL=24 -> 21 owned
+			// -> 24*21 = 504 problems vs a ctx sized 320, which aborted job 4631539).
+			int cap = E;
+			if (GGL::MoEExpertParallelOn()) {
+				auto own = GGL::MoEOwnedExpertRange(E);
+				cap = std::max(E,
+					GGL::MoEExpertParallelSession()->group_world() * own.second);
+			}
+			blk->_gemmCtxLearn = ggl_moe_ctx_create(cap);
+		}
 
 		auto logits = torch::mm(xn, routerW.t()).contiguous();          // fp32 [R,E]
 		auto counts = torch::empty({ 2LL * E }, i32);
