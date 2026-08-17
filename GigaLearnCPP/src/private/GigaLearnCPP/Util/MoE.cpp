@@ -78,13 +78,16 @@ std::pair<int, int> GGL::MoEOwnedExpertRange(int numExperts) {
 		return { 0, numExperts };
 	const int nL = g_epSession->group_world();
 	const int me = g_epSession->group_rank();
-	// Even split; the remainder goes to the last owner so every expert has exactly
-	// one owner regardless of divisibility.
 	const int per = numExperts / nL;
 	if (per <= 0)
 		return { 0, numExperts }; // fewer experts than learners: no split, all replicate
-	const int start = me * per;
-	const int count = (me == nL - 1) ? (numExperts - start) : per;
+	// BALANCED split: spread the remainder over the FIRST (E % nL) owners instead of
+	// dumping it on the last one. At E=320/nL=24 the old rule gave rank 23 twenty-one
+	// experts vs thirteen for everyone else — 60% more work on one rank, and every one
+	// of the ~72 token exchanges per iteration waits on that straggler.
+	const int rem = numExperts % nL;
+	const int count = per + (me < rem ? 1 : 0);
+	const int start = me * per + std::min(me, rem);
 	return { start, count };
 }
 
@@ -582,9 +585,12 @@ EpPlan EpBuildPlan(GGL::Dist::Session* sess, const std::vector<int>& myOffsets, 
 	pl.allCounts.assign((size_t)pl.nL * (size_t)E, 0);
 	sess->allgather_host_group(myCounts.data(), pl.allCounts.data(), E);
 
+	// MUST mirror MoEOwnedExpertRange exactly (balanced remainder) or send/recv
+	// sizes disagree between sender and owner and the exchange deadlocks.
+	const int rem = E % pl.nL;
 	auto ownRangeOf = [&](int o) {
-		int st = o * per;
-		int cn = (o == pl.nL - 1) ? (E - st) : per;
+		int cn = per + (o < rem ? 1 : 0);
+		int st = o * per + std::min(o, rem);
 		return std::make_pair(st, cn);
 	};
 
@@ -648,9 +654,11 @@ EpPlan EpBuildPlanFixed(GGL::Dist::Session* sess, int E, int cap,
 	pl.sendDisp.assign((size_t)pl.nL, 0);
 	pl.recvRows.assign((size_t)pl.nL, 0);
 	pl.recvDisp.assign((size_t)pl.nL, 0);
+	// Mirrors MoEOwnedExpertRange (balanced remainder) — see the note there.
+	const int rem = E % pl.nL;
 	for (int o = 0; o < pl.nL; o++) {
-		const int st = o * per;
-		const int cn = (o == pl.nL - 1) ? (E - st) : per;
+		const int cn = per + (o < rem ? 1 : 0);
+		const int st = o * per + std::min(o, rem);
 		pl.sendDisp[(size_t)o] = st * cap;      // contiguous: experts are owner-sorted
 		pl.sendRows[(size_t)o] = cn * cap;
 		pl.recvDisp[(size_t)o] = o * pl.ownCount * cap;
