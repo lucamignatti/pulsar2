@@ -117,7 +117,10 @@ GGL::MetricSender::~MetricSender() {
 		RG_LOG("MetricSender: worker stuck in wandb at shutdown - detaching (last metrics may be lost)");
 		if (_worker.joinable())
 			_worker.detach();
-		// The worker may own the GIL or be blocked inside Python; leave the interpreter
-		// alone (it is never finalized) and let process exit reap the thread.
+		// The stuck worker may hold (or be waiting on) the GIL. ~_gilRelease would
+		// REACQUIRE it on this thread and hang the exit path — the exact failure this
+		// bounded shutdown exists to prevent. Leak it: the interpreter is never
+		// finalized and the process is exiting.
+		(void)_gilRelease.release();
 	}
 }
