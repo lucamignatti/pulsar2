@@ -30,8 +30,13 @@ namespace GGL::Plasticity {
 	// approaches min(rows,cols); collapse toward a small number is the feature-rank-collapse alarm.
 	inline float EffectiveRank(const torch::Tensor& weight) {
 		RG_NO_GRAD;
-		// singular values via SVD (compute_uv=false path unavailable in this build, so take S only)
-		torch::Tensor s = std::get<1>(torch::svd(weight.detach().to(torch::kFloat), /*some=*/true, /*compute_uv=*/false));
+		// CPU on purpose. The CUDA path goes through cusolver, whose handle creation
+		// cudaMalloc's OUTSIDE the caching allocator — at 1B (allocator hoarding ~28GB of
+		// a 32GB V100) that malloc failed on the tightest ranks and the uncaught
+		// CUSOLVER_STATUS_INTERNAL_ERROR killed a 96-rank fleet (job 4631777, 2026-08-17).
+		// This is a slow-moving structural canary on a 32-iteration cadence; a ~100ms CPU
+		// SVD is free, and telemetry must never contend with training for device memory.
+		torch::Tensor s = std::get<1>(torch::svd(weight.detach().to(torch::kFloat).cpu(), /*some=*/true, /*compute_uv=*/false));
 		torch::Tensor p = s / (s.sum() + 1e-12f);
 		torch::Tensor ent = -(p * (p + 1e-12f).log()).sum();
 		return std::exp(ent.item<float>());

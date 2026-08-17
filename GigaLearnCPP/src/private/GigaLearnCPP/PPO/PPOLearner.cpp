@@ -2161,13 +2161,23 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			constexpr uint64_t EFFRANK_EVERY = 32;
 			static uint64_t effRankTick = 0;   // telemetry cadence only; Learn() has no counter
 			if ((effRankTick++ % EFFRANK_EVERY) == 0 && !noPlast) {
-				auto lins = Plasticity::LinearLayers(models["policy"]);
-				if (!lins.empty())
-					report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);
-				if (models["shared_head"]) {
-					auto tl = Plasticity::LinearLayers(models["shared_head"]);
-					if (!tl.empty())
-						report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
+				// try/catch: a telemetry op must never kill training (job 4631777: the
+				// then-CUDA SVD's cusolver handle creation failed under device-memory
+				// pressure and the uncaught exception took down all 96 ranks).
+				try {
+					auto lins = Plasticity::LinearLayers(models["policy"]);
+					if (!lins.empty())
+						report["Plasticity/Policy EffRank"] = Plasticity::EffectiveRank(lins.back()->weight);
+					if (models["shared_head"]) {
+						auto tl = Plasticity::LinearLayers(models["shared_head"]);
+						if (!tl.empty())
+							report["Plasticity/Trunk EffRank"] = Plasticity::EffectiveRank(tl.back()->weight);
+					}
+				} catch (const std::exception& e) {
+					static std::atomic<uint64_t> plasErrs{ 0 };
+					uint64_t n = ++plasErrs;
+					if ((n & (n - 1)) == 0)
+						RG_LOG("Plasticity: EffRank telemetry failed (" << n << "x): " << e.what());
 				}
 			}
 			report["Plasticity Time"] = plasTimer.Elapsed();
