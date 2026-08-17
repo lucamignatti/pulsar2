@@ -510,7 +510,7 @@ extern "C" void ggl_moe_grouped_gemm_f16_dev_mod(
 
 	typename GglkGemmF16::EpilogueOutputOp::Params epilogue(1.f, 0.f);
 	typename GglkGemmF16::Arguments args(
-		c->d_problems, E, c->tbc, epilogue,
+		c->d_problems, nProb, c->tbc, epilogue,
 		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
 		c->d_ld, c->d_ld + nProb, c->d_ld + 2 * nProb, c->d_ld + 3 * nProb,
 		/*host_problem_sizes=*/nullptr);
