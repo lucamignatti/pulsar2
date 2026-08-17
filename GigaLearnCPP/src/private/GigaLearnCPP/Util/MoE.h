@@ -4,8 +4,11 @@
 #include <torch/nn/modules/normalization.h>
 #include <atomic>
 #include <map>
+#include <utility>
+#include <vector>
 
 namespace GGL {
+	namespace Dist { class Session; }
 
 	// Bumped by Model::RefreshHalfCache after every in-place fp16 weight refresh.
 	// The MoE fast path keys its transposed-weight caches on it (rebuild once per
@@ -80,11 +83,35 @@ namespace GGL {
 		torch::Tensor _lb1, _lb2, _lBias;        // fp16 [E,h],[E,d],[E]
 		uint64_t _lwVer1 = ~0ull, _lwVer2 = ~0ull;
 		void* _gemmCtxLearn = nullptr;
+		// EP (Stage 2) per-call owner-side state, handed from forward to backward
+		// (these are exchange-plan-shaped, not autograd-tensor-shaped).
+		int64_t _epPlanRecvTotal = 0;
+		torch::Tensor _epRecvPacked, _epRecvHid, _epRecvOffsets, _epRecvLocal;
+		std::vector<int> _epSendRows, _epSendDisp, _epRecvRows, _epRecvDisp;
+		int _epOwnStart = 0, _epOwnCount = 0, _epNL = 1;
 	};
 
 	// Stage 1b custom autograd routed-FFN (research/reports/MOE_SPEED.md). Takes the
 	// LN output; LN, shared expert, and the residual stay in ordinary autograd.
 	torch::Tensor MoERoutedFFNApply(MoEBlockImpl* blk, torch::Tensor xn);
+
+	// ===================== Stage 2: expert parallelism (EP) =====================
+	// Set once at learner init (barrier zone). Non-null + group_world() > 1 + env
+	// GGL_MOE_EP arms EP: expert e is owned by rank e / (E / nL), tokens all-to-all
+	// to owners at learn time, expert grads complete OWNER-LOCAL (no expert-grad
+	// allreduce), optimizer steps only owned slices. Learn-only: the no-grad collect
+	// fast path (ForwardFast) is untouched.
+	void SetMoEExpertParallel(GGL::Dist::Session* session);
+	// Armed state, read by the autograd fn and by the optimizer/allreduce hooks.
+	bool MoEExpertParallelOn();
+	GGL::Dist::Session* MoEExpertParallelSession();
+	// Owned expert range for this rank given E; {start, count}. count == E when off.
+	std::pair<int, int> MoEOwnedExpertRange(int numExperts);
+	// Every [E,...] expert parameter registered by a live MoEBlock, so AllReduceGrads
+	// can skip them under EP (they are already owner-local) and the post-step
+	// replication knows exactly what to broadcast.
+	const std::vector<torch::Tensor>& MoEExpertParams();
+	void RegisterMoEExpertParams(const std::vector<torch::Tensor>& params);
 	TORCH_MODULE(MoEBlock);
 
 	int RunMoESelfTest();

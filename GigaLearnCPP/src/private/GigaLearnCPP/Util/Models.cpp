@@ -447,9 +447,23 @@ static GGL::Dist::Session::Stream GGLCurrentCudaStream(const torch::Tensor& t) {
 }
 
 static void GGLCollectGrads(torch::nn::Module& m, const char* name, std::vector<GGL::Dist::Session::GradRef>& refs) {
+	// EP (MOE_SPEED.md Stage 2): expert params are OWNER-LOCAL — the owner's
+	// backward already produced the complete gradient for its slice and exact
+	// zeros elsewhere, so allreducing them would be wrong (it would average the
+	// owner's real grad against other ranks' zeros) as well as wasteful. They are
+	// reconciled by the post-step owner broadcast instead.
+	const bool epOn = GGL::MoEExpertParallelOn();
+	const auto& epParams = GGL::MoEExpertParams();
 	for (auto& p : m.parameters()) {
 		if (!p.requires_grad())
 			continue;
+		if (epOn) {
+			bool isExpert = false;
+			for (auto& ep : epParams)
+				if (ep.is_same(p)) { isExpert = true; break; }
+			if (isExpert)
+				continue;
+		}
 		if (!p.grad().defined())
 			p.mutable_grad() = torch::zeros_like(p);
 		auto g = p.grad();
@@ -517,6 +531,41 @@ void GGL::ModelSet::AllReduceGrads(Dist::Session* dist, bool includeExempt) {
 	if (refs.empty())
 		return;
 	dist->allreduce_avg_grads(refs, streamSrc.defined() ? GGLCurrentCudaStream(streamSrc) : nullptr);
+}
+
+// EP (MOE_SPEED.md Stage 2): after the optimizer step, every owner broadcasts its
+// expert slices so all learners hold a complete net for publishing/checkpointing.
+// COARSE and at the ALLREDUCE LANE by design: per-param collectives inside the
+// optimizer step deadlocked against the collector publish comm (the GGL_MUON_SHARD
+// async verdict). Non-owned slices may carry stray momentum-driven updates; the
+// broadcast clobbers them, so the owner's value is authoritative either way.
+// v2 (task #4) drops replication entirely and gathers from owners at publish time.
+void GGL::ModelSet::ReplicateExpertSlices(Dist::Session* dist) {
+	if (!dist || !GGL::MoEExpertParallelOn())
+		return;
+	const int nL = dist->group_world();
+	if (nL <= 1)
+		return;
+	const auto& params = GGL::MoEExpertParams();
+	torch::NoGradGuard ng;
+	// Deterministic order: param-major, then owner — every rank issues the exact
+	// same broadcast sequence.
+	for (auto& p : params) {
+		if (!p.defined() || p.size(0) <= 0)
+			continue;
+		const int E = (int)p.size(0);
+		const int per = E / nL;
+		if (per <= 0)
+			continue;
+		for (int o = 0; o < nL; o++) {
+			const int st = o * per;
+			const int cn = (o == nL - 1) ? (E - st) : per;
+			auto slice = p.narrow(0, st, cn).contiguous();
+			dist->bcast_device(slice.data_ptr<float>(), (size_t)slice.numel(), o);
+			if (dist->group_rank() != o)
+				p.narrow(0, st, cn).copy_(slice);
+		}
+	}
 }
 
 void GGL::ModelSet::StepOptimsSharded(Dist::Session* dist) {

@@ -1,5 +1,6 @@
 #include "MoE.h"
 #include "Models.h"
+#include <GigaLearnCPP/Distributed/Session.h>
 #include <torch/cuda.h>
 #ifdef GGL_MOE_KERNELS
 #include "MoEKernels.h"
@@ -40,6 +41,54 @@ namespace {
 #endif
 
 using namespace torch;
+
+// ===================== Stage 2: expert-parallel state =====================
+// Set once at learner init; read by the learn-time autograd fn, by
+// ModelSet::AllReduceGrads (expert grads are owner-local, never allreduced) and
+// by the post-step replication. See research/reports/MOE_SPEED.md Stage 2.
+namespace {
+	GGL::Dist::Session* g_epSession = nullptr;
+	std::vector<torch::Tensor> g_epExpertParams;
+}
+
+void GGL::SetMoEExpertParallel(GGL::Dist::Session* session) {
+	static const bool envOn = [] {
+		const char* e = std::getenv("GGL_MOE_EP");
+		return e && *e && std::string(e) != "0";
+	}();
+	g_epSession = envOn ? session : nullptr;
+}
+
+bool GGL::MoEExpertParallelOn() {
+	// Armed only with a real multi-rank learner group; nL == 1 degenerates to the
+	// ordinary Stage 1b path (the desktop-testable correctness gate).
+	return g_epSession != nullptr && g_epSession->group_world() > 1;
+}
+
+GGL::Dist::Session* GGL::MoEExpertParallelSession() { return g_epSession; }
+
+std::pair<int, int> GGL::MoEOwnedExpertRange(int numExperts) {
+	if (!GGL::MoEExpertParallelOn() || numExperts <= 0)
+		return { 0, numExperts };
+	const int nL = g_epSession->group_world();
+	const int me = g_epSession->group_rank();
+	// Even split; the remainder goes to the last owner so every expert has exactly
+	// one owner regardless of divisibility.
+	const int per = numExperts / nL;
+	if (per <= 0)
+		return { 0, numExperts }; // fewer experts than learners: no split, all replicate
+	const int start = me * per;
+	const int count = (me == nL - 1) ? (numExperts - start) : per;
+	return { start, count };
+}
+
+const std::vector<torch::Tensor>& GGL::MoEExpertParams() { return g_epExpertParams; }
+
+void GGL::RegisterMoEExpertParams(const std::vector<torch::Tensor>& params) {
+	for (auto& p : params)
+		g_epExpertParams.push_back(p);
+}
+
 
 // Isolated forward/backward/clone microtest (called from ExampleMain via extern decl;
 // GGL_MOE_SELFTEST=1). Exists because the first in-trainer segfault took four bisect
@@ -258,6 +307,9 @@ GGL::MoEBlockImpl::MoEBlockImpl(int64_t dim, int64_t hidden, int64_t numExperts,
 	sharedB2.zero_();
 	routerBias.zero_();
 	loadAcc.zero_();
+	// EP bookkeeping: AllReduceGrads skips these under EP (owner-local grads) and
+	// the post-step replication broadcasts owner slices of exactly this set.
+	GGL::RegisterMoEExpertParams({ expertW1, expertB1, expertW2, expertB2 });
 }
 
 void GGL::MoEBlockImpl::reset() {
@@ -483,6 +535,96 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 // is grouped dgrad/wgrad + segment sums + a gate-grad chain. LN, shared expert and
 // the residual stay OUTSIDE in ordinary autograd. All GEMM compute fp16 (tensor
 // cores); returned grads fp32 so accumulation/AMP-unscale are unchanged.
+
+#ifdef GGL_MOE_KERNELS
+// ===================== Stage 2 (EP): learn-time token exchange =====================
+// KEY SIMPLIFICATION: the route plan emits assignments EXPERT-SORTED, and owner o
+// owns the CONTIGUOUS expert range [o*per, ...). So the rows destined for each
+// owner are already a contiguous slice of the packed buffer — no reorder kernel,
+// send counts/displacements fall straight out of `offsets`. Every per-expert
+// segment is 8-aligned (route plan align=1), so every (rank, expert) segment that
+// arrives is 8-aligned too and the wgrad GEMM's alignment contract survives the
+// exchange.
+namespace {
+
+struct EpPlan {
+	int nL = 1, me = 0;
+	int ownStart = 0, ownCount = 0;
+	std::vector<int> sendRows, sendDisp, recvRows, recvDisp;
+	std::vector<int> allCounts;         // [nL * E] per-expert counts of every rank
+	int64_t recvTotal = 0;
+	torch::Tensor recvOffsets;          // int32 [nL*ownCount + 1] device, GEMM problems
+	torch::Tensor recvLocalExpert;      // int32 [recvTotal] device, LOCAL expert per row
+};
+
+// Builds the exchange plan from this rank's per-expert counts (host copy).
+EpPlan EpBuildPlan(GGL::Dist::Session* sess, const std::vector<int>& myOffsets, int E,
+	torch::Device dev) {
+
+	EpPlan pl;
+	pl.nL = sess->group_world();
+	pl.me = sess->group_rank();
+	auto own = GGL::MoEOwnedExpertRange(E);
+	pl.ownStart = own.first;
+	pl.ownCount = own.second;
+	const int per = E / pl.nL;
+
+	std::vector<int> myCounts((size_t)E);
+	for (int e = 0; e < E; e++)
+		myCounts[(size_t)e] = myOffsets[(size_t)e + 1] - myOffsets[(size_t)e];
+
+	pl.allCounts.assign((size_t)pl.nL * (size_t)E, 0);
+	sess->allgather_host_group(myCounts.data(), pl.allCounts.data(), E);
+
+	auto ownRangeOf = [&](int o) {
+		int st = o * per;
+		int cn = (o == pl.nL - 1) ? (E - st) : per;
+		return std::make_pair(st, cn);
+	};
+
+	pl.sendRows.assign((size_t)pl.nL, 0);
+	pl.sendDisp.assign((size_t)pl.nL, 0);
+	pl.recvRows.assign((size_t)pl.nL, 0);
+	pl.recvDisp.assign((size_t)pl.nL, 0);
+	for (int o = 0; o < pl.nL; o++) {
+		auto rg = ownRangeOf(o);
+		pl.sendDisp[(size_t)o] = myOffsets[(size_t)rg.first];
+		pl.sendRows[(size_t)o] = myOffsets[(size_t)(rg.first + rg.second)]
+			- myOffsets[(size_t)rg.first];
+	}
+	int acc = 0;
+	std::vector<int> recvOffHost;
+	recvOffHost.reserve((size_t)pl.nL * (size_t)pl.ownCount + 1);
+	std::vector<int> recvExpHost;
+	for (int r = 0; r < pl.nL; r++) {
+		pl.recvDisp[(size_t)r] = acc;
+		int rows = 0;
+		for (int e = pl.ownStart; e < pl.ownStart + pl.ownCount; e++) {
+			recvOffHost.push_back(acc + rows);
+			int c = pl.allCounts[(size_t)r * (size_t)E + (size_t)e];
+			for (int i = 0; i < c; i++)
+				recvExpHost.push_back(e - pl.ownStart); // LOCAL expert index
+			rows += c;
+		}
+		pl.recvRows[(size_t)r] = rows;
+		acc += rows;
+	}
+	recvOffHost.push_back(acc);
+	pl.recvTotal = acc;
+
+	auto i32cpu = torch::TensorOptions().dtype(torch::kInt32);
+	pl.recvOffsets = torch::from_blob(recvOffHost.data(),
+		{ (int64_t)recvOffHost.size() }, i32cpu).clone().to(dev, /*non_blocking=*/true);
+	pl.recvLocalExpert = recvExpHost.empty()
+		? torch::zeros({ 0 }, i32cpu).to(dev)
+		: torch::from_blob(recvExpHost.data(), { (int64_t)recvExpHost.size() }, i32cpu)
+			.clone().to(dev, /*non_blocking=*/true);
+	return pl;
+}
+
+} // namespace
+#endif
+
 namespace {
 
 struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
@@ -546,12 +688,69 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto y = torch::empty({ n, d }, h16);
 		ggl_moe_gather_f16(xn16.data_ptr(), srcRows.data_ptr<int>(),
 			packed.data_ptr(), (int)n, (int)d, s);
-		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, packed.data_ptr(),
-			blk->_lw1T.data_ptr(), hid.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
-		ggl_moe_bias_leaky_f16(hid.data_ptr(), blk->_lb1.data_ptr(),
-			expertId.data_ptr<int>(), (int)n, (int)h, 0.01f, s);
-		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, hid.data_ptr(),
-			blk->_lw2T.data_ptr(), y.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+
+		const bool epOn = GGL::MoEExpertParallelOn();
+		if (epOn) {
+			// ---- EP: exchange tokens to expert owners, compute, exchange back ----
+			auto* sess = GGL::MoEExpertParallelSession();
+			auto offCpu = offsets.to(torch::kCPU);
+			std::vector<int> offHost(offCpu.data_ptr<int>(), offCpu.data_ptr<int>() + E + 1);
+			EpPlan pl = EpBuildPlan(sess, offHost, E, dev);
+			blk->_epPlanRecvTotal = pl.recvTotal; // backward reuses the same plan shape
+
+			auto rPacked = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), d }, h16);
+			sess->alltoall_rows_f16_group(packed.data_ptr(), rPacked.data_ptr(),
+				pl.sendRows.data(), pl.sendDisp.data(),
+				pl.recvRows.data(), pl.recvDisp.data(), (int)d, s);
+
+			const int nProb = pl.nL * pl.ownCount;
+			auto w1TOwn = blk->_lw1T.narrow(0, pl.ownStart, pl.ownCount).contiguous();
+			auto w2TOwn = blk->_lw2T.narrow(0, pl.ownStart, pl.ownCount).contiguous();
+			auto b1Own = blk->_lb1.narrow(0, pl.ownStart, pl.ownCount).contiguous();
+			// Problem list is (rank, ownedExpert): the weight stack must repeat per
+			// rank so problem i uses expert (i % ownCount)'s weights.
+			auto w1Rep = w1TOwn.repeat({ pl.nL, 1, 1 });
+			auto w2Rep = w2TOwn.repeat({ pl.nL, 1, 1 });
+			auto b1Rep = b1Own.repeat({ pl.nL, 1 });
+			auto rHid = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), h }, h16);
+			auto rY = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), d }, h16);
+			if (pl.recvTotal > 0) {
+				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rPacked.data_ptr(),
+					w1Rep.data_ptr(), rHid.data_ptr(), pl.recvOffsets.data_ptr<int>(),
+					nProb, (int)d, (int)h, s);
+				// bias indexes by LOCAL expert of each received row (rank-major layout)
+				auto rLocalRep = pl.recvLocalExpert;
+				ggl_moe_bias_leaky_f16(rHid.data_ptr(), b1Own.data_ptr(),
+					rLocalRep.data_ptr<int>(), (int)pl.recvTotal, (int)h, 0.01f, s);
+				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rHid.data_ptr(),
+					w2Rep.data_ptr(), rY.data_ptr(), pl.recvOffsets.data_ptr<int>(),
+					nProb, (int)h, (int)d, s);
+			}
+			// Return y rows to their origin ranks (reverse counts).
+			sess->alltoall_rows_f16_group(rY.data_ptr(), y.data_ptr(),
+				pl.recvRows.data(), pl.recvDisp.data(),
+				pl.sendRows.data(), pl.sendDisp.data(), (int)d, s);
+			// Owner-side tensors the backward needs (saved on the block: they are
+			// EP-plan-shaped, not autograd-shaped).
+			blk->_epRecvPacked = rPacked;
+			blk->_epRecvHid = rHid;
+			blk->_epRecvOffsets = pl.recvOffsets;
+			blk->_epRecvLocal = pl.recvLocalExpert;
+			blk->_epSendRows = pl.sendRows;
+			blk->_epSendDisp = pl.sendDisp;
+			blk->_epRecvRows = pl.recvRows;
+			blk->_epRecvDisp = pl.recvDisp;
+			blk->_epOwnStart = pl.ownStart;
+			blk->_epOwnCount = pl.ownCount;
+			blk->_epNL = pl.nL;
+		} else {
+			ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, packed.data_ptr(),
+				blk->_lw1T.data_ptr(), hid.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
+			ggl_moe_bias_leaky_f16(hid.data_ptr(), blk->_lb1.data_ptr(),
+				expertId.data_ptr<int>(), (int)n, (int)h, 0.01f, s);
+			ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, hid.data_ptr(),
+				blk->_lw2T.data_ptr(), y.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+		}
 		auto out16 = torch::zeros({ R, d }, h16);
 		ggl_moe_scatter_bias_gate_f16(y.data_ptr(), blk->_lb2.data_ptr(),
 			expertId.data_ptr<int>(), gates.data_ptr<float>(),
@@ -613,16 +812,82 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		// the tail beyond offsets[E] would stay uninitialized garbage and the B1
 		// segment-sum (which has no pad guard — pads are zero BY VALUE) swept NaNs
 		// into expert 0 (grad-parity run 4631409, refNorm 447 vs fast NaN).
+		const bool epOn = GGL::MoEExpertParallelOn() && blk->_epRecvOffsets.defined();
 		auto dH = torch::zeros({ n, h }, h16);
+		auto dB1 = torch::zeros({ (int64_t)E, h }, f32);
+		auto dX = torch::zeros({ n, d }, h16);
+		torch::Tensor dW1_16, dW2_16;
+		if (epOn) {
+			// ---- EP backward: dY to owners, owner-local dgrad+wgrad, dX back ----
+			auto* sess = GGL::MoEExpertParallelSession();
+			const int64_t rT = blk->_epPlanRecvTotal;
+			const int nProb = blk->_epNL * blk->_epOwnCount;
+			const int oc = blk->_epOwnCount;
+			auto rdY = torch::zeros({ std::max<int64_t>(rT, 1), d }, h16);
+			sess->alltoall_rows_f16_group(dY.data_ptr(), rdY.data_ptr(),
+				blk->_epSendRows.data(), blk->_epSendDisp.data(),
+				blk->_epRecvRows.data(), blk->_epRecvDisp.data(), (int)d, s);
+
+			auto w1Own = blk->_lw1.narrow(0, blk->_epOwnStart, oc).contiguous();
+			auto w2Own = blk->_lw2.narrow(0, blk->_epOwnStart, oc).contiguous();
+			auto w1Rep = w1Own.repeat({ blk->_epNL, 1, 1 });
+			auto w2Rep = w2Own.repeat({ blk->_epNL, 1, 1 });
+			auto rdH = torch::zeros({ std::max<int64_t>(rT, 1), h }, h16);
+			auto rdX = torch::zeros({ std::max<int64_t>(rT, 1), d }, h16);
+			// Owner-local bias grads over the owned slice (rank-major received rows).
+			auto dB2Own = torch::zeros({ (int64_t)oc, d }, f32);
+			auto dB1Own = torch::zeros({ (int64_t)oc, h }, f32);
+			// dW for the owned slice ONLY — this is the whole point: no expert-grad
+			// allreduce, the owner's wgrad is already the complete gradient.
+			auto dW1Own = torch::zeros({ (int64_t)oc, h, d }, h16);
+			auto dW2Own = torch::zeros({ (int64_t)oc, d, h }, h16);
+			if (rT > 0) {
+				ggl_moe_segment_sum_f16to32(rdY.data_ptr(), blk->_epRecvLocal.data_ptr<int>(),
+					dB2Own.data_ptr<float>(), (int)rT, (int)d, s);
+				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rdY.data_ptr(),
+					w2Rep.data_ptr(), rdH.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
+					nProb, (int)d, (int)h, s);
+				ggl_moe_leaky_bwd_f16(rdH.data_ptr(), blk->_epRecvHid.data_ptr(),
+					(int)rT, (int)h, 0.01f, s);
+				ggl_moe_segment_sum_f16to32(rdH.data_ptr(), blk->_epRecvLocal.data_ptr<int>(),
+					dB1Own.data_ptr<float>(), (int)rT, (int)h, s);
+				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rdH.data_ptr(),
+					w1Rep.data_ptr(), rdX.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
+					nProb, (int)h, (int)d, s);
+				// wgrad per (rank, ownedExpert) problem, then sum the nL rank-blocks:
+				// every learner's tokens contribute to the SAME owned expert weights.
+				auto dW1Rep = torch::zeros({ (int64_t)nProb, h, d }, h16);
+				auto dW2Rep = torch::zeros({ (int64_t)nProb, d, h }, h16);
+				ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, rdH.data_ptr(),
+					blk->_epRecvPacked.data_ptr(), dW1Rep.data_ptr(),
+					blk->_epRecvOffsets.data_ptr<int>(), nProb, (int)h, (int)d, (int)rT, s);
+				ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, rdY.data_ptr(),
+					blk->_epRecvHid.data_ptr(), dW2Rep.data_ptr(),
+					blk->_epRecvOffsets.data_ptr<int>(), nProb, (int)d, (int)h, (int)rT, s);
+				dW1Own = dW1Rep.view({ (int64_t)blk->_epNL, (int64_t)oc, h, d }).sum(0);
+				dW2Own = dW2Rep.view({ (int64_t)blk->_epNL, (int64_t)oc, d, h }).sum(0);
+			}
+			sess->alltoall_rows_f16_group(rdX.data_ptr(), dX.data_ptr(),
+				blk->_epRecvRows.data(), blk->_epRecvDisp.data(),
+				blk->_epSendRows.data(), blk->_epSendDisp.data(), (int)d, s);
+			// Scatter the owned slices into full-shaped grads; non-owned stay ZERO
+			// (Stage C excludes these params from allreduce and steps owned slices).
+			dB1.narrow(0, blk->_epOwnStart, oc).copy_(dB1Own);
+			dB2.zero_();
+			dB2.narrow(0, blk->_epOwnStart, oc).copy_(dB2Own);
+			dW1_16 = torch::zeros({ (int64_t)E, h, d }, h16);
+			dW2_16 = torch::zeros({ (int64_t)E, d, h }, h16);
+			dW1_16.narrow(0, blk->_epOwnStart, oc).copy_(dW1Own);
+			dW2_16.narrow(0, blk->_epOwnStart, oc).copy_(dW2Own);
+		} else {
 		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(),
 			blk->_lw2.data_ptr(), dH.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, s);
 		ggl_moe_leaky_bwd_f16(dH.data_ptr(), hid.data_ptr(), (int)n, (int)h, 0.01f, s);
-		auto dB1 = torch::zeros({ (int64_t)E, h }, f32);
 		ggl_moe_segment_sum_f16to32(dH.data_ptr(), expertId.data_ptr<int>(),
 			dB1.data_ptr<float>(), (int)n, (int)h, s);
-		auto dX = torch::empty({ n, d }, h16);
 		ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(),
 			blk->_lw1.data_ptr(), dX.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, s);
+		}
 		auto dxn16 = torch::zeros({ R, d }, h16);
 		ggl_moe_scatter_add_f16(dX.data_ptr(), srcRows.data_ptr<int>(),
 			dxn16.data_ptr(), (int)n, (int)d, s);
@@ -632,19 +897,18 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 			const char* e = std::getenv("GGL_MOE_LEARN_BISECT");
 			return (e && *e) ? std::atoi(e) : 0;
 		}();
-		// wgrads: dW1[e] = dHpre_e^T @ X_e -> [h,d]; dW2[e] = dY_e^T @ Hpost_e -> [d,h].
-		auto dW1_16 = torch::empty({ (int64_t)E, h, d }, h16);
-		if (bisect < 1)
-			ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
-				dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, (int)n, s);
-		else
-			dW1_16.zero_();
-		auto dW2_16 = torch::empty({ (int64_t)E, d, h }, h16);
-		if (bisect < 1)
-			ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
-				dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, (int)n, s);
-		else
-			dW2_16.zero_();
+		// wgrads (non-EP): dW1[e] = dHpre_e^T @ X_e -> [h,d]; dW2[e] = dY_e^T @ Hpost_e.
+		// Under EP these were already computed OWNER-LOCAL above.
+		if (!epOn) {
+			dW1_16 = torch::zeros({ (int64_t)E, h, d }, h16);
+			if (bisect < 1)
+				ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dH.data_ptr(), packed.data_ptr(),
+					dW1_16.data_ptr(), offsets.data_ptr<int>(), E, (int)h, (int)d, (int)n, s);
+			dW2_16 = torch::zeros({ (int64_t)E, d, h }, h16);
+			if (bisect < 1)
+				ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, dY.data_ptr(), hid.data_ptr(),
+					dW2_16.data_ptr(), offsets.data_ptr<int>(), E, (int)d, (int)h, (int)n, s);
+		}
 
 		// Gate -> router-logit chain (tiny [n]/[R,E] torch ops, matches eager math:
 		// g_i = a_i / S_row with a = sigmoid of the SELECTED logits).

@@ -99,6 +99,11 @@ namespace {
 }
 
 GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _config, Device _device, Dist::Session* dist) : config(_config), device(_device), dist(dist) {
+	// EP (MOE_SPEED.md Stage 2) arming: env GGL_MOE_EP + a multi-rank learner group.
+	// Learn-only; the collect fast path is untouched. Safe to call unconditionally —
+	// SetMoEExpertParallel no-ops when the env flag is unset.
+	GGL::SetMoEExpertParallel(dist);
+
 
 	if (config.miniBatchSize == 0)
 		config.miniBatchSize = config.batchSize;
@@ -1922,6 +1927,11 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				models.StepOptimsSharded(dist);
 			else
 				models.StepOptims();
+			// EP: owners publish their expert slices so every learner holds a complete
+			// net for weight-publishing/checkpointing. At the ALLREDUCE LANE (this call
+			// site), never inside the optimizer's per-param loop — that is what
+			// deadlocked GGL_MUON_SHARD against the collector publish comm.
+			models.ReplicateExpertSlices(dist);
 			fnSyncNow();
 			tOptim += optStepTimer.Elapsed();
 			tOptStep += optStepTimer.Elapsed();

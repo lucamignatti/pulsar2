@@ -201,6 +201,8 @@ namespace GGL {
 		// unless includeExempt). Missing grads are zero-filled so every rank contributes
 		// the same tensor list.
 		void AllReduceGrads(Dist::Session* dist, bool includeExempt = false);
+		// EP: post-step owner broadcast of expert slices (see the impl comment).
+		void ReplicateExpertSlices(Dist::Session* dist);
 
 		// NOTE: Automatically zeros grad afte
 		void StepOptims() {
