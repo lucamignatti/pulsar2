@@ -311,7 +311,24 @@ directly (the per-rank block sum disappears). fwdbwd 3.77 -> 2.87.
 3. cap is 1.25x mean (38% padding at E=320) — lowering capacityFactor for EP
    trades a few dropped tokens for proportionally less GEMM work.
 
-## EP STATUS — earlier async record (do not re-enable blind on APPO)
+## ASYNC (APPO) EP MAY NOW WORK — HIGHEST-VALUE UNTESTED LEVER
+
+The async deadlock's prime suspect was the blocking MPI_Allgather of routing
+counts in EpBuildPlan: APPO learners are NOT in lockstep, so any path where one
+learner runs a different number of MoE forwards desyncs a host collective
+permanently. The fixed-capacity rewrite (EpBuildPlanFixed) removed that
+allgather entirely — every exchange size is now a pure function of (E, cap, nL),
+computed with ZERO host collectives. Verified by inspection: the only remaining
+allgather is in the dead dynamic builder.
+
+So the async path should be retried: sbatch `pulsar2_asyncmoe_luca.sbatch` with
+GGL_MOE_EP=1. This matters because DENSE'S 600k CAME FROM APPO — dedicated
+collectors with no barrier. Sync-path MoE is structurally capped well below it
+no matter how much kernel work is done; the remaining multiplier is the
+architecture, not the arithmetic. Success signal: "Async/Learner SPS" lines
+appear at all (the old failure was fragments flowing with ver=0 forever).
+
+## EP STATUS — earlier async record (superseded by the above)
 
 Stages A-C are implemented, compile, and pass the nL=1 degeneracy gate (all six
 grad-parity families + autocast unchanged). Multi-rank it still produces ZERO
