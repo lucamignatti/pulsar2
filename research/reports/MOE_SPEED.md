@@ -273,7 +273,45 @@ grow), chain 4631491-99 (9 x 2h hops), `checkpoints_1b_luca`, wandb `7.5-moe-1b`
 **Path back to pipelining at 1B** (untried): the snapshot only needs the POLICY
 half in fp16 for collection — a fp16-only snapshot would cost ~2GB instead of ~14GB.
 
-## EP STATUS — NOT YET CONVERGED (do not re-enable blind)
+## EP CONVERGED + THE 1B COST LEDGER (2026-08-17)
+
+EP works on the SYNC path. The async (APPO) deadlock was never diagnosed; the
+sync path is in strict rank lockstep so the collectives match by construction.
+Bugs fixed to get here, each real: EP armed on collectors (needs `is_learner()`),
+world-comm broadcast in the replication (`bcast_device_group`), GEMM ctx sized E
+instead of nL*ownCount, and the remainder-on-last-rank ownership split (rank 23
+held 21 experts vs 13 — one straggler paced all ~72 exchanges/iteration).
+
+**Measured at 1B, 4 nodes / 24 ranks, per learn pass:**
+
+| | non-EP (8 nodes) | EP | EP + expert-major |
+|---|---|---|---|
+| fwdbwd | 1.73 | 3.77 | **2.87** |
+| allreduce | 2.38 | **0.028** | **0.028** |
+| optstep | 1.77 | 1.49 | 1.49-2.0 |
+
+EP does exactly what it promised — the 4GB expert-grad allreduce is GONE
+(2.38s -> 0.028s) — and it made 1B memory-stable (7.7GB vs the 29.7GB OOM).
+But the token exchange initially gave the saving back in fwdbwd.
+
+**THE SHAPE FIND (bisect probe, decisive).** `GGL_MOE_LEARN_BISECT=1` (skip the
+wgrad GEMMs) took fwdbwd 3.77 -> 1.30s: **wgrad was 65% of it.** Not volume —
+SHAPE. NCCL needs per-peer contiguity, so rows arrive RANK-major and every wgrad
+problem had K = cap = 48: 312 tiny problems that are almost entirely tile
+overhead. One permute to EXPERT-major after the exchange gives ownCount problems
+of K = nL*cap = 1152, and each expert's wgrad then spans all ranks' tokens
+directly (the per-rank block sum disappears). fwdbwd 3.77 -> 2.87.
+
+**Still open, in order of expected value:**
+1. optstep 1.49-2.0s — Muon NS still runs over the FULL 1B on every rank.
+   Owner-slicing it (grads are already exact zeros off-slice) is the next big cut.
+2. The exchange itself. Hierarchical EP (expert-parallel WITHIN a node over
+   NVLink, data-parallel across nodes) would cut both participant count and
+   latency; the flat 24-rank a2a is the current design's weak point.
+3. cap is 1.25x mean (38% padding at E=320) — lowering capacityFactor for EP
+   trades a few dropped tokens for proportionally less GEMM work.
+
+## EP STATUS — earlier async record (do not re-enable blind on APPO)
 
 Stages A-C are implemented, compile, and pass the nL=1 degeneracy gate (all six
 grad-parity families + autocast unchanged). Multi-rank it still produces ZERO

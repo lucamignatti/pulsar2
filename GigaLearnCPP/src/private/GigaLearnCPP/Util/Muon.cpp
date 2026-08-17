@@ -1,4 +1,5 @@
 #include "Muon.h"
+#include "MoE.h"
 #include <torch/version.h>
 #if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 2)
 #include <c10/util/C++17.h>
@@ -91,11 +92,29 @@ torch::Tensor GGL::Muon::step(LossClosure closure) {
 					continue;
 
 				Tensor update = nesterov ? grad.add(buf, momentum) : buf;
+				// EP: under expert parallelism this rank's gradient is EXACT ZERO outside
+				// its owned expert slice (the owner computed the whole thing locally), so
+				// orthogonalizing the full [E,m,n] stack is ~nL x wasted work — at 1B/24
+				// ranks that was 1.5s of a 4.9s learn. Slice to the owned range; the rest
+                                // is reconciled by the post-step owner broadcast anyway.
+				Tensor target = param;
+				if (grad.dim() == 3 && GGL::MoEExpertParallelOn()) {
+					bool isExpert = false;
+					for (auto& ep : GGL::MoEExpertParams())
+						if (ep.is_same(param)) { isExpert = true; break; }
+					if (isExpert) {
+						auto own = GGL::MoEOwnedExpertRange((int)param.size(0));
+						if (own.second > 0 && own.second < param.size(0)) {
+							update = update.narrow(0, own.first, own.second);
+							target = param.narrow(0, own.first, own.second);
+						}
+					}
+				}
 				update = NewtonSchulz5(update);
 
 				// The RMS match (see header): per-element step ~= lr, like Adam
 				double adjustedLR = lr * std::sqrt((double)std::max(update.size(-2), update.size(-1)));
-				param.add_(update, -adjustedLR);
+				target.add_(update, -adjustedLR);
 			} else {
 				// Non-matrix param: plain Adam at the group lr
 				AdamState& adam = adamStates[param.unsafeGetTensorImpl()];
