@@ -251,3 +251,43 @@ place weight caches) so graphs and the CUTLASS path compose.
 - [ ] Stage 3 (async experts) pre-registration — also the lever that cuts
       per-expert NS FREQUENCY (parity with dense optimizer cost at ~16 sync
       learners, or fewer with async expert cadence).
+
+## THE 1B MODEL — LANDED 2026-08-17 (run 7.5-moe-1b)
+
+**Config**: `GGL_MOE_EXPERTS=320` at the existing 3 blocks x hidden 512 x width
+1024 = **1.006B total / ~15M active** — same active compute as the 402M run, 2.5x
+the capacity. NO architecture change was needed; 1B was purely a memory problem.
+
+**The memory find (this is the whole story).** 1B OOM'd at 29.7GB/31.75GB on BOTH
+the sync and async paths. Ledger at 1B: fp32 params 4.0 + Muon momentum 4.0 +
+grads 4.0 + fp16 learn caches 4.0 + seqHalf mirror 2.0 ~= 18GB, and then the
+**pipelined collect snapshot** adds a WHOLE SECOND COPY of the trunk (fp32 clone
++ its own fp16 mirror) — at 1B that is the difference between 29.7GB and 15.9GB.
+`GGL_PIPELINED_COLLECTION=0` was the single change that made 1B fit. Cost: collect
+no longer hides under learn (~35% throughput), which is the right trade to exist
+at all. Also landed: EP owner-slices the fp16 learn caches (4GB -> 1GB at nL=4).
+
+**Live**: 8 nodes / 48 GPUs, 7.7GB per GPU (abundant headroom — the minibatch can
+grow), chain 4631491-99 (9 x 2h hops), `checkpoints_1b_luca`, wandb `7.5-moe-1b`.
+
+**Path back to pipelining at 1B** (untried): the snapshot only needs the POLICY
+half in fp16 for collection — a fp16-only snapshot would cost ~2GB instead of ~14GB.
+
+## EP STATUS — NOT YET CONVERGED (do not re-enable blind)
+
+Stages A-C are implemented, compile, and pass the nL=1 degeneracy gate (all six
+grad-parity families + autocast unchanged). Multi-rank it still produces ZERO
+optimizer updates. Two deadlocks were found and fixed along the way, both real:
+1. Collectors also construct a PPOLearner, so EP armed on them and they entered
+   learner-only collectives ("collectors must not enter Learners collectives").
+   Fixed: `is_learner()` in the arming predicate.
+2. `ReplicateExpertSlices` used `bcast_device`, which broadcasts on the WORLD
+   comm — collectors are members but never call it. Fixed: `bcast_device_group`.
+After both fixes the fleet still hangs with fragments flowing and `ver=0`.
+Remaining suspects, in order: (a) a per-learn-step count mismatch in the
+MPI_Allgather (host, blocking) across learners — any code path where one learner
+runs a different number of MoE forwards desyncs it permanently; (b) MPI-collective
+vs NCCL-stream interleaving on the learner comm; (c) a zero-row send/recv pairing
+mismatch in the a2a. NEXT DEBUG STEP: log a per-rank counter of
+allgather_host_group calls + a barrier_learners() immediately before the first
+allgather — if the barrier hangs, the desync is upstream of EP entirely.

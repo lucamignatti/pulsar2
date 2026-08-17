@@ -29,6 +29,7 @@ Status vocabulary:
 
 | Report | Date | Run | Topic | Status |
 |---|---|---|---|---|
+| [ATTEMPT_ECONOMICS.md](ATTEMPT_ECONOMICS.md) | 08-16 | 7.0b-aimos @ 401B/529B | Attending feasible-free landings beats skipping in EVERY matched quartile (+500..794uu, +33..37% first-touch) while V/H are flat there — **the headroom gate is blind to this frontier**; verdict LEVER A (attempt-generation), arms SIGHT/SEEK specced | **RESULT** |
 | [KD_ROLLOUT.md](KD_ROLLOUT.md) | 08-16 | 7.0b-aimos @ 93B/529B | Rollout-only knowing–doing statistic (reach-head ρ_can−ρ_do vs witnessed touch bank) — **pre-registered gate FAILED**, φ is ~10× state- vs action-driven; KD phenomenon itself replicated (feasible-free unattendance 55%→68%, not closing) | **RESULT (negative)** |
 | [INTERP_53.md](INTERP_53.md) | 08-01 | 5.3 @ 9.75B | **The interpretability battery rerun** against the four-rung ladder: whiff tax reversed, rho calibrated, knowing-doing knowledge-graded, V† ZPD structure real, **V◇ degenerate (flat r̂ binding; solution routes through prevAction Σ)** | **RESULT** |
 | [COMPOSITION_CRITIC.md](COMPOSITION_CRITIC.md) | 07-25 | testbed + resid | **The paper.** Composition critic: exploration by seeking realizable headroom | **CANONICAL** |
