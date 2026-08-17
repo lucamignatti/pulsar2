@@ -662,11 +662,23 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		uint64_t v2 = expertW2.unsafeGetTensorImpl()->version_counter().current_version();
 		if (blk->_lwVer1 != v1 || blk->_lwVer2 != v2 || !blk->_lw1.defined()) {
 			torch::NoGradGuard ng;
-			blk->_lw1 = expertW1.detach().to(torch::kHalf).contiguous();
-			blk->_lw1T = expertW1.detach().transpose(1, 2).to(torch::kHalf).contiguous();
-			blk->_lw2 = expertW2.detach().to(torch::kHalf).contiguous();
-			blk->_lw2T = expertW2.detach().transpose(1, 2).to(torch::kHalf).contiguous();
-			blk->_lb1 = expertB1.detach().to(torch::kHalf).contiguous();
+			// Under EP a learner only ever GEMMs its OWN experts, so cache just that
+			// slice: 4 fp16 copies of the full stack is 4GB at 1B total, 1GB owned at
+			// nL=4. _lb2 stays full — the origin-side scatter adds b2 for every
+			// expert its rows were routed to, not just owned ones.
+			const bool epSlice = GGL::MoEExpertParallelOn();
+			auto own = GGL::MoEOwnedExpertRange((int)blk->numExperts);
+			auto w1src = epSlice ? expertW1.detach().narrow(0, own.first, own.second)
+				: expertW1.detach();
+			auto w2src = epSlice ? expertW2.detach().narrow(0, own.first, own.second)
+				: expertW2.detach();
+			auto b1src = epSlice ? expertB1.detach().narrow(0, own.first, own.second)
+				: expertB1.detach();
+			blk->_lw1 = w1src.to(torch::kHalf).contiguous();
+			blk->_lw1T = w1src.transpose(1, 2).to(torch::kHalf).contiguous();
+			blk->_lw2 = w2src.to(torch::kHalf).contiguous();
+			blk->_lw2T = w2src.transpose(1, 2).to(torch::kHalf).contiguous();
+			blk->_lb1 = b1src.to(torch::kHalf).contiguous();
 			blk->_lb2 = expertB2.detach().to(torch::kHalf).contiguous();
 			blk->_lBias = routerBias.detach().to(torch::kHalf).contiguous();
 			blk->_lwVer1 = v1;
@@ -710,9 +722,10 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 				pl.recvRows.data(), pl.recvDisp.data(), (int)d, s);
 
 			const int nProb = pl.nL * pl.ownCount;
-			auto w1TOwn = blk->_lw1T.narrow(0, pl.ownStart, pl.ownCount).contiguous();
-			auto w2TOwn = blk->_lw2T.narrow(0, pl.ownStart, pl.ownCount).contiguous();
-			auto b1Own = blk->_lb1.narrow(0, pl.ownStart, pl.ownCount).contiguous();
+			// Caches are already owner-sliced (see the refresh above).
+			auto w1TOwn = blk->_lw1T;
+			auto w2TOwn = blk->_lw2T;
+			auto b1Own = blk->_lb1;
 			// Problem list is (rank, ownedExpert): the weight stack must repeat per
 			// rank so problem i uses expert (i % ownCount)'s weights.
 			auto w1Rep = w1TOwn.repeat({ pl.nL, 1, 1 });
@@ -834,8 +847,8 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 				blk->_epSendRows.data(), blk->_epSendDisp.data(),
 				blk->_epRecvRows.data(), blk->_epRecvDisp.data(), (int)d, s);
 
-			auto w1Own = blk->_lw1.narrow(0, blk->_epOwnStart, oc).contiguous();
-			auto w2Own = blk->_lw2.narrow(0, blk->_epOwnStart, oc).contiguous();
+			auto w1Own = blk->_lw1;   // already owner-sliced
+			auto w2Own = blk->_lw2;
 			auto w1Rep = w1Own.repeat({ blk->_epNL, 1, 1 });
 			auto w2Rep = w2Own.repeat({ blk->_epNL, 1, 1 });
 			auto rdH = torch::zeros({ std::max<int64_t>(rT, 1), h }, h16);
