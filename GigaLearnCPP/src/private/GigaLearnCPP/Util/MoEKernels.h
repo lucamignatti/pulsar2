@@ -68,6 +68,14 @@ extern "C" {
 		void* ctx, const void* A, const void* B, void* C,
 		const int* offsets, int E, int K, int N, void* stream);
 
+	// EP variant: nProb problems but only `weightMod` distinct weight matrices —
+	// problem i uses B[i % weightMod]. Lets an owner run every learner's tokens
+	// against ONE copy of its expert stack instead of an nL-way repeat() (which
+	// was ~650MB of memcpy per GEMM and made fwdbwd 3.15s at 1B).
+	void ggl_moe_grouped_gemm_f16_dev_mod(
+		void* ctx, const void* A, const void* B, void* C,
+		const int* offsets, int nProb, int weightMod, int K, int N, void* stream);
+
 	// h[i,:] = leaky_relu(h[i,:] + b[expertId[i],:], slope), fp16, 1 launch.
 	void ggl_moe_bias_leaky_f16(
 		void* h, const void* b, const int* expertId,

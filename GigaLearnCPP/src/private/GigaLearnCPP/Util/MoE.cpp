@@ -738,22 +738,19 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 			auto b1Own = blk->_lb1;
 			// Problem list is (rank, ownedExpert): the weight stack must repeat per
 			// rank so problem i uses expert (i % ownCount)'s weights.
-			auto w1Rep = w1TOwn.repeat({ pl.nL, 1, 1 });
-			auto w2Rep = w2TOwn.repeat({ pl.nL, 1, 1 });
-			auto b1Rep = b1Own.repeat({ pl.nL, 1 });
 			auto rHid = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), h }, h16);
 			auto rY = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), d }, h16);
 			if (pl.recvTotal > 0) {
-				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rPacked.data_ptr(),
-					w1Rep.data_ptr(), rHid.data_ptr(), pl.recvOffsets.data_ptr<int>(),
-					nProb, (int)d, (int)h, s);
+				ggl_moe_grouped_gemm_f16_dev_mod(blk->_gemmCtxLearn, rPacked.data_ptr(),
+					w1TOwn.data_ptr(), rHid.data_ptr(), pl.recvOffsets.data_ptr<int>(),
+					nProb, pl.ownCount, (int)d, (int)h, s);
 				// bias indexes by LOCAL expert of each received row (rank-major layout)
 				auto rLocalRep = pl.recvLocalExpert;
 				ggl_moe_bias_leaky_f16(rHid.data_ptr(), b1Own.data_ptr(),
 					rLocalRep.data_ptr<int>(), (int)pl.recvTotal, (int)h, 0.01f, s);
-				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rHid.data_ptr(),
-					w2Rep.data_ptr(), rY.data_ptr(), pl.recvOffsets.data_ptr<int>(),
-					nProb, (int)h, (int)d, s);
+				ggl_moe_grouped_gemm_f16_dev_mod(blk->_gemmCtxLearn, rHid.data_ptr(),
+					w2TOwn.data_ptr(), rY.data_ptr(), pl.recvOffsets.data_ptr<int>(),
+					nProb, pl.ownCount, (int)h, (int)d, s);
 			}
 			// Return y rows to their origin ranks (reverse counts).
 			sess->alltoall_rows_f16_group(rY.data_ptr(), y.data_ptr(),
@@ -859,8 +856,6 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 
 			auto w1Own = blk->_lw1;   // already owner-sliced
 			auto w2Own = blk->_lw2;
-			auto w1Rep = w1Own.repeat({ blk->_epNL, 1, 1 });
-			auto w2Rep = w2Own.repeat({ blk->_epNL, 1, 1 });
 			auto rdH = torch::zeros({ std::max<int64_t>(rT, 1), h }, h16);
 			auto rdX = torch::zeros({ std::max<int64_t>(rT, 1), d }, h16);
 			// Owner-local bias grads over the owned slice (rank-major received rows).
@@ -873,16 +868,16 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 			if (rT > 0) {
 				ggl_moe_segment_sum_f16to32(rdY.data_ptr(), blk->_epRecvLocal.data_ptr<int>(),
 					dB2Own.data_ptr<float>(), (int)rT, (int)d, s);
-				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rdY.data_ptr(),
-					w2Rep.data_ptr(), rdH.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
-					nProb, (int)d, (int)h, s);
+				ggl_moe_grouped_gemm_f16_dev_mod(blk->_gemmCtxLearn, rdY.data_ptr(),
+					w2Own.data_ptr(), rdH.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
+					nProb, oc, (int)d, (int)h, s);
 				ggl_moe_leaky_bwd_f16(rdH.data_ptr(), blk->_epRecvHid.data_ptr(),
 					(int)rT, (int)h, 0.01f, s);
 				ggl_moe_segment_sum_f16to32(rdH.data_ptr(), blk->_epRecvLocal.data_ptr<int>(),
 					dB1Own.data_ptr<float>(), (int)rT, (int)h, s);
-				ggl_moe_grouped_gemm_f16_dev(blk->_gemmCtxLearn, rdH.data_ptr(),
-					w1Rep.data_ptr(), rdX.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
-					nProb, (int)h, (int)d, s);
+				ggl_moe_grouped_gemm_f16_dev_mod(blk->_gemmCtxLearn, rdH.data_ptr(),
+					w1Own.data_ptr(), rdX.data_ptr(), blk->_epRecvOffsets.data_ptr<int>(),
+					nProb, oc, (int)h, (int)d, s);
 				// wgrad per (rank, ownedExpert) problem, then sum the nL rank-blocks:
 				// every learner's tokens contribute to the SAME owned expert weights.
 				auto dW1Rep = torch::zeros({ (int64_t)nProb, h, d }, h16);

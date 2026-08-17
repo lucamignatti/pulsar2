@@ -431,8 +431,8 @@ extern "C" void* ggl_moe_ctx_create(int maxExperts) {
 
 // Fill problem descriptors + pointer tables from device offsets. One thread
 // per expert.
-__global__ void gglk_fill_problems(
-	const int* offsets, int E, int K, int N,
+__global__ void gglk_fill_problems_mod(
+	const int* offsets, int E, int weightMod, int K, int N,
 	const cutlass::half_t* A, const cutlass::half_t* B, cutlass::half_t* C,
 	cutlass::gemm::GemmCoord* problems,
 	cutlass::half_t** pA, cutlass::half_t** pB, cutlass::half_t** pC, cutlass::half_t** pD,
@@ -444,7 +444,10 @@ __global__ void gglk_fill_problems(
 	int m = offsets[e + 1] - offsets[e];
 	problems[e] = cutlass::gemm::GemmCoord(m, N, K);
 	pA[e] = const_cast<cutlass::half_t*>(A) + (size_t)offsets[e] * K;
-	pB[e] = const_cast<cutlass::half_t*>(B) + (size_t)e * K * N;
+	// weightMod: EP problem lists are (rank x ownedExpert), so many problems share
+	// one weight matrix — index it modulo the owned count instead of repeating it.
+	int w = (weightMod > 0) ? (e % weightMod) : e;
+	pB[e] = const_cast<cutlass::half_t*>(B) + (size_t)w * K * N;
 	pC[e] = C + (size_t)offsets[e] * N;
 	pD[e] = pC[e];
 	ld[e] = K;
@@ -463,8 +466,8 @@ extern "C" void ggl_moe_grouped_gemm_f16_dev(
 		fprintf(stderr, "MoEKernels: E=%d exceeds ctx capacity %d\n", E, c->E);
 		abort();
 	}
-	gglk_fill_problems<<<(E + 63) / 64, 64, 0, s>>>(
-		offsets, E, K, N,
+	gglk_fill_problems_mod<<<(E + 63) / 64, 64, 0, s>>>(
+		offsets, E, /*weightMod=*/0, K, N,
 		(const cutlass::half_t*)A, (const cutlass::half_t*)B, (cutlass::half_t*)C,
 		c->d_problems, c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D, c->d_ld);
 
@@ -473,6 +476,43 @@ extern "C" void ggl_moe_grouped_gemm_f16_dev(
 		c->d_problems, E, c->tbc, epilogue,
 		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
 		c->d_ld, c->d_ld + E, c->d_ld + 2 * E, c->d_ld + 3 * E,
+		/*host_problem_sizes=*/nullptr);
+
+	size_t ws = GglkGemmF16::get_workspace_size(args);
+	size_t need = ws + ((size_t)1 << 20);
+	if (need > c->ws_cap) {
+		// grow-only: never free the old workspace (V100/11.2 sticky-error trap)
+		GGLK_CUDA_CHECK(cudaMalloc(&c->d_workspace, need));
+		c->ws_cap = need;
+	}
+	if (ws > 0)
+		GGLK_CUDA_CHECK(cudaMemsetAsync(c->d_workspace, 0, ws, s));
+
+	GglkGemmF16 gemm;
+	GGLK_CUTLASS_CHECK(gemm.initialize(args, c->d_workspace, s));
+	GGLK_CUTLASS_CHECK(gemm.run(s));
+}
+
+extern "C" void ggl_moe_grouped_gemm_f16_dev_mod(
+	void* ctx, const void* A, const void* B, void* C,
+	const int* offsets, int nProb, int weightMod, int K, int N, void* stream) {
+
+	GemmCtx* c = (GemmCtx*)ctx;
+	cudaStream_t s = (cudaStream_t)stream;
+	if (nProb > c->E) {
+		fprintf(stderr, "MoEKernels: nProb=%d exceeds ctx capacity %d\n", nProb, c->E);
+		abort();
+	}
+	gglk_fill_problems_mod<<<(nProb + 63) / 64, 64, 0, s>>>(
+		offsets, nProb, weightMod, K, N,
+		(const cutlass::half_t*)A, (const cutlass::half_t*)B, (cutlass::half_t*)C,
+		c->d_problems, c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D, c->d_ld);
+
+	typename GglkGemmF16::EpilogueOutputOp::Params epilogue(1.f, 0.f);
+	typename GglkGemmF16::Arguments args(
+		c->d_problems, E, c->tbc, epilogue,
+		c->d_ptr_A, c->d_ptr_B, c->d_ptr_C, c->d_ptr_D,
+		c->d_ld, c->d_ld + nProb, c->d_ld + 2 * nProb, c->d_ld + 3 * nProb,
 		/*host_problem_sizes=*/nullptr);
 
 	size_t ws = GglkGemmF16::get_workspace_size(args);
