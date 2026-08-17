@@ -668,14 +668,16 @@ EpPlan EpBuildPlanFixed(GGL::Dist::Session* sess, int E, int cap,
 
 	// Device-side constants, built once per (block, cap).
 	if (!blk->_epFixedOffsets.defined() || blk->_epFixedCap != cap) {
-		const int nProb = pl.nL * pl.ownCount;
 		auto i32cpu = torch::TensorOptions().dtype(torch::kInt32);
-		std::vector<int> offHost((size_t)nProb + 1);
-		for (int i = 0; i <= nProb; i++)
-			offHost[(size_t)i] = i * cap;
+		// EXPERT-major after the post-a2a permute: expert j owns rows
+		// [j*nL*cap, (j+1)*nL*cap) — ownCount problems of K = nL*cap.
+		const int blockRows = pl.nL * cap;
+		std::vector<int> offHost((size_t)pl.ownCount + 1);
+		for (int i = 0; i <= pl.ownCount; i++)
+			offHost[(size_t)i] = i * blockRows;
 		std::vector<int> locHost((size_t)pl.recvTotal);
 		for (int i = 0; i < (int)pl.recvTotal; i++)
-			locHost[(size_t)i] = (i / cap) % pl.ownCount;   // LOCAL expert of each slot
+			locHost[(size_t)i] = i / blockRows;            // LOCAL expert of each slot
 		blk->_epFixedOffsets = torch::from_blob(offHost.data(),
 			{ (int64_t)offHost.size() }, i32cpu).clone().to(dev);
 		blk->_epFixedLocal = locHost.empty() ? torch::zeros({ 0 }, i32cpu).to(dev)
@@ -808,7 +810,14 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 				pl.sendRows.data(), pl.sendDisp.data(),
 				pl.recvRows.data(), pl.recvDisp.data(), (int)d, s);
 
-			const int nProb = pl.nL * pl.ownCount;
+			// Received rows arrive RANK-major ([nL][ownCount][cap]) because NCCL needs
+			// per-peer contiguity. That makes every GEMM problem K=cap (48) — 312 tiny
+			// problems that are pure tile overhead (wgrad alone was 65% of fwdbwd).
+			// Permute to EXPERT-major so each expert's rows from ALL ranks are one
+			// block: ownCount problems of K = nL*cap (1152).
+			rPacked = rPacked.view({ pl.nL, pl.ownCount, (int64_t)epCap, d })
+				.permute({ 1, 0, 2, 3 }).contiguous().view({ -1, d });
+			const int nProb = pl.ownCount;
 			// Caches are already owner-sliced (see the refresh above).
 			auto w1TOwn = blk->_lw1T;
 			auto w2TOwn = blk->_lw2T;
@@ -830,7 +839,10 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 					nProb, pl.ownCount, (int)h, (int)d, s);
 			}
 			// Return y rows to their origin ranks (reverse counts).
-			sess->alltoall_rows_f16_group(rY.data_ptr(), y.data_ptr(),
+			// back to RANK-major for the return exchange
+			auto rYsend = rY.view({ pl.ownCount, pl.nL, (int64_t)epCap, d })
+				.permute({ 1, 0, 2, 3 }).contiguous().view({ -1, d });
+			sess->alltoall_rows_f16_group(rYsend.data_ptr(), y.data_ptr(),
 				pl.recvRows.data(), pl.recvDisp.data(),
 				pl.sendRows.data(), pl.sendDisp.data(), (int)d, s);
 			// Owner-side tensors the backward needs (saved on the block: they are
@@ -924,12 +936,16 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 			// ---- EP backward: dY to owners, owner-local dgrad+wgrad, dX back ----
 			auto* sess = GGL::MoEExpertParallelSession();
 			const int64_t rT = blk->_epPlanRecvTotal;
-			const int nProb = blk->_epNL * blk->_epOwnCount;
+			const int nProb = blk->_epOwnCount;
 			const int oc = blk->_epOwnCount;
-			auto rdY = torch::zeros({ std::max<int64_t>(rT, 1), d }, h16);
-			sess->alltoall_rows_f16_group(dY.data_ptr(), rdY.data_ptr(),
+			auto rdYrank = torch::zeros({ std::max<int64_t>(rT, 1), d }, h16);
+			sess->alltoall_rows_f16_group(dY.data_ptr(), rdYrank.data_ptr(),
 				blk->_epSendRows.data(), blk->_epSendDisp.data(),
 				blk->_epRecvRows.data(), blk->_epRecvDisp.data(), (int)d, s);
+			// rank-major -> expert-major, matching the forward's saved buffers
+			const int64_t epc = blk->_epFixedCap;
+			auto rdY = rdYrank.view({ blk->_epNL, oc, epc, d })
+				.permute({ 1, 0, 2, 3 }).contiguous().view({ -1, d });
 
 			auto w1Own = blk->_lw1;   // already owner-sliced
 			auto w2Own = blk->_lw2;
@@ -965,10 +981,14 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 				ggl_moe_grouped_wgrad_f16_dev(blk->_gemmCtxLearn, rdY.data_ptr(),
 					blk->_epRecvHid.data_ptr(), dW2Rep.data_ptr(),
 					blk->_epRecvOffsets.data_ptr<int>(), nProb, (int)d, (int)h, (int)rT, s);
-				dW1Own = dW1Rep.view({ (int64_t)blk->_epNL, (int64_t)oc, h, d }).sum(0);
-				dW2Own = dW2Rep.view({ (int64_t)blk->_epNL, (int64_t)oc, d, h }).sum(0);
+				// expert-major: each problem already spans ALL ranks' tokens for that
+				// expert, so the wgrad output IS the complete owned gradient.
+				dW1Own = dW1Rep;
+				dW2Own = dW2Rep;
 			}
-			sess->alltoall_rows_f16_group(rdX.data_ptr(), dX.data_ptr(),
+			auto rdXsend = rdX.view({ oc, blk->_epNL, epc, d })
+				.permute({ 1, 0, 2, 3 }).contiguous().view({ -1, d });
+			sess->alltoall_rows_f16_group(rdXsend.data_ptr(), dX.data_ptr(),
 				blk->_epRecvRows.data(), blk->_epRecvDisp.data(),
 				blk->_epSendRows.data(), blk->_epSendDisp.data(), (int)d, s);
 			// Scatter the owned slices into full-shaped grads; non-owned stay ZERO
