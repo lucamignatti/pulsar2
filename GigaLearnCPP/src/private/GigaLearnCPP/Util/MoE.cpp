@@ -628,6 +628,58 @@ EpPlan EpBuildPlan(GGL::Dist::Session* sess, const std::vector<int>& myOffsets, 
 	return pl;
 }
 
+
+// Fixed-capacity EP plan: NOTHING here communicates or touches the device — every
+// size is a pure function of (E, cap, nL), so the whole plan is cacheable and the
+// per-block host rendezvous disappear. Cached on the block by (cap) since E/nL
+// are constant for a run.
+EpPlan EpBuildPlanFixed(GGL::Dist::Session* sess, int E, int cap,
+	torch::Device dev, GGL::MoEBlockImpl* blk) {
+
+	EpPlan pl;
+	pl.nL = sess->group_world();
+	pl.me = sess->group_rank();
+	auto own = GGL::MoEOwnedExpertRange(E);
+	pl.ownStart = own.first;
+	pl.ownCount = own.second;
+	const int per = E / pl.nL;
+
+	pl.sendRows.assign((size_t)pl.nL, 0);
+	pl.sendDisp.assign((size_t)pl.nL, 0);
+	pl.recvRows.assign((size_t)pl.nL, 0);
+	pl.recvDisp.assign((size_t)pl.nL, 0);
+	for (int o = 0; o < pl.nL; o++) {
+		const int st = o * per;
+		const int cn = (o == pl.nL - 1) ? (E - st) : per;
+		pl.sendDisp[(size_t)o] = st * cap;      // contiguous: experts are owner-sorted
+		pl.sendRows[(size_t)o] = cn * cap;
+		pl.recvDisp[(size_t)o] = o * pl.ownCount * cap;
+		pl.recvRows[(size_t)o] = pl.ownCount * cap;
+	}
+	pl.recvTotal = (int64_t)pl.nL * pl.ownCount * cap;
+
+	// Device-side constants, built once per (block, cap).
+	if (!blk->_epFixedOffsets.defined() || blk->_epFixedCap != cap) {
+		const int nProb = pl.nL * pl.ownCount;
+		auto i32cpu = torch::TensorOptions().dtype(torch::kInt32);
+		std::vector<int> offHost((size_t)nProb + 1);
+		for (int i = 0; i <= nProb; i++)
+			offHost[(size_t)i] = i * cap;
+		std::vector<int> locHost((size_t)pl.recvTotal);
+		for (int i = 0; i < (int)pl.recvTotal; i++)
+			locHost[(size_t)i] = (i / cap) % pl.ownCount;   // LOCAL expert of each slot
+		blk->_epFixedOffsets = torch::from_blob(offHost.data(),
+			{ (int64_t)offHost.size() }, i32cpu).clone().to(dev);
+		blk->_epFixedLocal = locHost.empty() ? torch::zeros({ 0 }, i32cpu).to(dev)
+			: torch::from_blob(locHost.data(), { (int64_t)locHost.size() }, i32cpu)
+				.clone().to(dev);
+		blk->_epFixedCap = cap;
+	}
+	pl.recvOffsets = blk->_epFixedOffsets;
+	pl.recvLocalExpert = blk->_epFixedLocal;
+	return pl;
+}
+
 } // namespace
 #endif
 
@@ -647,10 +699,18 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		const int64_t R = xn.size(0), d = blk->dim, h = blk->hidden;
 		const int E = (int)blk->numExperts, k = (int)blk->topK;
 		const int64_t nReal = R * k;
+		// EP uses FIXED per-expert capacity so every exchange size is static (no host
+		// round-trip); non-EP keeps the exact-M aligned-segment layout.
+		const bool epMode = GGL::MoEExpertParallelOn();
+		const int64_t epCap = epMode
+			? std::max<int64_t>(8, (((int64_t)std::ceil((double)nReal / (double)E
+				* (double)blk->capacityFactor) + 7) / 8) * 8)
+			: 0;
 		// Aligned segments: each expert's slot range rounds to 8 (wgrad fp16 tensor-op
 		// pointer/K alignment). Buffers sized to the bound; pad slots carry srcRows=-1
 		// and contribute exact zeros end to end.
-		const int64_t n = ((nReal + 7) & ~7LL) + 8LL * E;
+		const int64_t n = epMode ? ((int64_t)E * epCap + 1)
+			: (((nReal + 7) & ~7LL) + 8LL * E);
 		auto dev = xn.device();
 		auto h16 = torch::TensorOptions().dtype(torch::kHalf).device(dev);
 		auto f32 = torch::TensorOptions().dtype(torch::kFloat).device(dev);
@@ -705,10 +765,16 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		auto srcRows = torch::empty({ n }, i32);
 		auto expertId = torch::empty({ n }, i32);
 		auto gates = torch::empty({ n }, f32);
-		ggl_moe_route_plan_f16(logits.data_ptr(), blk->_lBias.data_ptr(),
-			(int)R, E, k, /*align=*/1, counts.data_ptr<int>(), offsets.data_ptr<int>(),
-			rowExp.data_ptr<int>(), rowGate.data_ptr<float>(),
-			srcRows.data_ptr<int>(), expertId.data_ptr<int>(), gates.data_ptr<float>(), s);
+		if (epMode)
+			ggl_moe_route_plan_fixed_f16(logits.data_ptr(), blk->_lBias.data_ptr(),
+				(int)R, E, k, (int)epCap, counts.data_ptr<int>(), offsets.data_ptr<int>(),
+				rowExp.data_ptr<int>(), rowGate.data_ptr<float>(),
+				srcRows.data_ptr<int>(), expertId.data_ptr<int>(), gates.data_ptr<float>(), s);
+		else
+			ggl_moe_route_plan_f16(logits.data_ptr(), blk->_lBias.data_ptr(),
+				(int)R, E, k, /*align=*/1, counts.data_ptr<int>(), offsets.data_ptr<int>(),
+				rowExp.data_ptr<int>(), rowGate.data_ptr<float>(),
+				srcRows.data_ptr<int>(), expertId.data_ptr<int>(), gates.data_ptr<float>(), s);
 
 		auto xn16 = xn.to(torch::kHalf);
 		auto packed = torch::empty({ n, d }, h16);
@@ -717,14 +783,17 @@ struct MoERoutedFFN : public torch::autograd::Function<MoERoutedFFN> {
 		ggl_moe_gather_f16(xn16.data_ptr(), srcRows.data_ptr<int>(),
 			packed.data_ptr(), (int)n, (int)d, s);
 
-		const bool epOn = GGL::MoEExpertParallelOn();
+		const bool epOn = epMode;
 		if (epOn) {
 			// ---- EP: exchange tokens to expert owners, compute, exchange back ----
+			// FIXED-CAPACITY plan: every expert holds exactly `cap` slots, so all
+			// exchange sizes are known WITHOUT any host round-trip. The dynamic
+			// version needed a D2H of offsets + an MPI allgather of counts PER BLOCK
+			// PER PASS (~108 blocking rendezvous/iteration at 24 ranks) — that, not
+			// the GEMMs, was the 2.75s fwdbwd at 1B.
 			auto* sess = GGL::MoEExpertParallelSession();
-			auto offCpu = offsets.to(torch::kCPU);
-			std::vector<int> offHost(offCpu.data_ptr<int>(), offCpu.data_ptr<int>() + E + 1);
-			EpPlan pl = EpBuildPlan(sess, offHost, E, dev);
-			blk->_epPlanRecvTotal = pl.recvTotal; // backward reuses the same plan shape
+			EpPlan pl = EpBuildPlanFixed(sess, E, (int)epCap, dev, blk);
+			blk->_epPlanRecvTotal = pl.recvTotal;
 
 			auto rPacked = torch::zeros({ std::max<int64_t>(pl.recvTotal, 1), d }, h16);
 			sess->alltoall_rows_f16_group(packed.data_ptr(), rPacked.data_ptr(),

@@ -127,6 +127,63 @@ __global__ void gglk_place(
 	gates[slot] = rowGate[i];
 }
 
+// Fixed-capacity placement: slot = e*cap + cursor, overflow -> trash row E*cap.
+__global__ void gglk_place_fixed(
+	const int* rowExp, const float* rowGate,
+	int* cursors, int n, int k, int E, int cap,
+	int* srcRows, int* expertId, float* gates) {
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	int e = rowExp[i];
+	int c = atomicAdd(&cursors[e], 1);
+	if (c >= cap)
+		return;                       // dropped: its slot keeps srcRows = -1
+	int slot = e * cap + c;
+	srcRows[slot] = i / k;
+	expertId[slot] = e;
+	gates[slot] = rowGate[i];
+}
+
+// offsets[e] = e*cap (device-side so the caller never needs a host copy).
+__global__ void gglk_fixed_offsets(int* offsets, int E, int cap) {
+	int e = blockIdx.x * blockDim.x + threadIdx.x;
+	if (e <= E)
+		offsets[e] = e * cap;
+}
+
+extern "C" void ggl_moe_route_plan_fixed_f16(
+	const void* logits, const void* selBias,
+	int R, int E, int k, int fixedCap,
+	int* countsCursors, int* offsets,
+	int* rowExpScratch, float* rowGateScratch,
+	int* srcRows, int* expertId, float* gates,
+	void* stream) {
+
+	if (E > 512) {
+		fprintf(stderr, "MoEKernels: E=%d exceeds the 512 routing limit\n", E);
+		abort();
+	}
+	cudaStream_t s = (cudaStream_t)stream;
+	const int n = R * k;
+	const int nSlots = E * fixedCap + 1;
+	int* counts = countsCursors;
+	int* cursors = countsCursors + E;
+	GGLK_CUDA_CHECK(cudaMemsetAsync(countsCursors, 0, sizeof(int) * 2 * (size_t)E, s));
+	// Unfilled + dropped slots must read as skippable everywhere.
+	GGLK_CUDA_CHECK(cudaMemsetAsync(srcRows, 0xFF, sizeof(int) * (size_t)nSlots, s));
+	GGLK_CUDA_CHECK(cudaMemsetAsync(gates, 0, sizeof(float) * (size_t)nSlots, s));
+	GGLK_CUDA_CHECK(cudaMemsetAsync(expertId, 0, sizeof(int) * (size_t)nSlots, s));
+	gglk_route_topk<<<(R + 127) / 128, 128, 0, s>>>(
+		(const float*)logits, (const __half*)selBias, R, E, k,
+		counts, rowExpScratch, rowGateScratch);
+	gglk_fixed_offsets<<<(E + 64) / 64, 64, 0, s>>>(offsets, E, fixedCap);
+	gglk_place_fixed<<<(n + 127) / 128, 128, 0, s>>>(
+		rowExpScratch, rowGateScratch, cursors, n, k, E, fixedCap,
+		srcRows, expertId, gates);
+}
+
 extern "C" void ggl_moe_route_plan_f16(
 	const void* logits, const void* selBias,
 	int R, int E, int k, int alignSegments,

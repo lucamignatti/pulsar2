@@ -89,6 +89,9 @@ namespace GGL {
 		torch::Tensor _epRecvPacked, _epRecvHid, _epRecvOffsets, _epRecvLocal;
 		std::vector<int> _epSendRows, _epSendDisp, _epRecvRows, _epRecvDisp;
 		int _epOwnStart = 0, _epOwnCount = 0, _epNL = 1;
+		// Fixed-capacity EP constants (pure functions of E/cap/nL — built once).
+		torch::Tensor _epFixedOffsets, _epFixedLocal;
+		int _epFixedCap = -1;
 	};
 
 	// Stage 1b custom autograd routed-FFN (research/reports/MOE_SPEED.md). Takes the

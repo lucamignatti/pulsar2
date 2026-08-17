@@ -45,6 +45,20 @@ extern "C" {
 	// gates = 0 (pre-initialized here); callers must size the assignment buffers
 	// to nBound = roundup8(R*k) + 8*E and launch the per-assignment kernels over
 	// nBound — every kernel below guards srcRows < 0.
+	// fixedCap > 0: every expert gets EXACTLY fixedCap slots at offsets[e]=e*fixedCap
+	// (no scan, no data-dependent sizes) and overflow assignments are DROPPED into a
+	// trash slot at index E*fixedCap. This makes every EP exchange size statically
+	// known — no D2H of the offsets and no host allgather of counts, which were
+	// ~108 blocking rendezvous per iteration at 24 ranks (fwdbwd 2.75s at 1B).
+	// Buffers must be sized E*fixedCap + 1.
+	void ggl_moe_route_plan_fixed_f16(
+		const void* logits, const void* selBias,
+		int R, int E, int k, int fixedCap,
+		int* countsCursors, int* offsets,
+		int* rowExpScratch, float* rowGateScratch,
+		int* srcRows, int* expertId, float* gates,
+		void* stream);
+
 	void ggl_moe_route_plan_f16(
 		const void* logits, const void* selBias,
 		int R, int E, int k, int alignSegments,
