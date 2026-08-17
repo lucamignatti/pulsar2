@@ -3074,6 +3074,13 @@ void GGL::Learner::Start() {
 		// destructor's std::terminate EATS the real error ("terminate called without an
 		// active exception" — six 1B-MoE bring-up cycles before this was understood).
 		try {
+		// True inter-iteration wall clock + last send/display costs. These exist because
+		// on 2026-08-17 a 96-rank fleet ran 3 iterations in 77 minutes while every phase
+		// timer (and the 'Overall Steps/Second' they feed) read healthy: rank 0 was
+		// stalling for minutes inside wandb.log(), AFTER the timers stopped, and the
+		// other 95 ranks waited at the next collective. Nothing displayed could see it.
+		Timer trueIterWall = {};
+		double lastSendTime = 0.0;
 		while (true) {
 			Report report = {};
 
@@ -3110,12 +3117,24 @@ void GGL::Learner::Start() {
 			}
 #endif
 			report["Display Time"] = lastDisplayTime; // previous iter; this iter's Display is after Overall
+			report["Send Time"] = lastSendTime;       // previous iter, same reason
 			int stepsCollected = collectSteps;
 			{
 				Timer obsSyncTimer = {};
 				if (obsStat)
 					obsStat->SyncAcrossRanks(dist);
-				report["Obs Stat Sync Time"] = obsSyncTimer.Elapsed();
+				double obsSyncT = obsSyncTimer.Elapsed();
+				report["Obs Stat Sync Time"] = obsSyncT;
+				// A large value on a NON-ZERO rank means this rank sat waiting for a
+				// straggler (usually rank 0 in un-timed epilogue work); the displayed
+				// report is rank 0's, so without this print the wait is invisible.
+				static const bool itwConsumeTimers = [] {
+					const char* e = std::getenv("GGL_CONSUME_TIMERS");
+					return e && *e && std::string(e) != "0";
+				}();
+				if (itwConsumeTimers && obsSyncT > 5.0)
+					fprintf(stderr, "[ITERWALL] rank=%d obs_sync_wait=%.1fs (straggler upstream)\n",
+						dist ? dist->rank() : 0, obsSyncT);
 			}
 			{
 				Timer glueTimer = {};
@@ -4437,6 +4456,27 @@ void GGL::Learner::Start() {
 				report["Collection Steps/Second"] = (float)globalSteps / collectionTime;
 				report["Consumption Steps/Second"] = (float)globalSteps / consumptionTime;
 				report["Overall Steps/Second"] = (float)globalSteps / overallTime;
+
+				// The honest number: full wall period since the previous iteration reached
+				// this same line, epilogue included. 'Overall' stops measuring before the
+				// exit collectives / save / metric send / display; anything stalling there
+				// (the 2026-08-17 wandb stall) inflates 'Overall' by orders of magnitude
+				// while this one reads the truth.
+				double trueIterTime = trueIterWall.Elapsed();
+				trueIterWall.Reset();
+				report["True Iter Time"] = trueIterTime;
+				report["True Steps/Second"] = (double)globalSteps / RS_MAX(1e-6, trueIterTime);
+				if (DistRank() == 0) {
+					time_t itwNow = time(nullptr);
+					struct tm itwTm;
+					localtime_r(&itwNow, &itwTm);
+					char itwBuf[16];
+					strftime(itwBuf, sizeof(itwBuf), "%H:%M:%S", &itwTm);
+					fprintf(stderr, "[ITERWALL] it=%llu true=%.1fs true_sps=%.0f overall_sps=%.0f send=%.2fs disp=%.2fs t=%s\n",
+						(unsigned long long)(totalIterations + 1), trueIterTime,
+						(double)globalSteps / RS_MAX(1e-6, trueIterTime),
+						(double)globalSteps / overallTime, lastSendTime, lastDisplayTime, itwBuf);
+				}
 				report["Collected Timesteps"] = globalSteps;
 				report["Total Timesteps"] = totalTimesteps;
 				totalIterations++;
@@ -4503,8 +4543,14 @@ void GGL::Learner::Start() {
 
 				report.Finish();
 
-				if (metricSender)
-					metricSender->Send(report);
+				{
+					// Async enqueue (see MetricSender.h) — this should read ~0. If it ever
+					// grows again, the sender's bounded-queue contract has been broken.
+					Timer sendTimer = {};
+					if (metricSender)
+						metricSender->Send(report);
+					lastSendTime = sendTimer.Elapsed();
+				}
 
 				if (DistRank() != 0)
 					continue;
@@ -4612,6 +4658,9 @@ void GGL::Learner::Start() {
 						"Collection Steps/Second",
 						"Consumption Steps/Second",
 						"Overall Steps/Second",
+						"True Steps/Second",
+						"True Iter Time",
+						"Send Time",
 						"",
 						"Collection Time",
 						"-Inference Time",

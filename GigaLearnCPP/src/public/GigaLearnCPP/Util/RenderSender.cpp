@@ -100,6 +100,9 @@ void GGL::RenderSender::Send(const GameState& state, const std::string& controlJ
 	std::string jStr = j.dump();
 
 	try {
+		// Safe whether or not this thread already holds the GIL (render mode holds it
+		// from init; a MetricSender-owning process has released it to the sender thread).
+		pybind11::gil_scoped_acquire gil;
 		pyMod.attr("render_state")(jStr);
 	} catch (std::exception& e) {
 		RG_ERR_CLOSE("RenderSender: Failed to send gamestate, exception: " << e.what());
