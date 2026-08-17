@@ -346,3 +346,43 @@ vs NCCL-stream interleaving on the learner comm; (c) a zero-row send/recv pairin
 mismatch in the a2a. NEXT DEBUG STEP: log a per-rank counter of
 allgather_host_group calls + a barrier_learners() immediately before the first
 allgather — if the barrier hangs, the desync is upstream of EP entirely.
+
+## POST-MORTEM 2026-08-17: the 16-node "production" failure was WANDB, not MoE
+
+The 4× production hops (4631580-83) that ran 77-90 min each and retained 0 steps
+were not slow at training at all. Autopsy of hop 4631583 (no timestamps in logs,
+reconstructed from timer semantics + wandb debug logs):
+
+- Every instrumented phase was healthy: collect ~4s (hidden by pipeline), learn
+  ~9s (fwdbwd 4.48 + optstep 4.16 × 2 updates), `Overall Steps/Second` 85-88k.
+- `Overall` is measured at the TOP of the epilogue. Everything after it —
+  exit-flag collectives, save check, `MetricSender::Send`, `Display` — was
+  unmeasured. Rank 0 stalled ~10-25 min per iteration inside **`wandb.log()`**
+  (the compute nodes' network path to the wandb backend is pathological: hop
+  4631580's `wandb.init` round-trip took 57 s; once the SDK's buffer fills,
+  `.log()` blocks on backpressure with 90 s HTTP retries). The other 95 ranks
+  waited at the next iteration's obs-stat sync — whose timer is only ever
+  *displayed* for rank 0, where it reads ~0 because everyone else is already
+  waiting. A perfect stealth stall: fleet at ~500 real SPS, log claiming 85k.
+- Corroboration: hops 81-83 created no wandb run dir at all (init returned a
+  degenerate run) and were slowest; hop 80 (working online wandb) was ~2.5×
+  faster but still wandb-bound. `[HALFREFRESH]` cost growth (0.3 → 944 ms) was
+  a symptom (queue backpressure), not a cause.
+
+Fixes landed (commit 01416a7):
+1. **MetricSender is now async**: `Send()` enqueues plain C++ data into a
+   bounded (8, drop-oldest, logged) queue; a dedicated worker thread owns all
+   Python/GIL. wandb can now be arbitrarily broken and cost zero train time.
+   `add_metrics` failures log instead of killing the run; shutdown drain is
+   bounded at 20 s then detaches.
+2. **`True Iter Time` / `True Steps/Second`**: wall period between consecutive
+   iterations measured across the WHOLE loop including the epilogue, displayed
+   and sent. `[ITERWALL]` stderr stamp per iteration with time-of-day on rank 0;
+   non-zero ranks print their obs-sync wait when > 5 s (GGL_CONSUME_TIMERS).
+   The class of "timers say fast, wall says slow" can no longer hide.
+
+METHOD LESSON (goes with "measurement before machinery"): a throughput metric
+computed from phase timers is a claim about the phases, not the run. Gate
+production decisions on wall-clock-derived rates only. The four configs pushed
+to production on the strength of `Overall Steps/Second` were pushed on a number
+that could not, even in principle, see the failure they died of.
