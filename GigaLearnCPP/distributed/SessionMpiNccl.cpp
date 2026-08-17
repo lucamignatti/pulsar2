@@ -529,7 +529,10 @@ void Session::alltoall_rows_f16_group(
 		}
 		GGL_NCCL_CHECK(ncclGroupEnd());
 	}
-	SyncStream(stream);
+	// NO SyncStream here: NCCL send/recv are STREAM-ORDERED, so anything queued
+	// after them on the same stream already sees the data. Syncing drained the GPU
+	// pipeline 12x per learn pass (~72 full drains per iteration) and was the bulk
+	// of fwdbwd=3.84s at 1B — not the GEMMs and not the wire.
 }
 
 void Session::bcast_weights(float* ptr, size_t n, Stream stream, bool wait) {
