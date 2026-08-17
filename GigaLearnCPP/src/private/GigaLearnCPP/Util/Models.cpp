@@ -546,6 +546,24 @@ void GGL::ModelSet::ReplicateExpertSlices(Dist::Session* dist) {
 	const int nL = dist->group_world();
 	if (nL <= 1)
 		return;
+	// GGL_MOE_EP_SYNC_EVERY (default 1): replicate owner slices every K steps
+	// instead of every step. The replication is ~4GB of fp32 per iteration and sits
+	// INSIDE the optimizer-step cost, which is the fixed per-UPDATE tax — and update
+	// count, not step count, is what bounds PPO progress here.
+	// Safe because collect-side staleness is bounded and PPO's ratio stays exact:
+	// stored logprobs come from the weights that actually acted, so slightly stale
+	// collect weights are ordinary policy lag (the same approximation APPO relies on),
+	// NOT a mismatched-ratio bug. K must stay small enough that the clipped ratio
+	// still covers the drift — watch the clip fraction if raising it.
+	static const int syncEvery = [] {
+		const char* e = std::getenv("GGL_MOE_EP_SYNC_EVERY");
+		int v = (e && *e) ? std::atoi(e) : 1;
+		return v > 0 ? v : 1;
+	}();
+	static int64_t syncCounter = 0;
+	if ((syncCounter++ % (int64_t)syncEvery) != 0)
+		return;
+
 	const auto& params = GGL::MoEExpertParams();
 	torch::NoGradGuard ng;
 	// ONE NCCL group for every (param, owner) broadcast — ungrouped this was nL per
