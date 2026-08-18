@@ -1171,7 +1171,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		const char* e = std::getenv("GGL_CONSUME_TIMERS");
 		return e && *e && std::string(e) != "0";
 	}();
-	double tShuffle = 0, tFwdBwd = 0, tAllReduce = 0, tClip = 0, tOptStep = 0;
+	double tShuffle = 0, tFwdBwd = 0, tAllReduce = 0, tClip = 0, tOptStep = 0, tEpReplicate = 0;
 	auto fnSyncNow = [&] { if (consumeTimers && device.is_cuda()) torch::cuda::synchronize(); };
 
 	// ADVANTAGE FILTERING AS A ROW SUBSET (config.advFilterSubset). Materialize the kept rows
@@ -1927,11 +1927,13 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				models.StepOptimsSharded(dist);
 			else
 				models.StepOptims();
-			// EP: owners publish their expert slices so every learner holds a complete
-			// net for weight-publishing/checkpointing. At the ALLREDUCE LANE (this call
-			// site), never inside the optimizer's per-param loop — that is what
-			// deadlocked GGL_MUON_SHARD against the collector publish comm.
-			models.ReplicateExpertSlices(dist);
+			// EP replication is HOISTED OUT of the minibatch loop — see the single call
+			// after the epoch loop below. Under EP the learn forward exchanges tokens and
+			// each rank computes ONLY its owned experts, so non-owned slices are never
+			// read between optimizer steps; replicating after every step broadcast ~4GB
+			// of fp32 across the fleet for nothing (measured 2.95s of a 5.8s learn at 96
+			// ranks). Owners publish once, at the end of the pass, which is still before
+			// anything that reads a complete net (collect snapshot, save, weight publish).
 			fnSyncNow();
 			tOptim += optStepTimer.Elapsed();
 			tOptStep += optStepTimer.Elapsed();
@@ -1943,9 +1945,21 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		}
 	}
 
+	// EP: owners publish their expert slices ONCE per learn pass (hoisted out of the
+	// minibatch loop, see the note at the old call site). Every rank holds a complete
+	// net from here on, which is what the collect snapshot, checkpoint save and async
+	// weight publish all require — and all of them run after Learn() returns.
+	{
+		Timer epReplTimer = {};
+		models.ReplicateExpertSlices(dist);
+		tEpReplicate = epReplTimer.Elapsed();
+		report["EP Replicate Time"] = tEpReplicate;
+	}
+
 	if (consumeTimers) {
 		RG_LOG("[CONSUME] rank_learn shuffle=" << tShuffle << " fwdbwd=" << tFwdBwd
-			<< " allreduce=" << tAllReduce << " clip=" << tClip << " optstep=" << tOptStep);
+			<< " allreduce=" << tAllReduce << " clip=" << tClip << " optstep=" << tOptStep
+			<< " ep_repl=" << tEpReplicate);
 	}
 
 	// MoE router maintenance (research/reports/MOE_POLICY.md): DSv3 aux-free balancing
