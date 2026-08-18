@@ -56,6 +56,21 @@ void GGL::SetMoEExpertParallel(GGL::Dist::Session* session) {
 		const char* e = std::getenv("GGL_MOE_EP");
 		return e && *e && std::string(e) != "0";
 	}();
+	// GGL_MOE_EP=1 with GGL_MOE_CUTLASS_LEARN=0 is a SILENTLY WRONG combination, not
+	// merely a slow one. The EP token all-to-all lives only inside MoERoutedFFNApply
+	// (the CUTLASS learn path); the eager fallback has no exchange. But GGLCollectGrads
+	// skips expert params whenever EP is on, whichever path ran — so under the eager
+	// path expert grads are never allreduced AND never exchanged, and each owner steps
+	// its experts on a 1/nL-batch gradient. It measures ~3.8x faster on fwdbwd (job
+	// 4631808), which is exactly what makes it dangerous to leave selectable.
+	if (envOn && session) {
+		const char* cl = std::getenv("GGL_MOE_CUTLASS_LEARN");
+		if (cl && *cl && std::string(cl) == "0")
+			RG_ERR_CLOSE("GGL_MOE_EP=1 with GGL_MOE_CUTLASS_LEARN=0 is unsupported: the "
+				"expert-parallel token exchange exists only in the CUTLASS learn path, so "
+				"this combination would train experts on 1/nL of the batch with no "
+				"allreduce. Set GGL_MOE_EP=0 to use the eager learn path.");
+	}
 	g_epSession = envOn ? session : nullptr;
 }
 
