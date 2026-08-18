@@ -5,6 +5,7 @@
 #ifdef GGL_MOE_KERNELS
 #include "MoEKernels.h"
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <ATen/autocast_mode.h>
 #include <torch/version.h>
 
@@ -514,6 +515,16 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 			return e && *e && std::string(e) != "0";
 		}();
 		constexpr size_t MAX_SHAPES = 4;
+		// SYNCHRONIZE BEFORE FREEING (2026-08-18). These buffers are handed to raw
+		// kernels and to NCCL as bare pointers, and NCCL runs on its own stream. The
+		// caching allocator only stream-guards blocks it saw used on their allocating
+		// stream, so returning a block here while another stream still had work queued
+		// against it let that memory be handed out again underneath in-flight collectives
+		// — the fleet then wedged in cuStreamSynchronize every few minutes (jobs
+		// 4631919/4631928/4631929). Eviction is rare (only past MAX_SHAPES distinct row
+		// counts), so a full device sync on this path costs effectively nothing.
+		if (!graphsOn && _scratchByRows.size() > MAX_SHAPES && x.is_cuda())
+			c10::cuda::device_synchronize();
 		while (!graphsOn && _scratchByRows.size() > MAX_SHAPES) {
 			auto victim = _scratchByRows.end();
 			uint64_t oldest = UINT64_MAX;
