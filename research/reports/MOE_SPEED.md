@@ -410,3 +410,53 @@ reserved was 28.5/32GB and that pressure caused the cusolver telemetry crash of
 job 4631777). Cost: collect (~2s at 2084 ts/rank) is exposed instead of hidden.
 Anyone re-enabling pipelining at 1B+EP must first survive TWO save boundaries on
 a throwaway arena.
+
+## THE ROOT CAUSE, MEASURED 2026-08-17: the MoE forward is per-CALL bound, and
+## production was running the smallest possible batch
+
+Six single-arm probes (1 node, 6 ranks, 24 forward passes per iteration, identical
+everything except the swept variable). `infer_s` covers exactly 24 forwards:
+
+| arm | players/rank | geometry | ms/forward | collect SPS/rank | learn fwdbwd |
+|---|---|---|---|---|---|
+| A | 84   | 320 exp x 512  | **85.8** |     979 | 1.386s @ 2,016 rows |
+| B | 336  | 320 exp x 512  |   69.2 |   4,858 | 2.224s @ 8,064 rows |
+| C | 1344 | 320 exp x 512  | **84.6** |  15,890 | 3.505s @ 32,256 rows |
+| D | 84   | 64 exp x 2560  | **35.2** |   2,389 | 1.408s @ 2,016 rows |
+| E | 84   | dense          | **1.25** |  67,425 | 0.071s @ 2,016 rows |
+| F | 1344 | dense          |   1.70 | 792,472 | 0.424s @ 32,256 rows |
+
+**Finding 1 — the MoE forward cost is FLAT in batch size.** 84 tokens and 1344
+tokens both cost ~85ms (A vs C: 16x the work, 0.99x the time). There is no token
+term at all at these sizes; it is entirely per-call (launch + per-expert problem
+overhead). Dense over the same range goes 1.25 -> 1.70ms, i.e. it actually does
+work proportional to input.
+
+**Finding 2 — that is the whole dense gap.** At the SAME shape (84 players) dense
+is 1.25ms and MoE is 85.8ms: **69x**. Not FLOPs (MoE has ~4.2M active params vs
+dense's ~34M), not the network, not wandb. Per-call overhead.
+
+**Finding 3 — the production config was pessimal.** `GGL_NUM_GAMES=42` (84
+players/rank) was chosen for DENSE, where it trades collect wall for GAE window
+length. For a MoE whose forward is batch-free it is the worst possible choice: it
+pays the 85ms 24 times to produce 2,016 rows. Collect wall is proportional to
+TICKS, not players — so the right shape is few ticks x many players, the exact
+opposite of the dense tuning.
+
+**Finding 4 — fewer, BIGGER experts win at iso-parameter.** 64 experts x hidden
+2560 is the same 1.006B total as 320 x 512 (both 335M/block x 3) but has 5x the
+ACTIVE params (21M vs 4.2M) and is **2.4x FASTER** (35.2 vs 85.8ms). More FLOPs,
+fewer problems, less time — the signature of an overhead-bound regime. 320 experts
+at top-4 also means ~1 token per expert at batch 84, i.e. the grouped GEMM was
+being asked to do 320 single-row problems.
+
+Consequences for configuration (all iso-parameter, no architecture change):
+- Maximize players/rank; minimize ticks/iteration subject to the GAE window.
+- Prefer 64 x 2560 (or 32 x 5120) over 320 x 512.
+- Global batch = ranks x players x ticks, so a big per-rank batch means FEWER
+  RANKS for the same global batch. The 1B MoE cannot usefully occupy 96 GPUs at a
+  200k-800k global batch; ~24 ranks is the right order.
+- Remaining kernel-side headroom after that: 35ms/3 blocks = 11.7ms per MoE block
+  vs dense's ~0.4ms per layer, so the grouped-GEMM/routing path is still ~30x off
+  dense per call. CUDA graphs (merged, currently gated behind pipelining) are the
+  next lever.
