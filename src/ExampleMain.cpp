@@ -1913,6 +1913,18 @@ int main(int argc, char* argv[]) {
 		cfg.numGames = std::atoi(n);
 	if (const char* c = std::getenv("GGL_CHECKPOINT_FOLDER"); c && *c)
 		cfg.checkpointFolder = c;
+	// Checkpoint retention overrides. Needed because the only FAST filesystem on AiMOS is
+	// the personal barn (measured 2026-08-18: barn 111 MB/s vs scratch and scratch-shared
+	// both ~24 MB/s, and under load a 1B save on scratch crawled at 742 KB/s -> a single
+	// 8.1GB checkpoint would have taken 3 HOURS and stalled the whole fleet mid-save).
+	// The barn is fast but SMALL (~21GB free), so an 8-deep rotation plus a 3-deep golden
+	// archive (~89GB) cannot live there and the defaults must be tunable per run.
+	// Sizing rule: peak usage is (keep + 1) * checkpointSize, because the in-progress
+	// "<ts>.tmp" exists alongside the published ones before the atomic rename.
+	if (const char* s = std::getenv("GGL_CKPT_KEEP"); s && *s)
+		cfg.checkpointsToKeep = std::atoi(s);
+	if (const char* s = std::getenv("GGL_BEST_KEEP"); s && *s)
+		cfg.bestCheckpointsToKeep = std::atoi(s);
 	// Dist A/B: zero old/Nexto so every rank is self-play. Leave unset for production.
 	if (const char* s = std::getenv("GGL_TRAIN_AGAINST_OLD_CHANCE"); s && *s)
 		cfg.trainAgainstOldChance = std::strtof(s, nullptr);

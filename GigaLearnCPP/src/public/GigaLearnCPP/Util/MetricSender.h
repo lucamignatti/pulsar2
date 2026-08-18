@@ -46,5 +46,8 @@ namespace GGL {
 		uint64_t _dropped = 0;
 		std::atomic<uint64_t> _sent{ 0 };
 		std::atomic<bool> _workerDone{ false };
+		// Set when import/init failed: the sender degrades to a no-op rather than
+		// killing the run (a wandb init timeout took down an 8-node 1B job).
+		bool _disabled = false;
 	};
 }

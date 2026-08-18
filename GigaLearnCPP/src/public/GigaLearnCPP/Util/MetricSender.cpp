@@ -10,10 +10,19 @@ GGL::MetricSender::MetricSender(std::string _projectName, std::string _groupName
 
 	RG_LOG("Initializing MetricSender...");
 
+	// NEITHER of these is fatal any more (2026-08-18). With WANDB_MODE=online on the
+	// compute nodes, wandb.init() timed out ("CommError: Run initialization has timed
+	// out after 90.0 sec") and the RG_ERR_CLOSE below took down an entire 8-node 1B
+	// job at boot — telemetry killing training, the exact failure the async Send path
+	// was built to prevent, just moved one function earlier. On failure we degrade to
+	// no metrics and train on; _disabled makes Send/dtor no-ops.
 	try {
 		pyMod = py::module::import("python_scripts.metric_receiver");
 	} catch (std::exception& e) {
-		RG_ERR_CLOSE("MetricSender: Failed to import metrics receiver, exception: " << e.what());
+		RG_LOG("MetricSender: failed to import metrics receiver (" << e.what()
+			<< ") - CONTINUING WITHOUT METRICS");
+		_disabled = true;
+		return;
 	}
 
 	try {
@@ -22,7 +31,11 @@ GGL::MetricSender::MetricSender(std::string _projectName, std::string _groupName
 		RG_LOG(" > " << (runID.empty() ? "Starting" : "Continuing") << " run with ID : \"" << curRunID << "\"...");
 
 	} catch (std::exception& e) {
-		RG_ERR_CLOSE("MetricSender: Failed to initialize in Python, exception: " << e.what());
+		RG_LOG("MetricSender: failed to initialize in Python (" << e.what()
+			<< ") - CONTINUING WITHOUT METRICS. If this is a wandb timeout on a compute"
+			   " node, set WANDB_MODE=offline and sync the run directory afterwards.");
+		_disabled = true;
+		return;
 	}
 
 	// Hand the GIL to the worker for the life of the run (see header). Order matters:
@@ -35,6 +48,8 @@ GGL::MetricSender::MetricSender(std::string _projectName, std::string _groupName
 }
 
 void GGL::MetricSender::Send(const Report& report) {
+	if (_disabled)
+		return;
 	std::lock_guard<std::mutex> lk(_mut);
 
 	// Bounded queue, drop-OLDEST on overflow: if wandb cannot keep up, training goes on
@@ -97,6 +112,8 @@ void GGL::MetricSender::WorkerLoop() {
 }
 
 GGL::MetricSender::~MetricSender() {
+	if (_disabled)
+		return;
 	{
 		std::lock_guard<std::mutex> lk(_mut);
 		_stop = true;
