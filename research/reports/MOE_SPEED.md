@@ -386,3 +386,27 @@ computed from phase timers is a claim about the phases, not the run. Gate
 production decisions on wall-clock-derived rates only. The four configs pushed
 to production on the strength of `Overall Steps/Second` were pushed on a number
 that could not, even in principle, see the failure they died of.
+
+## PARKED BUG 2026-08-17: pipelined + EP wedges at the first save boundary
+
+With the wandb stall fixed, a fresh 16-node run (job 4631779) did 26 iterations
+at **5-6.5s true / 30-40k SPS honest**, wrote checkpoint #1 (8.1GB, ~12s,
+verify-passed) — then wedged permanently in iteration 27, the first POST-SAVE
+iteration. Evidence: ranks 0/4/8/19 have 27 `[DIST][COLLECT]` lines vs 28 on the
+other 92 (their iteration-28 pipelined collect never started → they never reached
+the worker kick); all 96 main threads spin (the 4 in `cuCtxSynchronize`, the rest
+in MPI/NCCL busy-poll); `DIST lockstep ok` count = 26 → learn #27 never completed
+anywhere. The save path is the one structural novelty: on a save iteration the
+collect worker is joined and NOT re-kicked, so the next iteration collects INLINE
+on the main thread — this run is the first time 1B+EP crossed a save boundary in
+pipelined mode at all (the 31.9M-step 4-node run had pipelining OFF). Suspects:
+EP's NCCL-stream kernels from learn #26 still pending when the inline-collect /
+snapshot-sync path device-syncs, interleaved with the obs-stat MPI collective —
+the report's known trap (b) shape. NOT diagnosed further; fleet time was burning.
+
+Decision: run 1B with `GGL_PIPELINED_COLLECTION=0` (chain 4631783-86) — the
+configuration the 1B memory ledger wants anyway (kills the ~14GB snapshot copy;
+reserved was 28.5/32GB and that pressure caused the cusolver telemetry crash of
+job 4631777). Cost: collect (~2s at 2084 ts/rank) is exposed instead of hidden.
+Anyone re-enabling pipelining at 1B+EP must first survive TWO save boundaries on
+a throwaway arena.
