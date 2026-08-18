@@ -502,8 +502,31 @@ torch::Tensor GGL::MoEBlockImpl::ForwardFast(torch::Tensor x) {
 		_wCacheEpoch = ep;
 	}
 
-	// Per-shape persistent scratch (see MoE.h for why per-shape).
+	// Per-shape persistent scratch (see MoE.h for why per-shape, and why it is capped).
 	FastScratch& sc = _scratchByRows[R];
+	sc.lastUse = ++_scratchTick;
+	{
+		// Evict least-recently-used shapes. std::map references are stable across
+		// erase of OTHER keys, so `sc` stays valid. Never evict under CUDA graphs:
+		// a captured graph holds raw pointers into its entry's storage.
+		static const bool graphsOn = [] {
+			const char* e = std::getenv("GGL_CUDA_GRAPHS");
+			return e && *e && std::string(e) != "0";
+		}();
+		constexpr size_t MAX_SHAPES = 4;
+		while (!graphsOn && _scratchByRows.size() > MAX_SHAPES) {
+			auto victim = _scratchByRows.end();
+			uint64_t oldest = UINT64_MAX;
+			for (auto it = _scratchByRows.begin(); it != _scratchByRows.end(); ++it)
+				if (it->first != R && it->second.lastUse < oldest) {
+					oldest = it->second.lastUse;
+					victim = it;
+				}
+			if (victim == _scratchByRows.end())
+				break;
+			_scratchByRows.erase(victim);
+		}
+	}
 	if (!sc.packed.defined()) {
 		auto iopts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
 		auto fopts = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());

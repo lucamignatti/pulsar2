@@ -70,8 +70,17 @@ namespace GGL {
 		struct FastScratch {
 			torch::Tensor counts, offsets, rowExp, rowGate, srcRows, expertId, gates;
 			torch::Tensor logits32, packed, hid, out;
+			uint64_t lastUse = 0;
 		};
+		// BOUNDED (2026-08-17). This map was unbounded, and an entry costs ~128MB per
+		// block at learn batch (hid alone is n*hidden fp16 with n = R*topK). Row counts
+		// churn in normal operation — Nexto serves 15% of iterations and drives only some
+		// cars, so the policy's inference batch varies — so entries accumulated until the
+		// job died of CUDA OOM at ~31GB after ~120 iterations (chain 4631804-07, which
+		// took all four hops down the same way). Eviction is skipped when CUDA graphs are
+		// on, because a captured graph holds raw pointers into its entry (see above).
 		std::map<int64_t, FastScratch> _scratchByRows;
+		uint64_t _scratchTick = 0;
 		void* _gemmCtx = nullptr;                // ggl_moe_ctx_create, grow-only
 
 		// Stage 1b learn path (GGL_MOE_CUTLASS_LEARN): custom autograd routed-FFN with
