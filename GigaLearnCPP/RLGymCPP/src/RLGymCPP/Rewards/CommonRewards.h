@@ -469,7 +469,9 @@ namespace RLGC {
 	// walls, so wall-pinned touches pay exactly 0; the ball-height ramp starts
 	// at 150uu (rest ball = 93, current mean touch = 193 -> pays ~0). The
 	// impulse factor kills carry annuities; the refire cooldown caps juggle
-	// self-rally at ~1.25 payouts/s (1 / the 0.8s cooldown, tickSkip-invariant).
+	// self-rally at 0.2 payouts/s (1 / the 5s cooldown - genuinely tickSkip-invariant
+	// since 2026-08-17, when it became a deltaTime accumulation instead of a step count
+	// that claimed invariance it did not have; see the cooldown constant below).
 	// Wrap in ZeroSumReward(_, 0). Do NOT gate.
 	// KICKOFF RACE (2026-07-20, user-directed: Pulsar wins most play but loses NET on
 	// conceded kickoff goals - it loses the kickoff). A kickoff is a symmetric sprint
@@ -491,13 +493,32 @@ namespace RLGC {
 	// Kickoff is detected ONLY at Reset (ball spawned at field center at rest;
 	// KickoffState / FuzzedKickoffState both leave the ball at (0,0,rest)), so a ball
 	// passing through center mid-play can never false-fire it. Fires once per kickoff.
+	// WINDOW RE-DERIVATION (2026-08-17, measurement-convicted). This reward had NEVER
+	// FIRED in any lineage: a wandb sweep of `Rewards/KickoffRace` across every run
+	// since it shipped 2026-07-20 found exactly 2 nonzero samples ever (max 0.0011).
+	// Cause: the window was `WINDOW_STEPS = 30` with payout `1 - steps/30`, i.e. decaying
+	// to ZERO at 2.0s - but a corner-spawn kickoff car is ~3280uu from a resting ball, a
+	// pro-grade speedflip touch is ~1.9-2.1s (paying ~3%), and this bot's healthy median
+	// first touch is ~3.4s (the boot probe's own number). The window expired and
+	// `resolved` latched before any physically realistic touch, so the 5.3 weight raise
+	// 25 -> 60 doubled a term that could not pay.
+	// Now: FULL credit out to FULL_CREDIT_SECS (a near-optimal kickoff is not penalised
+	// for being 1.9s instead of 0s - the decay's job is to punish dawdling, not to demand
+	// superhuman speed), then a linear ramp to zero at WINDOW_SECS, which sits above the
+	// measured median so a normal contested kickoff lands on the ramp with real gradient.
+	// SECONDS, NOT STEPS: the old constant carried "re-derive if tickSkip changes" and
+	// was then not re-derived - on the ts1 lineages (6.0-6.2) the same 30 steps was a
+	// 0.25s window. Accumulating state.deltaTime makes it tickSkip-invariant by
+	// construction, so the landmine cannot be re-armed. Revert = FULL_CREDIT_SECS 0,
+	// WINDOW_SECS 2 (the old shape).
 	class KickoffRaceReward : public Reward {
 	public:
-		constexpr static int WINDOW_STEPS = 30;      // ~2s at 15Hz; a touch later pays ~0
+		constexpr static float FULL_CREDIT_SECS = 2.0f;  // at/below this, a contested win pays in full
+		constexpr static float WINDOW_SECS = 5.0f;       // ...ramping to 0 here; median touch ~3.4s
 		constexpr static float CONTEST_DIST = 1500;  // opponent within this of the ball = contesting
 		constexpr static float CONTEST_SPEED = 500;  // ...or closing on it faster than this
 		bool active = false, resolved = false;
-		int steps = 0;
+		float elapsed = 0;
 
 		static bool IsKickoffBall(const GameState& s) {
 			return fabsf(s.ball.pos.x) < 200 && fabsf(s.ball.pos.y) < 200
@@ -522,15 +543,21 @@ namespace RLGC {
 		virtual void Reset(const GameState& initialState) override {
 			active = IsKickoffBall(initialState);
 			resolved = false;
-			steps = 0;
+			elapsed = 0;
+		}
+
+		// EnvSet calls PreStep once per arena per step, before the reward pass - so this
+		// replaces the old `if (player.index == 0) steps++` hack (which bumped inside the
+		// per-player loop and depended on index 0 existing).
+		virtual void PreStep(const GameState& state) override {
+			if (active && !resolved)
+				elapsed += state.deltaTime;
 		}
 
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
 			if (!active || resolved)
 				return 0;
-			if (player.index == 0) // one bump per step (index 0 exists in every arena)
-				steps++;
-			if (steps > WINDOW_STEPS) { // window elapsed unresolved -> no race reward
+			if (elapsed > WINDOW_SECS) { // window elapsed unresolved -> no race reward
 				resolved = true;
 				return 0;
 			}
@@ -539,7 +566,10 @@ namespace RLGC {
 			resolved = true; // first touch of the kickoff, either team
 			if (!Contested(player, state))
 				return 0; // uncontested (delay kickoff) -> no drive to commit into a counter
-			return RS_CLAMP(1.f - (float)steps / WINDOW_STEPS, 0.f, 1.f);
+			float over = elapsed - FULL_CREDIT_SECS;
+			if (over <= 0)
+				return 1.f;
+			return RS_CLAMP(1.f - over / (WINDOW_SECS - FULL_CREDIT_SECS), 0.f, 1.f);
 		}
 
 		virtual std::string GetName() override { return "KickoffRace"; }
@@ -551,23 +581,42 @@ namespace RLGC {
 		constexpr static float BALL_FULL_Z = 1450;           // full height credit at/above
 		constexpr static float MAX_CREDIT_AIR_TIME = 1.75f;  // seconds of flight for full air credit
 		constexpr static float FULL_CREDIT_DELTA_V = 500;    // uu/s of ball delta-v for full credit
-		constexpr static int REFIRE_COOLDOWN_STEPS = 12;     // ~0.8s at tickSkip 8 (15Hz steps); re-derive if tickSkip changes
 
-		std::vector<int> stepsSincePay; // per player.index; per-arena instance, so safe
+		// REFIRE COOLDOWN 0.8s -> 5s (2026-08-17). The cooldown, not the weight, is the
+		// term's anti-farm mechanism, and at 0.8s it was not rate-limiting anything: an
+		// air-dribble juggle re-touches the ball far faster than that, so the farm ran at
+		// the full 1.25 payouts/s ceiling. That farm was then measured TWICE - at weight
+		// 120 (wandb pkljg9g1: raw income ~5x from 22B while windowed Nexto goal share
+		// collapsed 0.875 -> 0.32) and again at 40 on the AiMOS 690-GPU run - and both
+		// times it was answered by cutting the WEIGHT (120 -> 40 -> 15), which suppresses
+		// the farm and the acquisition signal in equal measure. Lengthening the cooldown
+		// is the asymmetric fix instead: a *legitimate* aerial play (leave the ground,
+		// climb, strike, recover) has a natural cadence already well above 5s, so it loses
+		// almost nothing, while a sustained juggle's income ceiling drops ~6x. This is
+		// what buys back the headroom to run a meaningful weight without re-arming the
+		// annuity - see the WEIGHT RULE note at the term's site in ExampleMain, which is
+		// deliberately left at 15 here (raising it is a separate, user-owned lever).
+		// SECONDS, NOT STEPS: the old `REFIRE_COOLDOWN_STEPS = 12` carried "re-derive if
+		// tickSkip changes" and was not re-derived across the ts1 lineages, where the same
+		// 12 steps meant 0.1s. Accumulating deltaTime is tickSkip-invariant by
+		// construction. Revert = REFIRE_COOLDOWN_SECS 0.8f.
+		constexpr static float REFIRE_COOLDOWN_SECS = 5.0f;
+
+		std::vector<float> secsSincePay; // per player.index; per-arena instance, so safe
 
 		virtual void Reset(const GameState& initialState) override {
-			stepsSincePay.assign(initialState.players.size(), REFIRE_COOLDOWN_STEPS + 1);
+			secsSincePay.assign(initialState.players.size(), REFIRE_COOLDOWN_SECS + 1);
 		}
 
 		virtual float GetReward(const Player& player, const GameState& state, bool isFinal) override {
-			if ((size_t)player.index >= stepsSincePay.size())
-				stepsSincePay.resize(player.index + 1, REFIRE_COOLDOWN_STEPS + 1);
-			int& sincePay = stepsSincePay[player.index];
-			sincePay++;
+			if ((size_t)player.index >= secsSincePay.size())
+				secsSincePay.resize(player.index + 1, REFIRE_COOLDOWN_SECS + 1);
+			float& sincePay = secsSincePay[player.index];
+			sincePay += state.deltaTime;
 
 			if (!state.prev || !player.ballTouchedStep || player.isOnGround)
 				return 0;
-			if (sincePay <= REFIRE_COOLDOWN_STEPS)
+			if (sincePay <= REFIRE_COOLDOWN_SECS)
 				return 0;
 
 			float ballFrac = RS_CLAMP((state.ball.pos.z - BALL_MIN_Z) / (BALL_FULL_Z - BALL_MIN_Z), 0, 1);

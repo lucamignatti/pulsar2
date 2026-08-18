@@ -13,6 +13,7 @@
 
 #include <RLGymCPP/Rewards/CommonRewards.h>
 #include <RLGymCPP/Rewards/ZeroSumReward.h>
+#include <RLGymCPP/Rewards/ScheduledScaleReward.h>
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
 #include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
@@ -151,6 +152,55 @@ static float TEAM_SPIRIT = 0.3f;
 // self-play opponent source; if throughput or Elo slope regresses, this flag is the first
 // thing to put back to false.
 
+// ---- THE SCAFFOLD ANNEAL (2026-08-17) ---------------------------------------------------
+// Discharges a debt this file has carried since 5.0. Several terms below are commented
+// "SCAFFOLD weight - anneal once <X> establishes", and the named trigger (`mechanic_census`)
+// was never built, so in practice "anneal later" meant "never" - and when a scaffold term
+// did have to come down it came down by hand, reactively, after a farm had already been
+// measured (AerialTouch 120 -> 40 -> 15 over two incidents). This replaces the unbuilt
+// measurement gate with the thing that actually works: a declared timestep schedule.
+//
+// Why a schedule and not a measurement trigger: the trigger has to be right about WHEN the
+// mechanic has established, and getting that wrong is silent. A schedule is wrong in a way
+// you can SEE - the `Scaffold/Scale` panel below plots it against the term's own income
+// panel every iteration, so a mis-anchored ramp shows up as a visible step in the reward
+// mix rather than as a mechanic that quietly never annealed. (This is the same reason the
+// PHASE_B trigger's dependence on the pool-inflated Rating/1v1 is called out as a mistake
+// ~150 lines above: a curriculum gated on a number you don't trust flips without anyone
+// deciding to.)
+//
+// ANCHOR: the ramp is expressed in absolute total timesteps, so it is LINEAGE-SPECIFIC.
+// It is set to begin above where the 7.0b lineage stands (~37.5B), which means resuming an
+// existing run sees NO immediate change in reward mix - the anneal engages as the run
+// continues past ANNEAL_START_TS. On a cold start it is inert for the whole formative
+// window, which is the point: the scaffold exists to get the mechanic off a zero base rate,
+// and only then steps out of the way of the objective. Moving the ramp is a two-constant
+// edit here; setting ANNEAL_END_SCALE to 1 disables it entirely.
+static constexpr uint64_t ANNEAL_START_TS = 40'000'000'000ULL; // hold full scaffold below this
+static constexpr uint64_t ANNEAL_END_TS = 60'000'000'000ULL; // fully annealed at/above this
+static constexpr float ANNEAL_END_SCALE = 0.4f;              // terminal multiplier on scaffold weights
+
+// Published by the learner each iteration (barrier zone, main thread), read by the reward
+// stack in each env's Reset(). See ScheduledScaleReward.h for why the read is latched
+// per-episode rather than per-step (PBRS telescoping).
+static std::atomic<float> g_scaffoldScale{ 1.0f };
+
+static float ScaffoldScaleAt(uint64_t totalTimesteps) {
+	if (totalTimesteps <= ANNEAL_START_TS)
+		return 1.0f;
+	if (totalTimesteps >= ANNEAL_END_TS)
+		return ANNEAL_END_SCALE;
+	float t = (float)(totalTimesteps - ANNEAL_START_TS) / (float)(ANNEAL_END_TS - ANNEAL_START_TS);
+	return 1.0f + t * (ANNEAL_END_SCALE - 1.0f); // linear; monotone, no cliff at either end
+}
+
+// Convenience: wrap a scaffold term so its weight follows the schedule. Goes INSIDE the
+// ZeroSumReward - EnvSet caches a dynamic_cast to ZeroSumReward for per-term logging and
+// wrapping the outside would drop the term's wandb panel (ScheduledScaleReward.h).
+static Reward* Scaffold(Reward* child) {
+	return new ScheduledScaleReward(child, &g_scaffoldScale);
+}
+
 // FRONTIER-9 reward stack (workflow-designed: understand -> research -> 5 competing designs ->
 // adversarial red-team+math+integration verification -> synthesis). Replaces SURGICAL-7.
 //
@@ -227,14 +277,25 @@ std::vector<WeightedReward> BuildRewards(float gamma) {
 		// Nexto goal share climbs. Revert = 40 (resume-compatible). AirIntercept 75 left
 		// alone deliberately: exact PBRS, telescopes to ~0 on any closed path — it pays
 		// approach and refunds the whiff, it cannot fund a dribble annuity.
-		{ new ZeroSumReward(new AerialTouchReward(), TEAM_SPIRIT), 15.f },
+		// 2026-08-17: the 0.8s refire cooldown that was supposed to bound the annuity is
+		// now 5s (CommonRewards.h) - that, not the weight, is the anti-farm mechanism, and
+		// it drops a sustained juggle's income ceiling ~6x while costing a legitimate
+		// aerial play (whose cadence is already >5s) essentially nothing. The weight stays
+		// at 15 per the user-set WEIGHT RULE above; raising it is now SAFER than it was,
+		// but it is a separate lever and remains the user's call.
+		// Also now on the scaffold anneal schedule (see ScaffoldScaleAt above).
+		{ new ZeroSumReward(Scaffold(new AerialTouchReward()), TEAM_SPIRIT), 15.f },
 
 		// Pre-touch aerial approach potential: pays the jump-and-climb toward a high ball
 		// immediately, refunds the whiff - the gradient that exists BEFORE the first air touch
 		// ever lands. Exact PBRS: telescopes to ~0 net, cannot be farmed. NEVER gate.
 		// 5.0 SCAFFOLD: 20 -> 40 (denser pre-touch climb credit for the formative
 		// window; exact PBRS, same guarantees at any weight; anneal with AerialTouch)
-		{ new ZeroSumReward(new AirInterceptPotentialReward(gamma), TEAM_SPIRIT), 75.f },
+		// 2026-08-17: "anneal with AerialTouch" is now mechanical rather than aspirational -
+		// both are on the same schedule. Still exact PBRS: the scale is latched per-episode,
+		// so k*Phi is itself a potential and telescoping is unaffected at any point on the
+		// ramp (ScheduledScaleReward.h).
+		{ new ZeroSumReward(Scaffold(new AirInterceptPotentialReward(gamma)), TEAM_SPIRIT), 75.f },
 
 
 		// THE defensive signal (the stack's first): engine-refereed save, guarded so only
@@ -1949,6 +2010,16 @@ int main(int argc, char* argv[]) {
 	// checkpoint just saved. Render mode never sets the callback (no ratings there anyway).
 	if (!cfg.renderMode) {
 		learner->iterationCallback = [](Learner* learner, Report& report) {
+			// SCAFFOLD ANNEAL: publish the schedule's current value for the env threads to
+			// latch at their next episode Reset. The iteration tail is inside the barrier
+			// zone (worker joined), which is where shared state may be mutated; the read
+			// side is a relaxed atomic load, so a one-episode-stale value is harmless.
+			// The panel is the whole safety story for this mechanism - read it against the
+			// term's own income panel (Rewards/AerialTouchReward) to see the ramp land.
+			float scaffoldScale = ScaffoldScaleAt(learner->totalTimesteps);
+			g_scaffoldScale.store(scaffoldScale, std::memory_order_relaxed);
+			report["Scaffold/Scale"] = scaffoldScale;
+
 			report["Curriculum/Team Phase"] = g_PhaseB ? 1.0f : 0.0f;
 			report["Curriculum/Phase B Streak"] = (float)g_PhaseBStreak;
 			// Team modes disabled for this lineage (PHASE_B_ENABLED) — never arm the streak,
