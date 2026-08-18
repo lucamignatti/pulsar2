@@ -1952,6 +1952,12 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	{
 		Timer epReplTimer = {};
 		models.ReplicateExpertSlices(dist);
+		// bcast_device_group deliberately does NOT sync (it is built to be batched in
+		// one NCCL group), so without this the timer would read ~0.4us — the enqueue,
+		// not the ~4GB of wire time. A permanently-zero panel is how the frozen-Vdag
+		// bug hid for an entire run; fnSyncNow is itself a no-op unless
+		// GGL_CONSUME_TIMERS is set, so this costs production nothing.
+		fnSyncNow();
 		tEpReplicate = epReplTimer.Elapsed();
 		report["EP Replicate Time"] = tEpReplicate;
 	}
