@@ -1643,7 +1643,9 @@ void GGL::Learner::Start() {
 		const bool collectionCudaGraphsOn = config.ppo.useCudaGraphs && pipelineOn && ppo->device.is_cuda();
 		if (config.ppo.useCudaGraphs)
 			RG_LOG("CUDA graph collection: " << (collectionCudaGraphsOn ? "on" : "inactive")
-				<< " (rank-local frozen self-play policy only)");
+				<< " (rank-local frozen self-play policy only)"
+				<< (pipelineOn ? "" : " - INACTIVE because GGL_PIPELINED_COLLECTION=0;"
+					" capture needs the frozen snapshot the pipelined worker provides"));
 
 #ifdef RG_CUDA_SUPPORT
 		std::optional<at::cuda::CUDAEvent> collectSnapshotReadyEvent;
@@ -3081,6 +3083,9 @@ void GGL::Learner::Start() {
 		// other 95 ranks waited at the next collective. Nothing displayed could see it.
 		Timer trueIterWall = {};
 		double lastSendTime = 0.0;
+		// Set when the save interval trips; consumed in the next iteration's barrier zone,
+		// where the collect worker is guaranteed joined (see both call sites).
+		bool savePendingAtBarrier = false;
 		while (true) {
 			Report report = {};
 
@@ -3169,6 +3174,22 @@ void GGL::Learner::Start() {
 			// stay at their original tail call sites; exactly one site is active per mode. Running
 			// them here (top of iteration N) is the same program point as the tail of iteration N-1.
 			if (pipelineOn) {
+				// AUTO-SAVE runs HERE under pipelining (2026-08-17). It used to run at the
+				// tail, where it had to fnCollectJoin() and then deliberately NOT re-kick the
+				// worker — so a save iteration was the one iteration whose pipeline shape
+				// differed from every other, and the next iteration collected inline. At 1B
+				// with expert parallelism that path wedged the whole fleet permanently on the
+				// FIRST save (job 4631779: 4 of 96 ranks one collect behind, stuck in
+				// cuCtxSynchronize, learn never completing on any rank). Here the worker is
+				// already joined and idle by construction, the save is just another
+				// barrier-zone consumer like versionMgr, and every iteration has an identical
+				// shape. It also stops discarding the collection the old join threw away.
+				if (savePendingAtBarrier) {
+					savePendingAtBarrier = false;
+					Timer saveTimer = {};
+					Save();
+					report["Save Time"] = saveTimer.Elapsed();
+				}
 				{
 					Timer versionMgrTimer = {};
 					if (versionMgr)
@@ -4526,18 +4547,18 @@ void GGL::Learner::Start() {
 				if (!config.checkpointFolder.empty()) {
 					if (totalIterations / (uint64_t)config.iterPerSave
 						> prevIterations / (uint64_t)config.iterPerSave) {
-						// Auto-save. JOIN THE COLLECT WORKER FIRST (2026-08-07): this was the
-						// only save path that did not, while the exit path 15 lines above has
-						// always joined with the comment "Never exit with a collection worker
-						// in flight". So every routine checkpoint was serialized out of models
-						// that a live worker thread was concurrently reading and (via the bf16
-						// mirror refresh on _seqHalfOutdated) writing through. That asymmetry
-						// is the only structural difference between the save path that has
-						// never produced a corrupt file and the one that produced 15 of them
-						// on 2026-08-07. Joining costs one pipelined iteration per save.
+						// The 2026-08-07 rule still binds: NEVER serialize models while a
+						// collect worker is reading them (and writing through the bf16 mirror
+						// on _seqHalfOutdated) — that asymmetry produced 15 corrupt
+						// checkpoints. Under pipelining we now satisfy it by DEFERRING to the
+						// next iteration's barrier zone, where the worker is already joined,
+						// instead of joining here and suppressing the re-kick (which wedged
+						// the 1B+EP fleet on its first save — see the barrier-zone note).
+						// Sequential mode has no worker at all, so it saves inline as before.
 						if (pipelineOn)
-							fnCollectJoin();
-						Save();
+							savePendingAtBarrier = true;
+						else
+							Save();
 					}
 				}
 
