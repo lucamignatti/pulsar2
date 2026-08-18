@@ -460,3 +460,41 @@ Consequences for configuration (all iso-parameter, no architecture change):
   vs dense's ~0.4ms per layer, so the grouped-GEMM/routing path is still ~30x off
   dense per call. CUDA graphs (merged, currently gated behind pipelining) are the
   next lever.
+
+## LEVER RESULTS 2026-08-17 night (all four measured, two are duds)
+
+**Lever 1 — pipelined collect: FIXED but WORTHLESS here.** The save-boundary wedge
+is real and is fixed (`94d894d`): auto-save now runs in the barrier zone, where the
+worker is already joined, instead of joining mid-iteration and suppressing the
+re-kick. Verified at 8 nodes: saves complete, no wedge. But pipelining does NOT
+speed this workload up — 5.4-6.5 s/iter with vs 5.2-5.9 s/iter without. The reason
+is structural and should have been predicted: collect here is ~98% GPU inference
+(`kern_s ~= infer_s` in every COLLECT line), and learn is GPU training, on the SAME
+device. Overlapping two GPU-bound phases on one GPU cannot help. Pipelining only
+pays when collect is CPU/env-bound. **Run with GGL_PIPELINED_COLLECTION=0.**
+
+**Lever 2 — grouped-GEMM overhead: confirmed as the wall, NOT reachable by flag.**
+`GroupScheduleMode::kDeviceOnly` makes CUTLASS's visitor linear-scan the problem
+list per tile, which is the measured `0.2ms x experts` term. Turning the CUTLASS
+LEARN path off drops fwdbwd 1.53 -> 0.40s (3.8x!) — but that number is a MIRAGE:
+the EP token all-to-all lives only inside `MoERoutedFFNApply`, so the eager
+fallback trains each owner's experts on 1/nL of the batch with no allreduce. Now
+hard-failed at startup (`83efbf1`). The honest alternative (EP off + eager + full
+4GB allreduce) measured 7.60 s/iter vs 4.95 — worse. So EP + CUTLASS-learn stays,
+and the real fix is a visitor/scheduling rewrite. Still the biggest lever left.
+
+**Lever 3 — CUDA graphs: a PESSIMIZATION on this platform.** 10.26 s/iter with
+graphs vs 6.48 s without, same shape. Capture cost is not amortized (per-shape
+scratch + shape churn). `GGL_CUDA_GRAPHS=0`.
+
+**Lever 4 — consolidate onto fewer nodes: BLOCKED by memory.** Fewer nodes at a
+fixed global batch means more rows/rank, and 8,352 rows/rank OOMs at ~30GB on a
+32GB V100. 4,176 is at the practical limit, so the per-GPU efficiency win is not
+available at 1B.
+
+**THE ACTUAL BUG behind the idle fleet:** `MoEBlockImpl::_scratchByRows` was an
+unbounded map keyed by row count, ~128MB/entry/block at learn batch. Nexto serves
+15% of iterations and drives only some cars, so the inference batch size churns
+and entries accumulated until CUDA OOM at ~31GB after ~120 iterations — which
+killed all four hops of chain 4631804-07 identically. LRU-capped at 4 shapes
+(`9e9be59`); verified allocated memory now FLAT at 20.63GB across a long run.
