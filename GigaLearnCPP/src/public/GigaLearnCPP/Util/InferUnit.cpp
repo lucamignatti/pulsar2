@@ -147,19 +147,30 @@ bool GGL::ReadMoEConfigFromModule(const std::string& ltPath, PartialModelConfig&
 	// (it is a routing scalar, not a parameter), so the caller supplies it.
 	torch::jit::script::Module m = torch::jit::load(ltPath, torch::kCPU);
 
-	int experts = 0, hidden = 0, dim = 0, expertTensors = 0;
+	// TRUNK WIDTH COMES FROM THE EMBED LAYER, NOT FROM max/min OF THE EXPERT DIMS.
+	// The expert stacks are [E, hidden, dim] and [E, dim, hidden], so a min/max guess
+	// silently SWAPS them whenever hidden < dim — which is exactly the 402M moe2
+	// lineage (width 1024, hidden 512). That built a 512-wide trunk for a 1024-wide
+	// checkpoint and failed with 262144 vs 524288 on the policy head's first layer.
+	// The embed Linear is the first 2-D weight and its rows ARE the trunk width.
+	int dim = 0;
+	for (const auto& p : m.named_parameters()) {
+		if (p.value.dim() == 2) { dim = (int)p.value.size(0); break; }
+	}
+
+	int experts = 0, hidden = 0, expertTensors = 0;
 	for (const auto& p : m.named_parameters()) {
 		if (p.value.dim() != 3)
 			continue;
 		expertTensors++;
-		const int e = (int)p.value.size(0);
+		experts = (int)p.value.size(0);
 		const int a = (int)p.value.size(1), b = (int)p.value.size(2);
-		experts = e;
-		// W1 is [E, hidden, dim] and W2 is [E, dim, hidden]; hidden is the larger of the
-		// two inner dims for an expanding FFN, but take it from W1 specifically by
-		// remembering the pair-min/max rather than assuming which we hit first.
-		if (hidden == 0 || dim == 0) { hidden = std::max(a, b); dim = std::min(a, b); }
+		if (hidden == 0)
+			hidden = (a == dim) ? b : a;   // the dim that is NOT the trunk width
 	}
+	if (expertTensors > 0 && dim <= 0)
+		RG_ERR_CLOSE("ReadMoEConfigFromModule: " << ltPath
+			<< " has expert stacks but no 2-D embed weight to read the trunk width from");
 	if (expertTensors == 0)
 		return false; // dense checkpoint, caller keeps its existing path
 
