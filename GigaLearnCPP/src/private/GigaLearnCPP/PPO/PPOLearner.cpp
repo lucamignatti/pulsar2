@@ -1209,6 +1209,24 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (dist && dist->distributed())
 			dist->min_host(&useSubset, 1);
 		if (useSubset) {
+			// EVERY RANK MUST KEEP THE SAME NUMBER OF ROWS. nKept is data-dependent, so
+			// without this ranks enter Learn with different batch sizes. Under expert
+			// parallelism that is fatal rather than merely untidy: MoE.cpp derives
+			// epCap from the LOCAL row count (nReal = R * topK), so the token all-to-all
+			// send/recv sizes disagree between ranks and NCCL wedges — the intermittent
+			// whole-fleet hang in cuStreamSynchronize that cost ~8 restarts on
+			// 2026-08-18. It is also a correctness fix independent of EP: DDP averages
+			// per-rank gradient MEANS, so unequal N silently weights ranks unequally.
+			// Truncating to the global min keeps every exchange static and the average
+			// unbiased; the dropped rows are a small tail of an already-random subset.
+			if (dist && dist->distributed()) {
+				int nMin = (int)nKept; // row counts here are far below INT_MAX
+				dist->min_host(&nMin, 1);
+				if ((int64_t)nMin < nKept) {
+					keptIdx = keptIdx.narrow(0, 0, nMin).contiguous();
+					nKept = nMin;
+				}
+			}
 			auto sampleIdx = experience.data.IsOnCUDA()
 				? keptIdx.to(experience.data.states.device())
 				: keptIdx;
