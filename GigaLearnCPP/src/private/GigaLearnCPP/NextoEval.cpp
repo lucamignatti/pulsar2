@@ -565,15 +565,20 @@ namespace {
 		return seq;
 	}
 
+	// numInSmall/numInBig differ whenever this stack CONSUMES an already-widened
+	// activation: the policy head reads the 1280-wide trunk in the original net and the
+	// 19200-wide trunk in the expanded one. firstReadsRaw is true only for the trunk,
+	// whose first Linear reads the (never widened) observation.
 	void ExpandOne(const std::string& inPath, const std::string& outPath,
-		int numIn, const std::vector<int>& widths, int numOut, int k) {
+		int numInSmall, int numInBig, const std::vector<int>& widths, int numOut, int k,
+		bool firstReadsRaw) {
 
-		torch::nn::Sequential small = BuildStack(numIn, widths, numOut);
+		torch::nn::Sequential small = BuildStack(numInSmall, widths, numOut);
 		torch::load(small, inPath);
 
 		std::vector<int> big;
 		for (int w : widths) big.push_back(w * k);
-		torch::nn::Sequential large = BuildStack(numIn, big, numOut);
+		torch::nn::Sequential large = BuildStack(numInBig, big, numOut);
 
 		auto sp = small->parameters();
 		auto lp = large->parameters();
@@ -584,7 +589,7 @@ namespace {
 		size_t pi = 0;
 		int nLin = (int)widths.size() + (numOut > 0 ? 1 : 0);
 		for (int li = 0; li < nLin; li++) {
-			bool isFirst = (li == 0);
+			bool isFirst = (li == 0) && firstReadsRaw;
 			bool isOut = (numOut > 0 && li == nLin - 1);
 			torch::Tensor w = sp[pi], b = sp[pi + 1];
 			torch::Tensor w2 = isFirst ? w : RepColsDiv(w, k);
@@ -618,8 +623,8 @@ int GGL::RunExpandCheckpoint() {
 	auto pw = GGL::ReadLayerSizesFromModule(in + "/POLICY.lt", true);
 	RG_LOG("GGL_EXPAND_K=" << k << ": trunk " << tw[0] << "->" << tw[0] * k
 		<< ", policy " << pw[0] << "->" << pw[0] * k);
-	ExpandOne(in + "/SHARED_HEAD.lt", out + "/SHARED_HEAD.lt", 230, tw, 0, k);
-	ExpandOne(in + "/POLICY.lt", out + "/POLICY.lt", tw[0] * k, pw, 90, k);
+	ExpandOne(in + "/SHARED_HEAD.lt", out + "/SHARED_HEAD.lt", 230, 230, tw, 0, k, true);
+	ExpandOne(in + "/POLICY.lt", out + "/POLICY.lt", tw[0], tw[0] * k, pw, 90, k, false);
 	RG_LOG("expansion complete -> " << out);
 	return 0;
 }
