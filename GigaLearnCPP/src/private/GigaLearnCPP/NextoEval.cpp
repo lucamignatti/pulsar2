@@ -164,9 +164,12 @@ int GGL::RunNextoEval() {
 	// no residuals, so mirror that too — otherwise the head shape will not match.
 	if (ReadMoEConfigFromModule(checkpoint + "/SHARED_HEAD.lt", sharedHeadConfig,
 			EnvInt("GGL_MOE_TOPK", 4))) {
+		// Only the RESIDUAL flag is an MoE consequence (the trainer turns it off for the
+		// policy head under GGL_MOE). Do NOT second-guess the head's width/depth: it is
+		// already read from the checkpoint's own weights, and different MoE lineages use
+		// different heads — forcing a single layer here made the 402M model (which has a
+		// deeper head) fail to load with "Saved model has different size".
 		policyConfig.addResiduals = false;
-		if (policySizes.size() > 1)
-			policyConfig.layerSizes = { policySizes.front() };
 	}
 
 	// CPU by default so this can run beside the live trainer without touching its GPU.

@@ -120,9 +120,9 @@ int main(int argc, char** argv) {
 		const char* tk = std::getenv("GGL_MOE_TOPK");
 		if (ReadMoEConfigFromModule(checkpoint + "/SHARED_HEAD.lt", sharedHeadConfig,
 				(tk && *tk) ? std::atoi(tk) : 4)) {
+			// Only the residual flag is an MoE consequence; the head's width/depth is
+			// already read from the checkpoint and differs between MoE lineages.
 			policyConfig.addResiduals = false;
-			if (policySizes.size() > 1)
-				policyConfig.layerSizes = { policySizes.front() };
 		}
 	}
 
