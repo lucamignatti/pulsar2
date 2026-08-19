@@ -134,3 +134,46 @@ std::vector<int> GGL::ReadLayerSizesFromModule(const std::string& ltPath, bool d
 		sizes.pop_back();
 	return sizes;
 }
+
+bool GGL::ReadMoEConfigFromModule(const std::string& ltPath, PartialModelConfig& cfgOut, int topK) {
+	// An MoE trunk is not describable by ReadLayerSizesFromModule: the expert stacks are
+	// 3-D so it skips them entirely, while each block's 2-D ROUTER weight [E, dim] gets
+	// read as an "E-wide layer". That is why every MoE checkpoint died in the deployment
+	// path with "addResiduals requires uniform layerSizes, got 64 among 1024-wide layers"
+	// — so no MoE bot could be evaluated offline or played in a real match.
+	//
+	// The geometry is fully recoverable from the weights: expertW1 is [E, hidden, dim]
+	// and expertW2 is [E, dim, hidden], one pair per block. Only topK is not stored
+	// (it is a routing scalar, not a parameter), so the caller supplies it.
+	torch::jit::script::Module m = torch::jit::load(ltPath, torch::kCPU);
+
+	int experts = 0, hidden = 0, dim = 0, expertTensors = 0;
+	for (const auto& p : m.named_parameters()) {
+		if (p.value.dim() != 3)
+			continue;
+		expertTensors++;
+		const int e = (int)p.value.size(0);
+		const int a = (int)p.value.size(1), b = (int)p.value.size(2);
+		experts = e;
+		// W1 is [E, hidden, dim] and W2 is [E, dim, hidden]; hidden is the larger of the
+		// two inner dims for an expanding FFN, but take it from W1 specifically by
+		// remembering the pair-min/max rather than assuming which we hit first.
+		if (hidden == 0 || dim == 0) { hidden = std::max(a, b); dim = std::min(a, b); }
+	}
+	if (expertTensors == 0)
+		return false; // dense checkpoint, caller keeps its existing path
+
+	if (expertTensors % 2 != 0)
+		RG_ERR_CLOSE("ReadMoEConfigFromModule: " << ltPath << " has " << expertTensors
+			<< " 3-D expert tensors, expected an even number (W1/W2 per block)");
+
+	cfgOut.layerSizes = { dim };
+	cfgOut.addResiduals = false;      // MoE blocks carry their own residual skips
+	cfgOut.moeBlocks = expertTensors / 2;
+	cfgOut.moeExperts = experts;
+	cfgOut.moeHidden = hidden;
+	cfgOut.moeTopK = topK;
+	RG_LOG("MoE checkpoint detected: " << cfgOut.moeBlocks << " blocks x " << experts
+		<< " experts, width " << dim << ", hidden " << hidden << ", top-" << topK);
+	return true;
+}

@@ -112,6 +112,20 @@ int main(int argc, char** argv) {
 	policyConfig.activationType = ModelActivationType::LEAKY_RELU;
 	policyConfig.addLayerNorm = true;
 
+	// MoE trunk: geometry comes from the 3-D expert stacks, not from the 2-D layer scan
+	// (which misreads each block's [E, dim] router as an E-wide layer and then trips
+	// addResiduals' uniform-width check). Without this no MoE checkpoint can be played.
+	// GGL_MOE_TOPK must match training - it is a routing scalar, not a saved parameter.
+	{
+		const char* tk = std::getenv("GGL_MOE_TOPK");
+		if (ReadMoEConfigFromModule(checkpoint + "/SHARED_HEAD.lt", sharedHeadConfig,
+				(tk && *tk) ? std::atoi(tk) : 4)) {
+			policyConfig.addResiduals = false;
+			if (policySizes.size() > 1)
+				policyConfig.layerSizes = { policySizes.front() };
+		}
+	}
+
 	// NOTE: the policy head is at plain trunk width. The Optimistic-Critic Ladder's
 	// 5-column policy wire (which made this head's input 512+5=517 on the 5.0v3 lineage
 	// from 18.88B on) was REMOVED 2026-07-25 with the rest of the Ladder actuation; the

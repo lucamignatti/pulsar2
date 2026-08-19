@@ -11,6 +11,11 @@ namespace GGL {
 	// 2-D weight is its output projection (addOutputLayer re-adds it).
 	RG_IMEXPORT std::vector<int> ReadLayerSizesFromModule(const std::string& ltPath, bool dropOutput);
 
+	// Fills cfgOut's MoE fields (and layerSizes/addResiduals) from a saved trunk that has
+	// 3-D expert stacks, returning false for an ordinary dense module so callers can keep
+	// their existing path. topK is the one thing the weights do not carry.
+	RG_IMEXPORT bool ReadMoEConfigFromModule(const std::string& ltPath, PartialModelConfig& cfgOut, int topK = 4);
+
 	struct RG_IMEXPORT InferUnit {
 		int obsSize;
 		RLGC::ObsBuilder* obsBuilder;

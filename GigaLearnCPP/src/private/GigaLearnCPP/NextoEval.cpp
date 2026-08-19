@@ -148,7 +148,7 @@ int GGL::RunNextoEval() {
 
 	PartialModelConfig sharedHeadConfig;
 	sharedHeadConfig.layerSizes = sharedSizes;
-	sharedHeadConfig.addResiduals = true; // current lineage; same hardcode as RLBotMain.cpp
+	sharedHeadConfig.addResiduals = true; // current dense lineage; same as RLBotMain.cpp
 	sharedHeadConfig.activationType = ModelActivationType::LEAKY_RELU;
 	sharedHeadConfig.addLayerNorm = true;
 	sharedHeadConfig.addOutputLayer = false;
@@ -158,6 +158,16 @@ int GGL::RunNextoEval() {
 	policyConfig.addResiduals = true;
 	policyConfig.activationType = ModelActivationType::LEAKY_RELU;
 	policyConfig.addLayerNorm = true;
+
+	// MoE trunks override the dense assumptions above (geometry read from the weights).
+	// Under GGL_MOE the trainer also shrinks the policy head to a single dense layer with
+	// no residuals, so mirror that too — otherwise the head shape will not match.
+	if (ReadMoEConfigFromModule(checkpoint + "/SHARED_HEAD.lt", sharedHeadConfig,
+			EnvInt("GGL_MOE_TOPK", 4))) {
+		policyConfig.addResiduals = false;
+		if (policySizes.size() > 1)
+			policyConfig.layerSizes = { policySizes.front() };
+	}
 
 	InferUnit inferUnit(obsBuilder, obsSize, actionParser,
 		sharedHeadConfig, policyConfig, checkpoint, /*useGPU=*/false);
