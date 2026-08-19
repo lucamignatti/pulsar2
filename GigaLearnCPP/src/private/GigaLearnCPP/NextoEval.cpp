@@ -169,11 +169,19 @@ int GGL::RunNextoEval() {
 			policyConfig.layerSizes = { policySizes.front() };
 	}
 
+	// CPU by default so this can run beside the live trainer without touching its GPU.
+	// GGL_EVAL_GPU=1 for large models: a 1B MoE (78M active params) on CPU is far too
+	// slow to reach a useful goal count — the first attempt on this checkpoint made no
+	// scoring progress in 10 minutes, while the GPU path is interactive.
+	const bool evalGPU = EnvOn("GGL_EVAL_GPU");
+	RG_LOG("  device:     " << (evalGPU ? "cuda" : "cpu"));
 	InferUnit inferUnit(obsBuilder, obsSize, actionParser,
-		sharedHeadConfig, policyConfig, checkpoint, /*useGPU=*/false);
+		sharedHeadConfig, policyConfig, checkpoint, /*useGPU=*/evalGPU);
 
 	// ---- Nexto via the trainer's adapter, on CPU (the GPU belongs to the trainer) ----
-	NextoOpponent nexto(nextoPath, torch::Device(torch::kCPU));
+	// Nexto follows the same device: leaving it on CPU while Pulsar is on GPU would make
+	// the opponent's forward the new bottleneck (it is small, but it runs every step).
+	NextoOpponent nexto(nextoPath, torch::Device(evalGPU ? torch::kCUDA : torch::kCPU));
 
 	// ---- Match-flow env ----
 	EnvSetConfig cfg = {};
