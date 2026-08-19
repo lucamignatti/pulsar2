@@ -13,6 +13,11 @@
 #include <RLGymCPP/TerminalConditions/NoTouchCondition.h>
 
 #include <ATen/Parallel.h>
+#include <torch/csrc/api/include/torch/serialize.h>
+#include <torch/nn/modules/normalization.h>
+#include <torch/nn/modules/linear.h>
+#include <torch/nn/modules/activation.h>
+#include <torch/nn/modules/container/sequential.h>
 
 #include <algorithm>
 #include <chrono>
@@ -528,5 +533,93 @@ int GGL::RunNextoEval() {
 	}
 
 	fnReport(true);
+	return 0;
+}
+
+// ===================== GGL_EXPAND_K: function-preserving width expansion =====================
+// Net2net widening of a trained dense policy. Duplicating every hidden unit k times leaves
+// LayerNorm EXACTLY invariant (mean and biased variance of [x,x,..,x] equal those of x), so a
+// layer CONSUMING a duplicated activation only has to duplicate its input columns and divide
+// by k for the network to compute the IDENTICAL function at k^2 the parameters. Verified
+// numerically before this was written (max err ~1e-5, float accumulation noise).
+//
+// This must be C++: Model::Save uses torch::save(Sequential), which writes a NESTED archive
+// (one sub-archive per submodule), while Python torch.jit.save writes a flat scripted module
+// that the C++ loader rejects. Same weights, wrong container.
+namespace {
+	torch::Tensor RepRows(const torch::Tensor& t, int k) { return t.repeat_interleave(k, 0); }
+	torch::Tensor RepColsDiv(const torch::Tensor& t, int k) { return t.repeat_interleave(k, 1) / (float)k; }
+
+	// Rebuild the flat Linear/LayerNorm/LeakyReLU stack these checkpoints use.
+	torch::nn::Sequential BuildStack(int numIn, const std::vector<int>& widths, int numOut) {
+		torch::nn::Sequential seq;
+		int prev = numIn;
+		for (size_t i = 0; i < widths.size(); i++) {
+			seq->push_back(torch::nn::Linear(torch::nn::LinearOptions(prev, widths[i])));
+			seq->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({ widths[i] })));
+			seq->push_back(torch::nn::LeakyReLU(torch::nn::LeakyReLUOptions().negative_slope(0.01)));
+			prev = widths[i];
+		}
+		if (numOut > 0)
+			seq->push_back(torch::nn::Linear(torch::nn::LinearOptions(prev, numOut)));
+		return seq;
+	}
+
+	void ExpandOne(const std::string& inPath, const std::string& outPath,
+		int numIn, const std::vector<int>& widths, int numOut, int k) {
+
+		torch::nn::Sequential small = BuildStack(numIn, widths, numOut);
+		torch::load(small, inPath);
+
+		std::vector<int> big;
+		for (int w : widths) big.push_back(w * k);
+		torch::nn::Sequential large = BuildStack(numIn, big, numOut);
+
+		auto sp = small->parameters();
+		auto lp = large->parameters();
+		if (sp.size() != lp.size())
+			RG_ERR_CLOSE("ExpandOne: parameter count mismatch " << sp.size() << " vs " << lp.size());
+
+		torch::NoGradGuard ng;
+		size_t pi = 0;
+		int nLin = (int)widths.size() + (numOut > 0 ? 1 : 0);
+		for (int li = 0; li < nLin; li++) {
+			bool isFirst = (li == 0);
+			bool isOut = (numOut > 0 && li == nLin - 1);
+			torch::Tensor w = sp[pi], b = sp[pi + 1];
+			torch::Tensor w2 = isFirst ? w : RepColsDiv(w, k);
+			torch::Tensor b2 = b;
+			if (!isOut) { w2 = RepRows(w2, k); b2 = RepRows(b, k); }
+			lp[pi].copy_(w2); lp[pi + 1].copy_(b2);
+			pi += 2;
+			if (!isOut) {
+				lp[pi].copy_(RepRows(sp[pi], k));
+				lp[pi + 1].copy_(RepRows(sp[pi + 1], k));
+				pi += 2;
+			}
+		}
+		{
+			std::ofstream out(outPath, std::ios::binary);
+			torch::save(large, out);
+			out.flush();
+		}
+		int64_t n = 0; for (auto& p : large->parameters()) n += p.numel();
+		RG_LOG("  wrote " << outPath << " (" << (n / 1000000) << "M params)");
+	}
+}
+
+int GGL::RunExpandCheckpoint() {
+	int k = EnvInt("GGL_EXPAND_K", 0);
+	std::string in = EnvStr("GGL_EXPAND_IN", ""), out = EnvStr("GGL_EXPAND_OUT", "");
+	if (k < 2 || in.empty() || out.empty())
+		RG_ERR_CLOSE("GGL_EXPAND_K>=2, GGL_EXPAND_IN and GGL_EXPAND_OUT are all required");
+	std::filesystem::create_directories(out);
+	auto tw = GGL::ReadLayerSizesFromModule(in + "/SHARED_HEAD.lt", false);
+	auto pw = GGL::ReadLayerSizesFromModule(in + "/POLICY.lt", true);
+	RG_LOG("GGL_EXPAND_K=" << k << ": trunk " << tw[0] << "->" << tw[0] * k
+		<< ", policy " << pw[0] << "->" << pw[0] * k);
+	ExpandOne(in + "/SHARED_HEAD.lt", out + "/SHARED_HEAD.lt", 230, tw, 0, k);
+	ExpandOne(in + "/POLICY.lt", out + "/POLICY.lt", tw[0] * k, pw, 90, k);
+	RG_LOG("expansion complete -> " << out);
 	return 0;
 }

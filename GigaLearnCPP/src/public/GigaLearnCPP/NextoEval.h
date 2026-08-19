@@ -2,6 +2,8 @@
 #include "Framework.h"
 
 namespace GGL {
+	// GGL_EXPAND_K/_IN/_OUT: net2net width expansion of a saved dense policy.
+	RG_IMEXPORT int RunExpandCheckpoint();
 	// Offline pure-sim goal-share eval vs the embedded Nexto (the qualifier yardstick:
 	// "score 42 before Nexto scores 28" is a race over at most 69 goals, so the whole
 	// question reduces to the per-goal win rate p - P(qualify per attempt) =

@@ -543,11 +543,15 @@ void StepCallback(Learner* learner, const std::vector<GameState>& states, Report
 	}
 }
 
+
 int main(int argc, char* argv[]) {
 	// Keep stdout live when it isn't a terminal (kept from the current codebase - a logging fix,
 	// not part of the regression). Under tools/run_trainer.sh stdout is a log file, so glibc
 	// block-buffers; unitbuf flushes after every insertion so --follow behaves like a terminal.
 	std::cout << std::unitbuf;
+
+	if (std::getenv("GGL_EXPAND_K"))
+		return GGL::RunExpandCheckpoint();
 
 	// MPI+NCCL (or stub). Collective self-test runs inside Init.
 	auto dist = Dist::Session::Init(argc, argv);
