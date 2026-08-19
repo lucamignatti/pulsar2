@@ -1237,6 +1237,30 @@ int main(int argc, char* argv[]) {
 	// shared trunk for embed + moeBlocks x MoEBlock and shrinks the policy head to one
 	// dense layer off the trunk. Defaults: 1.01B total / ~18M active. The value family
 	// stays dense. Cluster-only at full size (1B fp32 + Muon state needs ~12GB).
+
+	// GGL_DENSE_SCALE: multiply every dense width by this factor (rounded to 64) at birth.
+	// Added 2026-08-19 to test a DENSE net at MoE-comparable capacity, because dense at
+	// these batch sizes is overhead-bound rather than FLOP-bound - 27x the params may cost
+	// far less than 27x the time. Placed AFTER every dense width assignment (including the
+	// value families) so nothing silently overwrites it, and BEFORE the GGL_MOE block,
+	// which replaces these sizes wholesale. Birth-time only: widths are not shape-safe to
+	// change mid-run. Params scale ~quadratically (2x width ~= 4x params).
+	if (const char* ds = std::getenv("GGL_DENSE_SCALE"); ds && *ds) {
+		float f = std::strtof(ds, nullptr);
+		if (f > 0.f) {
+			auto scale = [f](std::vector<int>& v) {
+				for (int& x : v) x = std::max(64, (int)std::lround(x * f / 64.0f) * 64);
+			};
+			scale(cfg.ppo.sharedHead.layerSizes);
+			scale(cfg.ppo.policy.layerSizes);
+			scale(cfg.ppo.criticTrunk.layerSizes);
+			scale(cfg.ppo.critic.layerSizes);
+			RG_LOG("GGL_DENSE_SCALE=" << f << ": trunk " << cfg.ppo.sharedHead.layerSizes[0]
+				<< " policy " << cfg.ppo.policy.layerSizes[0]
+				<< " criticTrunk " << cfg.ppo.criticTrunk.layerSizes[0]);
+		}
+	}
+
 	if (const char* m = std::getenv("GGL_MOE"); m && *m && std::string(m) != "0") {
 		auto envInt = [](const char* n, int d) {
 			const char* e = std::getenv(n);
