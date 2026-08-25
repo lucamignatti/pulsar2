@@ -50,6 +50,13 @@ namespace GGL {
 		int epochs = 2;           // league PPO epochs per iteration
 		float clipRange = 0.2f;   // PPO clip (mirrors main)
 		float entropyScale = 0.f; // set from main config by the Learner
+		// Use the MAIN critic (read-only) as the variants' GAE baseline instead of the
+		// per-variant critic adapters. A fresh critic's error IS the advantage in the
+		// mostly-goal-free 24-step fragments this run collects, and PPO's clip
+		// asymmetry grinds that noise into policy diffusion (measured: variants at
+		// normalized entropy ~1.0 within ~350 iterations, both roles). Read-only, so
+		// no critic ever trains on two reward structures (the aliasing law holds).
+		bool useMainCritic = true;
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }

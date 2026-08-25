@@ -30,8 +30,12 @@ static constexpr float ACTION_DISABLED_LOGIT = -1e10f;
 // branch): entropy narrowed to the valid-action scope so heavily-masked states don't
 // read as inherently low-entropy.
 static torch::Tensor LeagueEntropyRows(torch::Tensor probs, torch::Tensor actionMasks) {
+	// Same normalization as the MAIN's panels (config.maskEntropy defaults false:
+	// divide by log(numActions)) so League ent and Policy Entropy are comparable -
+	// the /log(valid) form read 0.88 for the SAME distribution the main reports as
+	// 0.72, which sent one bring-up debugging session chasing a phantom.
 	auto entropy = -(probs.log() * probs).sum(-1);
-	entropy /= actionMasks.to(torch::kFloat32).sum(-1).clamp_min(2).log();
+	entropy /= logf((float)actionMasks.size(-1));
 	return entropy;
 }
 
@@ -400,6 +404,8 @@ void GGL::LeagueModule::PrepareLearnData() {
 
 torch::Tensor GGL::LeagueModule::InferValues(PPOLearner* ppo, torch::Tensor obs, torch::Tensor rowVariant) {
 	RG_NO_GRAD;
+	if (cfg.useMainCritic)
+		return ppo->InferCritic(obs).flatten().to(torch::kFloat32);
 	torch::Tensor trunk = ppo->ValueTrunk(obs, false);
 	int li = 0;
 	torch::Tensor v = ForwardLora(ppo->models["critic"], trunk, cri, rowVariant, li);
@@ -461,21 +467,27 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 
 			// Per-variant critic on the DETACHED value trunk: variant value error must
 			// not reshape shared perception; only the critic-head LoRA (and, unavoidably,
-			// the base critic head - zeroed below) receive gradient.
-			torch::Tensor trunk;
-			{
-				RG_NO_GRAD;
-				trunk = ppo->ValueTrunk(sl(states), false);
+			// the base critic head - zeroed below) receive gradient. Under useMainCritic
+			// the baseline is the main critic (read-only) and no critic trains here.
+			torch::Tensor criticLoss;
+			if (!cfg.useMainCritic) {
+				torch::Tensor trunk;
+				{
+					RG_NO_GRAD;
+					trunk = ppo->ValueTrunk(sl(states), false);
+				}
+				int li = 0;
+				auto vPred = ForwardLora(ppo->models["critic"], trunk.detach(), cri, sl(rowVariant), li).flatten();
+				criticLoss = (vPred - sl(targetValues)).pow(2).mean();
 			}
-			int li = 0;
-			auto vPred = ForwardLora(ppo->models["critic"], trunk.detach(), cri, sl(rowVariant), li).flatten();
-			auto criticLoss = (vPred - sl(targetValues)).pow(2).mean();
 
-			torch::Tensor loss = policyLoss - entropy * cfg.entropyScale + criticLoss * 0.5f;
+			torch::Tensor loss = policyLoss - entropy * cfg.entropyScale;
+			if (criticLoss.defined())
+				loss = loss + criticLoss * 0.5f;
 			loss.backward();
 
 			avgPolicyLoss += policyLoss.item<float>();
-			avgCriticLoss += criticLoss.item<float>();
+			avgCriticLoss += criticLoss.defined() ? criticLoss.item<float>() : 0.f;
 			avgEntropy += entropy.item<float>();
 			avgClipFrac += ((ratio - 1).abs() > cfg.clipRange).to(kFloat32).mean().item<float>();
 			updates++;
