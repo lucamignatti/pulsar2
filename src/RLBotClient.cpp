@@ -77,6 +77,14 @@ static Player ToPlayer(const rlbot::flat::PlayerInfo* p) {
 	// the window lapsed. Off-distribution obs plus a mask offering jumps the car cannot
 	// perform; the visible symptom is exactly "flails in the air, never converts".
 	pd.hasFlipped = p->has_dodged();
+	// ENGINE-SIDE JUMP/FLIP PHASE (2026-08-25). ToPlayer never set these, so any replay
+	// restoring a mid-jump or mid-flip car started it from a resting state — which made
+	// every dodge fired within ~100ms of takeoff untestable against the real game (the
+	// exact regime where wavedashes fail). The v5 AirState enum carries the phase, so
+	// derive the booleans; the durations are not in the packet and stay 0 (RocketSim
+	// re-derives them from its own tick counters after a SetState).
+	pd.isJumping = (airState == rlbot::flat::AirState::Jumping);
+	pd.isFlipping = (airState == rlbot::flat::AirState::Dodging);
 	// dodge_timeout = seconds of dodge window remaining; -1 "while on ground or when
 	// airborne for too long after jumping" (schema). Invert it into RocketSim's
 	// airTimeSinceJump. The -1 case is ambiguous, so disambiguate with the jump flags:
@@ -459,6 +467,102 @@ void RLBotBot::SendGroundReset(unsigned index) {
 	SendSegmentState(rst, index);
 }
 
+
+// ---- sim mirror -------------------------------------------------------------
+
+void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, int ticksElapsed) {
+	static const bool enabled = [] {
+		const char* v = std::getenv("GGL_SIM_MIRROR");
+		return !(v && *v && std::string(v) == "0");
+	}();
+	if (!enabled)
+		return;
+
+	if (!mirrorArena) {
+		// Arena::Create is safe here: RocketSim::Init already ran for the InferUnit path.
+		mirrorArena = Arena::Create(GameMode::SOCCAR);
+		if (!mirrorArena) {
+			RG_LOG("SIM MIRROR: arena creation failed; falling back to packet flags");
+			mirrorEnabled = false;
+		} else {
+			RG_LOG("SIM MIRROR: on (recovering isOnGround/jump/flip phase from RocketSim; "
+				"GGL_SIM_MIRROR=0 disables)");
+		}
+	}
+	if (!mirrorEnabled || !mirrorArena)
+		return;
+
+	MirrorCar& mc = mirrorByIndex[index];
+	if (!mc.car)
+		mc.car = mirrorArena->AddCar(pl.team);
+
+	CarState cs = mc.car->GetState();
+
+	// Physical pose is ground truth from the packet, every tick -> the mirror cannot
+	// drift. Everything NOT overwritten here is the engine-internal phase we are trying
+	// to recover, and is deliberately carried forward.
+	const Vec prevPos = cs.pos;
+	cs.pos = pl.pos;
+	cs.vel = pl.vel;
+	cs.rotMat = pl.rotMat;
+	cs.angVel = pl.angVel;
+	cs.boost = pl.boost;
+	cs.isDemoed = pl.isDemoed;
+
+	// Reconcile the phase flags the packet DOES report unmasked. Without this a missed
+	// tick would leave the mirror believing a spent flip is still available (or vice
+	// versa) for the rest of the life.
+	cs.hasJumped = pl.hasJumped;
+	cs.hasDoubleJumped = pl.hasDoubleJumped;
+	cs.hasFlipped = pl.hasFlipped;
+
+	if (!mc.primed) {
+		// First sight: trust the packet completely, including the (possibly masked)
+		// ground flag, so the mirror starts somewhere sane.
+		cs.isOnGround = pl.isOnGround;
+		mc.primed = true;
+	}
+	mc.car->SetState(cs);
+	CarControls cc = {};
+	cc.throttle = controls[0]; cc.steer = controls[1]; cc.pitch = controls[2];
+	cc.yaw = controls[3];      cc.roll = controls[4];
+	cc.jump = controls[5] > 0.5f; cc.boost = controls[6] > 0.5f; cc.handbrake = controls[7] > 0.5f;
+	mc.car->controls = cc;
+
+	const int steps = RS_CLAMP(ticksElapsed, 1, 16);
+	for (int t = 0; t < steps; t++)
+		mirrorArena->Step(1);
+
+	CarState out = mc.car->GetState();
+
+	// Divergence guard: the mirror is stepped from a re-synced pose, so a large position
+	// gap means the game did something we did not model (demo, goal reset, state set).
+	// Re-prime rather than feed the policy a stale phase.
+	const float gap = (out.pos - pl.pos).Length();
+	if (gap > 250.f) {
+		if (++mc.desyncTicks >= 3) {
+			mc.primed = false;
+			mc.desyncTicks = 0;
+			RG_LOG("SIM MIRROR: re-priming car " << index << " (pos gap " << gap << " uu)");
+			return;   // this tick keeps packet flags
+		}
+	} else {
+		mc.desyncTicks = 0;
+	}
+
+	// THE POINT: engine-derived state the packet masks or omits.
+	pl.isOnGround = out.isOnGround;
+	pl.hasFlipped = out.hasFlipped;
+	pl.hasJumped = out.hasJumped;
+	pl.hasDoubleJumped = out.hasDoubleJumped;
+	pl.isJumping = out.isJumping;
+	pl.isFlipping = out.isFlipping;
+	pl.jumpTime = out.jumpTime;
+	pl.flipTime = out.flipTime;
+	pl.airTimeSinceJump = out.airTimeSinceJump;
+	pl.flipRelTorque = out.flipRelTorque;
+}
+
 void RLBotBot::RunScripted(rlbot::flat::GamePacket const* packet, unsigned index, int ticksElapsed) {
 	auto players = packet->players();
 	if (!players || index >= players->size()) { setOutput(index, {}); return; }
@@ -606,6 +710,11 @@ void RLBotBot::update(
 		auto& localPlayer = gs.players[index];
 		localPlayer.prevAction = ctx.controls;
 
+		// Recover engine-derived jump/flip/ground state from a mirrored RocketSim (see
+		// RLBotClient.h). MUST run before the obs is built and before the action mask is
+		// computed, since both read isOnGround / HasFlipOrJump().
+		ApplyMirror(index, localPlayer, ctx.controls, ticksElapsed);
+
 		static const bool dbgOn = [] {
 			const char* v = std::getenv("GGL_DEBUG_JSONL");
 			return v && *v && std::string(v) != "0";
@@ -684,6 +793,18 @@ void RLBotBot::update(
 				float sav[3] = { localPlayer.angVel.x, localPlayer.angVel.y, localPlayer.angVel.z };
 				s << ",\"u\":"; AppendFloatArray(s, su, 3);
 				s << ",\"av\":"; AppendFloatArray(s, sav, 3);
+				// Jump/flip TIMERS (2026-08-25). Without these a replay cannot restore a
+				// car that is mid-jump, so every dodge fired within ~100ms of takeoff was
+				// untestable - which is precisely the early-dodge regime where real-game
+				// wavedashes fail. isJumping/jumpTime/flipTime/isFlipping complete the
+				// engine-side jump state that CarState carries across a SetState.
+				s << ",\"mir\":" << (int)(localPlayer.isOnGround)   // post-mirror ground flag
+				  << ",\"pkt_g\":" << (int)(packet->players()->Get(index)->air_state()
+					   == rlbot::flat::AirState::OnGround)             // raw packet flag
+				  << ",\"ij\":" << (int)localPlayer.isJumping
+				  << ",\"jt\":" << localPlayer.jumpTime
+				  << ",\"if\":" << (int)localPlayer.isFlipping
+				  << ",\"ft\":" << localPlayer.flipTime;
 				s << ",\"b\":"; AppendFloatArray(s, bp, 3);
 				s << ",\"bv\":"; AppendFloatArray(s, bv, 3);
 				s << ",\"mask\":\"" << MaskToHex(dbg.actionMask) << "\"";

@@ -7,6 +7,7 @@
 
 #include <rlbot/Bot.h>
 
+#include <RLGymCPP/Framework.h>
 #include <RLGymCPP/ObsBuilders/ObsBuilder.h>
 #include <RLGymCPP/ActionParsers/ActionParser.h>
 #include <GigaLearnCPP/Util/InferUnit.h>
@@ -106,6 +107,37 @@ private:
 		bool echoWaiting = false;
 	};
 	std::unordered_map<unsigned, CarCtx> ctxByIndex;
+
+	// ---- SIM MIRROR (2026-08-25) ------------------------------------------------
+	// RLBot's AirState masks the ground flag during a jump: the game reports Jumping
+	// from the press tick while the wheels stay in suspension contact for ~4 more
+	// ticks. Measured against a replay of 351 real ground jumps: for t+1..t+3 the sim
+	// says grounded ~80% while the packet says airborne ~90% - ~80% disagreement.
+	// At ts8 that was a sub-decision transient (the old code waived it on exactly that
+	// ground). At ts1 it is 4 CONSECUTIVE DECISIONS of corrupted self-obs, right where
+	// wavedash timing is decided, and the action mask gates jump rows on it.
+	//
+	// Fix (juan diego's diagnosis): step RocketSim alongside the live game for OUR OWN
+	// cars, whose controls we know exactly, and take the engine-derived state
+	// (isOnGround / isJumping / isFlipping / flip+jump timers / airTimeSinceJump) from
+	// the mirror instead of the packet. Physical pose is re-synced from the packet
+	// every tick, so the mirror cannot drift; only the internal jump/flip phase - which
+	// the packet does not expose - is carried forward. Opponents are NOT mirrored: we
+	// do not know their controls, so their flags stay packet-derived.
+	// GGL_SIM_MIRROR=0 disables and restores pure packet flags.
+	struct MirrorCar {
+		RocketSim::Car* car = nullptr;
+		bool primed = false;      // seen at least one packet
+		int desyncTicks = 0;      // consecutive ticks the mirror disagreed on position
+	};
+	RocketSim::Arena* mirrorArena = nullptr;
+	std::unordered_map<unsigned, MirrorCar> mirrorByIndex;
+	bool mirrorEnabled = true;
+
+	// Sync one controlled car into the mirror, step it, and overwrite the engine-derived
+	// fields of `pl` from the mirror. No-op if the mirror is disabled/unavailable.
+	void ApplyMirror(unsigned index, RLGC::Player& pl, const RLGC::Action& controls,
+		int ticksElapsed);
 
 	float prevTime = 0; // secondsElapsed of the previous packet (shared across this bot's cars)
 
