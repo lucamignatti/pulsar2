@@ -57,6 +57,12 @@ namespace GGL {
 		// normalized entropy ~1.0 within ~350 iterations, both roles). Read-only, so
 		// no critic ever trains on two reward structures (the aliasing law holds).
 		bool useMainCritic = true;
+		// Mirror the main's advantage filtering (MAGNITUDE mode): the policy trains
+		// only on the top-|A| fraction of rows. This is the third leg of the main's
+		// tuned economy (raw advantages + filtering + SIL); without it the league
+		// PPO grinds on the TD-residual noise sea of goal-free fragments and the
+		// clip asymmetry diffuses variants toward uniform (measured twice).
+		float advFilterFrac = 0.5f;
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }

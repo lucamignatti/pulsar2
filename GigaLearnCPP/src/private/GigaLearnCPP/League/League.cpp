@@ -445,11 +445,31 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	int64_t updates = 0;
 	(void)V;
 
+	// Advantage filter (see LeagueConfig::advFilterFrac). Applied by row selection
+	// up front - with useMainCritic there is no critic loss, so every remaining
+	// consumer of these tensors is policy-side and filtering all of them is exact.
+	int64_t nEff = n;
+	if (n > 3 && cfg.advFilterFrac < 1.f) {
+		RG_NO_GRAD;
+		auto thr = advantages.abs().quantile(1. - (double)cfg.advFilterFrac);
+		auto keep = (advantages.abs() >= thr).nonzero().flatten();
+		if (keep.numel() > 1) {
+			states = states.index_select(0, keep);
+			actionMasks = actionMasks.index_select(0, keep);
+			actions = actions.index_select(0, keep);
+			logProbs = logProbs.index_select(0, keep);
+			advantages = advantages.index_select(0, keep);
+			targetValues = targetValues.defined() ? targetValues.index_select(0, keep) : targetValues;
+			rowVariant = rowVariant.index_select(0, keep);
+			nEff = keep.numel();
+		}
+	}
+
 	for (int epoch = 0; epoch < cfg.epochs; epoch++) {
 		// PPO on variant rows (single pass; league buffers are small - minibatch only
 		// if the row count ever exceeds cfg.miniBatch).
-		for (int64_t start = 0; start < n; start += cfg.miniBatch) {
-			int64_t stop = RS_MIN(start + cfg.miniBatch, n);
+		for (int64_t start = 0; start < nEff; start += cfg.miniBatch) {
+			int64_t stop = RS_MIN(start + cfg.miniBatch, nEff);
 			auto sl = [&](torch::Tensor t) { return t.slice(0, start, stop); };
 
 			torch::Tensor logits = PolicyLogitsLora(ppo->models, sl(states), pol, sl(rowVariant));

@@ -421,6 +421,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.epochs = envI("GGL_LEAGUE_EPOCHS", lc.epochs);
 		lc.discWarmupUpdates = envI("GGL_LEAGUE_WARMUP", lc.discWarmupUpdates);
 		lc.useMainCritic = envI("GGL_LEAGUE_MAINV", lc.useMainCritic ? 1 : 0) != 0;
+		lc.advFilterFrac = envF("GGL_LEAGUE_ADVFRAC", lc.advFilterFrac);
 		lc.clipRange = config.ppo.clipRange;
 		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);
