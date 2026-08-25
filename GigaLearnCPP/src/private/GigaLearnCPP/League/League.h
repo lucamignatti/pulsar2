@@ -63,6 +63,13 @@ namespace GGL {
 		// PPO grinds on the TD-residual noise sea of goal-free fragments and the
 		// clip asymmetry diffuses variants toward uniform (measured twice).
 		float advFilterFrac = 0.5f;
+		// SIL, the fourth leg (set from the main's silCoeff): positive-only BC on rows
+		// whose advantage residual beats +1 sigma (conversion, not routine luck),
+		// weight = clamp(A, 0, 2 sigma). This is the GCO run's load-bearing sparse
+		// mechanism - without it a variant below break-even gets ~pure suppression
+		// gradient ("avoid what you did", never "do this instead") and death-spirals:
+		// measured as the residual gsDiv decay after the first three economy legs.
+		float silCoeff = 0.05f;
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }

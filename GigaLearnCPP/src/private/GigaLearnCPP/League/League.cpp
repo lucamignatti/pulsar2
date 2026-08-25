@@ -441,7 +441,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	// part of the main run's tuned economy (returnStd scaling, entropyScale balance);
 	// the league must inherit it, not invent its own.
 	double avgPolicyLoss = 0, avgCriticLoss = 0, avgEntropy = 0, avgDiscLoss = 0;
-	double avgClipFrac = 0;
+	double avgClipFrac = 0, avgSilFrac = 0;
 	int64_t updates = 0;
 	(void)V;
 
@@ -504,6 +504,25 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			torch::Tensor loss = policyLoss - entropy * cfg.entropyScale;
 			if (criticLoss.defined())
 				loss = loss + criticLoss * 0.5f;
+
+			// SIL (see LeagueConfig::silCoeff). Success-only consolidation: mean BC on
+			// conversion rows, mirroring PPOLearner's form with the advantage residual
+			// standing in for (R - V_exp) - no gap sensor exists for variants.
+			if (cfg.silCoeff > 0) {
+				torch::Tensor silW;
+				{
+					RG_NO_GRAD;
+					auto advMb = sl(advantages);
+					auto sd = advMb.std() + 1e-8f;
+					silW = advMb.clamp(0.f, 2.f * sd.item<float>())
+						* (advMb > sd).to(torch::kFloat32);
+				}
+				auto nConv = silW.count_nonzero().to(torch::kFloat32);
+				auto silLoss = (-(newLogProbs)*silW).sum() / nConv.clamp_min(1) * cfg.silCoeff;
+				silLoss = silLoss * (nConv > 0).to(silLoss.dtype());
+				loss = loss + silLoss;
+				avgSilFrac += (nConv / (float)RS_MAX((int64_t)1, stop - start)).item<float>();
+			}
 			loss.backward();
 
 			avgPolicyLoss += policyLoss.item<float>();
@@ -603,6 +622,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
 			<< " adNorm=" << report["League/Adapter Norm"]
+			<< " silFrac=" << (updates ? avgSilFrac / updates : -1.)
 			<< " ent=" << (updates ? avgEntropy / updates : -1.)
 			<< " discAcc=" << (report.Has("League/Disc Acc") ? report["League/Disc Acc"] : -1.)
 			<< " res=" << statReservoirFill
