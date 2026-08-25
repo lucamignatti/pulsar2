@@ -123,6 +123,8 @@ GGL::LeagueModule::LeagueModule(ModelSet& baseModels, LeagueConfig config, torch
 	rdivVar.assign(cfg.Total(), 1.f);
 	goalsFor.assign(cfg.Total(), 0);
 	goalsAgainst.assign(cfg.Total(), 0);
+	winGoalsFor.assign(cfg.Total(), 0);
+	winGoalsAgainst.assign(cfg.Total(), 0);
 
 	SyncCollectSnapshot();
 
@@ -139,14 +141,25 @@ GGL::LeagueModule::~LeagueModule() {
 	delete discOptim;
 }
 
-std::vector<torch::Tensor> GGL::LeagueModule::LiveParams() {
+std::vector<torch::Tensor> GGL::LeagueModule::AdapterParams() {
 	std::vector<torch::Tensor> out;
 	for (auto* s : { &pol, &cri })
 		for (auto* v : { &s->A, &s->B })
 			for (auto& t : *v)
 				out.push_back(t);
+	return out;
+}
+
+std::vector<torch::Tensor> GGL::LeagueModule::DiscParams() {
+	std::vector<torch::Tensor> out;
 	for (auto& p : discPair->parameters()) out.push_back(p);
 	for (auto& p : discMarg->parameters()) out.push_back(p);
+	return out;
+}
+
+std::vector<torch::Tensor> GGL::LeagueModule::LiveParams() {
+	auto out = AdapterParams();
+	for (auto& p : DiscParams()) out.push_back(p);
 	return out;
 }
 
@@ -384,6 +397,10 @@ void GGL::LeagueModule::PrepareLearnData() {
 	}
 	statGoalsFor = goalsFor;
 	statGoalsAgainst = goalsAgainst;
+	statWinFor = winGoalsFor;
+	statWinAgainst = winGoalsAgainst;
+	std::fill(winGoalsFor.begin(), winGoalsFor.end(), (int64_t)0);
+	std::fill(winGoalsAgainst.begin(), winGoalsAgainst.end(), (int64_t)0);
 	statReservoirFill = reservoir.Size();
 
 	discD0 = discD1 = discLag = discZ = torch::Tensor();
@@ -417,8 +434,36 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	torch::Tensor targetValues, torch::Tensor rowVariant,
 	Dist::Session* dist, Report& report) {
 
-	const int64_t n = states.defined() ? states.size(0) : 0;
 	const int V = cfg.Total();
+
+	// ---- ACCUMULATION (LeagueConfig::accumEvery) ----
+	// Bank this iteration's rows; only update when the window closes. accumCount is
+	// incremented identically on every rank, so the update decision is lockstep and
+	// the grad allreduce below can never deadlock.
+	if (states.defined() && states.size(0) > 0) {
+		pendStates.push_back(states);
+		pendMasks.push_back(actionMasks);
+		pendActions.push_back(actions);
+		pendLogProbs.push_back(logProbs);
+		pendAdv.push_back(advantages);
+		pendVariant.push_back(rowVariant);
+		if (targetValues.defined())
+			pendTargets.push_back(targetValues);
+	}
+	accumCount++;
+	const bool doUpdate = (accumCount >= RS_MAX(1, cfg.accumEvery)) && !pendStates.empty();
+	int64_t n = 0;
+	if (doUpdate) {
+		states = torch::cat(pendStates, 0);
+		actionMasks = torch::cat(pendMasks, 0);
+		actions = torch::cat(pendActions, 0);
+		logProbs = torch::cat(pendLogProbs, 0);
+		advantages = torch::cat(pendAdv, 0);
+		rowVariant = torch::cat(pendVariant, 0);
+		targetValues = pendTargets.size() == pendStates.size()
+			? torch::cat(pendTargets, 0) : torch::Tensor();
+		n = states.size(0);
+	}
 
 	// Pre-step copy for the update-magnitude panel (the "is it actually training"
 	// tripwire this project keeps re-learning the need for).
@@ -556,11 +601,17 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			discUpdates++;
 		}
 
-		// Grad sync + step: league params only. Every rank hosts every variant, so the
-		// allreduce keeps adapters bit-identical across ranks like the main models.
-		if (dist && dist->distributed()) {
+		// Grad sync + step. The two optimizers run on DIFFERENT cadences (adapters only
+		// when the accumulation window closes, disc every iteration), so they get
+		// separate allreduces - and the adapter optimizer is NOT stepped on a
+		// no-update iteration: Adam with a zeroed grad still emits a nonzero step from
+		// leftover momentum, which would let the adapters drift on stale gradient
+		// exactly when the design says they are holding still.
+		auto fnAllreduce = [&](const std::vector<torch::Tensor>& params) {
+			if (!dist || !dist->distributed() || params.empty())
+				return;
 			std::vector<Dist::Session::GradRef> refs;
-			for (auto& p : LiveParams()) {
+			for (auto& p : params) {
 				auto g = p.mutable_grad();
 				if (!g.defined()) {
 					g = torch::zeros_like(p);
@@ -572,14 +623,23 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 				}
 				refs.push_back({ g.data_ptr<float>(), (size_t)g.numel() });
 			}
-			dist->allreduce_avg_grads(refs, LeagueCudaStream(LiveParams()[0].grad()));
+			dist->allreduce_avg_grads(refs, LeagueCudaStream(params[0].grad()));
+		};
+		if (doUpdate) {
+			fnAllreduce(AdapterParams());
+			adapterOptim->step();
+			adapterOptim->zero_grad();
 		}
-		adapterOptim->step();
-		adapterOptim->zero_grad();
 		if (discD0.defined()) {
+			fnAllreduce(DiscParams());
 			discOptim->step();
 			discOptim->zero_grad();
 		}
+	}
+	if (doUpdate) {
+		pendStates.clear(); pendMasks.clear(); pendActions.clear();
+		pendLogProbs.clear(); pendAdv.clear(); pendTargets.clear(); pendVariant.clear();
+		accumCount = 0;
 	}
 
 	// The league backward necessarily deposited gradients on the BASE weights
@@ -612,13 +672,20 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	if (!dist || dist->rank() == 0) {
 		// Mean goal share vs the main per role (criteria 3/4 readable from the log
 		// alone - this lineage runs with wandb disabled).
-		auto share = [&](int lo, int hi) {
+		auto shareOf = [&](const std::vector<int64_t>& F, const std::vector<int64_t>& A,
+			int lo, int hi) {
 			int64_t gf = 0, ga = 0;
-			for (int v = lo; v < hi && v < (int)statGoalsFor.size(); v++) {
-				gf += statGoalsFor[v];
-				ga += statGoalsAgainst[v];
+			for (int v = lo; v < hi && v < (int)F.size(); v++) {
+				gf += F[v];
+				ga += A[v];
 			}
 			return (gf + ga > 0) ? (double)gf / (double)(gf + ga) : -1.0;
+		};
+		auto share = [&](int lo, int hi) {
+			return shareOf(statGoalsFor, statGoalsAgainst, lo, hi);
+		};
+		auto wshare = [&](int lo, int hi) {
+			return shareOf(statWinFor, statWinAgainst, lo, hi);
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
 			<< " adNorm=" << report["League/Adapter Norm"]
@@ -629,6 +696,8 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			<< " rdivMean=" << statRdivMean
 			<< " gsDiv=" << share(0, cfg.numDiverse)
 			<< " gsExp=" << share(cfg.numDiverse, cfg.Total())
+			<< " wDiv=" << wshare(0, cfg.numDiverse)
+			<< " wExp=" << wshare(cfg.numDiverse, cfg.Total())
 			<< " (warmup " << discUpdates << "/" << cfg.discWarmupUpdates << ")");
 	}
 	if (avgDiscLoss != 0)

@@ -70,6 +70,14 @@ namespace GGL {
 		// gradient ("avoid what you did", never "do this instead") and death-spirals:
 		// measured as the residual gsDiv decay after the first three economy legs.
 		float silCoeff = 0.05f;
+		// Iterations of league rows to ACCUMULATE before one adapter update. The fleet
+		// gives the main 4176 rows/rank/iter for ONE policy; the league gets 594 split
+		// across Total() variants = ~59/variant/rank, a 70x smaller batch taking the
+		// SAME number of update steps. That is far past the advantage-noise floor this
+		// env has (episode-cluster variance ~5x binomial). Accumulating is free in data
+		// terms and costs only off-policyness: the adapters are CONSTANT across a
+		// window, so the only staleness is base drift, which the clip absorbs.
+		int accumEvery = 4;
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }
@@ -124,8 +132,13 @@ namespace GGL {
 
 		// Per-variant r_div running stats (EMA mean/var) - collect thread only.
 		std::vector<float> rdivMean, rdivVar;
-		// Per-variant cumulative goal counters (collect thread writes, barrier reads).
+		// Per-variant goal counters (collect thread writes, barrier reads). CUMULATIVE
+		// since process start, plus a WINDOW pair zeroed at every barrier harvest: a
+		// cumulative share has so much inertia that a recovered variant still reads
+		// low for hours (the Nexto-counter lesson - the slope is the signal, so
+		// publish the slope directly).
 		std::vector<int64_t> goalsFor, goalsAgainst;
+		std::vector<int64_t> winGoalsFor, winGoalsAgainst;
 		// Iteration-window r_div telemetry (collect thread).
 		double rdivSum = 0, rdivSqSum = 0; int64_t rdivCnt = 0;
 
@@ -137,6 +150,13 @@ namespace GGL {
 		int64_t statRdivCnt = 0;
 		int64_t statReservoirFill = 0;
 		std::vector<int64_t> statGoalsFor, statGoalsAgainst;
+		std::vector<int64_t> statWinFor, statWinAgainst;
+
+		// Accumulation buffers (see LeagueConfig::accumEvery). Device tensors held
+		// across iterations; ~4MB at the fleet's row counts.
+		std::vector<torch::Tensor> pendStates, pendMasks, pendActions, pendLogProbs,
+			pendAdv, pendTargets, pendVariant;
+		int accumCount = 0;
 
 		LeagueModule(ModelSet& baseModels, LeagueConfig config, torch::Device device, int numPlayers);
 		~LeagueModule();
@@ -192,7 +212,10 @@ namespace GGL {
 		void BroadcastParams(Dist::Session* dist);
 
 		// All live trainable tensors (adapters + disc), for save/bcast/allreduce.
+		// The two families step on different cadences, hence the split accessors.
 		std::vector<torch::Tensor> LiveParams();
+		std::vector<torch::Tensor> AdapterParams();
+		std::vector<torch::Tensor> DiscParams();
 
 	private:
 		// Walk a model chain's fp32 seq with per-row rank-r deltas; honors residual spans.

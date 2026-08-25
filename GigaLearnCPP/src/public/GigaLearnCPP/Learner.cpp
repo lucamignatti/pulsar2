@@ -423,6 +423,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.useMainCritic = envI("GGL_LEAGUE_MAINV", lc.useMainCritic ? 1 : 0) != 0;
 		lc.advFilterFrac = envF("GGL_LEAGUE_ADVFRAC", lc.advFilterFrac);
 		lc.silCoeff = envF("GGL_LEAGUE_SIL", config.ppo.silCoeff > 0 ? config.ppo.silCoeff : lc.silCoeff);
+		lc.accumEvery = envI("GGL_LEAGUE_ACCUM", lc.accumEvery);
 		lc.clipRange = config.ppo.clipRange;
 		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);
@@ -3185,10 +3186,13 @@ void GGL::Learner::Start() {
 									if (gs.goalScored) {
 										int v = leaguePlayerVariant[lp];
 										auto& pl = gs.players[playerSlotIdx[lp]];
-										if (pl.team != RS_TEAM_FROM_Y(gs.ball.pos.y))
+										if (pl.team != RS_TEAM_FROM_Y(gs.ball.pos.y)) {
 											league->goalsFor[v]++;
-										else
+											league->winGoalsFor[v]++;
+										} else {
 											league->goalsAgainst[v]++;
+											league->winGoalsAgainst[v]++;
+										}
 									}
 								}
 							}
