@@ -298,6 +298,8 @@ pub struct RaycastInfo {
 
 pub struct WheelInfo {
     pub raycast_info: Option<RaycastInfo>,
+    /// Contact as of the previous tick's pre-pass (touchdown-exception bookkeeping).
+    pub was_in_contact_prev_tick: bool,
     /// A surface is within the EXTENDED probe but outside the suspension's working range.
     /// Such a wheel feeds the sticky-force gate (adhesion) but gets no `raycast_info`, so
     /// it generates no friction, drive or suspension force. See SIM2REAL_AUDIT.md S29/S30.
@@ -326,6 +328,7 @@ pub struct WheelInfo {
 impl WheelInfo {
     pub const DEFAULT: Self = Self {
         raycast_info: None,
+        was_in_contact_prev_tick: false,
         adhesion_contact: false,
         hard_point: Vec3A::ZERO,
         axle_dir: Vec3A::ZERO,

@@ -37,6 +37,18 @@ fn env_f32(name: &'static str, default: f32) -> f32 {
 /// stack (SIM2REAL_LOOP.md 2026-08-23 22:00) together with apply-time forces,
 /// no graze-damp fade, tuned ray, steer-at-apply, and uncapped pushback.
 /// DEFAULT ON since 2026-08-23; `GGL_WHEELS_PRE=0` restores post-step wheels.
+fn ggl_no_touchdown_exc() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_NO_TOUCHDOWN_EXC").is_ok_and(|s| s != "0"))
+}
+
+/// How many ticks after touchdown keep the post-step wheel pass. Fit on real-game
+/// full-pose captures (see research/tools landing tests); default from that fit.
+fn ggl_touchdown_exc_ticks() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_TOUCHDOWN_EXC_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(5))
+}
+
 fn ggl_wheels_pre() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| env::var("GGL_WHEELS_PRE").map_or(true, |s| s != "0"))
@@ -92,6 +104,10 @@ use crate::{
 };
 
 pub struct Car {
+    /// Touchdown exception: run the wheel pass post-step for THIS tick only.
+    pub(crate) wheels_post_this_tick: bool,
+    /// Countdown: remaining ticks of post-step wheel pass after a touchdown.
+    pub(crate) touchdown_post_ticks: u8,
     pub(crate) info: CarInfo,
     pub(crate) bullet_vehicle: VehicleRL,
     pub(crate) rigid_body_idx: usize,
@@ -181,6 +197,8 @@ impl Car {
         }
 
         Self {
+            wheels_post_this_tick: false,
+            touchdown_post_ticks: 0,
             info: CarInfo { idx, team, config },
             rigid_body_idx,
             bullet_vehicle: VehicleRL::new(rigid_body_idx, wheels),
@@ -1292,11 +1310,40 @@ impl Car {
         }
 
         if ggl_wheels_pre() {
-            // Tuned order: suspension/friction at this pose, then Bullet step.
-            self.bullet_vehicle
-                .update_vehicle_second(collision_world, TICK_TIME);
-            let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
-            self.update_boost(rb, mutator_config);
+            // TOUCHDOWN EXCEPTION (2026-08-25, measured on two real-game full-pose
+            // captures): the pre-step wheel pass is exact for wheels ALREADY in contact
+            // (steady ground |vz| residual 0.01 uu/s) but over-damps the first contact
+            // ticks of a landing: sim under-rebounds by -13.5 uu/s vertical at t+2 vs
+            // the real game, while the post-step path lands at -1.6 (and conversely
+            // costs 2-9 uu/s continuously when used for steady rolling). So gate
+            // per tick: any wheel newly in contact this tick (touchdown) -> post-step
+            // path for this tick; all persisting contacts -> pre-step path.
+            // GGL_NO_TOUCHDOWN_EXC=1 restores unconditional pre-step.
+            let newly_touching = !ggl_no_touchdown_exc()
+                && self.bullet_vehicle.wheels.iter().any(|w| {
+                    w.raycast_info.is_some() && !w.was_in_contact_prev_tick
+                });
+            for w in self.bullet_vehicle.wheels.iter_mut() {
+                w.was_in_contact_prev_tick = w.raycast_info.is_some();
+            }
+            if newly_touching {
+                self.touchdown_post_ticks = ggl_touchdown_exc_ticks();
+            }
+            if self.touchdown_post_ticks > 0 {
+                self.touchdown_post_ticks -= 1;
+                // post-step semantics for the touchdown tick: boost now, wheels after
+                // the Bullet step (post_tick path invoked by the caller flag below).
+                let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
+                self.update_boost(rb, mutator_config);
+                self.wheels_post_this_tick = true;
+            } else {
+                // Tuned order: suspension/friction at this pose, then Bullet step.
+                self.bullet_vehicle
+                    .update_vehicle_second(collision_world, TICK_TIME);
+                let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
+                self.update_boost(rb, mutator_config);
+                self.wheels_post_this_tick = false;
+            }
         }
     }
 
@@ -1353,9 +1400,10 @@ impl Car {
             let chassis = &collision_world.bodies()[self.rigid_body_idx];
             self.apply_friction_curves(chassis);
         }
-        if !ggl_wheels_pre() {
+        if !ggl_wheels_pre() || self.wheels_post_this_tick {
             self.bullet_vehicle
                 .update_vehicle_second(collision_world, TICK_TIME);
+            self.wheels_post_this_tick = false;
         }
         let mut num_wheels_in_contact = 0u8;
         let travel_bt = vehicle_consts::MAX_SUSPENSION_TRAVEL * UU_TO_BT;

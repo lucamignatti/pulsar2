@@ -58,6 +58,20 @@ set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}")
 # Include RLGymSim_PPO
 add_subdirectory(GigaLearnCPP)
 target_link_libraries(GigaLearnBot PRIVATE GigaLearnCPP)
+
+# GGL_BUILD_CROSSPLAY: two-bot cross-play evaluator (src/CrossPlay.cpp). Runs a foreign
+# GGL-family bot (its own obs builder / arch / tickSkip) against ours inside the certified
+# RocketSimV3, for large-n goal-share measurement that real matches cannot supply.
+option(GGL_BUILD_CROSSPLAY "Build the cross-play evaluator" OFF)
+if (GGL_BUILD_CROSSPLAY)
+	add_executable(GigaLearnCrossPlay src/CrossPlay.cpp)
+	set_target_properties(GigaLearnCrossPlay PROPERTIES LINKER_LANGUAGE CXX CXX_STANDARD 20)
+	target_link_libraries(GigaLearnCrossPlay PRIVATE GigaLearnCPP)
+	if (UNIX)
+		find_package(Threads REQUIRED)
+		target_link_libraries(GigaLearnCrossPlay PRIVATE Threads::Threads)
+	endif()
+endif()
 if (GGL_USE_MULTI_GPU)
 	target_compile_definitions(GigaLearnBot PUBLIC USE_MULTI_GPU=1 USE_NCCL=1 USE_MPI=1)
 	target_link_libraries(GigaLearnBot PRIVATE Threads::Threads)

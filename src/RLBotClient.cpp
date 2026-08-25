@@ -675,6 +675,15 @@ void RLBotBot::update(
 				s << ",\"p\":"; AppendFloatArray(s, sp, 3);
 				s << ",\"v\":"; AppendFloatArray(s, sv, 3);
 				s << ",\"f\":"; AppendFloatArray(s, sf, 3);
+				// Full rotation state for sim2real replay (2026-08-25): forward alone cannot
+				// restore roll or angular velocity, which capped the free-run divergence
+				// analysis at ~4 ticks of validity (orientation drift dominated all deeper
+				// error). up + angVel complete the pose; suspension compression remains the
+				// one un-captured state (GamePacket does not expose it).
+				float su[3] = { localPlayer.rotMat.up.x, localPlayer.rotMat.up.y, localPlayer.rotMat.up.z };
+				float sav[3] = { localPlayer.angVel.x, localPlayer.angVel.y, localPlayer.angVel.z };
+				s << ",\"u\":"; AppendFloatArray(s, su, 3);
+				s << ",\"av\":"; AppendFloatArray(s, sav, 3);
 				s << ",\"b\":"; AppendFloatArray(s, bp, 3);
 				s << ",\"bv\":"; AppendFloatArray(s, bv, 3);
 				s << ",\"mask\":\"" << MaskToHex(dbg.actionMask) << "\"";
