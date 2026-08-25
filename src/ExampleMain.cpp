@@ -218,6 +218,17 @@ static Reward* Scaffold(Reward* child) {
 // OWN net (after any opponent touch) arms a phantom shot credited to the opponent - a red-teamed,
 // source-verified exploit (GameEventTracker.cpp). OpposedSaveReward below closes the matching
 // self-save farm with a last-touch guard instead.
+// LEAGUE (GGL_LEAGUE=1) — a fixed roster of LoRA policy variants riding the LIVE main
+// weights: 8 diverse bots (paid a discriminator-derived diversity term over state pairs
+// ~2.5s and ~9s apart, credited at the later endpoint) + 2 exploiters (plain zero-sum
+// reward vs the main). A per-arena slice of the fleet (GGL_LEAGUE_FRAC, default 0.25)
+// hosts main-vs-variant play; the main trains on its half of those rows, the variants on
+// theirs (separate LoRA critics — one critic must never price two reward structures).
+// Entirely env-driven (see the GGL_LEAGUE block in Learner.cpp): GGL_LEAGUE_DIVERSE /
+// _EXPLOITERS / _RANK / _FRAC / _DIV_BETA / _LR / _DISC_LR / _LAG_SHORT / _LAG_LONG /
+// _EPOCHS. Default OFF; designed for the pulsar2-league test arm beside prod 7.9-gco.
+// Design record: the league plan of 2026-08-25 (adapters-on-live-base, I(z; s_{t+n}|s_t)
+// diversity, no snapshot sync). Remember every GGL_LEAGUE_* var in the mpirun -x list.
 std::vector<WeightedReward> BuildRewards(float gamma) {
 	// GCO ("goal/concede only") — GGL_GCO=1. The whole shaping stack is removed and the
 	// ONLY reward is the terminal +-150 goal. This is the sparse-RL control: every

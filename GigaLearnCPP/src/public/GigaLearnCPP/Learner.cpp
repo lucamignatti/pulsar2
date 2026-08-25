@@ -23,6 +23,7 @@
 #include <private/GigaLearnCPP/NextoOpponent.h>
 #include <private/GigaLearnCPP/KickoffScript.h>
 #include <private/GigaLearnCPP/Util/Plasticity.h>
+#include <private/GigaLearnCPP/League/League.h>
 
 #include "Util/KeyPressDetector.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
@@ -394,6 +395,40 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
 	}
 
+	// ===================== LEAGUE (GGL_LEAGUE) =====================
+	// LoRA-variant league: diverse bots + exploiters riding the LIVE main weights.
+	// Test-arm feature, default off; see League/League.h for the design contract.
+	// Env-driven like GGL_ES/GGL_GCO so enabling it cannot shape-break other runs.
+	if (const char* e = std::getenv("GGL_LEAGUE"); e && *e && std::string(e) != "0"
+		&& !config.renderMode) {
+		auto envF = [](const char* n, float d) {
+			const char* s = std::getenv(n); return (s && *s) ? std::strtof(s, nullptr) : d;
+		};
+		auto envI = [](const char* n, int d) {
+			const char* s = std::getenv(n); return (s && *s) ? std::atoi(s) : d;
+		};
+		LeagueConfig lc = {};
+		lc.numDiverse = envI("GGL_LEAGUE_DIVERSE", lc.numDiverse);
+		lc.numExploiters = envI("GGL_LEAGUE_EXPLOITERS", lc.numExploiters);
+		lc.rank = envI("GGL_LEAGUE_RANK", lc.rank);
+		lc.arenaFrac = envF("GGL_LEAGUE_FRAC", lc.arenaFrac);
+		lc.divBeta = envF("GGL_LEAGUE_DIV_BETA", lc.divBeta);
+		lc.adapterLR = envF("GGL_LEAGUE_LR", lc.adapterLR);
+		lc.discLR = envF("GGL_LEAGUE_DISC_LR", lc.discLR);
+		// Lags in DECISION STEPS; defaults re-derived from tickSkip for ~2.5s / ~9s.
+		lc.lagShort = envI("GGL_LEAGUE_LAG_SHORT", (int)(2.5f * 120.f / config.tickSkip));
+		lc.lagLong = envI("GGL_LEAGUE_LAG_LONG", (int)(9.f * 120.f / config.tickSkip));
+		lc.epochs = envI("GGL_LEAGUE_EPOCHS", lc.epochs);
+		lc.discWarmupUpdates = envI("GGL_LEAGUE_WARMUP", lc.discWarmupUpdates);
+		lc.clipRange = config.ppo.clipRange;
+		lc.entropyScale = config.ppo.entropyScale;
+		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);
+		RG_LOG("League: ON - " << lc.numDiverse << " diverse + " << lc.numExploiters
+			<< " exploiters, rank " << lc.rank << ", arenaFrac " << lc.arenaFrac
+			<< ", beta " << lc.divBeta << ", lags " << lc.lagShort << "/" << lc.lagLong
+			<< " steps");
+	}
+
 	if (config.renderMode) {
 		renderSender = new RenderSender(config.renderTimeScale);
 		// The viewer's control panel: transport, rewind history, live state editing.
@@ -436,6 +471,8 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 
 	if (dist && dist->distributed()) {
 		ppo->models.BroadcastParameters(dist);
+		if (league)
+			league->BroadcastParams(dist); // random A init must match across ranks
 		torch::manual_seed((uint64_t)config.randomSeed + (uint64_t)dist->rank() + 1);
 		dist->barrier();
 	}
@@ -707,6 +744,8 @@ void GGL::Learner::Save() {
 	RG_LOG("Saving to folder " << finalFolder << "...");
 	SaveStats(saveFolder / STATS_FILE_NAME);
 	ppo->SaveTo(saveFolder);
+	if (league)
+		league->Save(saveFolder);
 	if (gapSensor && gapSensor->exp)
 		torch::save(gapSensor->exp, (saveFolder / "GAP_EXP.lt").string());
 
@@ -821,6 +860,8 @@ void GGL::Learner::Load() {
 	auto fnTryLoad = [&](const std::filesystem::path& loadFolder) {
 		LoadStats(loadFolder / STATS_FILE_NAME);
 		ppo->LoadFrom(loadFolder);
+		if (league)
+			league->Load(loadFolder); // missing LEAGUE.lt = fresh adapters (warm starts)
 		if (config.gapSensor.enabled && gapSensor)
 			gapSensor->loadFrom = loadFolder;
 
@@ -1446,10 +1487,15 @@ void GGL::Learner::Start() {
 		auto combinedTraj = Trajectory();
 		combinedTraj.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, false, false);
 
+		// League row buffers (episodes appended whole, like combinedTraj) + the per-row
+		// variant id and per-truncation-row variant id that ride alongside.
+		Trajectory leagueCombined;
+		std::vector<int8_t> leagueRowVariant, leagueTruncVariant;
+
 		// goalCriticOn: the goal-channel recorder below indexes these maps too - without it,
 		// a goal-critic-only config would read arena 0 / slot 0 for every player and train
 		// indexes playerArenaIdx as well.
-		if (reachOn || goalCriticOn) {
+		if (reachOn || goalCriticOn || league) {
 			for (int arenaIdx = 0; arenaIdx < envSet->arenas.size(); arenaIdx++) {
 				int startIdx = envSet->state.arenaPlayerStartIdx[arenaIdx];
 				auto& players = envSet->state.gameStates[arenaIdx].players;
@@ -1465,6 +1511,43 @@ void GGL::Learner::Start() {
 				}
 			}
 		}
+
+		// ===================== LEAGUE static arena/player assignment =====================
+		// The first ceil(frac * numArenas) arenas host main-vs-variant play (arenas are
+		// homogeneous, so which indices is arbitrary); arena a's variant is a % Total(),
+		// on alternating sides to halve side bias. PER-ARENA and static - unlike the
+		// per-iteration whole-fleet opponent draw, variant rows are collected and TRAINED
+		// every iteration (the old QD league discarded every opponent row it simulated).
+		std::vector<int> leaguePlayerVariant(numPlayers, -1);
+		if (league) {
+			// League adapters must never meet ES noise or the steered viewer.
+			RG_ASSERT(!render);
+			int numLeagueArenas = RS_MIN((int)envSet->arenas.size(),
+				(int)((float)envSet->arenas.size() * league->cfg.arenaFrac + 0.5f));
+			int assigned = 0;
+			for (int a = 0; a < numLeagueArenas; a++) {
+				int variant = a % league->cfg.Total();
+				Team vTeam = (a & 1) ? Team::ORANGE : Team::BLUE;
+				int startIdx = envSet->state.arenaPlayerStartIdx[a];
+				auto& players = envSet->state.gameStates[a].players;
+				for (int i = 0; i < (int)players.size(); i++) {
+					if (players[i].team == vTeam) {
+						leaguePlayerVariant[startIdx + i] = variant;
+						assigned++;
+					}
+				}
+			}
+			RG_LOG("League: " << numLeagueArenas << "/" << envSet->arenas.size()
+				<< " arenas, " << assigned << "/" << numPlayers << " players are variants");
+			if (numLeagueArenas < league->cfg.Total())
+				RG_LOG("League: WARNING - fewer league arenas than variants ("
+					<< numLeagueArenas << " < " << league->cfg.Total()
+					<< "), some variants collect NO data on this rank");
+		}
+		// League trajectories (variant rows), separate from the main `trajectories` so the
+		// two reward structures can never mix. Reuses the Trajectory struct; only the PPO
+		// core fields are filled (no HER, no goal channel - league rows train adapters only).
+		auto leagueTrajs = std::vector<Trajectory>(numPlayers, Trajectory{});
 
 		// Appends one achieved-state row (canonical ball + car-local ball, normalized) for
 		// this player from the given game state. Used per step during collection AND once at
@@ -1640,6 +1723,11 @@ void GGL::Learner::Start() {
 			const char* e = std::getenv("GGL_ES_HYBRID");
 			return e && *e && std::string(e) != "0";
 		}();
+		// The league's per-row adapters and ES's per-arena noise both own the "which
+		// weights acted on this row" story; combined they'd silently corrupt each other's
+		// logprobs. Refuse loudly.
+		if (league && (esMode || esHybrid))
+			RG_ERR_CLOSE("GGL_LEAGUE is incompatible with GGL_ES / GGL_ES_HYBRID");
 		const bool collectionCudaGraphsOn = config.ppo.useCudaGraphs && pipelineOn && ppo->device.is_cuda();
 		if (config.ppo.useCudaGraphs)
 			RG_LOG("CUDA graph collection: " << (collectionCudaGraphsOn ? "on" : "inactive")
@@ -2020,6 +2108,8 @@ void GGL::Learner::Start() {
 
 		Trajectory combinedTrajNext;  // the worker fills this; swapped into combinedTraj at the join
 		combinedTrajNext.Reserve((size_t)config.ppo.tsPerItr + numPlayers * 4, obsSize, numActions, reachOn, false, false);
+		Trajectory leagueCombinedNext; // league variant rows, same worker->barrier handoff
+		std::vector<int8_t> leagueRowVariantNext, leagueTruncVariantNext;
 		Report collectReport;         // worker-owned between barriers; merged into the iteration report
 		int collectSteps = 0;
 		float collectWallTime = 0;
@@ -2199,6 +2289,52 @@ void GGL::Learner::Start() {
 				fnBuildOppSplit(oppTeam);
 			}
 
+			// ===================== LEAGUE row split =====================
+			// Variant players leave the main collection group; their rows go to the league
+			// buffer. On opponent-served iterations the league is SUSPENDED for the whole
+			// iteration (variant cars are just cars that iteration) - it keeps the
+			// interaction surface with the opponent cascade at zero, and on the GCO test
+			// arm the cascade never fires anyway.
+			const bool leagueIter = league && !oppServed && !render && !esNoiseOn;
+			std::vector<int> leaguePlayerIndices;
+			std::vector<int> leagueRowVariantH;
+			torch::Tensor tLeagueIndicesDevice, tLeagueRowVariantDev;
+			if (league) {
+				if (leagueIter) {
+					newPlayerIndices.clear();
+					for (int i = 0; i < numPlayers; i++) {
+						if (leaguePlayerVariant[i] >= 0) {
+							leaguePlayerIndices.push_back(i);
+							leagueRowVariantH.push_back(leaguePlayerVariant[i]);
+						} else {
+							newPlayerIndices.push_back(i);
+						}
+					}
+					auto tLg = torch::tensor(leaguePlayerIndices, torch::TensorOptions().dtype(torch::kInt64));
+					auto tVar = torch::tensor(std::vector<int64_t>(leagueRowVariantH.begin(), leagueRowVariantH.end()),
+						torch::TensorOptions().dtype(torch::kInt64));
+					tLeagueIndicesDevice = ppo->device.is_cuda() ? tLg.to(ppo->device) : tLg;
+					tLeagueRowVariantDev = ppo->device.is_cuda() ? tVar.to(ppo->device) : tVar;
+					// Main-row index tensors (normally fnBuildOppSplit's job)
+					tNewPlayerIndices = torch::tensor(newPlayerIndices, torch::TensorOptions().dtype(torch::kInt64));
+					tNewIndicesDevice = ppo->device.is_cuda() ? tNewPlayerIndices.to(ppo->device) : tNewPlayerIndices;
+					// A variant player's MAIN trajectory can only hold rows from a suspended
+					// iteration; those were finalized at that iteration's boundary truncate,
+					// so this Clear is hygiene, not data loss.
+					for (int lp : leaguePlayerIndices)
+						trajectories[lp].Clear();
+				} else {
+					// Suspended: drop in-flight variant partials + rings (an episode must
+					// never splice across a policy handover).
+					for (int i = 0; i < numPlayers; i++) {
+						if (leaguePlayerVariant[i] >= 0) {
+							leagueTrajs[i].Clear();
+							league->ResetRing(i);
+						}
+					}
+				}
+			}
+
 			// EGGROLL-ES per-arena members: row k of the member-side batch belongs to the
 			// member (= arena) of player newPlayerIndices[k]. Built once per iteration
 			// (the split is fixed for the iteration); also reset the fitness cells.
@@ -2280,12 +2416,15 @@ void GGL::Learner::Start() {
 					<< "  orange=" << (vizControl->orangeAgent.empty() ? "live" : vizControl->orangeAgent));
 			};
 
-			int numRealPlayers = oppServed ? newPlayerIndices.size() : envSet->state.numPlayers;
+			int numRealPlayers = (oppServed || leagueIter) ? newPlayerIndices.size() : envSet->state.numPlayers;
 
 			collectSteps = 0;
 			// -- Generate experience (scope brace removed: body now lives in the collect fn) --
 
 				combinedTrajNext.ClearKeepCapacity();
+				leagueCombinedNext.ClearKeepCapacity();
+				leagueRowVariantNext.clear();
+				leagueTruncVariantNext.clear();
 
 				// Players handed to the opponent this iteration stop being collected; their in-flight
 				// partial episode must not silently SPLICE with a later episode when they return to
@@ -2338,6 +2477,10 @@ void GGL::Learner::Start() {
 					std::vector<uint8_t> curTerminals(numPlayers, 0);
 					curActions.reserve((size_t)numPlayers);
 					newLogProbs.reserve((size_t)numPlayers);
+					// League per-step scratch (hoisted like curActions): this step's
+					// descriptors (row k aligned with leaguePlayerIndices[k]) + logprobs.
+					std::vector<float> leagueStepDescs;
+					std::vector<float> lgLogProbsHost;
 
 					for (int step = 0; step < targetStepsPerPlayer || render; step++, collectSteps += numRealPlayers) {
 						Timer stepTimer = {};
@@ -2546,6 +2689,26 @@ void GGL::Learner::Start() {
 									fnAppendAchieved(traj, gs, gs.players[playerSlotIdx[newPlayerIdx]]);
 								}
 							});
+							// League prep: obs/mask rows into the league trajectories + this
+							// step's canonical descriptors (from the PRE-step game state, the
+							// same moment the obs row describes).
+							if (leagueIter && !leaguePlayerIndices.empty()) {
+								leagueStepDescs.resize(leaguePlayerIndices.size() * (size_t)LeagueModule::DESC_DIM);
+								fnParallelFor((int)leaguePlayerIndices.size(), [&](int k) {
+									int lp = leaguePlayerIndices[k];
+									if (ksSuppress[lp]) // scripted car: rows are training-poison
+										return;
+									fnAppendObsRow(leagueTrajs[lp].states, lp);
+									fnAppendMaskRow(leagueTrajs[lp].actionMasks, lp);
+									auto& gs = envSet->state.gameStates[playerArenaIdx[lp]];
+									auto& self = gs.players[playerSlotIdx[lp]];
+									int partner = playerPartnerIdx[lp];
+									const RLGC::Player* opp = (partner >= 0)
+										? &gs.players[playerSlotIdx[partner]] : nullptr;
+									LeagueModule::BuildDescriptor(gs, self, opp,
+										&leagueStepDescs[(size_t)k * LeagueModule::DESC_DIM]);
+								});
+							}
 							prepTime += prepTimer.Elapsed();
 						}
 
@@ -2620,6 +2783,32 @@ void GGL::Learner::Start() {
 							tActions = torch::zeros({ (int64_t)numPlayers }, tNewActions.options());
 							tActions.index_copy_(0, idxNew, tNewActions);
 							tActions.index_copy_(0, idxOld, tOldActions.to(tNewActions.dtype()));
+						} else if (leagueIter && !leaguePlayerIndices.empty()) {
+							// LEAGUE split forward: main rows through the ordinary path, variant
+							// rows through the batched per-row LoRA forward on the SAME frozen
+							// base. Two sequential forwards, the oppServed pattern (deliberately
+							// not GGL_OPP_PARALLEL - that path is known-broken).
+							torch::Tensor idxNew = tNewIndicesDevice.defined() ? tNewIndicesDevice : tNewPlayerIndices;
+							torch::Tensor tdNewStates = tdStates.index_select(0, idxNew);
+							torch::Tensor tdNewActionMasks = tdActionMasks.index_select(0, idxNew);
+							torch::Tensor tdLgStates = tdStates.index_select(0, tLeagueIndicesDevice);
+							torch::Tensor tdLgActionMasks = tdActionMasks.index_select(0, tLeagueIndicesDevice);
+
+							torch::Tensor tNewActions, tLgActions, tLgLogProbs;
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs,
+								collectModelsPtr, /*allowCudaGraph=*/collectionCudaGraphsOn);
+							league->InferActions(collectModelsPtr ? *collectModelsPtr : ppo->models,
+								tdLgStates, tdLgActionMasks, tLeagueRowVariantDev,
+								&tLgActions, &tLgLogProbs);
+
+							tActions = torch::zeros({ (int64_t)numPlayers }, tNewActions.options());
+							tActions.index_copy_(0, idxNew, tNewActions);
+							tActions.index_copy_(0, tLeagueIndicesDevice, tLgActions.to(tNewActions.dtype()));
+							// Small D2H (league rows are a fleet slice); the pinned main-path
+							// D2H below has its own stream sync, this one rides before it.
+							auto lgHost = tLgLogProbs.to(torch::kCPU, torch::kFloat32).contiguous();
+							lgLogProbsHost.assign(lgHost.data_ptr<float>(),
+								lgHost.data_ptr<float>() + lgHost.numel());
 						} else {
 							if (esNoiseOn && collectModelsPtr)
 								ppo->InferActionsLowRankES(*collectModelsPtr, tdStates,
@@ -2936,6 +3125,90 @@ void GGL::Learner::Start() {
 							traj.Clear();
 						}
 
+						// ===================== LEAGUE record + finalize =====================
+						if (leagueIter && !leaguePlayerIndices.empty()) {
+							// Parallel per-variant-player record (each body writes only its own
+							// trajectory; same race-freedom argument as the main loop).
+							fnParallelFor((int)leaguePlayerIndices.size(), [&](int k) {
+								int lp = leaguePlayerIndices[k];
+								if (ksSuppress[lp]) {
+									finalTerminals[lp] = 0;
+									return;
+								}
+								auto& traj = leagueTrajs[lp];
+								traj.actions.push_back(curActions[lp]);
+								traj.rewards += envSet->state.rewards[lp];
+								traj.logProbs += lgLogProbsHost[k];
+
+								int8_t terminalType = curTerminals[lp];
+								if (!terminalType && traj.Length() >= maxEpisodeLength)
+									terminalType = RLGC::TerminalType::TRUNCATED;
+								traj.terminals.push_back(terminalType);
+								if (terminalType == RLGC::TerminalType::TRUNCATED) {
+									fnAppendObsRow(traj.nextStates, lp);
+									if (obsStat) {
+										size_t rowStart = traj.nextStates.size() - obsSize;
+										for (int j = 0; j < obsSize; j++)
+											traj.nextStates[rowStart + j] =
+												(traj.nextStates[rowStart + j] - (float)obsNormMean[j]) / (float)obsNormStd[j];
+									}
+								}
+								finalTerminals[lp] = terminalType;
+							});
+
+							// Serial: r_div at the LATER pair endpoint (this step's reward), goal
+							// counters, then episode finalize into the league buffer.
+							{
+								std::vector<int> stepPlayers, stepVariants;
+								std::vector<float> stepDescs;
+								stepPlayers.reserve(leaguePlayerIndices.size());
+								stepVariants.reserve(leaguePlayerIndices.size());
+								stepDescs.reserve(leaguePlayerIndices.size() * (size_t)LeagueModule::DESC_DIM);
+								for (int k = 0; k < (int)leaguePlayerIndices.size(); k++) {
+									int lp = leaguePlayerIndices[k];
+									if (ksSuppress[lp])
+										continue;
+									stepPlayers.push_back(lp);
+									stepVariants.push_back(leagueRowVariantH[k]);
+									const float* d = &leagueStepDescs[(size_t)k * LeagueModule::DESC_DIM];
+									stepDescs.insert(stepDescs.end(), d, d + LeagueModule::DESC_DIM);
+								}
+								auto rdiv = league->StepRdivAndPush(stepPlayers, stepVariants, stepDescs);
+								for (size_t j = 0; j < stepPlayers.size(); j++) {
+									int lp = stepPlayers[j];
+									if (rdiv[j] != 0.f)
+										leagueTrajs[lp].rewards.back() += rdiv[j];
+									auto& gs = envSet->state.gameStates[playerArenaIdx[lp]];
+									if (gs.goalScored) {
+										int v = leaguePlayerVariant[lp];
+										auto& pl = gs.players[playerSlotIdx[lp]];
+										if (pl.team != RS_TEAM_FROM_Y(gs.ball.pos.y))
+											league->goalsFor[v]++;
+										else
+											league->goalsAgainst[v]++;
+									}
+								}
+							}
+
+							for (int k = 0; k < (int)leaguePlayerIndices.size(); k++) {
+								int lp = leaguePlayerIndices[k];
+								// The ring is per-EPISODE: cleared only on a real env reset.
+								// maxEpisodeLength truncation chops the BUFFER, not the episode,
+								// and the ring must keep spanning it (that is its whole job).
+								if (curTerminals[lp])
+									league->ResetRing(lp);
+								if (!finalTerminals[lp])
+									continue;
+								auto& traj = leagueTrajs[lp];
+								leagueRowVariantNext.insert(leagueRowVariantNext.end(),
+									traj.Length(), (int8_t)leagueRowVariantH[k]);
+								if (traj.terminals.back() == RLGC::TerminalType::TRUNCATED)
+									leagueTruncVariantNext.push_back((int8_t)leagueRowVariantH[k]);
+								leagueCombinedNext.Append(traj);
+								traj.Clear();
+							}
+						}
+
 						recordTime += recordTimer.Elapsed();
 					}
 
@@ -2960,6 +3233,31 @@ void GGL::Learner::Start() {
 							}
 							fnRelabelReachGoals(traj, newPlayerIdx);
 							combinedTrajNext.Append(traj);
+							traj.Clear();
+						}
+					}
+
+					// League boundary truncate: same contract as the main loop above (mark
+					// TRUNCATED for the critic bootstrap; the env episode continues and the
+					// descriptor ring deliberately survives the buffer boundary).
+					if (!render && leagueIter) {
+						for (int k = 0; k < (int)leaguePlayerIndices.size(); k++) {
+							int lp = leaguePlayerIndices[k];
+							auto& traj = leagueTrajs[lp];
+							if (traj.Length() == 0)
+								continue;
+							traj.terminals.back() = RLGC::TerminalType::TRUNCATED;
+							fnAppendObsRow(traj.nextStates, lp);
+							if (obsStat) {
+								size_t rowStart = traj.nextStates.size() - obsSize;
+								for (int j = 0; j < obsSize; j++)
+									traj.nextStates[rowStart + j] =
+										(traj.nextStates[rowStart + j] - (float)obsNormMean[j]) / (float)obsNormStd[j];
+							}
+							leagueRowVariantNext.insert(leagueRowVariantNext.end(),
+								traj.Length(), (int8_t)leagueRowVariantH[k]);
+							leagueTruncVariantNext.push_back((int8_t)leagueRowVariantH[k]);
+							leagueCombinedNext.Append(traj);
 							traj.Clear();
 						}
 					}
@@ -3144,6 +3442,17 @@ void GGL::Learner::Start() {
 			{
 				Timer glueTimer = {};
 				std::swap(combinedTraj, combinedTrajNext);
+				if (league) {
+					// Barrier zone (worker joined): hand the league rows to the learn side,
+					// freeze adapters+disc for the next collection, and sample the disc
+					// reservoir - the ONLY places collect-side league state may be touched
+					// from this thread.
+					std::swap(leagueCombined, leagueCombinedNext);
+					std::swap(leagueRowVariant, leagueRowVariantNext);
+					std::swap(leagueTruncVariant, leagueTruncVariantNext);
+					league->SyncCollectSnapshot();
+					league->PrepareLearnData();
+				}
 				// composite value critic: hand the just-joined collection's opponent context
 				// to the learn pass BEFORE the worker relaunches and overwrites it
 				if (config.ppo.oppCondEnabled)
@@ -3268,6 +3577,10 @@ void GGL::Learner::Start() {
 					report["ES/Members"] = (float)((esPerArena ? (int64_t)envSet->arenas.size() : 1)
 						* (int64_t)((dist && dist->distributed()) ? dist->world() : 1));
 				} else {
+
+				// League learn tensors: prepared (no-grad) inside the Process block below,
+				// consumed by league->Learn() after ppo->Learn() (grads needed there).
+				torch::Tensor lgStates, lgMasks, lgActions, lgLogProbs, lgAdv, lgTargets, lgVariant;
 
 				// Deliberate-practice proposer: Train() needs gradients, but the whole "Process
 				// timesteps" block below runs under RG_NO_GRAD (like the reachability gate's own
@@ -4442,6 +4755,78 @@ void GGL::Learner::Start() {
 							experience.data.carStateHerGoals = torch::tensor(combinedTraj.carStateHerGoals).reshape({ -1, 6 });
 					}
 
+					// ===================== LEAGUE learn-prep (no-grad) =====================
+					// Value preds through each row's own critic adapter, then the SAME GAE
+					// (same gamma/lambda/terminal semantics/return scaling as the main run -
+					// league rewards are the same zero-sum stack plus the small r_div term).
+					if (league) {
+						const int64_t nLg = (int64_t)leagueCombined.Length();
+						report["League/Rows Collected"] = (float)nLg;
+						if (nLg > 1) {
+							RG_ASSERT((int64_t)leagueRowVariant.size() == nLg);
+							auto lgStatesHost = MakePinnedFromVector(leagueCombined.states, { nLg, obsSize });
+							torch::Tensor lgMasksHost = torch::empty({ nLg, numActions },
+								torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true));
+							{
+								auto mv = torch::from_blob(leagueCombined.actionMasks.data(),
+									{ (int64_t)leagueCombined.actionMasks.size() },
+									torch::TensorOptions().dtype(torch::kUInt8));
+								lgMasksHost.view({ -1 }).copy_(mv);
+							}
+							auto lgActionsHost = MakePinnedActionIndices(leagueCombined.actions);
+							auto lgLogProbsHost2 = MakePinned1D<float>(leagueCombined.logProbs);
+							auto lgRewards = MakePinned1D<float>(leagueCombined.rewards);
+							auto lgTerminals = MakePinned1D<int8_t>(leagueCombined.terminals);
+							auto lgVariantHost = torch::tensor(
+								std::vector<int64_t>(leagueRowVariant.begin(), leagueRowVariant.end()),
+								torch::TensorOptions().dtype(torch::kInt64));
+
+							auto lgStatesDev = ppo->device.is_cuda()
+								? lgStatesHost.to(ppo->device, true) : lgStatesHost;
+							auto lgVariantDev = ppo->device.is_cuda()
+								? lgVariantHost.to(ppo->device, true) : lgVariantHost;
+
+							// Chunked like the main value-pred loop (league rows are a fleet
+							// slice, but never materialize an unbounded forward).
+							torch::Tensor lgValPreds = torch::empty({ nLg }, torch::kFloat32);
+							for (int64_t i = 0; i < nLg; i += ppo->config.miniBatchSize) {
+								int64_t end = RS_MIN(i + ppo->config.miniBatchSize, nLg);
+								lgValPreds.slice(0, i, end).copy_(
+									league->InferValues(ppo, lgStatesDev.slice(0, i, end),
+										lgVariantDev.slice(0, i, end)).to(torch::kFloat32).cpu());
+							}
+							torch::Tensor lgTruncPreds;
+							if (!leagueCombined.nextStates.empty()) {
+								int64_t kT = (int64_t)(leagueCombined.nextStates.size() / (size_t)obsSize);
+								RG_ASSERT((int64_t)leagueTruncVariant.size() == kT);
+								auto tTruncStates = MakePinnedFromVector(leagueCombined.nextStates, { kT, obsSize });
+								auto tTruncVar = torch::tensor(
+									std::vector<int64_t>(leagueTruncVariant.begin(), leagueTruncVariant.end()),
+									torch::TensorOptions().dtype(torch::kInt64));
+								lgTruncPreds = league->InferValues(ppo,
+									tTruncStates.to(ppo->device, true, true),
+									tTruncVar.to(ppo->device, true, true)).to(torch::kFloat32).cpu();
+							}
+
+							torch::Tensor lgReturns;
+							float lgClipPortion;
+							GAE::Compute(
+								lgRewards, lgTerminals, lgValPreds, lgTruncPreds,
+								lgAdv, lgTargets, lgReturns, lgClipPortion,
+								config.ppo.gaeGamma, config.ppo.gaeLambda,
+								returnStat ? returnStat->GetSTD() : 1, config.ppo.rewardClipRange);
+
+							// Device copies for the league learn pass
+							lgStates = lgStatesDev;
+							lgVariant = lgVariantDev;
+							lgMasks = ppo->device.is_cuda() ? lgMasksHost.to(ppo->device, true) : lgMasksHost;
+							lgActions = ppo->device.is_cuda() ? lgActionsHost.to(ppo->device, true) : lgActionsHost;
+							lgLogProbs = ppo->device.is_cuda() ? lgLogProbsHost2.to(ppo->device, true) : lgLogProbsHost2;
+							lgAdv = ppo->device.is_cuda() ? lgAdv.to(ppo->device, true) : lgAdv;
+							lgTargets = ppo->device.is_cuda() ? lgTargets.to(ppo->device, true) : lgTargets;
+						}
+					}
+
 				}
 
 				// Deliberate-practice proposer training: deferred until here (outside the
@@ -4455,6 +4840,17 @@ void GGL::Learner::Start() {
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H_learn_start\n");
 				ppo->Learn(experience, report, isFirstIteration);
 				report["PPO Learn Time"] = learnTimer.Elapsed();
+
+				// LEAGUE learn pass: AFTER the main optimizer step so the base weights the
+				// league backward pollutes are zeroed before the next main update, never
+				// inside it. Called on EVERY rank each iteration (its grad allreduce is a
+				// collective - a rank skipping it would deadlock the fleet).
+				if (league) {
+					Timer leagueTimer = {};
+					league->Learn(ppo, lgStates, lgMasks, lgActions, lgLogProbs,
+						lgAdv, lgTargets, lgVariant, dist, report);
+					report["League/Learn Time"] = leagueTimer.Elapsed();
+				}
 				} // end !esMode (PPO consume phase)
 
 				// Set metrics. Throughput uses the all-rank step sum (same as Total
@@ -4733,6 +5129,7 @@ GGL::Learner::~Learner() {
 		envSet = nullptr;
 	}
 	delete ppo;
+	delete league;
 	delete versionMgr;
 	delete metricSender;
 	delete renderSender;

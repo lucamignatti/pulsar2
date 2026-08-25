@@ -30,6 +30,9 @@ namespace GGL {
 
 		class PPOLearner* ppo;
 		class PolicyVersionManager* versionMgr;
+		// GGL_LEAGUE: LoRA-variant league (diverse bots + exploiters riding the live main).
+		// Null unless enabled; env-var-configured (see the block in Learner()).
+		class LeagueModule* league = nullptr;
 
 		RLGC::EnvCreateFn envCreateFn;
 		MetricSender* metricSender;
