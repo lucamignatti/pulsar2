@@ -41,7 +41,7 @@ namespace GGL {
 		int rank = 4;             // LoRA rank r
 		float arenaFrac = 0.25f;  // share of arenas hosting main-vs-variant play
 		float divBeta = 0.1f;     // r_div scale (raw centered log-prob units)
-		float adapterLR = 1e-3f;
+		float adapterLR = 3e-4f; // adapters walk FAST at rank 4 (deltas reach O(hidden) within ~1k steps at 1e-3); keep near the main's policy LR scale
 		float discLR = 1e-3f;
 		int lagShort = 300;       // decision steps (~2.5s at ts1 120Hz)
 		int lagLong = 1080;       // decision steps (~9s at ts1 120Hz)

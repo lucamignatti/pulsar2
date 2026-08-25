@@ -421,7 +421,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.epochs = envI("GGL_LEAGUE_EPOCHS", lc.epochs);
 		lc.discWarmupUpdates = envI("GGL_LEAGUE_WARMUP", lc.discWarmupUpdates);
 		lc.clipRange = config.ppo.clipRange;
-		lc.entropyScale = config.ppo.entropyScale;
+		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);
 		RG_LOG("League: ON - " << lc.numDiverse << " diverse + " << lc.numExploiters
 			<< " exploiters, rank " << lc.rank << ", arenaFrac " << lc.arenaFrac

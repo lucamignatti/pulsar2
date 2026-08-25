@@ -427,22 +427,17 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		preFlat = torch::cat(flats).clone();
 	}
 
-	// Per-variant advantage normalization: one scatter-mean/var, never a loop over
-	// variants (ppc64le is op-count-bound; N loops would multiply dispatch cost by N).
+	// RAW advantages, exactly like the main PPO pass. The first cluster deploy
+	// normalized them to unit std per variant - under GCO a 24-step fragment almost
+	// never contains a goal, so that amplified near-pure value noise to unit scale
+	// (a 10-100x hotter policy gradient of noise than the main's calibration) and
+	// walked every variant into conceding 25:1 within an hour. Advantage SCALE is
+	// part of the main run's tuned economy (returnStd scaling, entropyScale balance);
+	// the league must inherit it, not invent its own.
 	double avgPolicyLoss = 0, avgCriticLoss = 0, avgEntropy = 0, avgDiscLoss = 0;
 	double avgClipFrac = 0;
 	int64_t updates = 0;
-
-	if (n > 1) {
-		RG_NO_GRAD;
-		auto vid = rowVariant;
-		auto cnt = torch::zeros({ V }, advantages.options()).scatter_add_(0, vid,
-			torch::ones_like(advantages)).clamp_min(1);
-		auto mean = torch::zeros({ V }, advantages.options()).scatter_add_(0, vid, advantages) / cnt;
-		auto ctr = advantages - mean.index_select(0, vid);
-		auto var = torch::zeros({ V }, advantages.options()).scatter_add_(0, vid, ctr * ctr) / cnt;
-		advantages = ctr / (var.index_select(0, vid).sqrt() + 1e-8f);
-	}
+	(void)V;
 
 	for (int epoch = 0; epoch < cfg.epochs; epoch++) {
 		// PPO on variant rows (single pass; league buffers are small - minibatch only
@@ -575,6 +570,8 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			return (gf + ga > 0) ? (double)gf / (double)(gf + ga) : -1.0;
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
+			<< " adNorm=" << report["League/Adapter Norm"]
+			<< " ent=" << (updates ? avgEntropy / updates : -1.)
 			<< " discAcc=" << (report.Has("League/Disc Acc") ? report["League/Disc Acc"] : -1.)
 			<< " res=" << statReservoirFill
 			<< " rdivMean=" << statRdivMean
