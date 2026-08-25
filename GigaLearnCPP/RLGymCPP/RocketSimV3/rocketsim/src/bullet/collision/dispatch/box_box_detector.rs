@@ -1,6 +1,7 @@
 use std::{
     f32::consts::{PI, TAU},
     mem,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use arrayvec::ArrayVec;
@@ -181,6 +182,88 @@ struct Hit {
     depth: f32,
     normal: Vec3A,
     axis_idx: usize,
+    /// Some if this overlap was a SAT miss promoted by `GGL_SAT_SLACK`.
+    orig_gap_bt: Option<f32>,
+}
+
+/// Closest-axis SAT gap from the last car-car box test this tick, in uu.
+/// Positive = separated (short of contact); negative = penetration.
+/// NAN if SAT did not run (AABB miss is stored separately as kind=4).
+pub static LAST_SAT_GAP_UU: AtomicU32 = AtomicU32::new(0);
+pub static LAST_SAT_AXIS: AtomicU32 = AtomicU32::new(0);
+/// 0 = no pair, 1 = SAT miss, 2 = SAT hit, 3 = SAT overlap but clip empty,
+/// 4 = AABB miss, 5 = slack-promoted (geometric miss, treated as hit).
+pub static LAST_SAT_KIND: AtomicU32 = AtomicU32::new(0);
+
+pub fn reset_last_sat_gap() {
+    LAST_SAT_GAP_UU.store(f32::NAN.to_bits(), Ordering::Relaxed);
+    LAST_SAT_AXIS.store(0, Ordering::Relaxed);
+    LAST_SAT_KIND.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn store_last_sat(gap_uu: f32, axis: usize, kind: u32) {
+    LAST_SAT_GAP_UU.store(gap_uu.to_bits(), Ordering::Relaxed);
+    LAST_SAT_AXIS.store(axis as u32, Ordering::Relaxed);
+    LAST_SAT_KIND.store(kind, Ordering::Relaxed);
+}
+
+pub(crate) fn sat_gap_dump() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    let env = *V.get_or_init(|| std::env::var("GGL_SAT_GAP").is_ok_and(|s| s != "0"));
+    env || crate::DBG_IMPULSE_TRACE.load(Ordering::Relaxed)
+}
+
+/// Closest-axis SAT miss→hit promotion, in uu. If the closest SAT axis misses
+/// by at most this many uu, treat it as a shallow overlap on that axis
+/// (contact generation, not box inflation). Measured 2026-08-24 on v5 1v1
+/// rlrecord2/autosave_20260824_211647 [0,25000): halves CarImpact vel_err p90
+/// (26.05→13.82) with no regime regressions. Bump-cone evaluation still
+/// requires true overlap (arena/base.rs), so promotions cannot manufacture
+/// RL bumper impulses.
+fn sat_slack_bt() -> f32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_SAT_SLACK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.2)
+            * crate::consts::UU_TO_BT
+    })
+}
+
+/// `GGL_CC_CLIP_FB=<uu>`: minimum SAT penetration depth (uu) for the
+/// clip-empty fallback contact; promoted hits always qualify. 0 = off.
+fn clip_fallback_bt() -> f32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_CC_CLIP_FB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+            * crate::consts::UU_TO_BT
+    })
+}
+
+/// `GGL_SLACK_CD=<min dot>`: minimum dot(contact_normal, center_dir) for a
+/// slack promotion to stand (see `get_closest_points`). 0 = keep all.
+fn slack_center_dot_min() -> f32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_SLACK_CD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Half-extent of an OBB along world direction `n` (n unit): support width.
+fn support_half_extent(axis: Mat3A, half: Vec3A, n: Vec3A) -> f32 {
+    let c = axis.transpose() * n;
+    c.x.abs() * half.x + c.y.abs() * half.y + c.z.abs() * half.z
 }
 
 pub struct BoxBoxDetector<'a, T: ContactAddedCallback> {
@@ -201,23 +284,142 @@ impl<T: ContactAddedCallback> BoxBoxDetector<'_, T> {
         let axis_b = transform_b.matrix3;
         let axis_a_inv = axis_a.transpose();
 
-        let side1 = self.box1.get_half_extents() + self.box1.get_margin();
-        let side2 = self.box2.get_half_extents() + self.box2.get_margin();
+        // GGL_CC_INFLATE=<uu>: inflate each box by this much per side for the
+        // box-box (car-car) test. RL ships a 2.6x-era Bullet whose btBoxShape did
+        // NOT shrink implicit dims by the collision margin at construction, so
+        // its box-box collides at nominal dims + margin (0.04 BT ~ 2 uu) per box;
+        // modern Bullet (and this port) shrink-then-add so the surface is
+        // nominal. T1 grind i=4648+: real applies mutual separation while our
+        // detector reads a 1-3 uu surface gap. Default 0 (off).
+        let inflate = {
+            use std::sync::OnceLock;
+            static V: OnceLock<f32> = OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("GGL_CC_INFLATE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+                    * crate::consts::UU_TO_BT
+            })
+        };
+        let side1 = self.box1.get_half_extents() + self.box1.get_margin() + inflate;
+        let side2 = self.box2.get_half_extents() + self.box2.get_margin() + inflate;
 
         let obb1 = Obb::new(transform_a.translation, axis_a, side1);
         let obb2 = Obb::new(transform_b.translation, axis_b, side2);
 
-        let hit = box_box_sat(&obb1, &axis_a_inv, &obb2)?;
+        let dump_gap = sat_gap_dump();
+        let sat = box_box_sat_ex(&obb1, &axis_a_inv, &obb2);
+        let d_uu = (transform_a.translation - transform_b.translation).length()
+            * crate::consts::BT_TO_UU;
+        let mut hit = match sat {
+            Ok(hit) => hit,
+            Err((gap_bt, axis)) => {
+                let gap_uu = gap_bt * crate::consts::BT_TO_UU;
+                store_last_sat(gap_uu, axis, 1);
+                if dump_gap {
+                    eprintln!("SATGAP hit=0 gap={gap_uu:+.2} axis={axis} d={d_uu:.1}");
+                }
+                return None;
+            }
+        };
+        if hit.orig_gap_bt.is_some() {
+            // GGL_SLACK_CD=<min dot>: a promoted contact's normal must still point
+            // roughly along the center-separation axis (dot >= threshold). Edge-
+            // cross normals can land nearly perpendicular to the line of centers;
+            // promoting those lets the solver cancel a huge relative velocity
+            // along a direction the real collision never used (the measured
+            // phantom bumps i2017_c0 / i29268_c1). 0 = keep all promotions.
+            let cd_min = slack_center_dot_min();
+            if cd_min > 0.0 {
+                let center_dir =
+                    (transform_b.translation - transform_a.translation).normalize_or_zero();
+                if hit.normal.dot(center_dir) < cd_min {
+                    store_last_sat(
+                        hit.orig_gap_bt.unwrap() * crate::consts::BT_TO_UU,
+                        hit.axis_idx,
+                        6,
+                    );
+                    if dump_gap {
+                        eprintln!(
+                            "SATGAP slack-drop axis={} dot={:+.2} d={d_uu:.1}",
+                            hit.axis_idx,
+                            hit.normal.dot(center_dir),
+                        );
+                    }
+                    return None;
+                }
+            }
+            store_last_sat(
+                hit.orig_gap_bt.unwrap() * crate::consts::BT_TO_UU,
+                hit.axis_idx,
+                5,
+            );
+            if dump_gap {
+                eprintln!(
+                    "SATGAP hit=1 slack=1 gap={:+.2} axis={} d={d_uu:.1}",
+                    hit.orig_gap_bt.unwrap() * crate::consts::BT_TO_UU,
+                    hit.axis_idx,
+                );
+            }
+        } else {
+            store_last_sat(-hit.depth * crate::consts::BT_TO_UU, hit.axis_idx, 2);
+            if dump_gap {
+                eprintln!(
+                    "SATGAP hit=1 gap={:+.2} axis={} d={d_uu:.1}",
+                    -hit.depth * crate::consts::BT_TO_UU,
+                    hit.axis_idx,
+                );
+            }
+        }
 
         let mut manifold = PersistentManifold::new(self.col1, self.col2);
 
         self.compute_contact_points(&obb1, &axis_a, &obb2, &axis_b, &hit, &mut manifold);
 
         if manifold.point_cache.is_empty() {
-            return None;
+            store_last_sat(-hit.depth * crate::consts::BT_TO_UU, hit.axis_idx, 3);
+            if dump_gap {
+                eprintln!(
+                    "SATGAP hit=0 gap={:+.2} axis={} clip=1 d={d_uu:.1}",
+                    -hit.depth * crate::consts::BT_TO_UU,
+                    hit.axis_idx,
+                );
+            }
+            // GGL_CC_CLIP_FB=<uu>: clip-empty fallback for GENUINE overlaps — SAT
+            // found penetration deeper than the threshold but face clipping
+            // produced no points (glancing overlaps); synthesize one mid-surface
+            // contact along the SAT normal instead of dropping the collision.
+            // Slack-promoted hits do NOT qualify (real drops those grazes).
+            // 0 = off.
+            let fb_thresh_bt = clip_fallback_bt();
+            if fb_thresh_bt > 0.0 && hit.orig_gap_bt.is_none() && hit.depth >= fb_thresh_bt {
+                {
+                    let n = hit.normal;
+                    let s1 = transform_a.translation + n * support_half_extent(axis_a, side1, n);
+                    let s2 = transform_b.translation - n * support_half_extent(axis_b, side2, n);
+                    // Glancing clip-empty overlaps have an unreliable SAT depth;
+                    // cap the synthesized penetration so the solver's position
+                    // bias cannot manufacture a large phantom Δv (measured
+                    // i49776/77 over-delivery at 2.2uu depth).
+                    let depth = hit.depth.min(fb_thresh_bt);
+                    manifold.add_contact_point(
+                        self.col1,
+                        self.col2,
+                        -hit.normal,
+                        (s1 + s2) * 0.5,
+                        -depth,
+                        None,
+                        self.contact_added_callback,
+                    );
+                }
+            } else {
+                return None;
+            }
         }
 
         manifold.refresh_contact_points(self.col1, self.col2);
+        let _ = d_uu;
         Some(manifold)
     }
 
@@ -456,6 +658,12 @@ impl<T: ContactAddedCallback> BoxBoxDetector<'_, T> {
 }
 
 fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
+    box_box_sat_ex(obb1, r1t, obb2).ok()
+}
+
+/// Ok = penetrating (depth > 0). Err = separated; the f32 is the *minimum*
+/// positive SAT gap in BT (how far apart the closest axis says they are).
+fn box_box_sat_ex(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Result<Hit, (f32, usize)> {
     const FUDGE_FACTOR: f32 = 1.05;
     const FUDGE_2: Vec3A = Vec3A::splat(1e-5);
 
@@ -489,21 +697,30 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
     let mut normal_c = Vec3A::ZERO;
     let mut invert_normal = false;
     let mut code = 0;
+    let mut min_sep = f32::INFINITY;
+    let mut sep_axis = 0;
+    let mut sep_normal_r: Option<Vec3A> = None;
+    let mut sep_normal_c = Vec3A::ZERO;
+    let mut sep_invert = false;
 
     let mut tst = |expr1: f32, expr2: f32, n: Vec3A, cc: usize| {
         s2 = expr1.abs() - expr2;
         if s2 > 0.0 {
-            return false;
+            if s2 < min_sep {
+                min_sep = s2;
+                sep_axis = cc;
+                sep_normal_r = Some(n);
+                sep_normal_c = Vec3A::ZERO;
+                sep_invert = expr1 < 0.0;
+            }
+            return;
         }
-
         if s2 > s {
             s = s2;
             normal_r = Some(n);
             invert_normal = expr1 < 0.0;
             code = cc;
         }
-
-        true
     };
 
     // separating axis = u1,u2,u3
@@ -511,14 +728,12 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
         .into_iter()
         .enumerate()
     {
-        if !tst(
+        tst(
             pp[i],
             obb1.extent[i] + obb2.extent.dot(q_rows[i]),
             normal,
             i + 1,
-        ) {
-            return None;
-        }
+        );
     }
 
     // separating axis = v1,v2,v3
@@ -526,14 +741,12 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
         .into_iter()
         .enumerate()
     {
-        if !tst(
+        tst(
             normal.dot(p),
             obb1.extent.dot(q_cols[i]) + obb2.extent[i],
             normal,
             i + 4,
-        ) {
-            return None;
-        }
+        );
     }
 
     // note: cross product axes need to be scaled when s is computed.
@@ -541,7 +754,16 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
     let mut tst = |expr1: f32, expr2: f32, n: Vec3A, cc: usize| {
         s2 = expr1.abs() - expr2;
         if s2 > f32::EPSILON {
-            return false;
+            let l = n.length();
+            let gap = if l > f32::EPSILON { s2 / l } else { s2 };
+            if gap < min_sep {
+                min_sep = gap;
+                sep_axis = cc;
+                sep_normal_r = None;
+                sep_normal_c = if l > f32::EPSILON { n / l } else { n };
+                sep_invert = expr1 < 0.0;
+            }
+            return;
         }
 
         let l = n.length();
@@ -555,8 +777,6 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
                 code = cc;
             }
         }
-
-        true
     };
 
     for col in &mut q_cols {
@@ -579,14 +799,33 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
                 + obb2.extent[j1] * q_rows[i][j2]
                 + obb2.extent[j2] * q_rows[i][j1];
 
-            if !tst(pp.dot(n), expr2, n, 7 + i * 3 + j) {
-                return None;
-            }
+            tst(pp.dot(n), expr2, n, 7 + i * 3 + j);
         }
     }
 
+    if min_sep.is_finite() {
+        let slack_bt = sat_slack_bt();
+        if slack_bt > 0.0 && min_sep <= slack_bt && sep_axis != 0 {
+            let mut normal = sep_normal_r.unwrap_or_else(|| obb1.axis * sep_normal_c);
+            if sep_invert {
+                normal = -normal;
+            }
+            let nlen = normal.length();
+            if nlen > f32::EPSILON {
+                normal /= nlen;
+            }
+            return Ok(Hit {
+                depth: (slack_bt - min_sep).max(1e-5),
+                normal,
+                axis_idx: sep_axis,
+                orig_gap_bt: Some(min_sep),
+            });
+        }
+        return Err((min_sep, sep_axis));
+    }
+
     if code == 0 {
-        return None;
+        return Err((0.0, 0));
     }
 
     // if we get to this point, the boxes interpenetrate. compute the normal
@@ -598,10 +837,11 @@ fn box_box_sat(obb1: &Obb, r1t: &Mat3A, obb2: &Obb) -> Option<Hit> {
 
     let depth = -s;
 
-    Some(Hit {
+    Ok(Hit {
         depth,
         normal,
         axis_idx: code,
+        orig_gap_bt: None,
     })
 }
 

@@ -21,7 +21,25 @@ const MESHES: &str = concat!(
 );
 
 fn setup() -> Arena {
-    rocketsim::init(MESHES, true).ok(); // idempotent across tests
+    let mut paths = vec![std::path::PathBuf::from(MESHES)];
+    if let Ok(p) = std::env::var("RLPR_MESHES") {
+        paths.insert(0, std::path::PathBuf::from(p));
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let root = std::path::PathBuf::from(manifest);
+        paths.push(root.join("collision_meshes"));
+        paths.push(root.join("../../../../collision_meshes"));
+        paths.push(root.join("../../../../build/collision_meshes"));
+        paths.push(root.join("../../../../build-npl/collision_meshes"));
+    }
+    let mut inited = false;
+    for p in &paths {
+        if p.is_dir() && rocketsim::init(p, true).is_ok() {
+            inited = true;
+            break;
+        }
+    }
+    assert!(inited, "no collision_meshes found; tried {paths:?}");
     let mut arena = Arena::new(GameMode::Soccar);
     // Park the ball far away so it can never interfere.
     let mut bs = *arena.get_ball_state();
@@ -164,4 +182,34 @@ fn pickup_box_is_centred_on_the_hitbox_not_the_origin() {
         arena.get_car_state(car).boost > 0.0,
         "the hitbox-offset trigger box must reach this pad; the origin-centred box did not"
     );
+}
+
+/// PR66 sink repro: hold a downward force on the ball. Unfixed special contacts
+/// use contact radius as "penetration", so positional recovery never fires and
+/// the ball goes through the floor. Floor rest height is ~93.15 uu.
+#[test]
+fn ball_floor_sink_under_sustained_force() {
+    fn run(label: &str, start_z: f32, force_z: f32, ticks: u32) -> f32 {
+        let mut arena = setup();
+        let mut bs = *arena.get_ball_state();
+        bs.phys.pos = Vec3A::new(0.0, 0.0, start_z);
+        bs.phys.vel = Vec3A::ZERO;
+        arena.set_ball_state(bs);
+        let mut min_z = start_z;
+        for _ in 0..ticks {
+            let mut bs = *arena.get_ball_state();
+            bs.phys.vel.z += force_z;
+            arena.set_ball_state(bs);
+            arena.step_tick();
+            min_z = min_z.min(arena.get_ball_state().phys.pos.z);
+        }
+        let end_z = arena.get_ball_state().phys.pos.z;
+        eprintln!(
+            "SINK {label} pen_fix={} start={start_z} force={force_z} min_z={min_z:.2} end_z={end_z:.2}",
+            std::env::var("GGL_BALL_PEN_FIX").unwrap_or_default()
+        );
+        min_z
+    }
+    run("rest+press", 93.15, -2000.0, 120);
+    run("already-under", 40.0, -200.0, 120);
 }

@@ -1,7 +1,66 @@
 use std::{
+    env,
     f32::consts::PI,
     ops::{Deref, DerefMut},
+    sync::OnceLock,
 };
+
+fn env_on(name: &'static str) -> bool {
+    static LOCKS: OnceLock<std::sync::Mutex<Vec<(String, bool)>>> = OnceLock::new();
+    let cache = LOCKS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some((_, v)) = g.iter().find(|(n, _)| n == name) {
+        return *v;
+    }
+    let v = env::var(name).is_ok_and(|s| s != "0");
+    g.push((name.to_string(), v));
+    v
+}
+
+fn env_f32(name: &'static str, default: f32) -> f32 {
+    static LOCKS: OnceLock<std::sync::Mutex<Vec<(String, f32)>>> = OnceLock::new();
+    let cache = LOCKS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some((_, v)) = g.iter().find(|(n, _)| n == name) {
+        return *v;
+    }
+    let v = env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default);
+    g.push((name.to_string(), v));
+    v
+}
+
+/// Tuned wheel order: suspension/friction impulses at this tick's pose BEFORE the
+/// Bullet step (with the end-of-tick raycast reused next tick). Part of the winning
+/// stack (SIM2REAL_LOOP.md 2026-08-23 22:00) together with apply-time forces,
+/// no graze-damp fade, tuned ray, steer-at-apply, and uncapped pushback.
+/// DEFAULT ON since 2026-08-23; `GGL_WHEELS_PRE=0` restores post-step wheels.
+fn ggl_wheels_pre() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_WHEELS_PRE").map_or(true, |s| s != "0"))
+}
+
+/// Where car speed caps run. Default `both` = arena tick head + publish (S37).
+/// `GGL_VEL_CLAMP=head` = tuned default (start only). `end` = publish only.
+fn ggl_vel_clamp_mode() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| match env::var("GGL_VEL_CLAMP").ok().as_deref() {
+        Some("head") => "head".to_string(),
+        Some("end") => "end".to_string(),
+        _ => "both".to_string(),
+    })
+    .as_str()
+}
+
+pub(crate) fn ggl_vel_clamp_head() -> bool {
+    ggl_vel_clamp_mode() != "end"
+}
+
+pub(crate) fn ggl_vel_clamp_end() -> bool {
+    ggl_vel_clamp_mode() != "head"
+}
 
 use fastrand::Rng;
 use glam::{Affine3A, EulerRot, Mat3A, Vec3A};
@@ -27,7 +86,7 @@ use crate::{
     consts::{
         BT_TO_UU, TICK_TIME, UU_TO_BT, bullet_vehicle as vehicle_consts,
         car::{self as car_consts, drive as drive_consts},
-        curves,
+        curves, secs_to_ticks, ticks_gt, ticks_until,
     },
     sim::{UserInfoTypes, car::car_info::CarInfo},
 };
@@ -38,6 +97,8 @@ pub struct Car {
     pub(crate) rigid_body_idx: usize,
     pub(crate) vel_impulse_cache: Vec3A,
     pub(crate) state: CarState,
+    /// Last tick's world-contact sticky gate (PR73). Default false.
+    pub(crate) sticky_gate_prev: bool,
 }
 
 impl Deref for Car {
@@ -128,13 +189,14 @@ impl Car {
                 boost: mutator_config.car_spawn_boost_amount,
                 ..Default::default()
             },
+            sticky_gate_prev: false,
         }
     }
 
     /// - `respawn_delay` by default is `rocketsim::consts::DEMO_RESPAWN_TIME`
     pub(crate) const fn demolish(&mut self, respawn_delay: f32) {
         self.state.is_demoed = true;
-        self.state.demo_respawn_timer = respawn_delay;
+        self.state.demo_respawn_ticks = secs_to_ticks(respawn_delay);
     }
 
     /// - `boost_amount` by default is `rocketsim::consts::BOOST_RESPAWN_AMOUNT`
@@ -203,6 +265,39 @@ impl Car {
 
         self.vel_impulse_cache = Vec3A::ZERO;
         self.state = *state;
+        self.sticky_gate_prev = self.state.wheels_with_contact.iter().any(|&c| c);
+    }
+
+    /// Re-raycast wheels at the car's current pose and refresh contact flags.
+    ///
+    /// `From<CarRecord>` leaves `wheels_with_contact` false. Without this, the
+    /// next tick treats a grounded car as 0 wheels in contact (drive torque /4,
+    /// no sticky, chassis-world friction on). Tuned calls this from every
+    /// `set_car_state`. Disable with `GGL_NO_REFRESH_CONTACT=1`.
+    pub(crate) fn refresh_contact_state(
+        &mut self,
+        collision_world: &mut DiscreteDynamicsWorld,
+    ) {
+        if self.state.is_demoed {
+            return;
+        }
+        self.bullet_vehicle
+            .update_vehicle_first(collision_world, TICK_TIME);
+        let mut n = 0u8;
+        for (i, wheel) in self.bullet_vehicle.wheels.iter().enumerate() {
+            let hit = wheel.raycast_info.is_some();
+            self.state.wheels_with_contact[i] = hit;
+            n += u8::from(hit);
+        }
+        self.state.is_on_ground = n >= 3;
+        collision_world.bodies_mut()[self.rigid_body_idx].wheels_grounded = n >= 3;
+        self.sticky_gate_prev = self.bullet_vehicle.wheels.iter().any(|wheel| {
+            wheel.adhesion_contact
+                || wheel
+                    .raycast_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_in_contact_with_world)
+        });
     }
 
     /////////////////////////////
@@ -253,7 +348,29 @@ impl Car {
         let mut drive_speed_scale =
             curves::DRIVE_SPEED_TORQUE_FACTOR.get_output(abs_forward_speed_uu);
         if num_wheels_in_contact < 3 {
-            drive_speed_scale /= 4.0;
+            // Shipped RL: 1/4 drive with <3 wheels. GGL_DRIVE_PARTIAL overrides
+            // the divisor (1 = full torque, 2 = half). Air+wheels 1-tick error
+            // is forward-short; this is the first A/B for that bucket.
+            drive_speed_scale /= env_f32("GGL_DRIVE_PARTIAL", 4.0);
+        }
+        // Packed+tilted 4-wheel fillets never hit DRIVE_PARTIAL. 3-step T7
+        // packed thr+ accumulates +fwd (sim too fast). GGL_FILLET_DRIVE>1
+        // divides engine force when last-tick extra_pushback fired and
+        // |up.z| is in the fillet band (not floor ~1, not true wall ~0).
+        // Rejected 2026-08-24: true walls bit-identical, packed thr+ 1.23→2.03,
+        // uncomp fillet p90 0.89→4.12 (pushback also fires there). 1-step is
+        // not over-drive.
+        let fillet_div = env_f32("GGL_FILLET_DRIVE", 1.0);
+        if fillet_div > 1.0 {
+            let uz = self.state.get_up_dir().z.abs();
+            let packed = self
+                .bullet_vehicle
+                .wheels
+                .iter()
+                .any(|w| w.extra_pushback.abs() > 0.0);
+            if packed && (0.25..0.90).contains(&uz) {
+                drive_speed_scale /= fillet_div;
+            }
         }
 
         let drive_engine_force = engine_throttle
@@ -297,7 +414,11 @@ impl Car {
             let lat_dir = wheel.axle_dir;
             let long_dir = lat_dir.cross(raycast_info.contact_normal);
 
-            let wheel_delta = wheel.hard_point - car_pos;
+            let wheel_delta = if env_on("GGL_FRIC_LEVER") {
+                raycast_info.contact_point - car_pos
+            } else {
+                wheel.hard_point - car_pos
+            };
             let cross_vec = (car_ang_vel.cross(wheel_delta) + car_vel) * BT_TO_UU;
 
             let base_friction = cross_vec.dot(lat_dir).abs();
@@ -306,6 +427,7 @@ impl Car {
             } else {
                 0.0
             };
+            wheel.last_friction_curve_input = friction_curve_input;
 
             let mut lat_friction = if self.info.config.three_wheels {
                 curves::LAT_FRICTION_THREEWHEEL
@@ -335,32 +457,112 @@ impl Car {
                 long_friction *= non_sticky_scale;
             }
 
-            wheel.lat_friction = lat_friction;
-            wheel.long_friction = long_friction;
+            if !env_on("GGL_FRIC_APPLY") {
+                wheel.lat_friction = lat_friction;
+                wheel.long_friction = long_friction;
+            }
         }
 
-        let wheels_have_world_contact = self.bullet_vehicle.wheels.iter().any(|wheel| {
-            wheel.adhesion_contact
-                || wheel
-                    .raycast_info
-                    .as_ref()
-                    .is_some_and(|info| info.is_in_contact_with_world)
-        });
-        if wheels_have_world_contact {
+        let n_sticky_wheels = self
+            .bullet_vehicle
+            .wheels
+            .iter()
+            .filter(|wheel| {
+                wheel.adhesion_contact
+                    || wheel
+                        .raycast_info
+                        .as_ref()
+                        .is_some_and(|info| info.is_in_contact_with_world)
+            })
+            .count();
+        // GGL_STICKY_FADE: SUPERSEDED, default off. Fades sticky over the last
+        // stretch of suspension travel. This was a proxy fit to the T1
+        // extension-vs-bias curve before the true variable was found: the "fade"
+        // was really P(no contact one tick earlier | extension) -- the prev-tick
+        // gate above beats every fade shape on both tapes. Kept for A/B only.
+        // Modes: unset/0 = off, "cut" = hard zero above 0.875 travel, "lin" =
+        // linear fade over [0.875, 1.0], "quad" = that squared.
+        let sticky_fade = {
+            static V: OnceLock<u8> = OnceLock::new();
+            *V.get_or_init(|| match env::var("GGL_STICKY_FADE").as_deref() {
+                Ok("cut") => 1,
+                Ok("lin") => 2,
+                Ok("quad") => 3,
+                _ => 0,
+            })
+        };
+        // Flip exemption: the same extension bins measured NO bias during flips
+        // (flip+wheels ext 11.5-12 med_up -0.032 vs air+wheels -2.61) -- the real
+        // game keeps full sticky on a grazing wheel while dodging.
+        let sticky_fade_scale = if sticky_fade == 0 || self.state.is_flipping {
+            1.0
+        } else {
+            let travel = const { vehicle_consts::MAX_SUSPENSION_TRAVEL * UU_TO_BT };
+            let mut min_ext_frac = f32::INFINITY;
+            for wheel in &self.bullet_vehicle.wheels {
+                if let Some(info) = wheel.raycast_info.as_ref()
+                    && info.is_in_contact_with_world
+                {
+                    let ext = (info.suspension_length - wheel.suspension_rest_length_1) / travel;
+                    min_ext_frac = min_ext_frac.min(ext);
+                }
+            }
+            if min_ext_frac.is_infinite() {
+                1.0
+            } else {
+                let lin = ((1.0 - min_ext_frac) / 0.125).clamp(0.0, 1.0);
+                match sticky_fade {
+                    1 => f32::from(min_ext_frac <= 0.875),
+                    2 => lin,
+                    _ => lin * lin,
+                }
+            }
+        };
+        // GGL_STICKY_PREV: DEFAULT ON since 2026-08-23 (`=0` restores fresh-ray gate).
+        // Sticky requires contact on the PREVIOUS tick too (upstream PR73: "a car
+        // doesn't stick on its spawn tick"). Independently derived from T1: single
+        // grazing wheels carry the full 0.5*g*dt sticky bias when FALLING (no contact
+        // one tick earlier, med_up -2.53) and none when RISING (had contact, +0.005)
+        // -- the extension-fade model this replaces was a proxy for exactly that.
+        // Conjunction with current contact keeps the upwards-dir well-defined.
+        let sticky_prev_gate = {
+            static V: OnceLock<bool> = OnceLock::new();
+            *V.get_or_init(|| env::var("GGL_STICKY_PREV").map_or(true, |s| s != "0"))
+        };
+        let sticky_ok = if sticky_prev_gate {
+            self.sticky_gate_prev
+                && n_sticky_wheels >= env_f32("GGL_STICKY_MIN_WHEELS", 1.0) as usize
+        } else {
+            n_sticky_wheels >= env_f32("GGL_STICKY_MIN_WHEELS", 1.0) as usize
+        };
+        if sticky_ok {
             let upwards_dir = self.bullet_vehicle.get_upwards_dir_from_wheel_contacts(rb);
 
             let full_stick = real_throttle != 0.0
                 || abs_forward_speed_uu > car_consts::drive::STOPPING_FORWARD_VEL;
             let mut sticky_force_scale = f32::from(!self.config.three_wheels) * 0.5;
-            if full_stick {
+            // Extra 1-|up.z| term is ~+1.0 on walls. GGL_NO_STICKY_TILT=1 drops it.
+            if full_stick && !env_on("GGL_NO_STICKY_TILT") {
                 sticky_force_scale += 1.0 - upwards_dir.z.abs();
             }
 
-            // TODO: Should we be using the mutator config for gravity?
+            // GGL_STICKY_SCALE: 1 = shipped 0.5·g on a level Octane. Ground 1-tick
+            // error is ~+3 uu/s along up (we float); 0.5·g·dt ≈ 2.7 uu/s, so 2.0 is
+            // the first A/B for "full gravity-sticky on flat".
+            // GGL_STICKY_FLAT: replace SCALE when |up.z| > 0.9 (floor only). Default 1.
+            let mut sticky_scale = env_f32("GGL_STICKY_SCALE", 1.0);
+            let sticky_flat = env_f32("GGL_STICKY_FLAT", 1.0);
+            if (sticky_flat - 1.0).abs() > 1e-6 && upwards_dir.z.abs() > 0.9 {
+                sticky_scale = sticky_flat;
+            }
             rb.add_impulse(
                 Some("StickyForce"),
                 Impulse::Linear(
-                    upwards_dir * sticky_force_scale * const { GRAVITY_Z * TICK_TIME * UU_TO_BT },
+                    upwards_dir
+                        * sticky_force_scale
+                        * sticky_scale
+                        * sticky_fade_scale
+                        * const { GRAVITY_Z * TICK_TIME * UU_TO_BT },
                 ),
                 false,
                 true,
@@ -368,7 +570,73 @@ impl Car {
         }
     }
 
-    fn update_air_torque(&mut self, rb: &mut RigidBody, update_air_control: bool) {
+    fn apply_friction_curves(&mut self, rb: &RigidBody) {
+        let real_throttle = if self.state.controls.boost && self.state.boost > 0.0 {
+            1.0
+        } else {
+            self.state.controls.throttle
+        };
+        let car_pos = rb.get_world_pos();
+        let car_vel = rb.lin_vel;
+        let car_ang_vel = rb.ang_vel;
+        for wheel in &mut self.bullet_vehicle.wheels {
+            wheel.last_friction_curve_input = 0.0;
+            let Some(raycast_info) = wheel.raycast_info.as_ref() else {
+                continue;
+            };
+            if !raycast_info.is_in_contact_with_world {
+                continue;
+            }
+            let lat_dir = wheel.axle_dir;
+            let long_dir = lat_dir.cross(raycast_info.contact_normal);
+            let wheel_delta = if env_on("GGL_FRIC_LEVER") {
+                raycast_info.contact_point - car_pos
+            } else {
+                wheel.hard_point - car_pos
+            };
+            let cross_vec = (car_ang_vel.cross(wheel_delta) + car_vel) * BT_TO_UU;
+            let base_friction = cross_vec.dot(lat_dir).abs();
+            let friction_curve_input = if base_friction > 5.0 {
+                base_friction / (cross_vec.dot(long_dir).abs() + base_friction)
+            } else {
+                0.0
+            };
+            wheel.last_friction_curve_input = friction_curve_input;
+            let mut lat_friction = if self.info.config.three_wheels {
+                curves::LAT_FRICTION_THREEWHEEL
+            } else {
+                curves::LAT_FRICTION
+            }
+            .get_output(friction_curve_input);
+            let mut long_friction = 1.0;
+            if self.state.handbrake_val != 0.0 {
+                let handbrake_amount = self.state.handbrake_val;
+                lat_friction *= 1.0
+                    + (curves::HANDBRAKE_LAT_FRICTION_FACTOR.get_output(friction_curve_input)
+                        - 1.0)
+                        * handbrake_amount;
+                long_friction *= 1.0
+                    + (curves::HANDBRAKE_LONG_FRICTION_FACTOR.get_output(friction_curve_input)
+                        - 1.0)
+                        * handbrake_amount;
+            }
+            if real_throttle == 0.0 {
+                let non_sticky_scale =
+                    curves::NON_STICKY_FRICTION_FACTOR.get_output(raycast_info.contact_normal.z);
+                lat_friction *= non_sticky_scale;
+                long_friction *= non_sticky_scale;
+            }
+            wheel.lat_friction = lat_friction;
+            wheel.long_friction = long_friction;
+        }
+    }
+
+    fn update_air_torque(
+        &mut self,
+        rb: &mut RigidBody,
+        update_air_control: bool,
+        num_wheels_in_contact: usize,
+    ) {
         let forward_dir = self.state.get_forward_dir();
         let right_dir = self.state.get_right_dir();
         let up_dir = self.state.get_up_dir();
@@ -379,7 +647,8 @@ impl Car {
 
         if self.state.is_flipping {
             self.state.is_flipping =
-                self.state.has_flipped && self.state.flip_time < car_consts::flip::TORQUE_TIME;
+                self.state.has_flipped
+                    && self.state.flip_ticks < car_consts::flip::TORQUE_TICKS;
         }
 
         let mut do_air_control = false;
@@ -397,15 +666,18 @@ impl Car {
                     // old -- the first ~5 ticks always get full torque (measured; see
                     // the constant's comment). Without this gate a 1ts policy's brief
                     // into-flip pitch taps killed torque the real game applies.
-                    && self.state.flip_time >= car_consts::flip::PITCH_CANCEL_MIN_TIME
+                    && self.state.flip_ticks >= car_consts::flip::PITCH_CANCEL_MIN_TICKS
                 {
                     pitch_scale = 1.0 - self.state.controls.pitch.abs().min(1.0);
                     do_air_control = true;
                 }
 
                 rel_dodge_torque.y *= pitch_scale;
+                // GGL_DODGE_NEEDS_AIR=1: skip dodge torque once any wheel is down (PR72).
+                let apply_dodge = update_air_control || !env_on("GGL_DODGE_NEEDS_AIR");
                 let dodge_torque = rel_dodge_torque
                     * Vec3A::new(car_consts::flip::TORQUE_X, car_consts::flip::TORQUE_Y, 0.0)
+                    * env_f32("GGL_FLIP_TORQUE", 1.0)
                     * TICK_TIME;
 
                 // REVERTED to upstream (pulsar 2026-08-02). A vendor patch here divided
@@ -425,12 +697,47 @@ impl Car {
                 //     WITH the inertia division:  fwd 94.6 / 98.6 / 121.7 / 99.4 deg
                 //     WITHOUT (this code):        fwd  6.0 /  4.4 /   5.1 /  2.5 deg
                 // for dodge forward/backward/side/diagonal. See SIM2REAL_AUDIT.md S21.
-                rb.add_impulse(
-                    None,
-                    Impulse::Angular(rb.get_world_trans().matrix3 * dodge_torque),
-                    false,
-                    true,
-                );
+                // Re-checked 2026-08-23 on the 120 Hz RLPR tape: inv_inertia * torque
+                // raises flip+wheels vel p50/p90 and flip_air ang p50/p90. Keep this.
+                // GGL_DODGE_NEEDS_AIR=1: drop dodge torque as soon as any wheel is down.
+                if apply_dodge {
+                    rb.add_impulse(
+                        None,
+                        Impulse::Angular(rb.get_world_trans().matrix3 * dodge_torque),
+                        false,
+                        true,
+                    );
+                }
+                if env_on("GGL_DODGE_DAMP") {
+                    let damp_pitch = dir_pitch.dot(rb.ang_vel) * car_consts::air_control::DAMPING.x;
+                    let damp_yaw = dir_yaw.dot(rb.ang_vel) * car_consts::air_control::DAMPING.y;
+                    let damp_roll = dir_roll.dot(rb.ang_vel) * car_consts::air_control::DAMPING.z;
+                    let damping = dir_yaw * damp_yaw + dir_pitch * damp_pitch + dir_roll * damp_roll;
+                    rb.add_impulse(
+                        None,
+                        Impulse::Angular(
+                            damping * const { car_consts::air_control::TORQUE_APPLY_SCALE * TICK_TIME },
+                        ),
+                        false,
+                        true,
+                    );
+                }
+                if env_on("GGL_AXIS_SPIN") {
+                    const CAP_X: f32 = 7.4396;
+                    const CAP_Y: f32 = 7.2348;
+                    let proj_x = rb.ang_vel.x + rb.accum_ang_vel.x;
+                    if proj_x > CAP_X {
+                        rb.accum_ang_vel.x -= proj_x - CAP_X;
+                    } else if proj_x < -CAP_X {
+                        rb.accum_ang_vel.x -= proj_x + CAP_X;
+                    }
+                    let proj_y = rb.ang_vel.y + rb.accum_ang_vel.y;
+                    if proj_y > CAP_Y {
+                        rb.accum_ang_vel.y -= proj_y - CAP_Y;
+                    } else if proj_y < -CAP_Y {
+                        rb.accum_ang_vel.y -= proj_y + CAP_Y;
+                    }
+                }
             }
         } else {
             do_air_control = true;
@@ -446,11 +753,7 @@ impl Car {
             {
                 if self.state.is_flipping
                     || self.state.has_flipped
-                        && self.state.flip_time
-                            < const {
-                                car_consts::flip::TORQUE_TIME
-                                    + car_consts::flip::PITCHLOCK_EXTRA_TIME
-                            }
+                        && self.state.flip_ticks < car_consts::flip::PITCHLOCK_TICKS
                 {
                     pitch_torque_scale = 0.0;
                 }
@@ -490,9 +793,25 @@ impl Car {
         // telemetry: predicted excess forward dV +4.444 uu/s per 8-tick window,
         // measured +4.459 (0.3%). Was upstream's "TODO: Fix air-throttle not
         // respecting boost". See research/reports/SIM2REAL_AUDIT.md S5.
-        if self.state.controls.throttle != 0.0 && !self.state.controls.boost {
+        // VENDOR PATCH (pulsar 2026-08-24): no air throttle while ANY wheel is in
+        // contact. T4 (solo autoroll/powerslide tape): every thr=+/-1 partial-
+        // contact tick carried a forward bias of exactly +/-0.556 uu/s =
+        // THROTTLE_AIR_ACCEL (200/3) * dt, uniform across speed 0-2300 (including
+        // >1400 where ground drive is zero), tilt, and wheel count 1-2 -- the sim
+        // stacked air throttle on top of wheel drive; the real game does not.
+        // GGL_AIR_THROTTLE_WHEELS=1 restores the old stacking behavior.
+        let throttle_scale = if num_wheels_in_contact > 0 && !env_on("GGL_AIR_THROTTLE_WHEELS") {
+            0.0
+        } else if env_on("GGL_BOOST_THROTTLE") && self.state.controls.boost {
+            1.0
+        } else if self.state.controls.boost {
+            0.0
+        } else {
+            self.state.controls.throttle
+        };
+        if throttle_scale != 0.0 {
             let throttle_force = forward_dir
-                * self.state.controls.throttle
+                * throttle_scale
                 * const { car_consts::drive::THROTTLE_AIR_ACCEL * UU_TO_BT * TICK_TIME };
             rb.add_impulse(None, Impulse::Linear(throttle_force), false, true);
         }
@@ -510,13 +829,13 @@ impl Car {
         if !self.state.has_jumped && self.state.is_on_ground && jump_pressed {
             self.state.is_jumping = true;
             self.state.has_jumped = true;
-            self.state.jump_time = 0.0;
+            self.state.jump_ticks = 0;
         }
 
         // Apply forces
         if self.state.is_jumping {
             // Jump started, apply initial boost force
-            if self.state.jump_time == 0.0 {
+            if self.state.jump_ticks == 0 {
                 let jump_start_force = up_dir * mutator_config.jump_immediate_force * UU_TO_BT;
                 rb.add_impulse(
                     Some("Jump"),
@@ -532,37 +851,39 @@ impl Car {
             // the jump->double-jump/dodge transition. Measured: battery fit 1027.8 ->
             // 1017.9, holdout 1057.3 -> 1048.2, moving 7 of 80 segments (all jump/dodge),
             // with double_jump -5.14 and dodge_diagonal -4.89 carrying it.
-            let still_held = self.state.jump_time < car_consts::jump::MIN_TIME
-                || (self.state.controls.jump
-                    && self.state.jump_time < car_consts::jump::MAX_TIME);
+            let still_held = self.state.jump_ticks < car_consts::jump::MIN_TICKS
+                || (self.state.controls.jump && self.state.jump_ticks < car_consts::jump::MAX_TICKS);
             if still_held {
                 let jump_force =
                     up_dir * mutator_config.jump_accel * const { UU_TO_BT * TICK_TIME };
                 rb.add_impulse(Some("Jump"), Impulse::Linear(jump_force), false, true);
             }
 
-            self.state.jump_time += TICK_TIME;
-            self.state.is_jumping = self.state.jump_time < car_consts::jump::MIN_TIME
-                || (self.state.controls.jump && self.state.jump_time < car_consts::jump::MAX_TIME);
+            self.state.jump_ticks += 1;
+            self.state.is_jumping = self.state.jump_ticks < car_consts::jump::MIN_TICKS
+                || (self.state.controls.jump && self.state.jump_ticks < car_consts::jump::MAX_TICKS);
         }
 
         // Update jump state
         if self.state.has_jumped {
             if !self.state.is_jumping {
-                self.state.jump_time += TICK_TIME;
+                self.state.jump_ticks += 1;
             }
 
             // Possibly reset `has_jumped`
-            if self.state.is_on_ground
-                && self.state.jump_time
-                    > const { car_consts::jump::MIN_TIME + car_consts::jump::RESET_TIME_PAD }
+            if !env_on("GGL_JUMP_SETTLE")
+                && self.state.is_on_ground
+                && ticks_gt(
+                    self.state.jump_ticks,
+                    const { car_consts::jump::MIN_TIME + car_consts::jump::RESET_TIME_PAD },
+                )
             {
                 // Don't reset the jump just yet, we might still be leaving the ground
                 // This fixes the bug where jump is reset before we actually leave the ground after a minimum-time jump
                 // TODO: RL does something similar to this time-pad, but not exactly the same
                 self.state.has_jumped = false;
                 self.state.is_jumping = false;
-                self.state.jump_time = 0.0;
+                self.state.jump_ticks = 0;
             }
         }
     }
@@ -579,7 +900,8 @@ impl Car {
             let (_, _, roll) = self.state.phys.rot_mat.to_euler(EulerRot::ZYX);
             let abs_roll = roll.abs();
             if abs_roll > car_consts::autoflip::ROLL_THRESH {
-                self.state.auto_flip_timer = car_consts::autoflip::TIME * (abs_roll / PI);
+                self.state.auto_flip_ticks =
+                    secs_to_ticks(car_consts::autoflip::TIME * (abs_roll / PI));
                 self.state.auto_flip_torque_scale = roll.signum();
                 self.state.is_auto_flipping = true;
 
@@ -590,15 +912,14 @@ impl Car {
         }
 
         if self.state.is_auto_flipping {
-            if self.state.auto_flip_timer <= 0.0 {
+            if self.state.auto_flip_ticks == 0 {
                 self.state.is_auto_flipping = false;
-                self.state.auto_flip_timer = 0.0;
             } else {
                 rb.ang_vel += self.state.get_forward_dir()
                     * car_consts::autoflip::TORQUE
                     * self.state.auto_flip_torque_scale
                     * TICK_TIME;
-                self.state.auto_flip_timer -= TICK_TIME;
+                self.state.auto_flip_ticks -= 1;
             }
         }
     }
@@ -613,31 +934,31 @@ impl Car {
         if self.state.is_on_ground {
             self.state.has_double_jumped = false;
             self.state.has_flipped = false;
-            self.state.air_time = 0.0;
-            self.state.air_time_since_jump = 0.0;
-            self.state.flip_time = 0.0;
+            self.state.air_ticks = 0;
+            self.state.air_ticks_since_jump = 0;
+            self.state.flip_ticks = 0;
             return;
         }
 
-        self.state.air_time += TICK_TIME;
+        self.state.air_ticks += 1;
 
         if self.state.has_jumped && !self.state.is_jumping {
-            self.state.air_time_since_jump += TICK_TIME;
+            self.state.air_ticks_since_jump += 1;
         } else {
-            self.state.air_time_since_jump = 0.0;
+            self.state.air_ticks_since_jump = 0;
         }
 
         // The post-jump lockout only means anything if a jump actually happened:
-        // air_time_since_jump is pinned at 0 for a car that never jumped, so gating on it
+        // air_ticks_since_jump is pinned at 0 for a car that never jumped, so gating on it
         // unconditionally re-imposes the has_jumped block that the capture already
         // disproved (corner_flip_into shows the real car taking a +280.8 uu/s jump impulse
         // in mid-air having never grounded). Measured: without this guard stall regresses
         // 9.3 -> 240.6 uu and corner_flip_into 11.1 -> 106.5 uu.
         let flip_delay_ok = !self.state.has_jumped
-            || self.state.air_time_since_jump >= car_consts::jump::FLIP_MIN_DELAY;
+            || self.state.air_ticks_since_jump >= car_consts::jump::FLIP_MIN_DELAY_TICKS;
         if jump_pressed
             && flip_delay_ok
-            && self.state.air_time_since_jump < car_consts::jump::DOUBLEJUMP_MAX_DELAY
+            && self.state.air_ticks_since_jump < car_consts::jump::DOUBLEJUMP_MAX_TICKS
         {
             let input_magnitude = self.state.controls.yaw.abs()
                 + self.state.controls.pitch.abs()
@@ -671,7 +992,7 @@ impl Car {
 
             if can_use {
                 if is_flip_input {
-                    self.state.flip_time = 0.0;
+                    self.state.flip_ticks = 0;
                     self.state.has_flipped = true;
                     self.state.is_flipping = true;
 
@@ -711,7 +1032,9 @@ impl Car {
                             car_consts::flip::FORWARD_IMPULSE_MAX_SPEED_SCALE
                         };
 
-                        let mut initial_dodge_vel = dodge_dir * car_consts::flip::INITIAL_VEL_SCALE;
+                        let mut initial_dodge_vel = dodge_dir
+                            * car_consts::flip::INITIAL_VEL_SCALE
+                            * env_f32("GGL_DODGE_VEL", 1.0);
                         initial_dodge_vel.x *=
                             ((max_speed_scale_x - 1.) * forward_speed_ratio) + 1.0;
                         initial_dodge_vel.y *= ((car_consts::flip::SIDE_IMPULSE_MAX_SPEED_SCALE
@@ -750,15 +1073,19 @@ impl Car {
         }
 
         if self.state.is_flipping {
-            self.state.flip_time += TICK_TIME;
-            if self.state.flip_time <= car_consts::flip::TORQUE_TIME
-                && self.state.flip_time >= car_consts::flip::Z_DAMP_START
-                && (rb.lin_vel.z < 0.0 || self.state.flip_time < car_consts::flip::Z_DAMP_END)
+            // Gate Z-damp on pre-increment flip_ticks (Zealan PR73 / v3-tuned
+            // RS_TUNE_FLIP_ZDAMP_PRE_INCREMENT). Post-increment fires one tick early.
+            if !env_on("GGL_NO_FLIP_ZDAMP")
+                && self.state.flip_ticks < car_consts::flip::TORQUE_TICKS
+                && self.state.flip_ticks >= car_consts::flip::Z_DAMP_START_TICKS
+                && (rb.lin_vel.z < 0.0
+                    || self.state.flip_ticks < car_consts::flip::Z_DAMP_END_TICKS)
             {
                 rb.lin_vel.z *= 1.0 - car_consts::flip::Z_DAMP_120;
             }
+            self.state.flip_ticks += 1;
         } else if self.state.has_flipped {
-            self.state.flip_time += TICK_TIME;
+            self.state.flip_ticks += 1;
         }
     }
 
@@ -810,34 +1137,43 @@ impl Car {
         self.state.is_boosting = if self.state.boost > 0.0 {
             self.state.controls.boost
                 || (self.state.is_boosting
-                    && self.state.boosting_time < car_consts::boost::MIN_TIME)
+                    && self.state.boosting_ticks < car_consts::boost::MIN_TICKS)
         } else {
             false
         };
 
         if self.state.is_boosting {
-            self.state.boosting_time += TICK_TIME;
-            self.state.time_since_boosted = 0.0;
+            self.state.boosting_ticks += 1;
+            self.state.ticks_since_boosted = 0;
             self.state.boost -= mutator_config.boost_used_per_second * TICK_TIME;
 
-            let accel = if self.state.is_on_ground {
+            // GGL_BOOST_AIR_WHEELS: DEFAULT OFF since 2026-08-24. Ground boost
+            // accel whenever any wheel is down. is_on_ground is n>=3, so 1-2-wheel
+            // ticks were taking ACCEL_AIR (3175/3) instead of ACCEL_GROUND (2975/3).
+            // Difference = THROTTLE_AIR_ACCEL (200/3) = +0.556 uu/s/tick. Dual of
+            // the wheel-gated air-throttle patch. =1 restores air accel on
+            // partial contact.
+            let accel = if self.state.is_on_ground
+                || (self.state.num_wheels_in_contact() > 0 && !env_on("GGL_BOOST_AIR_WHEELS"))
+            {
                 mutator_config.boost_accel_ground
             } else {
                 mutator_config.boost_accel_air
             };
 
             rb.add_impulse(
-                None,
+                Some("Boost"),
                 Impulse::Linear(accel * self.state.get_forward_dir() * (UU_TO_BT * TICK_TIME)),
                 false,
                 true,
             );
         } else {
-            self.state.boosting_time = 0.0;
-            self.state.time_since_boosted += TICK_TIME;
+            self.state.boosting_ticks = 0;
+            self.state.ticks_since_boosted += 1;
 
             if mutator_config.recharge_boost_enabled
-                && self.state.time_since_boosted >= mutator_config.recharge_boost_delay
+                && self.state.ticks_since_boosted
+                    >= ticks_until(mutator_config.recharge_boost_delay)
             {
                 self.state.boost += mutator_config.recharge_boost_per_second * TICK_TIME;
             }
@@ -860,9 +1196,8 @@ impl Car {
         {
             let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
             if self.state.is_demoed {
-                self.state.demo_respawn_timer =
-                    (self.state.demo_respawn_timer - TICK_TIME).max(0.0);
-                if self.state.demo_respawn_timer == 0.0 {
+                self.state.demo_respawn_ticks = self.state.demo_respawn_ticks.saturating_sub(1);
+                if self.state.demo_respawn_ticks == 0 {
                     self.respawn(rb, rng, game_mode, mutator_config.car_spawn_boost_amount);
                 }
 
@@ -881,42 +1216,88 @@ impl Car {
 
         let jump_pressed = self.state.controls.jump && !self.state.prev_controls.jump;
 
-        let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
-
-        // TODO: Refactor and move
-        let num_wheels_in_contact = self.state.num_wheels_in_contact();
-        // Tell the contact layer the wheels are carrying the car this tick, so chassis
-        // friction against world geometry is suppressed (see arena_contact_tracker.rs).
-        //
-        // >= 3 is RocketSim's own "on the ground" threshold (see update_wheels), and the
-        // capture agrees: >=1 and >=2 also fix the fillet but wrongly suppress friction
-        // for tilted landings, which touch one or two wheels AND the shell
-        // (tilt_nose_down 12.0 -> 63.9 uu, tilt_roll_right 6.5 -> 55.4 uu). >=3 fixes the
-        // fillet with those intact; >=4 is marginally worse overall.
-        rb.wheels_grounded = num_wheels_in_contact >= 3;
-
-        self.update_wheels(rb, num_wheels_in_contact, forward_speed_uu);
-
-        if self.state.is_on_ground {
-            self.state.is_flipping = false;
-        } else {
-            self.update_air_torque(rb, num_wheels_in_contact == 0);
-        }
-
-        self.update_jump(rb, mutator_config, jump_pressed);
-        self.update_auto_flip(rb, jump_pressed);
-        self.update_double_jump_or_flip(rb, mutator_config, jump_pressed, forward_speed_uu);
-
-        if self.state.controls.throttle != 0.0
-            && ((0 < num_wheels_in_contact && num_wheels_in_contact < 4)
-                || self.state.world_contact_normal.is_some())
         {
-            self.update_auto_roll(rb, num_wheels_in_contact);
+            let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
+
+            // TODO: Refactor and move
+            let num_wheels_in_contact = self.state.num_wheels_in_contact();
+            rb.wheels_grounded = num_wheels_in_contact >= 3;
+
+            self.update_wheels(rb, num_wheels_in_contact, forward_speed_uu);
+
+            if self.state.is_on_ground {
+                self.state.is_flipping = false;
+            } else if !env_on("GGL_FLIP_THEN_AIR") {
+                self.update_air_torque(
+                    rb,
+                    num_wheels_in_contact == 0 || env_on("GGL_AIR_WITH_WHEELS"),
+                    num_wheels_in_contact,
+                );
+            }
+
+            self.update_jump(rb, mutator_config, jump_pressed);
+            self.update_auto_flip(rb, jump_pressed);
+            self.update_double_jump_or_flip(rb, mutator_config, jump_pressed, forward_speed_uu);
+
+            if !self.state.is_on_ground && env_on("GGL_FLIP_THEN_AIR") {
+                self.update_air_torque(
+                    rb,
+                    num_wheels_in_contact == 0 || env_on("GGL_AIR_WITH_WHEELS"),
+                    num_wheels_in_contact,
+                );
+            }
+
+            // GGL_AUTOROLL: "1" = v2 always-on, "0"/"off" = never, "noflip" = v2
+            // gate minus jump/flip ticks, "strict" = noflip and wheels-only (no
+            // chassis world-contact arm). The T1 partial-contact up-error histogram
+            // has a discrete mode at -0.82 uu/s; the impulse trace pinned it to
+            // this block's linear term, exactly autoroll::FORCE (100 uu/s^2) * dt,
+            // firing on flip landings and rising jumps where the real game applies
+            // nothing -- but fully removing it regresses ground/air+wheels, so the
+            // real assist exists outside jump/flip. (v3-tuned zeroed both scales on
+            // a coarser corpus; the jump/flip split explains their mixed signal.)
+            let autoroll_mode = {
+                static V: OnceLock<u8> = OnceLock::new();
+                *V.get_or_init(|| match env::var("GGL_AUTOROLL").as_deref() {
+                    Ok("1") => 1,
+                    Ok("0") | Ok("off") => 0,
+                    Ok("strict") => 3,
+                    Ok("nofliplanded") => 4,
+                    _ => 2, // noflip default
+                })
+            };
+            let autoroll_ok = match autoroll_mode {
+                0 => false,
+                1 => true,
+                _ => {
+                    !self.state.is_flipping
+                        && !self.state.is_jumping
+                        && (autoroll_mode != 4 || !self.state.has_flipped)
+                        && (autoroll_mode == 2 || num_wheels_in_contact > 0)
+                }
+            };
+            if autoroll_ok
+                && self.state.controls.throttle != 0.0
+                && ((0 < num_wheels_in_contact && num_wheels_in_contact < 4)
+                    || (autoroll_mode != 3 && self.state.world_contact_normal.is_some()))
+            {
+                self.update_auto_roll(rb, num_wheels_in_contact);
+            }
+
+            self.state.world_contact_normal = None;
+
+            if !ggl_wheels_pre() {
+                self.update_boost(rb, mutator_config);
+            }
         }
 
-        self.state.world_contact_normal = None;
-
-        self.update_boost(rb, mutator_config);
+        if ggl_wheels_pre() {
+            // Tuned order: suspension/friction at this pose, then Bullet step.
+            self.bullet_vehicle
+                .update_vehicle_second(collision_world, TICK_TIME);
+            let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
+            self.update_boost(rb, mutator_config);
+        }
     }
 
     pub(crate) fn post_tick_update(&mut self, collision_world: &mut DiscreteDynamicsWorld) {
@@ -936,17 +1317,18 @@ impl Car {
         if self.state.is_supersonic {
             if speed_squared >= START_SPEED_SQ {
                 // Back above start speed: reset the maintain timer.
-                self.state.supersonic_grace_timer = 0.0;
+                self.state.supersonic_grace_ticks = 0;
             } else if speed_squared < MAINTAIN_MIN_SPEED_SQ {
                 // Dropped below the minimum maintain speed: lose supersonic immediately.
                 self.state.is_supersonic = false;
-                self.state.supersonic_grace_timer = 0.0;
+                self.state.supersonic_grace_ticks = 0;
             } else {
                 // Between maintain min and start speed: keep supersonic for the grace period.
-                self.state.supersonic_grace_timer += TICK_TIME;
-                if self.state.supersonic_grace_timer >= car_consts::supersonic::MAINTAIN_MAX_TIME {
+                self.state.supersonic_grace_ticks += 1;
+                if self.state.supersonic_grace_ticks >= car_consts::supersonic::MAINTAIN_MAX_TICKS
+                {
                     self.state.is_supersonic = false;
-                    self.state.supersonic_grace_timer = 0.0;
+                    self.state.supersonic_grace_ticks = 0;
                 }
             }
         } else if speed_squared >= START_SPEED_SQ {
@@ -960,30 +1342,66 @@ impl Car {
             // not this rule; the hit-angle cones + forward-speed gate (S36) are the
             // real phantom filters.
             self.state.is_supersonic = true;
-            self.state.supersonic_grace_timer = 0.0;
+            self.state.supersonic_grace_ticks = 0;
         } else {
-            self.state.supersonic_grace_timer = 0.0;
+            self.state.supersonic_grace_ticks = 0;
         }
 
         self.bullet_vehicle
             .update_vehicle_first(collision_world, TICK_TIME);
-        self.bullet_vehicle
-            .update_vehicle_second(collision_world, TICK_TIME);
+        if env_on("GGL_FRIC_APPLY") {
+            let chassis = &collision_world.bodies()[self.rigid_body_idx];
+            self.apply_friction_curves(chassis);
+        }
+        if !ggl_wheels_pre() {
+            self.bullet_vehicle
+                .update_vehicle_second(collision_world, TICK_TIME);
+        }
         let mut num_wheels_in_contact = 0u8;
-        for (wheel, has_contact) in self
-            .bullet_vehicle
-            .wheels
-            .iter()
-            .zip(&mut self.state.wheels_with_contact)
-        {
+        let travel_bt = vehicle_consts::MAX_SUSPENSION_TRAVEL * UU_TO_BT;
+        for (i, wheel) in self.bullet_vehicle.wheels.iter().enumerate() {
             let in_contact = wheel.raycast_info.is_some();
-            *has_contact = in_contact;
+            self.state.wheels_with_contact[i] = in_contact;
             num_wheels_in_contact += u8::from(in_contact);
+
+            let rest = wheel.suspension_rest_length_1;
+            let len = wheel
+                .raycast_info
+                .as_ref()
+                .map(|r| r.suspension_length)
+                .unwrap_or(rest + travel_bt);
+            let denom = 2.0 * travel_bt;
+            self.state.wheels_suspension[i] = if denom > 0.0 {
+                ((len - (rest - travel_bt)) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         }
 
         self.state.is_on_ground = num_wheels_in_contact >= 3;
 
-        self.state.bump_cooldown_timer = (self.state.bump_cooldown_timer - TICK_TIME).max(0.0);
+        self.sticky_gate_prev = self.bullet_vehicle.wheels.iter().any(|wheel| {
+            wheel
+                .raycast_info
+                .as_ref()
+                .is_some_and(|info| info.is_in_contact_with_world)
+        });
+        if env_on("GGL_JUMP_SETTLE")
+            && self.state.has_jumped
+            && !self.state.is_jumping
+            && self.state.is_on_ground
+        {
+            let extending = self.bullet_vehicle.wheels.iter().any(|w| {
+                w.raycast_info
+                    .as_ref()
+                    .is_some_and(|ri| ri.suspension_relative_vel > 1.0)
+            });
+            if !extending {
+                self.state.has_jumped = false;
+            }
+        }
+
+        self.state.bump_cooldown_ticks = self.state.bump_cooldown_ticks.saturating_sub(1);
         self.state.prev_controls = self.state.controls;
     }
 
@@ -1000,17 +1418,13 @@ impl Car {
         }
 
         // Clamp BEFORE publishing, matching RL's observable state (SIM2REAL_AUDIT.md
-        // S37): the real game applies its speed caps to the stored state at the end of
-        // the frame -- a capped dodge reads ang_vel exactly 5.5 and a ball-blasted car
-        // exactly 2300.0 in real captures -- while this sim only clamped at the START
-        // of the next tick, so everything BETWEEN ticks (obs builders, the RLBot
-        // bridge, recordings) saw pre-clamp values up to ~7.4 rad/s that the real game
-        // never exposes. Trajectories are unchanged (the start-of-tick clamp made the
-        // same correction before any force ran); only the published state moves.
-        rb.limit_vels(
-            const { car_consts::MAX_SPEED * UU_TO_BT },
-            car_consts::MAX_ANG_SPEED,
-        );
+        // S37). `GGL_VEL_CLAMP=head` skips this (tuned default: head of tick only).
+        if ggl_vel_clamp_end() {
+            rb.limit_vels(
+                const { car_consts::MAX_SPEED * UU_TO_BT },
+                car_consts::MAX_ANG_SPEED,
+            );
+        }
 
         self.state.phys.pos = rb.get_world_trans().translation * BT_TO_UU;
         self.state.phys.vel = rb.lin_vel * BT_TO_UU;

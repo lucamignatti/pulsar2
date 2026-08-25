@@ -36,11 +36,21 @@ struct RsfCarState {
 	RsfVec3 worldContactNormal;
 	uint8_t isDemoed;
 	float demoRespawnTimer;
+	float wheelsSuspension[4];
+	uint32_t bumpLastVictim;
+	uint64_t ballExtraImpulseTick;
 };
 
 struct RsfBallState { RsfPhysState phys; };
 struct RsfPadConfig { RsfVec3 pos; uint8_t isBig; };
 struct RsfPadState { float cooldown; uint8_t isActive; };
+
+struct RsfClosestSurface {
+	RsfVec3 point;
+	RsfVec3 normal;
+	float dist;
+	uint8_t hit;
+};
 
 enum : uint32_t {
 	RSF_EVENT_CAR_HIT_BALL = 0,
@@ -93,5 +103,10 @@ uint32_t rsf_arena_num_pads(RsfArena* arena);
 void rsf_arena_get_pad_config(RsfArena* arena, uint32_t idx, RsfPadConfig* out);
 void rsf_arena_get_pad_state(RsfArena* arena, uint32_t idx, RsfPadState* out);
 void rsf_arena_set_pad_state(RsfArena* arena, uint32_t idx, const RsfPadState* s);
+uint8_t rsf_arena_car_has_pending_pad_grant(RsfArena* arena, uint32_t carIdx);
+void rsf_arena_closest_surface(
+	RsfArena* arena, RsfVec3 query, float maxDist, RsfClosestSurface* out);
+void rsf_arena_closest_surface_n(
+	RsfArena* arena, const RsfVec3* queries, uint32_t n, float maxDist, RsfClosestSurface* out);
 
 } // extern "C"

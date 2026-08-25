@@ -30,7 +30,8 @@ fn generate_comparison_tests() {
             }
         }
     } else {
-        panic!("Tests dir not found");
+        // Fixtures are optional; analyze_rlpr + unit tests still build.
+        eprintln!("cargo:warning=rl_comparison_test/test_recordings missing; no generated fixture tests");
     }
 
     fs::write(destination, test_code).unwrap();

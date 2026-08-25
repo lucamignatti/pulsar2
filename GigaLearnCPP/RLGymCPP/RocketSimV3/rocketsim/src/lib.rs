@@ -14,6 +14,10 @@ mod sim;
 ///////////
 
 pub use base::*;
+pub use bullet::collision::dispatch::{
+    LAST_SAT_AXIS, LAST_SAT_GAP_UU, LAST_SAT_KIND, reset_last_sat_gap,
+};
+pub use bullet::dynamics::rigid_body::DBG_IMPULSE_TRACE;
 pub use glam_inc::*;
 
 pub use crate::sim::*;

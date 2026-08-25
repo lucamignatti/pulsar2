@@ -22,7 +22,19 @@ pub fn resolve_single_collision(
     let vel = vel1 - vel2;
     let rel_vel = contact_normal_on_b.dot(vel);
 
-    let positional_error = contact_solver_info::ERP * -distance / time_step;
+    // Only used for wheel pushback. Tuned measured real RL at HALF Bullet's ERP here
+    // (0.492/0.499/0.503 ratio over landing ticks in its wheel records) and ships 0.1.
+    // GGL_PUSHBACK_ERP overrides; default stays Bullet's 0.2.
+    fn ggl_pushback_erp() -> f32 {
+        static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("GGL_PUSHBACK_ERP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(contact_solver_info::ERP)
+        })
+    }
+    let positional_error = ggl_pushback_erp() * -distance / time_step;
     let vel_error = -rel_vel;
     let denom0 = body1.compute_impulse_denominator(contact_pos_world, contact_normal_on_b);
     let denom1 = body2.compute_impulse_denominator(contact_pos_world, contact_normal_on_b);

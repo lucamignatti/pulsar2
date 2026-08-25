@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use glam::Vec3A;
 
 use super::{contact_solver_info, solver_body::SolverBody, solver_constraint::SolverConstraint};
@@ -9,25 +11,82 @@ use crate::bullet::{
     linear_math::{integrate_trans, integrate_trans_no_rot, plane_space_1},
 };
 
+/// Env knobs: empty string still counts as on — unset, do not set to empty.
+fn ggl_env_on(name: &'static str) -> bool {
+    std::env::var(name).is_ok_and(|s| s != "0")
+}
+
+/// PR74 `22cf396` is shipped: special normals are unit-length.
+/// `GGL_NO_NORM=1` restores the unnormalized average.
+fn ggl_no_norm() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| ggl_env_on("GGL_NO_NORM"))
+}
+
+/// PR74 `1499c4d` (default off): dedup + single dynamic body + min `distance_1`
+/// + static-only special. `GGL_PR74=1` also enables this (stacked PR).
+fn ggl_pr74_dedup() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| ggl_env_on("GGL_PR74") || ggl_env_on("GGL_PR74_DEDUP"))
+}
+
+const SPECIAL_CONTACT_DEDUP_NORMAL_DOT: f32 = 0.999;
+const SPECIAL_CONTACT_DEDUP_SCALE: f32 = 0.1;
+
+#[derive(Clone, Copy)]
+struct SpecialContact {
+    obj_idx: usize,
+    pos_world_on_a: Vec3A,
+    pos_world_on_b: Vec3A,
+    normal_world_on_b: Vec3A,
+    distance: f32,
+    dedup_distance: f32,
+}
+
+impl SpecialContact {
+    fn is_duplicate_of(self, other: Self) -> bool {
+        let tolerance = self.dedup_distance.max(other.dedup_distance);
+        let tolerance_sq = tolerance * tolerance;
+        self.obj_idx == other.obj_idx
+            && (self.pos_world_on_a - other.pos_world_on_a).length_squared() <= tolerance_sq
+            && (self.pos_world_on_b - other.pos_world_on_b).length_squared() <= tolerance_sq
+            && (self.distance - other.distance).abs() <= tolerance
+            && self.normal_world_on_b.dot(other.normal_world_on_b)
+                >= SPECIAL_CONTACT_DEDUP_NORMAL_DOT
+    }
+}
+
 struct SpecialResolveInfo {
     pub obj_idx: usize,
     pub num_special_collisions: u16,
     pub total_normal: Vec3A,
     pub total_dist: f32,
+    /// Sum of real contact depths (`distance_1`, negative when penetrating).
+    /// `total_dist` is the lever-arm radius (~ball radius), not penetration.
+    pub total_penetration: f32,
+    pub min_penetration: f32,
     pub restitution: f32,
     pub friction: f32,
+    special_contacts: Vec<SpecialContact>,
+}
+
+impl Default for SpecialResolveInfo {
+    fn default() -> Self {
+        Self {
+            obj_idx: 0,
+            num_special_collisions: 0,
+            total_normal: Vec3A::ZERO,
+            total_dist: 0.0,
+            total_penetration: 0.0,
+            min_penetration: f32::MAX,
+            restitution: 0.0,
+            friction: 0.0,
+            special_contacts: Vec::new(),
+        }
+    }
 }
 
 impl SpecialResolveInfo {
-    pub const DEFAULT: Self = Self {
-        obj_idx: 0,
-        num_special_collisions: 0,
-        total_normal: Vec3A::ZERO,
-        total_dist: 0.0,
-        restitution: 0.0,
-        friction: 0.0,
-    };
-
     fn add_special_collision(
         &mut self,
         body0: &RigidBody,
@@ -35,7 +94,45 @@ impl SpecialResolveInfo {
         cp: &ManifoldPoint,
         rel_pos1: Vec3A,
         rel_pos2: Vec3A,
+        contact_breaking_threshold: f32,
     ) {
+        if ggl_pr74_dedup() {
+            let (obj_idx, rel_pos) = if !body0.is_static_obj() {
+                (body0.world_array_idx, rel_pos1)
+            } else if !body1.is_static_obj() {
+                (body1.world_array_idx, rel_pos2)
+            } else {
+                return;
+            };
+            let contact = SpecialContact {
+                obj_idx,
+                pos_world_on_a: cp.pos_world_on_a,
+                pos_world_on_b: cp.pos_world_on_b,
+                normal_world_on_b: cp.normal_world_on_b,
+                distance: cp.distance_1,
+                dedup_distance: (rel_pos.length() * SPECIAL_CONTACT_DEDUP_SCALE)
+                    .max(2.0 * contact_breaking_threshold),
+            };
+            if self
+                .special_contacts
+                .iter()
+                .copied()
+                .any(|existing| contact.is_duplicate_of(existing))
+            {
+                return;
+            }
+            self.special_contacts.push(contact);
+            self.obj_idx = obj_idx;
+            self.num_special_collisions += 1;
+            self.friction = cp.combined_friction;
+            self.restitution = cp.combined_restitution;
+            self.total_normal += cp.normal_world_on_b;
+            self.total_dist += rel_pos.length();
+            self.total_penetration += cp.distance_1;
+            self.min_penetration = self.min_penetration.min(cp.distance_1);
+            return;
+        }
+
         for (obj, rel_pos) in [(&body0, rel_pos1), (&body1, rel_pos2)] {
             if !obj.is_static_obj() {
                 self.obj_idx = obj.world_array_idx;
@@ -44,6 +141,7 @@ impl SpecialResolveInfo {
                 self.restitution = cp.combined_restitution;
                 self.total_normal += cp.normal_world_on_b;
                 self.total_dist += rel_pos.length();
+                self.total_penetration += cp.distance_1;
             }
         }
     }
@@ -72,7 +170,7 @@ impl Default for SeqImpulseConstraintSolver {
             tmp_solver_contact_friction_constraint_pool: Vec::new(),
             fixed_body_id: None,
             least_squares_residual: 0.0,
-            special_resolve_info: SpecialResolveInfo::DEFAULT,
+            special_resolve_info: SpecialResolveInfo::default(),
             split_impulse_should_run: Vec::new(),
         }
     }
@@ -154,8 +252,14 @@ impl SeqImpulseConstraintSolver {
                 let rel_pos2 = cp.pos_world_on_b - body1.get_world_trans().translation;
 
                 if cp.is_special {
-                    self.special_resolve_info
-                        .add_special_collision(body0, body1, cp, rel_pos1, rel_pos2);
+                    self.special_resolve_info.add_special_collision(
+                        body0,
+                        body1,
+                        cp,
+                        rel_pos1,
+                        rel_pos2,
+                        manifold.contact_breaking_threshold,
+                    );
 
                     // Skip normal contact processing for special contacts
                     continue;
@@ -197,7 +301,7 @@ impl SeqImpulseConstraintSolver {
         if self.special_resolve_info.num_special_collisions > 0 {
             let body = &mut collision_objs[self.special_resolve_info.obj_idx];
             self.convert_contact_special(body, time_step);
-            self.special_resolve_info = SpecialResolveInfo::DEFAULT;
+            self.special_resolve_info = SpecialResolveInfo::default();
         }
     }
 
@@ -238,7 +342,13 @@ impl SeqImpulseConstraintSolver {
         let sri = &self.special_resolve_info;
         let num_collisions = f32::from(sri.num_special_collisions);
         let distance = sri.total_dist / num_collisions;
-        let normal_world_on_b = sri.total_normal / num_collisions;
+        let avg_normal = sri.total_normal / num_collisions;
+        let normal_world_on_b = if ggl_no_norm() {
+            avg_normal
+        } else {
+            avg_normal.normalize()
+        };
+        let avg_penetration = sri.total_penetration / num_collisions;
 
         let friction_idx = self.tmp_solver_contact_constraint_pool.len();
 
@@ -274,7 +384,13 @@ impl SeqImpulseConstraintSolver {
 
         let (contact_normal_1, rel_pos1_cross_normal) = (normal_world_on_b, torque_axis_0);
 
-        let penetration = distance;
+        let penetration = if ggl_pr74_dedup() {
+            sri.min_penetration
+        } else if std::env::var("GGL_BALL_PEN_FIX").is_ok_and(|s| s != "0") {
+            avg_penetration
+        } else {
+            distance
+        };
 
         let vel = body.get_vel_in_local_point(rel_pos1);
         let rel_vel = normal_world_on_b.dot(vel);
@@ -382,7 +498,7 @@ impl SeqImpulseConstraintSolver {
         should_run.resize(self.tmp_solver_contact_constraint_pool.len(), true);
         let mut num_running = should_run.len();
 
-        for _ in 0..contact_solver_info::NUM_ITERATIONS {
+        for _ in 0..contact_solver_info::num_iterations() {
             for (i, contact) in self
                 .tmp_solver_contact_constraint_pool
                 .iter_mut()
@@ -462,7 +578,7 @@ impl SeqImpulseConstraintSolver {
     fn solve_group_iterations(&mut self) {
         self.solve_group_split_impulse_iterations();
 
-        for _ in 0..contact_solver_info::NUM_ITERATIONS {
+        for _ in 0..contact_solver_info::num_iterations() {
             self.least_squares_residual = self.solve_single_iteration();
             if self.least_squares_residual == 0.0 {
                 break;

@@ -50,6 +50,7 @@ pub struct WheelExtraState {
     pub suspension_force_scale: f32,
     pub extra_pushback: f32,
     pub real_ray_length: f32,
+    pub last_friction_curve_input: f32,
 }
 
 #[repr(C)]
@@ -83,6 +84,7 @@ impl WheelExtraState {
             suspension_force_scale: wheel.suspension_force_scale,
             extra_pushback: wheel.extra_pushback,
             real_ray_length: wheel.real_ray_length,
+            last_friction_curve_input: wheel.last_friction_curve_input,
             ..Default::default()
         };
 
@@ -115,6 +117,7 @@ impl WheelExtraState {
         wheel.suspension_force_scale = self.suspension_force_scale;
         wheel.extra_pushback = self.extra_pushback;
         wheel.real_ray_length = self.real_ray_length;
+        wheel.last_friction_curve_input = self.last_friction_curve_input;
 
         wheel.raycast_info = if self.has_raycast_info == 0 {
             None
@@ -127,6 +130,8 @@ impl WheelExtraState {
                 is_in_contact_with_world: self.is_in_contact_with_world != 0,
                 clipped_inv_contact_dot_suspension: self.clipped_inv_contact_dot_suspension,
                 suspension_relative_vel: self.suspension_relative_vel,
+                ground_body_idx: 0,
+                wheel_trace_len: 0.0,
             })
         };
     }

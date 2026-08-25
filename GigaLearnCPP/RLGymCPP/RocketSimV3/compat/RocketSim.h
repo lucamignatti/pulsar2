@@ -43,13 +43,14 @@ enum class Team : byte {
 #define RS_TEAM_FROM_Y(y) ((y) < 0 ? Team::BLUE : Team::ORANGE)
 
 // Field-for-field copy of v2's CarState (Sim/Car/Car.h) minus serialization.
-// Fields with no v3 counterpart (updateCounter, timeSpentBoosting,
-// supersonicTime, carContact) are carried but inert — see the mapping notes in
-// RocketSimCompat.cpp.
+// Fields with no v3 counterpart (updateCounter) are carried but inert — see
+// the mapping notes in RocketSimCompat.cpp.
 struct CarState : public PhysState {
 	uint64_t updateCounter = 0;
 	bool isOnGround = true;
 	bool wheelsWithContact[4] = {};
+	// [0,1] compressed→extended; wheel order FR, FL, BR, BL (same as wheelsWithContact)
+	float wheelsSuspension[4] = {};
 	bool hasJumped = false;
 	bool hasDoubleJumped = false;
 	bool hasFlipped = false;
@@ -63,6 +64,9 @@ struct CarState : public PhysState {
 	float boost = RLConst::BOOST_SPAWN_AMOUNT;
 	float timeSpentBoosting = 0;
 	bool isSupersonic = false;
+	// Compat name. Value is v3 supersonic_grace_timer: seconds spent in the
+	// [2100, 2200) band after dropping below START_SPEED (resets if you go back
+	// above 2200). Not "time since first became supersonic."
 	float supersonicTime = 0;
 	float handbrakeVal = 0;
 	bool isAutoFlipping = false;
@@ -83,6 +87,9 @@ struct CarState : public PhysState {
 	float demoRespawnTimer = 0;
 
 	BallHitInfo ballHitInfo = BallHitInfo();
+	// v3 ball_extra_impulse_tick. ~0 = never. Next on_hit is gated if
+	// tickCount <= last+1 (unless last > tickCount).
+	uint64_t ballExtraImpulseTick = ~0ULL;
 
 	CarControls lastControls = CarControls();
 
@@ -173,9 +180,12 @@ public:
 
 	std::vector<Car*>& GetCars() { return _cars; }
 	std::vector<BoostPad*>& GetBoostPads() { return _boostPads; }
-	float GetTickRate() const { return 1 / tickTime; }
+	// v3 only supports 120Hz. Do not return 1/tickTime: 1/(1/120.f) is not 120.f.
+	float GetTickRate() const { return 120.f; }
 
 	RSAPI Car* AddCar(Team team);
+	// True if this car (Car::id) is the pending claimant of any pad.
+	RSAPI bool CarHasPendingPadGrant(uint32_t carId) const;
 	RSAPI void Step(int ticksToSimulate = 1);
 	RSAPI void ResetToRandomKickoff(int seed = -1);
 	RSAPI bool IsBallScored() const;
@@ -183,6 +193,18 @@ public:
 	// Closed-form ballistic score prediction, ported verbatim from v2
 	// Arena.cpp (soccar path only) for GameEventTracker.
 	RSAPI bool IsBallProbablyGoingIn(float maxTime = 0.2f, float extraMargin = 0, Team* goalTeamOut = NULL) const;
+
+	// Closest static mesh (plus the floor plane) to a world-UU query.
+	// hit=false if nothing is inside maxDist; dist is then maxDist.
+	struct ClosestSurfaceHit {
+		Vec point;
+		Vec normal;
+		float dist = 0.f;
+		bool hit = false;
+	};
+	RSAPI void QueryClosestSurface(Vec query, float maxDist, ClosestSurfaceHit& out) const;
+	RSAPI void QueryClosestSurfaceN(
+		const Vec* queries, int n, float maxDist, ClosestSurfaceHit* out) const;
 
 	void SetCarBumpCallback(CarBumpEventFn callbackFn, void* userInfo = NULL) {
 		_bumpCallback.func = callbackFn;

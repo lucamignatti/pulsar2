@@ -15,14 +15,35 @@ use crate::bullet::{
 
 pub struct CollisionDispatcher {
     pub manifolds: Vec<PersistentManifold>,
+    /// CAR-CAR persistent manifold cache (GGL_CC_PERSIST). Real Bullet keeps a
+    /// manifold per broadphase pair across ticks: once a contact point exists it
+    /// survives (and keeps entering the solver) until it drifts past the
+    /// breaking threshold (~1 uu) along or orthogonal to its normal. This port
+    /// rebuilds manifolds from the detector every tick, so a grazing box-box
+    /// miss instantly drops the contact -- measured on the T1 grind (i=4648+)
+    /// as flickering contact and ~16 uu/s of missing mutual separation, while
+    /// blanket box inflation over-fires on fly-by ticks. Entries are evicted
+    /// when the broadphase pair stops overlapping (near_callback not reached).
+    cc_cache: Vec<(usize, usize, PersistentManifold, bool)>,
 }
 
 impl Default for CollisionDispatcher {
     fn default() -> Self {
         Self {
             manifolds: Vec::with_capacity(8),
+            cc_cache: Vec::new(),
         }
     }
+}
+
+fn ggl_cc_persist() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    // Default ON (2026-08-24): T1 od<130 verr p90 12.39 -> 10.92, grind-event
+    // axis bias +6.21 -> +2.70, no collateral anywhere (fly-bys untouched --
+    // persistence needs a real seed contact, unlike box inflation which was
+    // tested and rejected). GGL_CC_PERSIST=0 restores per-tick manifolds.
+    *V.get_or_init(|| !std::env::var("GGL_CC_PERSIST").is_ok_and(|s| s == "0"))
 }
 
 impl CollisionDispatcher {
@@ -205,7 +226,48 @@ impl CollisionDispatcher {
             return;
         }
 
-        if let Some(manifold) = Self::process_collision(rb0, rb1, contact_added_callback) {
+        let fresh = Self::process_collision(rb0, rb1, contact_added_callback);
+
+        let is_car_car = ggl_cc_persist()
+            && rb0.user_idx == crate::sim::UserInfoTypes::Car
+            && rb1.user_idx == crate::sim::UserInfoTypes::Car;
+        if is_car_car {
+            let key = if rb0.world_array_idx < rb1.world_array_idx {
+                (rb0.world_array_idx, rb1.world_array_idx)
+            } else {
+                (rb1.world_array_idx, rb0.world_array_idx)
+            };
+            let slot = self
+                .cc_cache
+                .iter_mut()
+                .find(|(a, b, ..)| (*a, *b) == key);
+            if let Some(manifold) = fresh {
+                match slot {
+                    Some(entry) => {
+                        entry.2 = manifold.clone();
+                        entry.3 = true;
+                    }
+                    None => self.cc_cache.push((key.0, key.1, manifold.clone(), true)),
+                }
+                self.manifolds.push(manifold);
+            } else if let Some(entry) = slot {
+                entry.3 = true;
+                // Detector miss with live cached points: refresh against the
+                // current transforms (drops points past the breaking threshold)
+                // and, if any survive, hand the cached manifold to the solver.
+                let (b0, b1) = if entry.2.body0_idx == rb0.world_array_idx {
+                    (rb0, rb1)
+                } else {
+                    (rb1, rb0)
+                };
+                entry.2.refresh_contact_points(b0, b1);
+                if entry.2.point_cache.is_empty() {
+                    entry.3 = false;
+                } else {
+                    self.manifolds.push(entry.2.clone());
+                }
+            }
+        } else if let Some(manifold) = fresh {
             self.manifolds.push(manifold);
         }
     }
@@ -216,6 +278,10 @@ impl CollisionDispatcher {
         pair_cache: &mut GridBroadphase,
         contact_added_callback: &mut T,
     ) {
+        for entry in &mut self.cc_cache {
+            entry.3 = false;
+        }
         pair_cache.process_all_overlapping_pairs(collision_objs, self, contact_added_callback);
+        self.cc_cache.retain(|(.., touched)| *touched);
     }
 }

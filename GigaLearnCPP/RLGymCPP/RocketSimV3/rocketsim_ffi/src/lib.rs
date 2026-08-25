@@ -14,7 +14,8 @@ use std::os::raw::{c_char, c_int};
 use glam::{Mat3A, Vec3A};
 use rocketsim::{
     Arena, ArenaConfig, ArenaEvent, BallState, BoostPadState, CarBodyConfig, CarControls,
-    CarExtraState, CarState, GameMode, Team,
+    CarExtraState, CarState, ClosestSurface, GameMode, Team,
+    consts::{secs_to_ticks},
 };
 
 // A Rust panic aborts (panic="abort") rather than unwinding into C++; arena
@@ -153,6 +154,11 @@ pub struct RsfCarState {
     pub world_contact_normal: RsfVec3,
     pub is_demoed: u8,
     pub demo_respawn_timer: f32,
+    pub wheels_suspension: [f32; 4],
+    /// 1 + victim arena index of last extra-bump; 0 = none. Same as C++ car id.
+    pub bump_last_victim: u32,
+    /// Last tick this car applied the psyonix ball extra impulse. u64::MAX = none.
+    pub ball_extra_impulse_tick: u64,
 }
 
 impl From<&CarState> for RsfCarState {
@@ -172,27 +178,30 @@ impl From<&CarState> for RsfCarState {
             has_double_jumped: s.has_double_jumped as u8,
             has_flipped: s.has_flipped as u8,
             flip_rel_torque: s.flip_rel_torque.into(),
-            jump_time: s.jump_time,
-            flip_time: s.flip_time,
+            jump_time: s.jump_time(),
+            flip_time: s.flip_time(),
             is_flipping: s.is_flipping as u8,
             is_jumping: s.is_jumping as u8,
-            air_time: s.air_time,
-            air_time_since_jump: s.air_time_since_jump,
+            air_time: s.air_time(),
+            air_time_since_jump: s.air_time_since_jump(),
             boost: s.boost,
-            time_since_boosted: s.time_since_boosted,
+            time_since_boosted: s.time_since_boosted(),
             is_boosting: s.is_boosting as u8,
-            boosting_time: s.boosting_time,
+            boosting_time: s.boosting_time(),
             is_supersonic: s.is_supersonic as u8,
-            supersonic_grace_timer: s.supersonic_grace_timer,
+            supersonic_grace_timer: s.supersonic_grace_timer(),
             handbrake_val: s.handbrake_val,
             is_auto_flipping: s.is_auto_flipping as u8,
-            auto_flip_timer: s.auto_flip_timer,
+            auto_flip_timer: s.auto_flip_timer(),
             auto_flip_torque_scale: s.auto_flip_torque_scale,
-            bump_cooldown_timer: s.bump_cooldown_timer,
+            bump_cooldown_timer: s.bump_cooldown_timer(),
             has_world_contact: s.world_contact_normal.is_some() as u8,
             world_contact_normal: s.world_contact_normal.unwrap_or(Vec3A::ZERO).into(),
             is_demoed: s.is_demoed as u8,
-            demo_respawn_timer: s.demo_respawn_timer,
+            demo_respawn_timer: s.demo_respawn_timer(),
+            wheels_suspension: s.wheels_suspension,
+            bump_last_victim: s.bump_last_victim,
+            ball_extra_impulse_tick: s.ball_extra_impulse_tick.unwrap_or(u64::MAX),
         }
     }
 }
@@ -214,34 +223,31 @@ impl From<&RsfCarState> for CarState {
             has_double_jumped: s.has_double_jumped != 0,
             has_flipped: s.has_flipped != 0,
             flip_rel_torque: s.flip_rel_torque.into(),
-            jump_time: s.jump_time,
-            flip_time: s.flip_time,
+            jump_ticks: secs_to_ticks(s.jump_time),
+            flip_ticks: secs_to_ticks(s.flip_time),
             is_flipping: s.is_flipping != 0,
             is_jumping: s.is_jumping != 0,
-            air_time: s.air_time,
-            air_time_since_jump: s.air_time_since_jump,
+            air_ticks: secs_to_ticks(s.air_time),
+            air_ticks_since_jump: secs_to_ticks(s.air_time_since_jump),
             boost: s.boost,
-            time_since_boosted: s.time_since_boosted,
+            ticks_since_boosted: secs_to_ticks(s.time_since_boosted),
             is_boosting: s.is_boosting != 0,
-            boosting_time: s.boosting_time,
+            boosting_ticks: secs_to_ticks(s.boosting_time),
             is_supersonic: s.is_supersonic != 0,
-            supersonic_grace_timer: s.supersonic_grace_timer,
+            supersonic_grace_ticks: secs_to_ticks(s.supersonic_grace_timer),
             handbrake_val: s.handbrake_val,
             is_auto_flipping: s.is_auto_flipping != 0,
-            auto_flip_timer: s.auto_flip_timer,
+            auto_flip_ticks: secs_to_ticks(s.auto_flip_timer),
             auto_flip_torque_scale: s.auto_flip_torque_scale,
-            bump_cooldown_timer: s.bump_cooldown_timer,
-            // Not carried over the FFI: a state set clears the per-victim bump memory,
-            // so the first bump after a state set is never interval-limited. State sets
-            // happen at episode resets where the cooldown is stale anyway.
-            bump_last_victim: 0,
-            // Same episode-reset rationale as bump_last_victim: not carried over the
-            // FFI, so a state set re-arms the psyonix-impulse gate.
-            ball_extra_impulse_tick: None,
+            bump_cooldown_ticks: secs_to_ticks(s.bump_cooldown_timer),
+            bump_last_victim: s.bump_last_victim,
+            ball_extra_impulse_tick: (s.ball_extra_impulse_tick != u64::MAX)
+                .then_some(s.ball_extra_impulse_tick),
             world_contact_normal: (s.has_world_contact != 0)
                 .then(|| s.world_contact_normal.into()),
             is_demoed: s.is_demoed != 0,
-            demo_respawn_timer: s.demo_respawn_timer,
+            demo_respawn_ticks: secs_to_ticks(s.demo_respawn_timer),
+            wheels_suspension: s.wheels_suspension,
         }
     }
 }
@@ -264,6 +270,24 @@ pub struct RsfPadConfig {
 pub struct RsfPadState {
     pub cooldown: f32,
     pub is_active: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RsfClosestSurface {
+    pub point: RsfVec3,
+    pub normal: RsfVec3,
+    pub dist: f32,
+    pub hit: u8,
+}
+
+fn closest_to_rsf(s: ClosestSurface) -> RsfClosestSurface {
+    RsfClosestSurface {
+        point: s.point.into(),
+        normal: s.normal.into(),
+        dist: s.dist,
+        hit: u8::from(s.hit),
+    }
 }
 
 pub const RSF_EVENT_CAR_HIT_BALL: u32 = 0;
@@ -610,6 +634,16 @@ pub unsafe extern "C" fn rsf_arena_get_pad_state(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_car_has_pending_pad_grant(
+    p: *mut FfiArena,
+    car_idx: u32,
+) -> u8 {
+    unsafe { arena(p) }
+        .arena
+        .car_has_pending_pad_grant(car_idx as usize) as u8
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rsf_arena_set_pad_state(
     p: *mut FfiArena,
     idx: u32,
@@ -619,4 +653,61 @@ pub unsafe extern "C" fn rsf_arena_set_pad_state(
     unsafe { arena(p) }
         .arena
         .set_boost_pad_state(idx as usize, BoostPadState { cooldown: src.cooldown });
+}
+
+/// # Safety
+/// `out` must be a valid `RsfClosestSurface`. Query/maxDist are UU.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_closest_surface(
+    p: *mut FfiArena,
+    query: RsfVec3,
+    max_dist: f32,
+    out: *mut RsfClosestSurface,
+) {
+    let hit = unsafe { arena(p) }
+        .arena
+        .closest_surface(query.into(), max_dist);
+    unsafe { *out = closest_to_rsf(hit) };
+}
+
+/// # Safety
+/// `queries` and `out` must each have `n` elements. Units are UU.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rsf_arena_closest_surface_n(
+    p: *mut FfiArena,
+    queries: *const RsfVec3,
+    n: u32,
+    max_dist: f32,
+    out: *mut RsfClosestSurface,
+) {
+    if n == 0 {
+        return;
+    }
+    let queries = unsafe { std::slice::from_raw_parts(queries, n as usize) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, n as usize) };
+    const MAX_N: usize = 8;
+    let n = queries.len().min(out.len());
+    if n > MAX_N {
+        let arena = &unsafe { arena(p) }.arena;
+        for (query, slot) in queries.iter().zip(out.iter_mut()) {
+            *slot = closest_to_rsf(arena.closest_surface((*query).into(), max_dist));
+        }
+        return;
+    }
+    let mut q = [Vec3A::ZERO; MAX_N];
+    let mut hits = [ClosestSurface {
+        point: Vec3A::ZERO,
+        normal: Vec3A::ZERO,
+        dist: max_dist,
+        hit: false,
+    }; MAX_N];
+    for i in 0..n {
+        q[i] = queries[i].into();
+    }
+    unsafe { arena(p) }
+        .arena
+        .closest_surface_n(&q[..n], max_dist, &mut hits[..n]);
+    for i in 0..n {
+        out[i] = closest_to_rsf(hits[i]);
+    }
 }

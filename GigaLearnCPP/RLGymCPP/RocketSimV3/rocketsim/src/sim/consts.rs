@@ -2,6 +2,7 @@ use glam::Vec3A;
 
 use crate::{GameMode, sim::linear_piece_curve::LinearPieceCurve};
 
+#[derive(Clone, Copy, Debug)]
 pub struct PhysicsCoefs {
     pub friction: f32,
     pub restitution: f32,
@@ -36,6 +37,113 @@ pub const TICK_RATE: f32 = 120.0;
 /// The amount of time each tick takes up (inverse of `TICK_RATE`)
 pub const TICK_TIME: f32 = 1.0 / TICK_RATE;
 
+/// Convert a tick counter to seconds (`ticks * TICK_TIME`).
+#[inline]
+#[must_use]
+pub const fn ticks_to_secs(ticks: u32) -> f32 {
+    ticks as f32 * TICK_TIME
+}
+
+/// Convert seconds to ticks, rounding to nearest (non-negative).
+/// RL f32 clocks often land on values like 41.999 ticks; round, do not trunc.
+#[inline]
+#[must_use]
+pub const fn secs_to_ticks(secs: f32) -> u32 {
+    if secs <= 0.0 {
+        0
+    } else {
+        (secs * TICK_RATE + 0.5) as u32
+    }
+}
+
+/// `+= TICK_TIME` applied `ticks` times (the old f32 clock), not `ticks * TICK_TIME`.
+#[inline]
+#[must_use]
+pub const fn ticks_to_secs_sum(ticks: u32) -> f32 {
+    let mut t = 0.0f32;
+    let mut i = 0u32;
+    while i < ticks {
+        t += TICK_TIME;
+        i += 1;
+    }
+    t
+}
+
+/// First tick count whose `+= TICK_TIME` sum is `>= secs`.
+/// `ticks < ticks_until(secs)` is the integer form of `time < secs`.
+#[inline]
+#[must_use]
+pub const fn ticks_until(secs: f32) -> u32 {
+    if secs <= 0.0 {
+        return 0;
+    }
+    let mut t = 0.0f32;
+    let mut n = 0u32;
+    loop {
+        t += TICK_TIME;
+        n += 1;
+        if t >= secs {
+            return n;
+        }
+        if n == u32::MAX {
+            return n;
+        }
+    }
+}
+
+#[inline]
+#[must_use]
+pub const fn ticks_lt(ticks: u32, secs: f32) -> bool {
+    ticks < ticks_until(secs)
+}
+
+#[inline]
+#[must_use]
+pub const fn ticks_le(ticks: u32, secs: f32) -> bool {
+    ticks_to_secs_sum(ticks) <= secs
+}
+
+#[inline]
+#[must_use]
+pub const fn ticks_ge(ticks: u32, secs: f32) -> bool {
+    ticks >= ticks_until(secs)
+}
+
+#[inline]
+#[must_use]
+pub const fn ticks_gt(ticks: u32, secs: f32) -> bool {
+    ticks_to_secs_sum(ticks) > secs
+}
+
+#[cfg(test)]
+mod tick_conv_tests {
+    use super::{TICK_RATE, TICK_TIME, secs_to_ticks, ticks_lt, ticks_to_secs, ticks_until};
+
+    #[test]
+    fn jump_min_time_is_three_ticks() {
+        assert_eq!(secs_to_ticks(0.025), 3);
+        assert_eq!(ticks_to_secs(3), 3.0 * TICK_TIME);
+        assert_eq!(ticks_until(0.025), 3);
+        assert!(ticks_lt(2, 0.025));
+        assert!(!ticks_lt(3, 0.025));
+    }
+
+    #[test]
+    fn round_not_trunc_near_integer_ticks() {
+        // 41.999 ticks of f32 clock should restore as 42, not 41.
+        let secs = 41.999 / TICK_RATE;
+        assert_eq!(secs_to_ticks(secs), 42);
+    }
+
+    #[test]
+    fn torque_window_keeps_tick_78() {
+        // `+= TICK_TIME` 78 times is still < 0.65; `78 * TICK_TIME` is not.
+        assert_eq!(ticks_until(0.65), 79);
+        assert!(ticks_lt(78, 0.65));
+        assert!(!ticks_lt(79, 0.65));
+    }
+}
+
 /// The z-velocity added by gravity each second
 pub const GRAVITY_Z: f32 = -650.0;
 
@@ -50,14 +158,26 @@ pub mod arena {
         restitution: 0.3,
     };
 
+    /// Soccar side wall |x| (wiki / RLBot useful-game-values).
+    pub const SOCCAR_EXTENT_X: f32 = 4096.0;
+    /// Soccar back wall |y|, not including inner-goal.
+    pub const SOCCAR_EXTENT_Y: f32 = 5120.0;
+    /// Play-surface ceiling z. The Bullet AABB max.z is 2048.
+    pub const SOCCAR_CEILING_Z: f32 = 2044.0;
+    /// 45° corner planes intersect the axes at ±this.
+    pub const SOCCAR_CORNER_INTERCEPT: f32 = 8064.0;
+    /// Wiki: "Wall bottom ramp radius: Aprox. 256 (but they are not circular)".
+    /// Floor-wall and wall-ceiling fillets score as **wall**, not ground.
+    pub const SOCCAR_WALL_BOTTOM_RAMP: f32 = 256.0;
+
     #[must_use]
     pub const fn get_aabb(game_mode: GameMode) -> Aabb {
         let (max_x, max_y, max_z) = match game_mode {
             GameMode::Hoops => (8900.0 / 3.0, 3581.0, 1820.0),
             GameMode::Dropshot => (5075.0, 4592.0, 2024.0),
 
-            // Soccar arena
-            _ => (4096.0, 5120.0, 2048.0),
+            // Soccar arena. z=2048 is the Bullet world box, not SOCCAR_CEILING_Z.
+            _ => (SOCCAR_EXTENT_X, SOCCAR_EXTENT_Y, 2048.0),
         };
 
         let floor_height = match game_mode {
@@ -111,6 +231,7 @@ pub mod car {
         pub const USED_PER_SECOND: f32 = MAX / 3.0;
         /// Minimum time we can be boosting for
         pub const MIN_TIME: f32 = 0.1;
+        pub const MIN_TICKS: u32 = super::super::ticks_until(MIN_TIME);
         /// uu/s for vel (on the ground)
         pub const ACCEL_GROUND: f32 = 2975.0 / 3.0;
         /// uu/s for vel (airborne)
@@ -129,6 +250,7 @@ pub mod car {
         pub const START_SPEED: f32 = 2200.0;
         pub const MAINTAIN_MIN_SPEED: f32 = START_SPEED - 100.0;
         pub const MAINTAIN_MAX_TIME: f32 = 1.0;
+        pub const MAINTAIN_MAX_TICKS: u32 = super::super::ticks_until(MAINTAIN_MAX_TIME);
     }
 
     pub mod drive {
@@ -146,7 +268,8 @@ pub mod car {
         /// (research/maneuvers) isolates a pure coast from a fixed state and is decisive:
         ///   real decel 525 uu/s^2   vs   sim 385 at 0.11   and   525 at 0.15
         ///   coast_decel segment error: 56.01 uu at 0.11, 4.11 uu at 0.15
-        /// 0.15 is correct. Do not "fix" this from match-play aggregates again.
+        /// Re-checked 2026-08-23 on the 120 Hz RLPR tape: 0.11 slightly worse on
+        /// fit+holdout ground/air+wheels. Keep 0.15.
         pub const COASTING_BRAKE_FACTOR: f32 = 0.15;
         /// If we are braking and moving faster than this, disable throttle
         pub const BRAKING_NO_THROTTLE_SPEED_THRESH: f32 = 0.01;
@@ -168,31 +291,15 @@ pub mod car {
         pub const DOUBLEJUMP_MAX_DELAY: f32 = 1.25;
         /// Minimum time after a jump before a dodge/double jump may fire.
         ///
-        /// RocketSim had no such gate: with a 1-tick jump tap `is_jumping` clears at
-        /// MIN_TIME and a dodge could fire ~3 ticks after the jump. The real game refuses
-        /// it there. Measured (research/maneuvers vs a real capture): `speed_flip` presses
-        /// the dodge 6 ticks after the jump and the real car does NOT dodge -- its roll
-        /// rate stays flat at 0.00 rad/s while the sim reached 7.2 -- yet
-        /// `wavedash_forward` dodges 18 ticks after the jump and matches to 5.9 uu.
-        ///
-        /// Swept against the capture: the window is [0.0167, 0.0333]. Below it speed_flip
-        /// breaks (583.3 uu), above it half_flip breaks (3.3 -> 347.2 uu). MIN_TIME sits
-        /// dead centre and is an existing RL constant, so use it rather than a fitted
-        /// number. See SIM2REAL_AUDIT.md S24.
-        /// Minimum time after a jump before a dodge/double jump may fire.
-        ///
-        /// RocketSim had no such gate: with a 1-tick jump tap `is_jumping` clears at
-        /// MIN_TIME and a dodge could fire ~3 ticks after the jump. The real game refuses
-        /// it there. Measured (research/maneuvers vs a real capture): `speed_flip` presses
-        /// the dodge 6 ticks after the jump and the real car does NOT dodge -- its roll
-        /// rate stays flat at 0.00 rad/s while the sim reached 7.2 -- yet
-        /// `wavedash_forward` dodges 18 ticks after the jump and matches to 5.9 uu.
-        ///
-        /// Swept against the capture: the window is [0.0167, 0.0333]. Below it speed_flip
-        /// breaks (583.3 uu), above it half_flip breaks (3.3 -> 347.2 uu). MIN_TIME sits
-        /// dead centre and is an existing RL constant, so use it rather than a fitted
-        /// number. See SIM2REAL_AUDIT.md S24.
-        pub const FLIP_MIN_DELAY: f32 = MIN_TIME;
+        /// One physics tick (`TICK_TIME`). Blocks dodge on the first airborne tick
+        /// after takeoff (`air_time_since_jump` is 0 while `is_jumping`). `0` allowed
+        /// that tick; `MIN_TIME` (0.025) was a 60 fps fit and a no-op vs 2 ticks on
+        /// the 120 Hz tape. See S24.
+        pub const FLIP_MIN_DELAY: f32 = super::super::TICK_TIME;
+        pub const MIN_TICKS: u32 = super::super::ticks_until(MIN_TIME);
+        pub const MAX_TICKS: u32 = super::super::ticks_until(MAX_TIME);
+        pub const DOUBLEJUMP_MAX_TICKS: u32 = super::super::ticks_until(DOUBLEJUMP_MAX_DELAY);
+        pub const FLIP_MIN_DELAY_TICKS: u32 = super::super::ticks_until(FLIP_MIN_DELAY);
     }
 
     pub mod flip {
@@ -221,6 +328,13 @@ pub mod car {
         pub const SIDE_IMPULSE_MAX_SPEED_SCALE: f32 = 1.9;
         pub const BACKWARD_IMPULSE_MAX_SPEED_SCALE: f32 = 2.5;
         pub const BACKWARD_IMPULSE_SCALE_X: f32 = 16.0 / 15.0;
+        pub const PITCH_CANCEL_MIN_TICKS: u32 = super::super::ticks_until(PITCH_CANCEL_MIN_TIME);
+        pub const Z_DAMP_START_TICKS: u32 = super::super::ticks_until(Z_DAMP_START);
+        pub const Z_DAMP_END_TICKS: u32 = super::super::ticks_until(Z_DAMP_END);
+        /// Exclusive: `flip_ticks < TORQUE_TICKS` matches `+= TICK_TIME` vs 0.65.
+        pub const TORQUE_TICKS: u32 = super::super::ticks_until(TORQUE_TIME);
+        pub const PITCHLOCK_TICKS: u32 =
+            super::super::ticks_until(TORQUE_TIME + PITCHLOCK_EXTRA_TIME);
     }
 
     pub mod air_control {
@@ -400,6 +514,8 @@ pub mod goal {
     pub const SOCCAR_GOAL_HEIGHT: f32 = 642.775; // https://wiki.rlbot.org/v4/botmaking/useful-game-values/
     pub const SOCCAR_GOAL_HALF_WIDTH: f32 = 892.755; // https://wiki.rlbot.org/v4/botmaking/useful-game-values/
     pub const SOCCAR_GOAL_DEPTH: f32 = 880.0; // https://wiki.rlbot.org/v4/botmaking/useful-game-values/
+    /// Post/crossbar cylinder radius in the standard soccar arena model.
+    pub const SOCCAR_GOAL_FRAME_RADIUS: f32 = 75.0;
 
     pub const HOOPS_GOAL_SCORE_THRESHOLD_Z: f32 = 270.0;
 

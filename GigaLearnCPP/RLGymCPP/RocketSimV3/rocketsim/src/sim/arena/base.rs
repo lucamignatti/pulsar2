@@ -18,7 +18,7 @@ use crate::{
             rigid_body::{ActivationState, CollisionFlags, RigidBody, RigidBodyConstructionInfo},
         },
     },
-    consts::{self, BT_TO_UU, TICK_RATE, TICK_TIME, UU_TO_BT},
+    consts::{self, BT_TO_UU, TICK_RATE, TICK_TIME, UU_TO_BT, secs_to_ticks},
     make_tile_shapes,
     shared::quantize,
     sim::{
@@ -480,7 +480,9 @@ impl Arena {
 
             for car_idx in 0..self.cars.len() {
                 let car_rb = &mut self.bullet_world.bodies_mut()[self.cars[car_idx].rigid_body_idx];
-                car_rb.limit_vels(car::MAX_SPEED * UU_TO_BT, car::MAX_ANG_SPEED);
+                if crate::sim::car::ggl_vel_clamp_head() {
+                    car_rb.limit_vels(car::MAX_SPEED * UU_TO_BT, car::MAX_ANG_SPEED);
+                }
                 quantize::quantize(car_rb);
             }
             let ball_rb = &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx];
@@ -543,6 +545,17 @@ impl Arena {
                         );
                     }
                     UserInfoTypes::Car => {
+                        // A slack-promoted car-car manifold (boxes never truly
+                        // overlapped; LAST_SAT_KIND==5) gets the soft Bullet
+                        // contact response but must NOT trigger the RL bump/demo
+                        // cone: real only bumps on actual overlap. Measured
+                        // 2026-08-24 (tape autosave_20260824_211647): without
+                        // this gate, promoting a +0.14uu graze fired the bump
+                        // curve on attacker FULL speed and manufactured ~800
+                        // uu/s phantom Δv (i2017_c0, i29268_c1).
+                        if crate::LAST_SAT_KIND.load(std::sync::atomic::Ordering::Relaxed) == 5 {
+                            continue;
+                        }
                         self.on_car_car_collision(
                             user_pointer_a,
                             user_pointer_b,
@@ -697,6 +710,50 @@ impl Arena {
             &mut self.bullet_world.bodies_mut()[car.rigid_body_idx],
             &state,
         );
+        if !std::env::var("GGL_NO_REFRESH_CONTACT").is_ok_and(|s| s != "0") {
+            car.refresh_contact_state(&mut self.bullet_world);
+        }
+    }
+
+    /// Seed the sticky-force previous-tick contact gate directly (harness use:
+    /// a state restore re-raycasts at the restored pose, which erases the real
+    /// one-tick contact history the gate depends on -- see `Car::sticky_gate_prev`).
+    pub fn seed_sticky_gate_prev(&mut self, car_idx: usize, had_contact: bool) {
+        self.cars[car_idx].sticky_gate_prev = had_contact;
+    }
+
+    /// One-tick suspension/pushback contact-normal override (`GGL_TAPE_N` harness).
+    /// Friction still uses the sim ray. `None` slots leave that wheel on the ray n.
+    pub fn set_susp_n_override(&mut self, car_idx: usize, normals: [Option<Vec3A>; 4]) {
+        for (wheel, n) in self.cars[car_idx]
+            .bullet_vehicle
+            .wheels
+            .iter_mut()
+            .zip(normals)
+        {
+            wheel.susp_n_override = n;
+        }
+    }
+
+    /// Bitmask of wheels whose current raycast ground body is another car.
+    /// Used by the rl_comparison harness (`GGL_CARCAR`) to split wheel-on-car
+    /// ticks from chassis-only / floor contact.
+    #[must_use]
+    pub fn wheel_hit_car_mask(&self, car_idx: usize) -> u8 {
+        let car = &self.cars[car_idx];
+        let bodies = self.bullet_world.bodies();
+        car.bullet_vehicle
+            .wheels
+            .iter()
+            .enumerate()
+            .fold(0u8, |m, (i, w)| {
+                let hit = w.raycast_info.as_ref().is_some_and(|info| {
+                    bodies.get(info.ground_body_idx).is_some_and(|b| {
+                        b.user_idx == UserInfoTypes::Car && info.ground_body_idx != car.rigid_body_idx
+                    })
+                });
+                m | (u8::from(hit) << i)
+            })
     }
 
     /// The part of a car's state `get_car_state`/`set_car_state` cannot express:
@@ -748,6 +805,10 @@ impl Arena {
             self.config.game_mode,
             self.config.mutators.car_spawn_boost_amount,
         );
+        if !std::env::var("GGL_NO_REFRESH_CONTACT").is_ok_and(|s| s != "0") {
+            let car = &mut self.cars[car_idx];
+            car.refresh_contact_state(&mut self.bullet_world);
+        }
     }
 
     #[must_use]
@@ -760,6 +821,17 @@ impl Arena {
         });
 
         BoostPadState { cooldown }
+    }
+
+    /// True if this car is the pending claimant of any pad (grant still in flight).
+    #[must_use]
+    pub fn car_has_pending_pad_grant(&self, car_idx: usize) -> bool {
+        let Some(grid) = self.boost_pad_grid.as_ref() else {
+            return false;
+        };
+        grid.all_pads
+            .iter()
+            .any(|pad| pad.pending_grant.is_some_and(|(_, idx)| idx == car_idx))
     }
 
     pub fn set_boost_pad_state(&mut self, idx: usize, state: BoostPadState) {
@@ -1071,7 +1143,7 @@ impl Arena {
 
             // Per-victim cooldown: a repeat contact on the SAME car inside the
             // interval does nothing; a different car is never blocked.
-            if attacker_state.bump_cooldown_timer > 0.0
+            if attacker_state.bump_cooldown_ticks > 0
                 && attacker_state.bump_last_victim == (victim_idx as u32).wrapping_add(1)
             {
                 continue;
@@ -1208,7 +1280,7 @@ impl Arena {
             }
 
             let attacker = &mut self.cars[action.attacker_idx];
-            attacker.state.bump_cooldown_timer = self.config.mutators.bump_cooldown_time;
+            attacker.state.bump_cooldown_ticks = secs_to_ticks(self.config.mutators.bump_cooldown_time);
             attacker.state.bump_last_victim =
                 (action.victim_idx as u32).wrapping_add(1);
 

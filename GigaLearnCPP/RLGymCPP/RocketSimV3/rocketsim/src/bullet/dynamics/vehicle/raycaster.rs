@@ -12,6 +12,7 @@ pub struct VehicleRaycasterResult<'a> {
     pub hit_point_in_world: Vec3A,
     pub hit_normal_in_world: Vec3A,
     pub rigid_body: &'a RigidBody,
+    pub body_idx: usize,
 }
 
 pub struct VehicleRaycaster {
@@ -44,6 +45,7 @@ impl VehicleRaycaster {
                 if rb.has_contact_response() {
                     *result = Some(VehicleRaycasterResult {
                         rigid_body: rb,
+                        body_idx: co_idx,
                         hit_point_in_world: ray_callback.hit_point_world[i],
                         hit_normal_in_world: ray_callback.hit_normal_world[i].normalize_or_zero(),
                     });

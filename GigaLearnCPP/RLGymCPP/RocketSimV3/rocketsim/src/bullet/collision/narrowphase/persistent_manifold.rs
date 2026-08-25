@@ -20,6 +20,7 @@ pub trait ContactAddedCallback {
 pub const CONTACT_BREAKING_THRESHOLD: f32 = 0.02;
 pub const MANIFOLD_CACHE_SIZE: usize = 4;
 
+#[derive(Clone)]
 pub struct PersistentManifold {
     pub point_cache: ArrayVec<ManifoldPoint, MANIFOLD_CACHE_SIZE>,
     pub body0_idx: usize,
@@ -38,7 +39,27 @@ impl PersistentManifold {
         let body1_cbt = body1
             .get_collision_shape()
             .get_contact_breaking_threshold(CONTACT_BREAKING_THRESHOLD);
-        let contact_breaking_threshold = body0_cbt.min(body1_cbt);
+        let mut contact_breaking_threshold = body0_cbt.min(body1_cbt);
+        // GGL_CC_GEN=<uu>: widen contact GENERATION/persistence for CAR-CAR pairs
+        // by this many uu. Probe for the T1 grind finding (2026-08-24): on the
+        // worst mutual-separation ticks the sim finds NO car-car manifold while
+        // the real game demonstrably resolves contact -- real contact seems to
+        // engage with the surfaces ~a few uu apart. Default 0 (off).
+        if body0.user_idx == crate::sim::UserInfoTypes::Car
+            && body1.user_idx == crate::sim::UserInfoTypes::Car
+        {
+            let extra = {
+                use std::sync::OnceLock;
+                static V: OnceLock<f32> = OnceLock::new();
+                *V.get_or_init(|| {
+                    std::env::var("GGL_CC_GEN")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0)
+                })
+            };
+            contact_breaking_threshold += extra * crate::consts::UU_TO_BT;
+        }
         let contact_processing_threshold = body0
             .contact_processing_threshold
             .min(body1.contact_processing_threshold);

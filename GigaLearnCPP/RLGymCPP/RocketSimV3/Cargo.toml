@@ -9,17 +9,24 @@ members = [
 ]
 
 [workspace.dependencies]
-glam = { version = "0.33.0", features = ["debug-glam-assert"] }
+# No debug-glam-assert: that feature is assertion overhead on the sim hot path
+# even in release when listed here (workspace features apply to all profiles).
+glam = { version = "0.33.0" }
 rustc-hash = "2.1.2"
 
 [profile.dev]
 opt-level = 1
 
-# lto + panic=abort mirror upstream; abort is also required for FFI soundness
-# (a Rust panic must never unwind into the C++ trainer).
+# Fat LTO + one codegen unit is the sim hot path (TitanObs ball pred, arena
+# step). abort is also required for FFI soundness (a Rust panic must never
+# unwind into the C++ trainer).
+# rustc's powerpc64le default CPU is generic "ppc64le", not the host; native
+# VSX/POWER9 codegen is injected via .cargo/config.toml and CMake RUSTFLAGS.
 [profile.release]
+opt-level = 3
 debug = false
-lto = true
+lto = "fat"
+codegen-units = 1
 panic = "abort"
 
 [profile.test]

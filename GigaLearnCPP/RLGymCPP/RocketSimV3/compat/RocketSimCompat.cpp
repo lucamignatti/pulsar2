@@ -4,12 +4,15 @@
 
 // State-mapping notes (v2 field <- v3 field):
 //  - lastControls <- prev_controls (same semantics: controls used last sim tick)
-//  - supersonicTime: v2 counts time spent supersonic, v3 keeps a grace timer
-//    since dropping below threshold. No consumer reads or meaningfully writes
-//    either (state setters leave the default 0), so both directions map to 0.
+//  - supersonicTime <- supersonicGraceTimer (v3: time spent in the maintain band
+//    after dropping below START_SPEED; lose SS at SUPERSONIC_MAINTAIN_MAX_TIME.
+//    v2 counted time spent supersonic instead — different quantity, same field).
 //  - timeSpentBoosting <-> boosting_time (v3 splits is_boosting out; v2 infers
 //    boosting from timeSpentBoosting > 0).
-//  - carContact / updateCounter: no v3 counterpart, inert (no consumer reads).
+//  - carContact.cooldownTimer <- bumpCooldownTimer;
+//    carContact.otherCarID <- bump_last_victim (1 + victim arena idx = Car::id).
+//  - updateCounter: no v3 counterpart, inert.
+//  - ballExtraImpulseTick <- ball_extra_impulse_tick (u64::MAX / ~0 = none).
 //  - ballHitInfo: v3 reports touches as step events, not car state; the compat
 //    Arena accumulates them per-car into Car::_ballHitInfo (persists across
 //    steps like v2), and SetState overwrites it (setters reset it via {}).
@@ -77,8 +80,10 @@ CarState Car::GetState() {
 	PhysFromRsf(s, rs.phys);
 	s.updateCounter = _arena->tickCount;
 	s.isOnGround = rs.isOnGround;
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 4; i++) {
 		s.wheelsWithContact[i] = rs.wheelsWithContact[i];
+		s.wheelsSuspension[i] = rs.wheelsSuspension[i];
+	}
 	s.hasJumped = rs.hasJumped;
 	s.hasDoubleJumped = rs.hasDoubleJumped;
 	s.hasFlipped = rs.hasFlipped;
@@ -92,16 +97,19 @@ CarState Car::GetState() {
 	s.boost = rs.boost;
 	s.timeSpentBoosting = rs.boostingTime;
 	s.isSupersonic = rs.isSupersonic;
-	s.supersonicTime = 0;
+	s.supersonicTime = rs.supersonicGraceTimer;
 	s.handbrakeVal = rs.handbrakeVal;
 	s.isAutoFlipping = rs.isAutoFlipping;
 	s.autoFlipTimer = rs.autoFlipTimer;
 	s.autoFlipTorqueScale = rs.autoFlipTorqueScale;
+	s.carContact.cooldownTimer = rs.bumpCooldownTimer;
+	s.carContact.otherCarID = rs.bumpLastVictim;
 	s.worldContact.hasContact = rs.hasWorldContact;
 	s.worldContact.contactNormal = FromRsf(rs.worldContactNormal);
 	s.isDemoed = rs.isDemoed;
 	s.demoRespawnTimer = rs.demoRespawnTimer;
 	s.ballHitInfo = _ballHitInfo;
+	s.ballExtraImpulseTick = rs.ballExtraImpulseTick;
 	s.lastControls = FromRsf(rs.prevControls);
 	return s;
 }
@@ -112,8 +120,10 @@ void Car::SetState(const CarState& state) {
 	rs.controls = ToRsf(controls);
 	rs.prevControls = ToRsf(state.lastControls);
 	rs.isOnGround = state.isOnGround;
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 4; i++) {
 		rs.wheelsWithContact[i] = state.wheelsWithContact[i];
+		rs.wheelsSuspension[i] = state.wheelsSuspension[i];
+	}
 	rs.hasJumped = state.hasJumped;
 	rs.hasDoubleJumped = state.hasDoubleJumped;
 	rs.hasFlipped = state.hasFlipped;
@@ -129,16 +139,18 @@ void Car::SetState(const CarState& state) {
 	rs.isBoosting = state.timeSpentBoosting > 0;
 	rs.boostingTime = state.timeSpentBoosting;
 	rs.isSupersonic = state.isSupersonic;
-	rs.supersonicGraceTimer = 0;
+	rs.supersonicGraceTimer = state.supersonicTime;
 	rs.handbrakeVal = state.handbrakeVal;
 	rs.isAutoFlipping = state.isAutoFlipping;
 	rs.autoFlipTimer = state.autoFlipTimer;
 	rs.autoFlipTorqueScale = state.autoFlipTorqueScale;
 	rs.bumpCooldownTimer = state.carContact.cooldownTimer;
+	rs.bumpLastVictim = state.carContact.otherCarID;
 	rs.hasWorldContact = state.worldContact.hasContact;
 	rs.worldContactNormal = ToRsf(state.worldContact.contactNormal);
 	rs.isDemoed = state.isDemoed;
 	rs.demoRespawnTimer = state.demoRespawnTimer;
+	rs.ballExtraImpulseTick = state.ballExtraImpulseTick;
 	rsf_arena_set_car_state(_arena->_rs, _idx, &rs);
 
 	_ballHitInfo = state.ballHitInfo;
@@ -201,12 +213,12 @@ static uint32_t GameModeToRsf(GameMode mode) {
 Arena* Arena::Create(GameMode gameMode, float tickRate) {
 	if (g_Stage != RocketSimStage::INITIALIZED)
 		RS_ERR_CLOSE("RocketSim(v3) compat: Arena::Create() before Init()");
-	if (tickRate != 120)
+	if (tickRate != 120.f)
 		RS_ERR_CLOSE("RocketSim(v3) compat: only 120Hz tick rate is supported (got " << tickRate << ")");
 
 	Arena* arena = new Arena();
 	arena->gameMode = gameMode;
-	arena->tickTime = 1 / tickRate;
+	arena->tickTime = 1.f / 120.f;
 	arena->_rs = rsf_arena_new(GameModeToRsf(gameMode), -1);
 	arena->tickCount = rsf_arena_tick_count(arena->_rs);
 
@@ -251,6 +263,12 @@ Car* Arena::AddCar(Team team) {
 		RS_ERR_CLOSE("RocketSim(v3) compat: engine car index " << idx << " != wrapper count " << _cars.size());
 	_cars.push_back(car);
 	return car;
+}
+
+bool Arena::CarHasPendingPadGrant(uint32_t carId) const {
+	if (!_rs || carId == 0)
+		return false;
+	return rsf_arena_car_has_pending_pad_grant(_rs, carId - 1) != 0;
 }
 
 void Arena::Step(int ticksToSimulate) {
@@ -353,6 +371,38 @@ bool Arena::IsBallProbablyGoingIn(float maxTime, float extraMargin, Team* goalTe
 	} else {
 		RS_ERR_CLOSE("RocketSim(v3) compat: IsBallProbablyGoingIn() unsupported for gamemode " << (int)gameMode);
 		return false;
+	}
+}
+
+void Arena::QueryClosestSurface(Vec query, float maxDist, ClosestSurfaceHit& out) const {
+	QueryClosestSurfaceN(&query, 1, maxDist, &out);
+}
+
+void Arena::QueryClosestSurfaceN(
+	const Vec* queries, int n, float maxDist, ClosestSurfaceHit* out) const {
+	if (n <= 0 || !queries || !out || !_rs)
+		return;
+	constexpr int kStack = 16;
+	RsfVec3 qStack[kStack];
+	RsfClosestSurface rStack[kStack];
+	std::vector<RsfVec3> qHeap;
+	std::vector<RsfClosestSurface> rHeap;
+	RsfVec3* q = qStack;
+	RsfClosestSurface* r = rStack;
+	if (n > kStack) {
+		qHeap.resize((size_t)n);
+		rHeap.resize((size_t)n);
+		q = qHeap.data();
+		r = rHeap.data();
+	}
+	for (int i = 0; i < n; i++)
+		q[i] = ToRsf(queries[i]);
+	rsf_arena_closest_surface_n(_rs, q, (uint32_t)n, maxDist, r);
+	for (int i = 0; i < n; i++) {
+		out[i].point = FromRsf(r[i].point);
+		out[i].normal = FromRsf(r[i].normal);
+		out[i].dist = r[i].dist;
+		out[i].hit = r[i].hit != 0;
 	}
 }
 

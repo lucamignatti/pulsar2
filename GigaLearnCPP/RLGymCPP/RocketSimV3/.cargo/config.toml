@@ -1,0 +1,4 @@
+# rustc's powerpc64le default CPU is generic "ppc64le" (no POWER9 VSX).
+# native is pwr9 on CCNI dcs compute/fen, host CPU elsewhere.
+[build]
+rustflags = ["-Ctarget-cpu=native"]

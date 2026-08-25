@@ -13,6 +13,12 @@ use crate::{
     sim::UserInfoTypes,
 };
 
+/// Debug: when set, every labeled `add_impulse` prints an `IMP` line. Toggled
+/// by the rl_comparison harness around a tick window (release builds have no
+/// `dbg_tick_impulse_history`). One relaxed load in the hot path when off.
+pub static DBG_IMPULSE_TRACE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct RigidBodyConstructionInfo {
     pub mass: f32,
     pub start_world_trans: Affine3A,
@@ -349,6 +355,18 @@ impl RigidBody {
         } else {
             self.lin_vel += lin_impulse;
             self.ang_vel += ang_impulse;
+        }
+
+        if DBG_IMPULSE_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "IMP b{} {} lin=({:+.6},{:+.6},{:+.6}) accum={}",
+                self.world_array_idx,
+                name.unwrap_or("anon"),
+                lin_impulse.x,
+                lin_impulse.y,
+                lin_impulse.z,
+                u8::from(accum),
+            );
         }
 
         #[cfg(debug_assertions)]

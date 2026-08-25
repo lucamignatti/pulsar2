@@ -1,6 +1,19 @@
 use std::f32::consts::TAU;
+use std::sync::OnceLock;
 
 use glam::{Affine3A, Vec2, Vec3A};
+
+/// Repeat-gate width in physics ticks. Keep is 1 (`tick > last + 1`).
+/// `GGL_EXTRA_GATE=2` waits two ticks (60 fps-frame hypothesis). Unset = 1.
+fn extra_impulse_gate_ticks() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_EXTRA_GATE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    })
+}
 
 use crate::bullet::dynamics::rigid_body::Impulse;
 use crate::consts::TICK_TIME;
@@ -255,10 +268,11 @@ impl Ball {
         // double contact (every kickoff 50-50) both cars' impulses land and sum.
         // v2 also consumes the window on gate pass even if rel_speed ends up 0, and
         // early-returns (skipping the game-mode section) when blocked; both matched.
+        let gate = extra_impulse_gate_ticks();
         let gate_ok = car
             .state
             .ball_extra_impulse_tick
-            .is_none_or(|last| tick_count > last + 1 || last > tick_count);
+            .is_none_or(|last| tick_count > last + gate || last > tick_count);
         if !gate_ok {
             return;
         }

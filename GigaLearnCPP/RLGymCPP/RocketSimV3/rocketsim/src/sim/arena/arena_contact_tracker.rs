@@ -90,12 +90,33 @@ impl ContactAddedCallback for ArenaContactTracker {
                 // wrecked every tilted-landing segment (tilt_inverted 3.4 -> 171.2 uu),
                 // because a car sliding on its shell genuinely needs it. Gating on wheel
                 // contact separates the two cases. See SIM2REAL_AUDIT.md S25.
-                _ if body_a.wheels_grounded => consts::car::HIT_WORLD_WHEELS_DOWN_COEFS,
-                _ => consts::car::HIT_WORLD_COEFS,
+                _ if body_a.wheels_grounded
+                    && !std::env::var("GGL_NO_CHASSIS_SUPPRESS").is_ok_and(|s| s != "0") =>
+                {
+                    let mut coefs = consts::car::HIT_WORLD_WHEELS_DOWN_COEFS;
+                    // Wheels-down still used restitution 0.3; that can bounce the
+                    // chassis on a 1-tick GT pose even with friction already zeroed.
+                    if std::env::var("GGL_CHASSIS_REST0").is_ok_and(|s| s != "0") {
+                        coefs.restitution = 0.0;
+                    }
+                    coefs
+                }
+                _ => {
+                    let mut coefs = consts::car::HIT_WORLD_COEFS;
+                    if std::env::var("GGL_WORLD_REST0").is_ok_and(|s| s != "0") {
+                        coefs.restitution = 0.0;
+                    }
+                    coefs
+                }
             };
             manifold_point.combined_friction = hit_coefs.friction;
             manifold_point.combined_restitution = hit_coefs.restitution;
-        } else if user_idx_a == UserInfoTypes::Ball && user_idx_b == UserInfoTypes::None {
+        } else if user_idx_a == UserInfoTypes::Ball
+            && user_idx_b == UserInfoTypes::None
+            && (!std::env::var("GGL_PR74").is_ok_and(|s| s != "0")
+                && !std::env::var("GGL_PR74_DEDUP").is_ok_and(|s| s != "0")
+                || body_b.is_static_obj())
+        {
             manifold_point.is_special = true;
         }
 

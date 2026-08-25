@@ -1,4 +1,15 @@
 pub const NUM_ITERATIONS: usize = 10;
+
+/// Tuned ships 4 sequential-impulse iterations. Override with `GGL_SOLVER_ITERS`.
+pub fn num_iterations() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_SOLVER_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(NUM_ITERATIONS)
+    })
+}
 pub const SOR: f32 = 1.0;
 /// Positional-error ERP for the wheel hard-contact resolve (`resolve_single_collision`).
 /// MEASURED, not inherited: swept 0.0/0.05/0.10/0.15/0.20/0.30 against both real captures
@@ -7,10 +18,27 @@ pub const SOR: f32 = 1.0;
 /// holdout 1076.4/1065.4/**1057.3**/1059.2/1064.7/1065.4), so this is a real optimum rather
 /// than a monotone slide to "no positional correction". Bullet's stock 0.2 was never fit to
 /// Rocket League. Only valid TOGETHER WITH `PUSHBACK_MAX_IMPULSE` (S39): uncapped, 0.1 is
-/// much WORSE (fit 1186.0) than the shipped pair.
+/// much WORSE (fit 1186.0) than the shipped pair. UPDATE 2026-08-23: that pairing was
+/// measured on the old post-step wheel stack. The now-default pre-step apply-time stack
+/// ships pushback UNCAPPED, where ERP 0.1 vs 0.2 is bit-identical on both 120 Hz tapes
+/// (SIM2REAL_LOOP.md 22:00) -- the resolve is velocity-dominated there, so 0.1 stays.
 pub const ERP: f32 = 0.1;
 pub const ERP_2: f32 = 0.8;
 pub const SPLIT_IMPULSE_PENETRATION_THRESHOLD: f32 = 1e30;
 pub const SPLIT_IMPULSE_TURN_ERP: f32 = 0.1;
 pub const WARMSTARTING_FACTOR: f32 = 0.85;
 pub const RESTITUTION_VELOCITY_THRESHOLD: f32 = 0.2;
+
+/// Upstream PR73 (VirxEC, merged 2026-08-23) raises the restitution cutoff from
+/// Bullet's stock 0.2 (~10 uu/s) to 1.0 (~50 uu/s): recorded RL scrapes take zero
+/// restitution while the car crawls along the floor. `GGL_REST_THRESH` overrides
+/// for A/B; default stays 0.2 until the tapes vote.
+pub fn restitution_velocity_threshold() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_REST_THRESH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(RESTITUTION_VELOCITY_THRESHOLD)
+    })
+}

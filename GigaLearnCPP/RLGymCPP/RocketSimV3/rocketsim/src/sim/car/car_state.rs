@@ -17,6 +17,9 @@ pub struct CarState {
     /// First two are front
     /// If your car has 3 wheels, the 4th bool will always be false
     pub wheels_with_contact: [bool; 4],
+    /// Per-wheel suspension compression in [0, 1] (0 = fully compressed, 1 = fully extended).
+    /// Wheel order matches `wheels_with_contact` (FR, FL, BR, BL).
+    pub wheels_suspension: [f32; 4],
     /// Whether we jumped to get into the air
     ///
     /// Can be false while airborne, if we left the ground with a flip reset
@@ -29,40 +32,40 @@ pub struct CarState {
     ///
     /// Forward flip will have positive Y
     pub flip_rel_torque: Vec3A,
-    /// When currently jumping, the time since we started jumping, else 0
-    pub jump_time: f32,
-    /// When currently flipping, the time since we started flipping, else 0
-    pub flip_time: f32,
+    /// Ticks since the current jump started (0 if not in a jump)
+    pub jump_ticks: u32,
+    /// Ticks since the current flip started (0 if not flipping)
+    pub flip_ticks: u32,
     /// True during a flip (not an auto-flip, and not after a flip)
     pub is_flipping: bool,
     /// True during a jump
     pub is_jumping: bool,
-    /// Total time spent in the air
-    pub air_time: f32,
-    /// Time spent in the air once `!is_jumping`
+    /// Total ticks spent in the air
+    pub air_ticks: u32,
+    /// Ticks spent in the air once `!is_jumping`
     ///
     /// If we never jumped, it is 0
-    pub air_time_since_jump: f32,
+    pub air_ticks_since_jump: u32,
     /// Goes from 0 to 100
     pub boost: f32,
-    /// Used for recharge boost, counts up from 0 on spawn (in seconds)
-    pub time_since_boosted: f32,
+    /// Used for recharge boost, counts up from 0 on spawn
+    pub ticks_since_boosted: u32,
     /// True if we boosted that tick
     ///
     /// There exists a minimum boosting time, thus why we must track boosting time
     pub is_boosting: bool,
-    pub boosting_time: f32,
+    pub boosting_ticks: u32,
     pub is_supersonic: bool,
-    /// Time since the car's speed dropped below `START_SPEED` while still supersonic,
+    /// Ticks since the car's speed dropped below `START_SPEED` while still supersonic,
     /// used for the supersonic maintain grace period
-    pub supersonic_grace_timer: f32,
+    pub supersonic_grace_ticks: u32,
     /// This is a state variable due to the rise/fall rate of handbrake inputs
     pub handbrake_val: f32,
     pub is_auto_flipping: bool,
-    /// Counts down when auto-flipping
-    pub auto_flip_timer: f32,
+    /// Remaining auto-flip ticks (counts down)
+    pub auto_flip_ticks: u32,
     pub auto_flip_torque_scale: f32,
-    pub bump_cooldown_timer: f32,
+    pub bump_cooldown_ticks: u32,
     /// RL's bump rate limit is PER VICTIM (`CarInteraction.LastHitCar` + `BumpInterval`
     /// in the ShouldDemolish decompile): hitting a DIFFERENT car is never blocked by
     /// the cooldown. Stores `1 + victim arena index` of the last bumped car; 0 = none.
@@ -76,7 +79,7 @@ pub struct CarState {
     /// If in contact with a static mesh/body, this is the collision normal of that contact on said body
     pub world_contact_normal: Option<Vec3A>,
     pub is_demoed: bool,
-    pub demo_respawn_timer: f32,
+    pub demo_respawn_ticks: u32,
 }
 
 impl Default for CarState {
@@ -97,32 +100,33 @@ impl CarState {
         prev_controls: CarControls::DEFAULT,
         is_on_ground: true,
         wheels_with_contact: [false; 4],
+        wheels_suspension: [0.0; 4],
         has_jumped: false,
         has_double_jumped: false,
         has_flipped: false,
         flip_rel_torque: Vec3A::ZERO,
-        jump_time: 0.0,
-        flip_time: 0.0,
+        jump_ticks: 0,
+        flip_ticks: 0,
         is_flipping: false,
         is_jumping: false,
-        air_time: 0.0,
-        air_time_since_jump: 0.0,
+        air_ticks: 0,
+        air_ticks_since_jump: 0,
         boost: consts::car::boost::SPAWN_AMOUNT,
-        time_since_boosted: 0.0,
+        ticks_since_boosted: 0,
         is_boosting: false,
-        boosting_time: 0.0,
+        boosting_ticks: 0,
         is_supersonic: false,
-        supersonic_grace_timer: 0.0,
+        supersonic_grace_ticks: 0,
         handbrake_val: 0.0,
         is_auto_flipping: false,
         world_contact_normal: None,
-        bump_cooldown_timer: 0.0,
+        bump_cooldown_ticks: 0,
         bump_last_victim: 0,
         ball_extra_impulse_tick: None,
-        auto_flip_timer: 0.0,
+        auto_flip_ticks: 0,
         auto_flip_torque_scale: 0.0,
         is_demoed: false,
-        demo_respawn_timer: 0.0,
+        demo_respawn_ticks: 0,
     };
 
     #[must_use]
@@ -130,7 +134,7 @@ impl CarState {
         self.is_on_ground
             || (!self.has_flipped
                 && !self.has_double_jumped
-                && self.air_time_since_jump < consts::car::jump::DOUBLEJUMP_MAX_DELAY)
+                && self.air_ticks_since_jump < consts::car::jump::DOUBLEJUMP_MAX_TICKS)
     }
 
     #[must_use]
@@ -141,6 +145,76 @@ impl CarState {
     #[must_use]
     pub const fn got_flip_reset(&self) -> bool {
         !self.is_on_ground && !self.has_jumped
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn jump_time(&self) -> f32 {
+        consts::ticks_to_secs(self.jump_ticks)
+    }
+
+    #[inline]
+    pub const fn set_jump_time(&mut self, secs: f32) {
+        self.jump_ticks = consts::secs_to_ticks(secs);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn flip_time(&self) -> f32 {
+        consts::ticks_to_secs(self.flip_ticks)
+    }
+
+    #[inline]
+    pub const fn set_flip_time(&mut self, secs: f32) {
+        self.flip_ticks = consts::secs_to_ticks(secs);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn air_time(&self) -> f32 {
+        consts::ticks_to_secs(self.air_ticks)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn air_time_since_jump(&self) -> f32 {
+        consts::ticks_to_secs(self.air_ticks_since_jump)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn time_since_boosted(&self) -> f32 {
+        consts::ticks_to_secs(self.ticks_since_boosted)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn boosting_time(&self) -> f32 {
+        consts::ticks_to_secs(self.boosting_ticks)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn supersonic_grace_timer(&self) -> f32 {
+        consts::ticks_to_secs(self.supersonic_grace_ticks)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn auto_flip_timer(&self) -> f32 {
+        consts::ticks_to_secs(self.auto_flip_ticks)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn bump_cooldown_timer(&self) -> f32 {
+        consts::ticks_to_secs(self.bump_cooldown_ticks)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn demo_respawn_timer(&self) -> f32 {
+        consts::ticks_to_secs(self.demo_respawn_ticks)
     }
 
     #[must_use]

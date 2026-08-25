@@ -18,9 +18,8 @@ impl<'a> DataReader<'a> {
         self.bytes.read_u32::<LittleEndian>()
     }
 
-    /// Peek the next u32 size prefix without consuming it. Lets the tick loop
-    /// distinguish a CarRecord (584) from the ball PhysRecord (332) so recordings
-    /// with demolished-car gaps (short rosters, per the RLRecord2 spec) parse.
+    /// Peek the next u32 size prefix without consuming it. Distinguishes CarRecord
+    /// (1232 / 864 / 744 / 584) from the ball PhysRecord (344 / 332).
     pub fn peek_u32(&self) -> io::Result<u32> {
         if self.bytes.len() < 4 {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "peek past end"));

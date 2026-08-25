@@ -5,12 +5,27 @@ project("RocketSimV3")
 # The physics engine itself is Rust (vendored, see README.md); cargo produces a
 # staticlib the C++ compat layer links. rust-toolchain.toml pins the toolchain
 # and makes rustup auto-install it on first build.
-find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin")
+find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{CARGO_HOME}/bin" "$ENV{HOME}/.cargo/bin")
 if(NOT CARGO_EXECUTABLE)
     message(FATAL_ERROR
         "RocketSimV3 needs cargo (Rust). Install rustup once:\n"
         "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n"
         "then re-run cmake. (The pinned toolchain auto-installs on first build.)")
+endif()
+
+# rustc's default CPU for powerpc64le-unknown-linux-gnu is generic "ppc64le",
+# not the host. On CCNI POWER9 that drops VSX; -Ctarget-cpu=native selects pwr9.
+# Preserve any caller RUSTFLAGS (append, do not clobber).
+set(_rsv3_rustflags "-Ctarget-cpu=native")
+if(DEFINED ENV{RUSTFLAGS} AND NOT "$ENV{RUSTFLAGS}" STREQUAL "")
+    set(_rsv3_rustflags "$ENV{RUSTFLAGS} ${_rsv3_rustflags}")
+endif()
+set(_rsv3_cargo_env "RUSTFLAGS=${_rsv3_rustflags}")
+if(DEFINED ENV{RUSTUP_HOME})
+    list(APPEND _rsv3_cargo_env "RUSTUP_HOME=$ENV{RUSTUP_HOME}")
+endif()
+if(DEFINED ENV{CARGO_HOME})
+    list(APPEND _rsv3_cargo_env "CARGO_HOME=$ENV{CARGO_HOME}")
 endif()
 
 if(MSVC)
@@ -19,20 +34,28 @@ else()
     set(RSV3_RUST_LIB_NAME "librocketsim_ffi.a")
 endif()
 
+# Per-CMake-tree cargo output so ppc64le `build/` and x86_64 `build-npl/` can
+# share this source dir without clobbering librocketsim_ffi.a. Native cargo
+# writes target/release, not target/<triple>/release.
+set(RSV3_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
+list(APPEND _rsv3_cargo_env "CARGO_TARGET_DIR=${RSV3_CARGO_TARGET_DIR}")
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(RSV3_CARGO_PROFILE "dev")
-    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/debug/${RSV3_RUST_LIB_NAME}")
+    set(RSV3_CARGO_OUT "debug")
 else()
     set(RSV3_CARGO_PROFILE "release")
-    set(RSV3_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/target/release/${RSV3_RUST_LIB_NAME}")
+    set(RSV3_CARGO_OUT "release")
 endif()
+set(RSV3_RUST_LIB "${RSV3_CARGO_TARGET_DIR}/${RSV3_CARGO_OUT}/${RSV3_RUST_LIB_NAME}")
 
 # Always invoke cargo (it is its own fast incremental no-op when clean).
 add_custom_target(RocketSimV3Cargo
-    COMMAND ${CARGO_EXECUTABLE} build --profile ${RSV3_CARGO_PROFILE} -p rocketsim_ffi
+    COMMAND ${CMAKE_COMMAND} -E env ${_rsv3_cargo_env}
+        ${CARGO_EXECUTABLE} build --profile ${RSV3_CARGO_PROFILE} -p rocketsim_ffi
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     BYPRODUCTS ${RSV3_RUST_LIB}
-    COMMENT "cargo build rocketsim_ffi (${RSV3_CARGO_PROFILE})"
+    COMMENT "cargo build rocketsim_ffi (${RSV3_CARGO_PROFILE}, native CPU, CARGO_TARGET_DIR=${RSV3_CARGO_TARGET_DIR})"
     VERBATIM
 )
 

@@ -1,4 +1,7 @@
 mod box_box_detector;
+pub use box_box_detector::{
+    LAST_SAT_AXIS, LAST_SAT_GAP_UU, LAST_SAT_KIND, reset_last_sat_gap,
+};
 pub(super) mod collision_dispatcher;
 mod collision_obj_wrapper;
 pub mod collision_world;

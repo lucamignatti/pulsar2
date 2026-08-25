@@ -3,18 +3,21 @@ mod data_reader;
 pub mod tick_record;
 
 use std::io::ErrorKind;
+use std::mem::size_of;
 
 use crate::rl_comparison_test::recording::tick_record::TickRecord;
 use cpp_records::*;
 use data_reader::DataReader;
 
 const RLPR_MAGIC_BYTES: [u8; 4] = [82, 76, 80, 82];
-const RLPR_VERSION: u32 = 2;
-const RLPR_MAX_CARS: usize = 2;
+const RLPR_VERSION_MIN: u32 = 2;
+const RLPR_VERSION_MAX: u32 = 5;
+const RLPR_MAX_CARS: usize = 4;
 
 #[allow(dead_code)]
 pub struct Recording {
     pub name: String,
+    pub version: u32,
     pub info: RecordingInfo,
     pub ticks: Vec<TickRecord>,
 }
@@ -42,10 +45,12 @@ impl Recording {
         }
 
         let version = reader.read_u32()?;
-        if version != RLPR_VERSION {
+        if !(RLPR_VERSION_MIN..=RLPR_VERSION_MAX).contains(&version) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                format!("RLPR Version mismatch (expected: {RLPR_VERSION}, got: {version})"),
+                format!(
+                    "RLPR version {version} unsupported (this reader handles {RLPR_VERSION_MIN}..={RLPR_VERSION_MAX})"
+                ),
             ));
         }
 
@@ -61,28 +66,52 @@ impl Recording {
         let num_ticks = reader.read_u32()?;
         let mut ticks = Vec::with_capacity(num_ticks as usize);
 
-        let car_size = size_of::<CarRecord>() as u32;
-        let ball_size = size_of::<PhysRecord>() as u32;
-        for _ in 0..num_ticks {
-            // Demolished cars are OMITTED from ticks while they are gone (RLRecord2
-            // spec), so a tick holds 0..=num_cars CarRecords followed by exactly one
-            // ball PhysRecord. The size prefixes disambiguate (584 vs 332).
+        let car_size_v5 = size_of::<CarRecord>() as u32;
+        let car_size_v4 = size_of::<CarRecordV4>() as u32;
+        let car_size_v3 = size_of::<CarRecordV3>() as u32;
+        let car_size_v2 = size_of::<CarRecordV2>() as u32;
+        let ball_size_v5 = size_of::<PhysRecord>() as u32;
+        let ball_size_v4 = size_of::<PhysRecordV4>() as u32;
+        for tick_idx in 0..num_ticks {
+            // Demolished cars are omitted while gone. Size prefixes tell a CarRecord
+            // (1232 / 864 / 744 / 584) from the ball PhysRecord (344 / 332).
             let mut car_records = Vec::with_capacity(num_cars);
-            loop {
+            let ball_record = loop {
                 let next_size = reader.peek_u32()?;
-                if next_size == car_size && car_records.len() < num_cars {
-                    let car_record = unsafe { reader.read_struct_unsafe::<CarRecord>() }?;
+                if next_size == car_size_v5
+                    || next_size == car_size_v4
+                    || next_size == car_size_v3
+                    || next_size == car_size_v2
+                {
+                    if car_records.len() >= num_cars {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "RLPR tick {tick_idx} has more than the declared {num_cars} cars"
+                            ),
+                        ));
+                    }
+                    let car_record = if next_size == car_size_v5 {
+                        unsafe { reader.read_struct_unsafe::<CarRecord>() }?
+                    } else if next_size == car_size_v4 {
+                        unsafe { reader.read_struct_unsafe::<CarRecordV4>() }?.into()
+                    } else if next_size == car_size_v3 {
+                        unsafe { reader.read_struct_unsafe::<CarRecordV3>() }?.into()
+                    } else {
+                        unsafe { reader.read_struct_unsafe::<CarRecordV2>() }?.into()
+                    };
                     car_records.push(car_record);
-                } else if next_size == ball_size {
-                    break;
+                } else if next_size == ball_size_v5 {
+                    break unsafe { reader.read_struct_unsafe::<PhysRecord>() }?;
+                } else if next_size == ball_size_v4 {
+                    break unsafe { reader.read_struct_unsafe::<PhysRecordV4>() }?.into();
                 } else {
                     return Err(std::io::Error::new(
                         ErrorKind::InvalidData,
                         format!("Unexpected struct size prefix {next_size} in tick stream"),
                     ));
                 }
-            }
-            let ball_record = unsafe { reader.read_struct_unsafe::<PhysRecord>() }?;
+            };
             ticks.push(TickRecord {
                 car_records,
                 ball_record,
@@ -101,6 +130,7 @@ impl Recording {
 
         Ok(Self {
             name: name.to_string(),
+            version,
             info,
             ticks,
         })

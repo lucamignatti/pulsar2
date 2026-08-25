@@ -150,7 +150,7 @@ fn compare_car(car_state: &CarState, car_record: &CarRecord, comparisons: &mut C
     if car_state.has_jumped {
         comparisons.insert(
             "jump_time",
-            Comparison::new_float(car_state.jump_time, car_record.jump_time, TICK_TIME * 2.0),
+            Comparison::new_float(car_state.jump_time(), car_record.jump_time, TICK_TIME * 2.0),
         );
     }
     comparisons.insert(
@@ -161,7 +161,7 @@ fn compare_car(car_state: &CarState, car_record: &CarRecord, comparisons: &mut C
     if car_state.is_flipping {
         comparisons.insert(
             "flip_time",
-            Comparison::new_float(car_state.flip_time, car_record.flip_time, TICK_TIME * 2.0),
+            Comparison::new_float(car_state.flip_time(), car_record.flip_time, TICK_TIME * 2.0),
         );
         comparisons.insert(
             "flip_rel_torque",

@@ -13,24 +13,105 @@ pub fn set_state_to_record_tick(
     car_idcs: &[usize],
     tick: &TickRecord,
     car_controls: &[CarControls],
+    bakkes_semantics: bool,
 ) {
     for (i, &car_idx) in car_idcs.iter().enumerate() {
         let mut cs = *arena.get_car_state(car_idx);
-        let rep_cs: CarState = tick.car_records[i].into();
+        let rec = &tick.car_records[i];
+        let rep_cs: CarState = (*rec).into();
         cs.phys = rep_cs.phys;
         cs.is_jumping = rep_cs.is_jumping;
         cs.is_flipping = rep_cs.is_flipping;
-        cs.jump_time = rep_cs.jump_time;
-        cs.flip_time = rep_cs.flip_time;
+        cs.set_jump_time(rep_cs.jump_time());
+        cs.set_flip_time(rep_cs.flip_time());
         cs.has_jumped = rep_cs.has_jumped;
+        cs.prev_controls = rec.prev_controls.into();
+        cs.controls = car_controls[i];
+        cs.boost = rec.boost_amount;
+        cs.is_demoed = false;
+        cs.demo_respawn_ticks = 0;
+        // Bakkes stores already-scaled dodge torque; CarState wants a unit direction.
+        let rec_torque = Vec3A::from(rec.flip_rel_torque);
+        cs.flip_rel_torque = if bakkes_semantics {
+            rec_torque / Vec3A::new(260.0, 224.0, 1.0)
+        } else {
+            rec_torque
+        };
 
-        if cs.has_flip_or_jump() {
+        if bakkes_semantics {
+            // Bakkes `has_flip` is "flip still available" — inverse of `has_flipped`.
+            let flip_spent = !rec.has_flip && !rec.is_on_ground;
+            let was_flip = rec_torque.length_squared() > 0.0;
+            cs.has_flipped = rec.is_flipping || (flip_spent && was_flip);
+            cs.has_double_jumped = flip_spent && !was_flip;
+        } else if cs.has_flip_or_jump() {
             cs.has_double_jumped = rep_cs.has_double_jumped;
         }
 
-        cs.controls = car_controls[i];
+        // GGL_RESTORE_WORLD=1: teacher-force chassis-world contact (autoflip / autoroll).
+        if std::env::var("GGL_RESTORE_WORLD").is_ok_and(|s| s != "0") {
+            cs.world_contact_normal = if rec.phys.has_world_contact {
+                Some(rec.phys.world_contact_normal.into())
+            } else {
+                None
+            };
+        }
 
         arena.set_car_state(car_idx, cs);
+
+        // GGL_RESTORE_WHEELS: overlay recorded per-wheel extra after refresh_contact.
+        // Unset = off. `1`/`bt` = susp as Bullet units (tuned dump). `uu` = convert UU→BT.
+        if let Ok(mode) = std::env::var("GGL_RESTORE_WHEELS") {
+            if mode != "0" {
+                let mut extra = arena.get_car_extra_state(car_idx);
+                for (dst, src) in extra.wheels.iter_mut().zip(rec.wheels.iter()) {
+                    dst.engine_force = src.engine_force;
+                    dst.brake = src.brake;
+                    dst.steer_angle = src.steer_amount;
+                    dst.lat_friction = src.lat_friction;
+                    dst.long_friction = src.long_friction;
+                    dst.extra_pushback = src.extra_pushback;
+                    // Bakkes susp_length is ~-2 while our raycast is ~+0.5 BT.
+                    // Do not overlay length/relvel; they are a different convention.
+                    if src.has_contact {
+                        dst.has_raycast_info = 1;
+                        dst.is_in_contact_with_world = 1;
+                        dst.contact_normal = [
+                            src.contact_normal.x,
+                            src.contact_normal.y,
+                            src.contact_normal.z,
+                        ];
+                    } else {
+                        dst.has_raycast_info = 0;
+                        dst.is_in_contact_with_world = 0;
+                    }
+                }
+                arena.set_car_extra_state(car_idx, &extra);
+            }
+        }
+
+        if std::env::var("GGL_DUMP_SUSP").is_ok() && rec.is_on_ground {
+            static DUMP_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = DUMP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 {
+                let extra = arena.get_car_extra_state(car_idx);
+                eprint!("SUSP rec=[");
+                for w in &rec.wheels {
+                    eprint!(" {:.4}", w.susp_length);
+                }
+                eprint!("] sim=[");
+                for w in &extra.wheels {
+                    eprint!(" {:.4}", w.suspension_length);
+                }
+                eprintln!(
+                    "] vel=[{:.3} {:.3} {:.3} {:.3}]",
+                    rec.wheels[0].susp_rel_vel,
+                    rec.wheels[1].susp_rel_vel,
+                    rec.wheels[2].susp_rel_vel,
+                    rec.wheels[3].susp_rel_vel,
+                );
+            }
+        }
     }
 
     let rep_bs_phys: PhysState = tick.ball_record.into();
@@ -61,7 +142,9 @@ fn test_recording(recording: &Recording) {
             .iter()
             .map(|car_record| car_record.prev_controls.into())
             .collect();
-        set_state_to_record_tick(&mut arena, &car_idcs, from_tick, &controls_during);
+        let hb = &recording.info.hitbox_rel_min_bt;
+        let bakkes = hb.x == 0.0 && hb.y == 0.0 && hb.z == 0.0;
+        set_state_to_record_tick(&mut arena, &car_idcs, from_tick, &controls_during, bakkes);
         arena.step_tick();
 
         let ball_state = arena.get_ball_state();

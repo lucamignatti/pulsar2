@@ -93,7 +93,7 @@ impl SolverConstraint {
     }
 
     pub fn restitution_curve(rel_vel: f32, restitution: f32) -> f32 {
-        if rel_vel.abs() < contact_solver_info::RESTITUTION_VELOCITY_THRESHOLD {
+        if rel_vel.abs() < contact_solver_info::restitution_velocity_threshold() {
             0.0
         } else {
             restitution * -rel_vel
@@ -184,12 +184,86 @@ impl SolverConstraint {
         let penetration_impulse = positional_error * self.jac_diag_ab_inv;
         let vel_impulse = vel_error * self.jac_diag_ab_inv;
 
-        (self.rhs, self.rhs_penetration) =
-            if penetration > contact_solver_info::SPLIT_IMPULSE_PENETRATION_THRESHOLD {
-                (penetration_impulse + vel_impulse, 0.0)
+        // GGL_CC_BAUMGARTE=<erp>: for CAR-CAR contacts, route the penetration
+        // correction into the VELOCITY rhs (old-Bullet `m_splitImpulse = false`
+        // path) instead of the position-only split impulse. RL ships a 2.6x-era
+        // Bullet where split impulse defaulted OFF, so its 1e30 threshold is
+        // inert and penetrating cars gain real separation VELOCITY each tick --
+        // the T1 grind (i=4648+) shows mutual momentum-conserving separation
+        // bursts of ~16 uu/s decaying over ~5 ticks that the split path can
+        // never produce (push velocity is discarded, never recorded). v2 set the
+        // threshold but inherited the modern `m_splitImpulse = true` default
+        // silently. 0 = off (split path, v2/v3 behavior).
+        let cc_erp = {
+            use std::sync::OnceLock;
+            static V: OnceLock<f32> = OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("GGL_CC_BAUMGARTE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+            })
+        };
+        // GGL_CC_DEPTH=<uu>: deepen the SOLVER's view of car-car penetration by
+        // this many uu (only when already penetrating -- never creates contact).
+        // RL's 2.6x Bullet measures box-box depth against margin-inflated boxes,
+        // so its restoring impulses run ~1-2 uu deeper than nominal geometry.
+        let cc_depth = {
+            use std::sync::OnceLock;
+            static V: OnceLock<f32> = OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("GGL_CC_DEPTH")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+                    * crate::consts::UU_TO_BT
+            })
+        };
+        let is_car_car = (cc_erp > 0.0 || cc_depth > 0.0)
+            && rb0.is_some_and(|r| r.user_idx == crate::sim::UserInfoTypes::Car)
+            && rb1.is_some_and(|r| r.user_idx == crate::sim::UserInfoTypes::Car);
+        let penetration = if is_car_car && penetration < 0.0 {
+            penetration - cc_depth
+        } else {
+            penetration
+        };
+        if (rb0.is_some_and(|r| r.user_idx == crate::sim::UserInfoTypes::Car)
+            && rb1.is_some_and(|r| r.user_idx == crate::sim::UserInfoTypes::Car))
+            && crate::DBG_IMPULSE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "CCSOLVE pen={penetration:+.5} rel_vel={rel_vel:+.4} vel_imp={vel_impulse:+.4} pen_imp={penetration_impulse:+.4} n=({:+.2},{:+.2},{:+.2}) fric={:.3}",
+                cp.normal_world_on_b.x,
+                cp.normal_world_on_b.y,
+                cp.normal_world_on_b.z,
+                cp.combined_friction,
+            );
+        }
+        (self.rhs, self.rhs_penetration) = if is_car_car && cc_erp > 0.0 {
+            let pos_err = if penetration > 0.0 {
+                0.0
             } else {
-                (vel_impulse, penetration_impulse)
+                -penetration * cc_erp * inv_time_step
             };
+            (pos_err * self.jac_diag_ab_inv + vel_impulse, 0.0)
+        } else {
+            // Depth-only car-car mode still deepens the split-impulse pushout.
+            let pen_imp = if is_car_car {
+                let pos_err = if penetration > 0.0 {
+                    0.0
+                } else {
+                    -penetration * erp * inv_time_step
+                };
+                pos_err * self.jac_diag_ab_inv
+            } else {
+                penetration_impulse
+            };
+            if penetration > contact_solver_info::SPLIT_IMPULSE_PENETRATION_THRESHOLD {
+                (pen_imp + vel_impulse, 0.0)
+            } else {
+                (vel_impulse, pen_imp)
+            }
+        };
     }
 
     fn setup_friction_constraint(
