@@ -196,6 +196,17 @@ tick_skip_for_root() {
 	# explicit table, not a prefix guess. Getting it wrong is SILENT: the bot just decides
 	# at the wrong rate and plays badly with no error anywhere.
 	case "$1" in
+		# MUST come before the 7.* rule. 7.8dense is the AiMOS dense control (2026-08-19),
+		# trained at tickSkip 8 like the 5.x/7.0b seats - NOT ts1 like 7.0/7.1/7.2.
+		*checkpoints_7.8dense*) echo 8 ;;
+		# MUST come before the plain 7.9gco rule: "*checkpoints_7.9gco*" ALSO matches
+		# "checkpoints_7.9gco_ts1", which would stamp the ts1 lineage as ts8 and run a
+		# 120 Hz policy at 15 Hz - silent, no error, just a broken bot.
+		# 7.9gco_ts1 = same gco lineage after the 2026-08-23 mid-run switch to tickSkip 1
+		# (120 Hz, gamma 0.99971123 / 20s). Recovered to ~98% at ts1 within ~8h.
+		*checkpoints_7.9gco_ts1*) echo 1 ;;
+		# 7.9gco = the goal/concede-only sparse cold start (2026-08-21), ts8 recipe.
+		*checkpoints_7.9gco*) echo 8 ;;
 		*checkpoints_7.0b*) echo 8 ;;   # composite critic, ts8 validation seat
 		*checkpoints_7.*)   echo 1 ;;   # 7.0 / 7.1 / 7.2 were all ts1
 		*checkpoints_6.*)   echo 1 ;;   # 6.0 / 6.1 / 6.1b / 6.2 all ts1
@@ -204,7 +215,15 @@ tick_skip_for_root() {
 }
 
 sync_checkpoint() {
-	local root="${GGL_CKPT_ROOT:-../build/checkpoints_7.0b}"
+	# DEFAULT LINEAGE, 2026-08-19: the dense control from the AiMOS architecture A/B.
+	# 36.7M dense (trunk 1280x3, policy 768x3), 13.0B steps, measured 91.6% goal share
+	# vs Nexto (229-21, 250-goal clean eval, argmax/deployment, ts8) - the strongest bot
+	# this project has produced and the first to beat Nexto convincingly. It replaces
+	# checkpoints_7.0b here. The MoE line was retired the same day: on an identical
+	# recipe the 1B MoE reached 3.6% while this reached 91.6%, because the MoE forward
+	# costs 22ms + 0.2ms*experts with no token term (25k SPS vs dense's 515k), i.e. 20x
+	# fewer experiences per hour. Override with GGL_CKPT_ROOT=<dir> as always.
+	local root="${GGL_CKPT_ROOT:-../build/checkpoints_7.8dense}"
 	local dest="pulsar-bot/checkpoint"
 
 	if [ ! -d "$root" ]; then
@@ -222,6 +241,17 @@ sync_checkpoint() {
 	mkdir -p "$dest" 2>/dev/null
 	echo "$ts_for_root" > "$dest/TICKSKIP"
 	log "SYNC: lineage '$root' -> tickSkip $ts_for_root ($(awk -v t="$ts_for_root" 'BEGIN{printf "%.0f", 120/t}') Hz)"
+
+	# In-game display name, per lineage (bot.toml is shared by every root, so stamp it
+	# at sync time like TICKSKIP - a stale name can never outlive its checkpoint).
+	local bot_name
+	case "$root" in
+		*checkpoints_7.9gco*) bot_name="pulsar2-GCO" ;;   # sparse goal-only cold start
+		*)                    bot_name="Pulsar2" ;;
+	esac
+	bot_name="${BOT_NAME:-$bot_name}"
+	sed -i "s/^name = \".*\"/name = \"$bot_name\"/" pulsar-bot/bot.toml
+	log "SYNC: bot name -> $bot_name"
 
 	local have=""
 	[ -f "$dest/STEPS.txt" ] && have=$(cat "$dest/STEPS.txt" 2>/dev/null)
@@ -329,8 +359,27 @@ abort_eac() {
 # holder sends StopMatch (auto_save_replay). RLBotServer must still be ALIVE when
 # that happens, so we signal the holder and WAIT for it to finish saving BEFORE
 # kill_all tears the server down. No-op outside eval or if the holder already exited.
-# Proton prefix Demos folder for Rocket League (appid 252950) on this box.
-REPLAY_DIR="/run/media/luca/biggestbox/SteamLibrary/steamapps/compatdata/252950/pfx/drive_c/users/steamuser/Documents/My Games/Rocket League/TAGame/Demos"
+# Proton prefix Demos folder for Rocket League (appid 252950).
+# This was HARDCODED to the biggestbox library and was WRONG: that library holds an old,
+# stale 252950 prefix (newest replay there is from 07-20), while Steam actually launches
+# RL from the default ~/.local/share/Steam prefix. Consequences, both silent: the
+# failed-attempt replay discard deleted nothing, and the end-of-match "wait for the
+# .replay to appear" poll watched a folder that never changes, so a successfully saved
+# replay still reported as missing. There are 4 Steam libraries on this box, so resolve
+# it by DATA - the prefix with the most recently written .replay is the live one.
+_resolve_replay_dir() {
+	local best="" best_t=0 d t
+	for lib in "$HOME/.local/share/Steam" /run/media/"$USER"/*/SteamLibrary; do
+		d="$lib/steamapps/compatdata/252950/pfx/drive_c/users/steamuser/Documents/My Games/Rocket League/TAGame/Demos"
+		[ -d "$d" ] || continue
+		[ -z "$best" ] && best="$d"        # fall back to any existing prefix
+		t=$(find "$d" -maxdepth 1 -name '*.replay' -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+		t=${t%%.*}
+		if [ -n "$t" ] && [ "$t" -gt "$best_t" ] 2>/dev/null; then best_t=$t; best=$d; fi
+	done
+	printf '%s' "$best"
+}
+REPLAY_DIR="${REPLAY_DIR:-$(_resolve_replay_dir)}"
 save_replay_if_eval() {
 	[ "$REPLAY" = 1 ] || return 0
 	[ -n "${HOLDER:-}" ] && kill -0 "$HOLDER" 2>/dev/null || return 0
@@ -399,11 +448,33 @@ fi
 # Before the server launches the bot, so the car spawns on the checkpoint we just staged.
 # A failed sync is NOT fatal: playing the previous checkpoint beats refusing to play,
 # and the log says loudly which one it is.
-if [ "$SYNC" = 1 ]; then
-	sync_checkpoint || log "SYNC: continuing on the previously staged checkpoint"
+# sync_checkpoint ONLY ever stages pulsar-bot/. Configs that field a STATIC bot dir
+# (pulsar-gco-bot, pulsar-gco-ts1-bot) ignore it entirely, so reporting the sync as if it
+# described the match is actively misleading - it once read "already current at 67.75B"
+# for a match whose cars were the 404.5B ts1 policy and BonkDaddy. Only sync when this
+# config actually uses pulsar-bot, and always print the REAL participants afterwards.
+if grep -q 'config_file = "pulsar-bot/bot.toml"' "$CONFIG" 2>/dev/null; then
+	if [ "$SYNC" = 1 ]; then
+		sync_checkpoint || log "SYNC: continuing on the previously staged checkpoint"
+	else
+		log "SYNC: skipped (nosync); bot stays on $(cat pulsar-bot/checkpoint/STEPS.txt 2>/dev/null || echo '<unknown>') steps"
+	fi
 else
-	log "SYNC: skipped (nosync); bot stays on $(cat pulsar-bot/checkpoint/STEPS.txt 2>/dev/null || echo '<unknown>') steps"
+	log "SYNC: skipped - '$CONFIG' does not use pulsar-bot (static bot dirs only)."
 fi
+# Say what is ACTUALLY on the field: each car's dir, staged steps and decision rate.
+log "PLAYERS:"
+grep -oE 'config_file = "[^"]+"' "$CONFIG" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' | while read -r bt; do
+	bdir="$(dirname "$bt")"
+	bname="$(grep -m1 '^name' "$bt" 2>/dev/null | sed 's/.*= *"\(.*\)"/\1/')"
+	steps="$(cat "$bdir/checkpoint/STEPS.txt" 2>/dev/null)"
+	ts="$(cat "$bdir/checkpoint/TICKSKIP" 2>/dev/null)"
+	if [ -n "$steps" ]; then
+		log "PLAYERS:   ${bname:-?}  <- $bdir  ${steps} steps, tickSkip ${ts:-?} ($(awk -v t="${ts:-8}" 'BEGIN{printf "%.0f", 120/t}') Hz)"
+	else
+		log "PLAYERS:   ${bname:-?}  <- $bdir"
+	fi
+done
 # QUALIFIER: eval runs against a *nexto* config race to QUAL_FOR-before-QUAL_AGAINST
 # (default 42/28). Plain eval only - a handicap MODE must never produce a qualifier
 # replay, so those runs stay hold-forever even though they force REPLAY=1.
@@ -413,9 +484,14 @@ if [ "$REPLAY" = 1 ] && [ "$NOQUAL" = 0 ] && [ -z "$MODE" ]; then
 		*nexto*)
 			QUAL_ON=1
 			export QUAL_FOR="${QUAL_FOR:-42}" QUAL_AGAINST="${QUAL_AGAINST:-28}" QUAL_TEAM=0
-			log "QUALIFIER armed: score $QUAL_FOR before Nexto scores $QUAL_AGAINST. Failed"
-			log "QUALIFIER: attempts auto-restart at 0-0; on success the session ends ITSELF"
-			log "QUALIFIER: with the replay saved. Leave it running. ('noqual' to disable.)" ;;
+			# The holder deletes the replay a FAILED attempt leaves behind, so the only
+			# .replay in the Demos folder is the one that passed. Without this export it
+			# cannot find the folder and silently keeps every failure's replay.
+			export REPLAY_DIR
+			log "QUALIFIER armed: score $QUAL_FOR before Nexto scores $QUAL_AGAINST. A failed"
+			log "QUALIFIER: attempt ENDS its match, its replay is DELETED, and a brand new"
+			log "QUALIFIER: attempt starts at 0-0. On success the session ends ITSELF with"
+			log "QUALIFIER: that replay kept. Leave it running. ('noqual' to disable.)" ;;
 	esac
 fi
 log "Match: $CONFIG   team_size: $TEAM_SIZE   eval(replay): $([ "$REPLAY" = 1 ] && echo on || echo off)"

@@ -120,11 +120,78 @@ signal.signal(signal.SIGINT, _begin_shutdown)
 # RLBotServer is still alive.
 REPLAY_FLUSH_SECS = 5
 
+# A FAILED qualifier attempt must leave NO replay behind: the whole point of the grind
+# is that the .replay in the Demos folder IS the evidence of a passed attempt, so a
+# folder littered with failures makes the successful one unidentifiable.
+# The old code restarted with start_match() and never sent StopMatch, on the assumption
+# that "no StopMatch => no replay". That was never verified, and auto_save_replay is set
+# on the config, so RL may well flush one when the match is replaced. So: end each failed
+# attempt EXPLICITLY, then delete whatever replay it produced.
+REPLAY_DIR = Path(os.environ.get("REPLAY_DIR", "")) if os.environ.get("REPLAY_DIR") else None
+REPLAY_SETTLE_SECS = 3  # let RL finish writing before we look for new files
+
+
+def _replay_snapshot() -> set:
+    if not REPLAY_DIR or not REPLAY_DIR.is_dir():
+        return set()
+    try:
+        return set(REPLAY_DIR.glob("*.replay"))
+    except OSError:
+        return set()
+
+
+def _discard_new_replays(before: set, why: str) -> None:
+    """Delete any .replay that appeared since `before` was taken."""
+    if not REPLAY_DIR:
+        return
+    time.sleep(REPLAY_SETTLE_SECS)
+    for f in sorted(_replay_snapshot() - before):
+        try:
+            f.unlink()
+            print(f"[holder] discarded replay of {why}: {f.name}", flush=True)
+        except OSError as e:
+            print(f"[holder] WARNING could not delete {f.name}: {e}", flush=True)
+
+
+# Rocket League does NOT silently auto-save here: on StopMatch it pops the "name your
+# replay" dialog and waits for KEYBOARD INPUT. The old fixed 5s flush window expired
+# with that dialog still open, play.sh tore the session down, and the replay of a
+# passing 42-7 run was lost. So after StopMatch, POLL for the new .replay instead of
+# sleeping a fixed time - the human needs time to type a name and confirm.
+REPLAY_WAIT_SECS = int(os.environ.get("REPLAY_WAIT_SECS", "300"))
+
+
+def _wait_for_replay(before: set, timeout: int) -> bool:
+    """Block until a new .replay appears (RL's save dialog needs a human). True if saved."""
+    if not REPLAY_DIR:
+        time.sleep(REPLAY_FLUSH_SECS)
+        return False
+    print("\n" + "#" * 62, flush=True)
+    print("#  ROCKET LEAGUE IS ASKING YOU TO NAME THE REPLAY.", flush=True)
+    print("#  Switch to the game, type a name, and confirm the save.", flush=True)
+    print(f"#  Waiting up to {timeout}s - nothing is torn down until you do.", flush=True)
+    print("#" * 62 + "\n", flush=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new = _replay_snapshot() - before
+        if new:
+            time.sleep(REPLAY_SETTLE_SECS)  # let the write finish
+            for f in sorted(new):
+                print(f"[holder] REPLAY SAVED: {f}", flush=True)
+            return True
+        time.sleep(2)
+    print(f"[holder] WARNING: no replay after {timeout}s - was the dialog confirmed?",
+          flush=True)
+    return False
+
+
+session_replays = _replay_snapshot()   # baseline for the end-of-session replay wait
 man = MatchManager()
 try:
     man.start_match(cfg, wait_for_start=False, ensure_server_started=False)
     print(f"[holder] match config sent: team_size={TEAM_SIZE}, {len(players)} cars", flush=True)
     attempt = 1
+    attempt_replays = _replay_snapshot()   # baseline for "did THIS attempt write one?"
     last = (-1, -1)
     # After a restart the packet can lag with the DEAD match's score still >= the
     # threshold, which would re-trigger instantly; stay disarmed until 0-0 is seen.
@@ -154,10 +221,19 @@ try:
             break  # -> finally: StopMatch + flush -> auto_save_replay writes the file
         if them >= QUAL_AGAINST:
             print(f"[holder] attempt {attempt} FAILED at {us}-{them}; "
-                  f"restarting match for attempt {attempt + 1}", flush=True)
+                  f"ending match, discarding its replay, starting attempt "
+                  f"{attempt + 1}", flush=True)
+            # STOP the failed match explicitly (shutdown_server=False keeps RLBotServer
+            # up), bin any replay it wrote, THEN start a brand new one.
+            try:
+                man.stop_match()
+            except Exception:
+                traceback.print_exc()
+            _discard_new_replays(attempt_replays, f"failed attempt {attempt}")
             attempt += 1
             last = (-1, -1)
             armed = False
+            attempt_replays = _replay_snapshot()
             man.start_match(cfg, wait_for_start=False, ensure_server_started=False)
 except KeyboardInterrupt:
     pass
@@ -175,8 +251,8 @@ finally:
         try:
             print("[holder] EVAL end: StopMatch -> triggering replay save...", flush=True)
             man.stop_match()  # StopCommand(shutdown_server=False)
-            time.sleep(REPLAY_FLUSH_SECS)
-            print("[holder] replay flush window elapsed.", flush=True)
+            # RL pops a name-the-replay dialog; wait for the FILE, not a fixed timeout.
+            _wait_for_replay(session_replays, REPLAY_WAIT_SECS)
         except Exception:
             traceback.print_exc()
     print("[holder] exiting (disconnect only; NOT shutting down server)", flush=True)

@@ -219,6 +219,32 @@ static Reward* Scaffold(Reward* child) {
 // source-verified exploit (GameEventTracker.cpp). OpposedSaveReward below closes the matching
 // self-save farm with a last-touch guard instead.
 std::vector<WeightedReward> BuildRewards(float gamma) {
+	// GCO ("goal/concede only") — GGL_GCO=1. The whole shaping stack is removed and the
+	// ONLY reward is the terminal +-150 goal. This is the sparse-RL control: every
+	// mechanic this bot has (aerials, flip resets, boost economy, tempo) was bought with
+	// a shaping term, and GCO asks whether any of it is reachable without them.
+	//
+	// Deliberately UNCHANGED, because they are already correct for sparse-only:
+	//  - Terminal conditions. GoalScoreCondition is the only TRUE terminal
+	//    (IsTruncation()==false); NoTouchCondition(20) reports IsTruncation()==true, so a
+	//    dead-play episode BOOTSTRAPS instead of writing a false "return = 0" target into
+	//    the critic. Making NoTouch a true terminal here would be the episode-boundary
+	//    aliasing bug that cost this run Elo twice (STEERED_PRACTICE.md).
+	//  - The exploration stack, whatever it currently is. NOTE (verified, not assumed):
+	//    geoSeekBeta and vdagSeekBeta are BOTH 0 on this lineage, so there is NO potential
+	//    injection to lean on. What is actually live is SIL (silCoeff 0.05) and
+	//    entropyScale 0.14. SIL is the load-bearing one here: it replays high-return
+	//    transitions, which is exactly how a rare first goal gets amplified instead of
+	//    being averaged away. If GCO learns at all, SIL is the most likely reason.
+	//  - Reset mix. BallNearCar 0.30 already puts a third of episodes one touch away from
+	//    a scorable state, which is the only reason a cold sparse start is not hopeless.
+	//  - entropyScale. Raising it is the obvious second lever; one lever at a time.
+	if (const char* g = std::getenv("GGL_GCO"); g && std::atoi(g) != 0) {
+		RG_LOG("GGL_GCO: SPARSE reward stack - terminal goal/concede ONLY, all shaping off.");
+		return {
+			{ new GoalReward(), 150.f },
+		};
+	}
 	return {
 		// ---- Proven core: bit-identical economics to the 1132-Elo run -------------
 		// Ball->goal potential (Nexto state_quality). Antisymmetric between teams, so ALREADY
@@ -1914,6 +1940,24 @@ int main(int argc, char* argv[]) {
 		cfg.ppo.silEnabled = false;
 		cfg.gapSensor.enabled = false;
 		RG_LOG("GGL_NO_HEADROOM: vdag + SIL + gap sensor disabled");
+	}
+	// GCO critic-ablation gates (2026-08-22): the GCO result is confounded by the custom
+	// critic stack - twin value critic (noise cancelling), goal-critic blend (under
+	// goal-only reward it becomes a 5x-longer-horizon second estimate of the SAME sparse
+	// signal), and headroom-gated SIL (frontier-targeted success amplifier). One gate per
+	// mechanism so each ablation arm removes exactly one lever. Unlike GGL_NO_HEADROOM
+	// (the coarse bisect hammer), GGL_NO_SIL leaves vdag/gap measurement alive.
+	if (const char* nt = std::getenv("GGL_NO_TWIN"); nt && *nt && std::string(nt) != "0") {
+		cfg.ppo.valueTwinEnabled = false;
+		RG_LOG("GGL_NO_TWIN: single value critic (twin noise-cancelling off)");
+	}
+	if (const char* ng = std::getenv("GGL_NO_GOALCRITIC"); ng && *ng && std::string(ng) != "0") {
+		cfg.ppo.goalCritic.enabled = false;
+		RG_LOG("GGL_NO_GOALCRITIC: goal critic + long-horizon advantage blend off");
+	}
+	if (const char* ns = std::getenv("GGL_NO_SIL"); ns && *ns && std::string(ns) != "0") {
+		cfg.ppo.silEnabled = false;
+		RG_LOG("GGL_NO_SIL: self-imitation off (vdag/gap measurement stays live)");
 	}
 	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
 	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
