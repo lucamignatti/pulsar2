@@ -397,10 +397,16 @@ void GGL::LeagueModule::PrepareLearnData() {
 	}
 	statGoalsFor = goalsFor;
 	statGoalsAgainst = goalsAgainst;
+	// The window ACCUMULATES for winResetEvery harvests, then starts over: the
+	// published share is "goals over the last <= winResetEvery iterations", which is
+	// the slope the cumulative counters bury.
 	statWinFor = winGoalsFor;
 	statWinAgainst = winGoalsAgainst;
-	std::fill(winGoalsFor.begin(), winGoalsFor.end(), (int64_t)0);
-	std::fill(winGoalsAgainst.begin(), winGoalsAgainst.end(), (int64_t)0);
+	if (++winHarvests >= RS_MAX(1, cfg.winResetEvery)) {
+		winHarvests = 0;
+		std::fill(winGoalsFor.begin(), winGoalsFor.end(), (int64_t)0);
+		std::fill(winGoalsAgainst.begin(), winGoalsAgainst.end(), (int64_t)0);
+	}
 	statReservoirFill = reservoir.Size();
 
 	discD0 = discD1 = discLag = discZ = torch::Tensor();
@@ -765,7 +771,22 @@ void GGL::LeagueModule::Load(std::filesystem::path folder) {
 	ar.read("discUpdates", du);
 	discUpdates = du.item<int64_t>();
 	SyncCollectSnapshot();
-	RG_LOG("LeagueModule: loaded LEAGUE.lt (discUpdates=" << discUpdates << ")");
+	// Report the loaded adapters' DEVIATION FROM THE BASE, not just that a file was
+	// found. ||B|| == 0 means the variants are still the main; a large value means we
+	// have inherited a trained (possibly damaged) lineage. A hop silently resuming
+	// broken adapters is exactly how one deploy of this arm got contaminated - the
+	// "loaded LEAGUE.lt" line alone did not make that visible.
+	double bNorm = 0;
+	{
+		RG_NO_GRAD;
+		for (auto* s : { &pol, &cri })
+			for (auto& t : s->B)
+				bNorm += t.detach().pow(2).sum().item<double>();
+		bNorm = std::sqrt(bNorm);
+	}
+	RG_LOG("LeagueModule: loaded LEAGUE.lt (discUpdates=" << discUpdates
+		<< ", ||B||=" << bNorm << (bNorm == 0 ? " - variants ARE the main)"
+			: " - RESUMING A TRAINED ADAPTER LINEAGE; delete LEAGUE.lt for a clean start)"));
 }
 
 void GGL::LeagueModule::BroadcastParams(Dist::Session* dist) {

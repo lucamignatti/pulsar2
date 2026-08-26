@@ -424,6 +424,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.advFilterFrac = envF("GGL_LEAGUE_ADVFRAC", lc.advFilterFrac);
 		lc.silCoeff = envF("GGL_LEAGUE_SIL", config.ppo.silCoeff > 0 ? config.ppo.silCoeff : lc.silCoeff);
 		lc.accumEvery = envI("GGL_LEAGUE_ACCUM", lc.accumEvery);
+		lc.winResetEvery = envI("GGL_LEAGUE_WIN", lc.winResetEvery);
 		lc.clipRange = config.ppo.clipRange;
 		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);

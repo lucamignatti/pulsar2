@@ -78,6 +78,11 @@ namespace GGL {
 		// terms and costs only off-policyness: the adapters are CONSTANT across a
 		// window, so the only staleness is base drift, which the clip absorbs.
 		int accumEvery = 4;
+		// Iterations the windowed goal share spans before it resets. Goals are RARE
+		// under GCO - a 1-iteration window almost never contains one, so the first
+		// version of this panel read 0/-1 forever and was unreadable. The window must
+		// be long enough to hold goals but short enough to still show a slope.
+		int winResetEvery = 200;
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }
@@ -157,6 +162,7 @@ namespace GGL {
 		std::vector<torch::Tensor> pendStates, pendMasks, pendActions, pendLogProbs,
 			pendAdv, pendTargets, pendVariant;
 		int accumCount = 0;
+		int winHarvests = 0;
 
 		LeagueModule(ModelSet& baseModels, LeagueConfig config, torch::Device device, int numPlayers);
 		~LeagueModule();
