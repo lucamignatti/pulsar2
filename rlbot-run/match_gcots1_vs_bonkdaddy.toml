@@ -1,0 +1,28 @@
+#:schema https://rlbot.org/schemas/match.json
+# GCO ts1 vs BonkDaddy V4.5 - the same calibrated anchor the CrossPlay evaluator uses, so
+# a real-game goal share here is directly comparable to the sim number on identical
+# weights (528B measured 34.9% over 200 sim episodes on the HEAD engine, 2026-08-26).
+# (The header used to describe Rain; the cars below have always been BonkDaddy.)
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-gco-ts1-bot/bot.toml"
+team = 0
+
+[[cars]]
+config_file = "gglbots/bonkdaddy/rlbot/bot.toml"
+team = 1

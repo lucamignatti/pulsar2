@@ -62,9 +62,11 @@ static Player ToPlayer(const rlbot::flat::PlayerInfo* p) {
 	//
 	// KNOWN RESIDUAL: the real game reports Jumping from the moment jump is pressed,
 	// while the wheels stay grounded for ~6 more ticks (RocketSim keeps isOnGround true
-	// there). Sub-decision-window transient (we act every 8 ticks, and our OWN jumps
-	// start on decision ticks, so self-obs never lands inside it) - only opponents'
-	// blocks can catch it. Tracking it needs per-car jump-time state; not worth it.
+	// there, which is why the sim mirror below exists - it reproduces that window so the
+	// obs matches training). At tickSkip 8 this was a sub-decision-window transient our
+	// own jumps never sampled; at tickSkip 1 (this GCO run) we decide every tick and land
+	// inside it constantly - so the mirror's grounded-during-Jumping call is load-bearing
+	// and is deliberately preserved by the authoritative-air gate in ApplyMirror.
 	const auto airState = p->air_state();
 	pd.isOnGround = (airState == rlbot::flat::AirState::OnGround);
 	pd.hasJumped = p->has_jumped();
@@ -475,6 +477,16 @@ void RLBotBot::SendGroundReset(unsigned index) {
 
 // ---- sim mirror -------------------------------------------------------------
 
+// Single source of truth for the authoritative-air gate (see ApplyMirror), so the boot
+// log and the per-tick behaviour can never disagree about which A/B arm is running.
+static bool AirStateGateEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("GGL_NO_AIRSTATE_GATE");
+		return !(v && *v && std::string(v) != "0");
+	}();
+	return on;
+}
+
 void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, int ticksElapsed) {
 	static const bool enabled = [] {
 		const char* v = std::getenv("GGL_SIM_MIRROR");
@@ -525,6 +537,9 @@ void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, i
 		} else {
 			RG_LOG("SIM MIRROR: on (recovering isOnGround/jump/flip phase from RocketSim; "
 				"GGL_SIM_MIRROR=0 disables)");
+			RG_LOG("AIRSTATE GATE: "
+				<< (AirStateGateEnabled() ? "ON (packet-authoritative air overrides mirror false-grounds)"
+				                          : "OFF (legacy mirror ground flag)"));
 		}
 	}
 	if (!mirrorEnabled || !mirrorArena)
@@ -533,6 +548,13 @@ void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, i
 	MirrorCar& mc = mirrorByIndex[index];
 	if (!mc.car)
 		mc.car = mirrorArena->AddCar(pl.team);
+
+	// Packet AirState (the game's authoritative component state), captured BEFORE the
+	// mirror overwrites pl's reconstructed flags. ToPlayer set isOnGround=(AirState==
+	// OnGround) and isJumping=(AirState==Jumping); so !onGround && !jumping means the
+	// packet says Dodging / DoubleJumping / InAir - states mutually exclusive with wheel
+	// contact. That is ground truth that the car is airborne, used by the gate below.
+	const bool pktUnambiguousAir = !pl.isOnGround && !pl.isJumping;
 
 	CarState cs = mc.car->GetState();
 
@@ -590,6 +612,24 @@ void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, i
 
 	// THE POINT: engine-derived state the packet masks or omits.
 	pl.isOnGround = out.isOnGround;
+
+	// AUTHORITATIVE-AIR GATE (2026-08-26). The mirror's RocketSim keeps isOnGround true
+	// for ~6 ticks after a jump press (matching what the trainer's engine does), which is
+	// why the mirror exists - the packet flips to Jumping immediately and would mismatch
+	// training in that transient. But the mirror is a re-synced reconstruction: during
+	// jump-mash it DESYNCS and reports grounded while the car is airborne. Measured on
+	// 417k real ts1 decisions (debug.2095102), the mirror disagrees with the packet
+	// AirState on 4.66%, and the false-grounds concentrate exactly where the packet says
+	// Dodging/DoubleJumping/InAir. A false ground is the "accidental flip" mechanism: the
+	// policy is handed the GROUND action table while airborne, so its jump press dodges
+	// instead of hopping. Those three states cannot coexist with wheel contact, so when
+	// the packet is authoritatively airborne we override the mirror - one-directional and
+	// provably safe. The Jumping post-press transient (where the mirror correctly models
+	// the grounded window) is deliberately left on the mirror. GGL_NO_AIRSTATE_GATE=1
+	// restores the pre-gate behaviour for A/B.
+	if (AirStateGateEnabled() && pktUnambiguousAir)
+		pl.isOnGround = false;
+
 	pl.hasFlipped = out.hasFlipped;
 	pl.hasJumped = out.hasJumped;
 	pl.hasDoubleJumped = out.hasDoubleJumped;
