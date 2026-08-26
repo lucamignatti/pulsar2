@@ -865,8 +865,26 @@ void GGL::Learner::Load() {
 	auto fnTryLoad = [&](const std::filesystem::path& loadFolder) {
 		LoadStats(loadFolder / STATS_FILE_NAME);
 		ppo->LoadFrom(loadFolder);
-		if (league)
-			league->Load(loadFolder); // missing LEAGUE.lt = fresh adapters (warm starts)
+		// GGL_LEAGUE_FRESH=1: ignore any LEAGUE.lt and keep the birth adapters (B=0, so
+		// every variant IS the main). Needed because the checkpoint the league resumes
+		// from is shared with the main's own rotation - you cannot get a clean adapter
+		// start by deleting files without racing the save cadence. This is also what
+		// makes the frozen-adapter CONTROL expressible: LR=0 alone freezes whatever
+		// lineage happened to be on disk, which is a different experiment.
+		if (league) {
+			static const bool leagueFresh = [] {
+				const char* e = std::getenv("GGL_LEAGUE_FRESH");
+				return e && *e && std::string(e) != "0";
+			}();
+			if (leagueFresh) {
+				// braces are load-bearing: RG_LOG expands to a braced block, so the
+				// trailing ';' would close the if and orphan the else
+				RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - adapters start at B=0"
+					" (variants ARE the main)");
+			} else {
+				league->Load(loadFolder); // missing LEAGUE.lt = fresh adapters (warm starts)
+			}
+		}
 		if (config.gapSensor.enabled && gapSensor)
 			gapSensor->loadFrom = loadFolder;
 
