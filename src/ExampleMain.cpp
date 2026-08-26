@@ -481,13 +481,19 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	// the measured corruption (deterministic per tick+car, obs and mask consistent)
 	// so the policy learns flag-noise robustness. ON in render as well - the viewer
 	// must reproduce what the bot experiences in the real game (acceptance test).
-	// DEFAULT ON (binary-default so queued cluster hops with stale spooled sbatch
-	// scripts still get it - the Slurm spool trap); GGL_NO_OBS_FLAG_NOISE=1 opts out.
+	// DEFAULT OFF since 2026-08-26 evening (binary-default, spool-proof;
+	// GGL_OBS_FLAG_NOISE=1 re-enables). RETIRED after one day live, on measurement:
+	// the channel error this modelled turned out to be mostly OUR OWN sim-mirror
+	// falsely showing grounded - fixed at the source (client authoritative-air gate:
+	// accidental flips halved in-game; engine level-takeoff contact hold: speed_flip
+	// 1127->24 uu, held-out) - while the noise cratered strength (Bonk share 34.9% ->
+	// 10-20% band, no recovery in ~6B steps) and its v1 day injected a failure mode
+	// the real game does not have. The remaining REAL channel error (~0.1% packet
+	// collapse + delivery-batching bursts) is not worth a POMDP tax. The wrapper and
+	// its measured statistics stay for reuse if a future capture disagrees.
 	{
-		const char* off = std::getenv("GGL_NO_OBS_FLAG_NOISE");
-		// ON in render too (user acceptance test: viz must show the SAME wrong
-		// behaviour as the real game, channel corruption included).
-		bool noiseOn = !(off && *off && std::string(off) != "0");
+		const char* on = std::getenv("GGL_OBS_FLAG_NOISE");
+		bool noiseOn = (on && *on && std::string(on) != "0");
 		if (noiseOn) {
 			RLGC::RealChannelNoiseCfg ncfg = {};
 			result.obsBuilder = new RLGC::NoisyChannelObs(result.obsBuilder, ncfg);
