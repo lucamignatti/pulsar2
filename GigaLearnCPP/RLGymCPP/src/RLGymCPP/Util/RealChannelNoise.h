@@ -26,9 +26,23 @@
 // ground/air table selection - exactly the real failure surface.
 namespace RLGC {
 
+	// Refit 2026-08-26 (v2, after side-by-side viz review read the first model as
+	// "way overdone"): the real channel's errors are ONE-DIRECTIONAL and BURSTY.
+	// Measured (debug.3914029, unambiguous-state subset):
+	//   - grounded-shown-as-air: 0 of 7,498 ticks. NEVER inject it (the v1 symmetric
+	//     flip did, handing a grounded bot the air table - a failure mode the real
+	//     game does not have).
+	//   - air-shown-as-grounded: 6.6% of airborne ticks, arriving as BURSTS:
+	//     starts 0.54%/tick, median length 2, heavy tail (p75 6, max 116) => mean ~12.
+	// Model: per car, hashed 64-tick epochs schedule at most one burst (p such that
+	// starts match), length mixture 80% short (mean ~2) / 20% long (mean ~50, cap 60).
+	// During a burst an AIRBORNE car reads isOnGround=true; grounded cars are never
+	// touched. i.i.d. injection at the same average wrongness produces many times
+	// more distinct decision derailments than bursts - that was the "overdone".
 	struct RealChannelNoiseCfg {
-		float pNear = 0.09f; // measured: wrong-flag rate within 12 ticks of a press
-		float pFar = 0.02f;  // measured: steady-state wrong-flag rate
+		float burstStartsPerTick = 0.0054f; // measured burst-start rate
+		float pLong = 0.20f;                // share of long desync episodes
+		int shortMean = 2, longMean = 50, longCap = 60;
 		uint64_t seed = 0x9E3779B97F4A7C15ull;
 	};
 
@@ -40,18 +54,32 @@ namespace RLGC {
 			return x ^ (x >> 31);
 		}
 
-		inline bool TransitionAdjacent(const Player& p) {
-			return p.isJumping || p.isFlipping
-				|| (p.hasJumped && p.airTimeSinceJump < 0.12f)
-				|| p.airTime < 0.12f;
-		}
-
 		inline void CorruptPlayer(Player& p, uint64_t tick, const RealChannelNoiseCfg& cfg) {
-			const float pr = TransitionAdjacent(p) ? cfg.pNear : cfg.pFar;
-			const uint64_t h = SplitMix(cfg.seed ^ (tick * 0x100000001B3ull) ^ p.carId);
-			const float u = (float)(h >> 40) / (float)(1ull << 24);
-			if (u < pr)
-				p.isOnGround = !p.isOnGround;
+			if (p.isOnGround)
+				return; // measured: the channel never shows a grounded car as airborne
+			constexpr uint64_t EPOCH = 64;
+			// A burst may spill from the previous epoch; check this epoch and the last.
+			for (int back = 0; back < 2; back++) {
+				const uint64_t epoch = tick / EPOCH - back;
+				const uint64_t h = SplitMix(cfg.seed ^ (epoch * 0x100000001B3ull) ^ p.carId);
+				const float u0 = (float)(h & 0xFFFFFF) / (float)(1 << 24);
+				if (u0 >= cfg.burstStartsPerTick * (float)EPOCH)
+					continue; // no burst scheduled in that epoch
+				const uint64_t start = epoch * EPOCH + ((h >> 24) & (EPOCH - 1));
+				const bool isLong = ((float)((h >> 32) & 0xFF) / 256.f) < cfg.pLong;
+				// geometric-ish length from hash bits
+				uint32_t bits = (uint32_t)(h >> 40);
+				int len = 1;
+				const int mean = isLong ? cfg.longMean : cfg.shortMean;
+				while ((bits & 1) == 0 && len < (isLong ? cfg.longCap : 8)) {
+					len += mean / 2 + 1;
+					bits >>= 1;
+				}
+				if (tick >= start && tick < start + (uint64_t)len) {
+					p.isOnGround = true;
+					return;
+				}
+			}
 		}
 
 		inline GameState CorruptState(const GameState& state, const RealChannelNoiseCfg& cfg) {

@@ -495,8 +495,8 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 			static bool logged = false;
 			if (!logged) {
 				logged = true;
-				RG_LOG("OBS FLAG NOISE: ON (real-channel isOnGround corruption, pNear="
-					<< ncfg.pNear << " pFar=" << ncfg.pFar
+				RG_LOG("OBS FLAG NOISE: ON v2 (directional air-shown-grounded bursts, "
+					<< "starts/tick=" << ncfg.burstStartsPerTick << " pLong=" << ncfg.pLong
 					<< "; GGL_NO_OBS_FLAG_NOISE=1 disables)");
 			}
 		}
