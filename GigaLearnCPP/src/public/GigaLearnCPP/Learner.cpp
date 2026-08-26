@@ -879,9 +879,16 @@ void GGL::Learner::Load() {
 			}();
 			if (leagueFresh) {
 				// braces are load-bearing: RG_LOG expands to a braced block, so the
-				// trailing ';' would close the if and orphan the else
-				RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - adapters start at B=0"
-					" (variants ARE the main)");
+				// trailing ';' would close the if and orphan the else.
+				// Report the ACTUAL birth state: this line used to claim "B=0" whether or
+				// not GGL_LEAGUE_BINIT was set, which made a symmetry-broken run
+				// indistinguishable from a symmetric one in the log -- exactly the kind of
+				// stale banner that costs an experiment its interpretation.
+				RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - adapters born at binitStd="
+					<< league->cfg.binitStd
+					<< (league->cfg.binitStd > 0
+						? " (diverse variants SYMMETRY-BROKEN; exploiters at B=0)"
+						: " (B=0: variants ARE the main)"));
 			} else {
 				league->Load(loadFolder); // missing LEAGUE.lt = fresh adapters (warm starts)
 			}
