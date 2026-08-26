@@ -23,6 +23,16 @@ fn ggl_wheel_sweep() -> f32 {
     })
 }
 
+fn ggl_wheel_ball_reaction() -> f32 {
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_WHEEL_BALL_REACTION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    })
+}
+
 pub struct VehicleRL {
     raycaster: VehicleRaycaster,
     chassis_body_idx: usize,
@@ -332,6 +342,41 @@ impl VehicleRL {
                     let rel = pt - ground.get_world_trans().translation;
                     ground.add_impulse(
                         Some("WheelOnCar"),
+                        Impulse::LinearRelPos(force, rel),
+                        true,
+                        false,
+                    );
+                }
+            }
+            let reaction_scale = ggl_wheel_ball_reaction();
+            if reaction_scale != 0.0 {
+                let mut reactions: [(usize, Vec3A, Vec3A); NUM_WHEELS] =
+                    [(0, Vec3A::ZERO, Vec3A::ZERO); NUM_WHEELS];
+                let mut n_react = 0;
+                {
+                    let bodies = collision_world.bodies();
+                    for (i, wheel) in self.wheels.iter().enumerate() {
+                        let (Some(force), Some(info)) =
+                            (suspension_impulses[i], wheel.raycast_info.as_ref())
+                        else {
+                            continue;
+                        };
+                        if !bodies
+                            .get(info.ground_body_idx)
+                            .is_some_and(|b| !b.is_static_obj())
+                        {
+                            continue;
+                        }
+                        reactions[n_react] =
+                            (info.ground_body_idx, -force * reaction_scale, info.contact_point);
+                        n_react += 1;
+                    }
+                }
+                for &(idx, force, pt) in reactions.iter().take(n_react) {
+                    let ground = &mut collision_world.bodies_mut()[idx];
+                    let rel = pt - ground.get_world_trans().translation;
+                    ground.add_impulse(
+                        Some("WheelOnBall"),
                         Impulse::LinearRelPos(force, rel),
                         true,
                         false,

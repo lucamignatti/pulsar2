@@ -30,6 +30,8 @@ pub struct SolverConstraint {
     pub solver_body_id_a: usize,
     pub solver_body_id_b: usize,
     pub is_special: bool,
+    /// (manifold index, point index) for `write_back_contacts` warmstart.
+    pub origin: Option<(usize, usize)>,
 }
 
 impl SolverConstraint {

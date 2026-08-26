@@ -106,13 +106,21 @@ fn ggl_dodge_contact_wheels() -> u32 {
 /// full-pose captures (see research/tools landing tests); default from that fit.
 fn ggl_touchdown_exc_ticks() -> u8 {
     static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env::var("GGL_TOUCHDOWN_EXC_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(5))
+    // Default 0 since 2026-08-26: the =5 ship was fit on the 60 Hz misaligned captures
+    // (the 1-tick comparison-harness offset found today inflated every landing number it
+    // was fit against). On the alignment-corrected 120 Hz battery exc=0 is better or
+    // equal on EVERY landing segment (corner_land_steep p90 122->8.8, tilt_nose_down
+    // 53->2.0, plain drops unchanged). Titan-appo reached the same verdict independently.
+    *V.get_or_init(|| env::var("GGL_TOUCHDOWN_EXC_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
 fn ggl_wheels_pre() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| env::var("GGL_WHEELS_PRE").map_or(true, |s| s != "0"))
 }
+
+// (titan-appo carried duplicates of ggl_no_touchdown_exc / ggl_touchdown_exc_ticks here
+//  with default 0; ours above, default 5, is the capture-fit ship. Port 2026-08-26.)
 
 /// Where car speed caps run. Default `both` = arena tick head + publish (S37).
 /// `GGL_VEL_CLAMP=head` = tuned default (start only). `end` = publish only.
@@ -179,6 +187,9 @@ pub struct Car {
     /// Lives on Car, NOT CarState: it is a within-tick bookkeeping aid, so adding it
     /// changes no serialized state and no checkpoint/FFI layout.
     pub(crate) ground_prev: bool,
+    /// Last tick's chassis world contact (GGL_PLANE_SLACK scrape gate).
+    /// Persistence law: promote only if there was contact before. Default false;
+    pub(crate) chassis_scrape_prev: bool,
 }
 
 impl Deref for Car {
@@ -273,6 +284,7 @@ impl Car {
             },
             sticky_gate_prev: false,
             ground_prev: false,
+            chassis_scrape_prev: false,
         }
     }
 
@@ -352,6 +364,8 @@ impl Car {
         // A restored car has no prior tick; seed from the restored flag so a SetState
         // never manufactures a spurious contact-break (replay probes restore mid-jump).
         self.ground_prev = self.state.is_on_ground;
+        self.wheels_post_this_tick = false;
+        self.touchdown_post_ticks = 0;
     }
 
     /// Re-raycast wheels at the car's current pose and refresh contact flags.
@@ -1262,6 +1276,33 @@ impl Car {
 
                     self.state.flip_rel_torque = Vec3A::new(-dodge_dir.y, dodge_dir.x, 0.0);
 
+                    // v3-tuned `RS_TUNE_DODGE_TORQUE_AT_START`: `update_air_torque`
+                    // already ran with `is_flipping` still false, so the first tick
+                    // of dodge torque is otherwise lost. Shipped on 2026-08-25
+                    // (T1/211647 flip_air tie; air+wheels ang p90 drop). `=0` opts out.
+                    if !env::var("GGL_DODGE_TORQUE_START").is_ok_and(|s| s == "0") {
+                        let mut rel_dodge_torque = self.state.flip_rel_torque;
+                        let mut pitch_scale = 1.0;
+                        if rel_dodge_torque.y != 0.0
+                            && self.state.controls.pitch != 0.0
+                            && rel_dodge_torque.y.signum() == self.state.controls.pitch.signum()
+                            && self.state.flip_ticks >= car_consts::flip::PITCH_CANCEL_MIN_TICKS
+                        {
+                            pitch_scale = 1.0 - self.state.controls.pitch.abs().min(1.0);
+                        }
+                        rel_dodge_torque.y *= pitch_scale;
+                        let dodge_torque = rel_dodge_torque
+                            * Vec3A::new(car_consts::flip::TORQUE_X, car_consts::flip::TORQUE_Y, 0.0)
+                            * env_f32("GGL_FLIP_TORQUE", 1.0)
+                            * TICK_TIME;
+                        rb.add_impulse(
+                            None,
+                            Impulse::Angular(rb.get_world_trans().matrix3 * dodge_torque),
+                            false,
+                            true,
+                        );
+                    }
+
                     if dodge_dir.x.abs() < 0.1 {
                         dodge_dir.x = 0.0;
                     }
@@ -1410,6 +1451,10 @@ impl Car {
                 mutator_config.boost_accel_ground
             } else {
                 mutator_config.boost_accel_air
+            } * if self.state.is_flipping {
+                env_f32("GGL_BOOST_FLIP_SCALE", 1.0)
+            } else {
+                1.0
             };
 
             rb.add_impulse(
@@ -1444,6 +1489,10 @@ impl Car {
             self.bullet_vehicle.get_num_wheels() == 4 || self.bullet_vehicle.get_num_wheels() == 3
         );
 
+        // Capture dodge before `is_on_ground` wipes `is_flipping` (sim ≥3 wheels,
+        // including a graze the real dodge still rides). Used by autoroll "land".
+        let flipping_at_entry = self.state.is_flipping;
+
         {
             let rb = &mut collision_world.bodies_mut()[self.rigid_body_idx];
             if self.state.is_demoed {
@@ -1473,6 +1522,9 @@ impl Car {
             // TODO: Refactor and move
             let num_wheels_in_contact = self.state.num_wheels_in_contact();
             rb.wheels_grounded = num_wheels_in_contact >= 3;
+            rb.chassis_scrape_ok = num_wheels_in_contact == 0
+                && self.state.is_flipping
+                && self.chassis_scrape_prev;
 
             self.update_wheels(rb, num_wheels_in_contact, forward_speed_uu);
 
@@ -1515,13 +1567,11 @@ impl Car {
 
             // GGL_AUTOROLL: "1" = v2 always-on, "0"/"off" = never, "noflip" = v2
             // gate minus jump/flip ticks, "strict" = noflip and wheels-only (no
-            // chassis world-contact arm). The T1 partial-contact up-error histogram
-            // has a discrete mode at -0.82 uu/s; the impulse trace pinned it to
-            // this block's linear term, exactly autoroll::FORCE (100 uu/s^2) * dt,
-            // firing on flip landings and rising jumps where the real game applies
-            // nothing -- but fully removing it regresses ground/air+wheels, so the
-            // real assist exists outside jump/flip. (v3-tuned zeroed both scales on
-            // a coarser corpus; the jump/flip split explains their mixed signal.)
+            // chassis world-contact arm). Default "land" (5) = noflip plus skip
+            // assist on ticks that *entered* mid-dodge even if sim wheels cleared
+            // `is_flipping` this tick (lv-flipwheels 2026-08-26: T1 fw p90
+            // 1.055→0.922, other regimes bit-identical). `GGL_AUTOROLL=noflip`
+            // restores the previous default.
             let autoroll_mode = {
                 static V: OnceLock<u8> = OnceLock::new();
                 *V.get_or_init(|| match env::var("GGL_AUTOROLL").as_deref() {
@@ -1529,7 +1579,9 @@ impl Car {
                     Ok("0") | Ok("off") => 0,
                     Ok("strict") => 3,
                     Ok("nofliplanded") => 4,
-                    _ => 2, // noflip default
+                    Ok("noflip") => 2,
+                    Ok("land") => 5,
+                    _ => 5, // land default
                 })
             };
             let autoroll_ok = match autoroll_mode {
@@ -1539,7 +1591,8 @@ impl Car {
                     !self.state.is_flipping
                         && !self.state.is_jumping
                         && (autoroll_mode != 4 || !self.state.has_flipped)
-                        && (autoroll_mode == 2 || num_wheels_in_contact > 0)
+                        && (autoroll_mode != 5 || !flipping_at_entry)
+                        && (autoroll_mode == 2 || autoroll_mode == 5 || num_wheels_in_contact > 0)
                 }
             };
             if autoroll_ok
@@ -1688,6 +1741,9 @@ impl Car {
                 .as_ref()
                 .is_some_and(|info| info.is_in_contact_with_world)
         });
+        // world_contact_normal still holds THIS step's contact here (cleared in
+        // the next pre_tick_update).
+        self.chassis_scrape_prev = self.state.world_contact_normal.is_some();
         if env_on("GGL_JUMP_SETTLE")
             && self.state.has_jumped
             && !self.state.is_jumping

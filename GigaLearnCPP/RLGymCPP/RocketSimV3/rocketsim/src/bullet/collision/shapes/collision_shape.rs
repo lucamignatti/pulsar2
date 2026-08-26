@@ -76,7 +76,7 @@ impl CollisionShapes {
         (center, radius)
     }
 
-    fn get_angular_motion_disc(&self) -> f32 {
+    pub fn get_angular_motion_disc(&self) -> f32 {
         let (center, disc) = self.get_bounding_sphere();
         disc + center.length()
     }

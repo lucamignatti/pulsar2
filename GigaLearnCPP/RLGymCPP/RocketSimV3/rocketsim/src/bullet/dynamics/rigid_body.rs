@@ -152,6 +152,11 @@ pub struct RigidBody {
     /// Used to suppress CHASSIS-vs-world friction while the car is riding on its wheels.
     /// See arena_contact_tracker.rs and SIM2REAL_AUDIT.md S25.
     pub wheels_grounded: bool,
+    /// Set each tick for cars: zero wheels in contact AND mid-flip AND world
+    /// contact last tick. Gates GGL_PLANE_SLACK chassis-vs-plane promotion
+    /// (lv-flipair 2026-08-26). Ungated promotion regresses flip+wheels /
+    /// air+wheels.
+    pub chassis_scrape_ok: bool,
     pub deactivation_time: f32,
     pub friction: f32,
     pub restitution: f32,
@@ -212,6 +217,7 @@ impl RigidBody {
             companion_id: None,
             world_array_idx: 0,
             wheels_grounded: false,
+            chassis_scrape_ok: false,
             activation: ActivationState::Active,
             deactivation_time: 0.0,
             friction: info.friction,

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::{
     collision_obj_wrapper::RigidBodyWrapper, compound_collision_alg, convex_concave_collision_alg,
     convex_plane_collision_alg, obb_obb_collision_alg, sphere_concave_collision_alg,
@@ -25,6 +27,10 @@ pub struct CollisionDispatcher {
     /// blanket box inflation over-fires on fly-by ticks. Entries are evicted
     /// when the broadphase pair stops overlapping (near_callback not reached).
     cc_cache: Vec<(usize, usize, PersistentManifold, bool)>,
+    /// Chassis-vs-plane/mesh 4-point cache (v3-tuned `RS_TUNE_PERSISTENT_MANIFOLDS`).
+    /// Separate from car-car `GGL_CC_PERSIST`. Off unless `GGL_PLANE_PERSIST` is set.
+    plane_cache: HashMap<(usize, usize), PersistentManifold>,
+    plane_touched: HashSet<(usize, usize)>,
 }
 
 impl Default for CollisionDispatcher {
@@ -32,6 +38,8 @@ impl Default for CollisionDispatcher {
         Self {
             manifolds: Vec::with_capacity(8),
             cc_cache: Vec::new(),
+            plane_cache: HashMap::new(),
+            plane_touched: HashSet::new(),
         }
     }
 }
@@ -44,6 +52,19 @@ fn ggl_cc_persist() -> bool {
     // persistence needs a real seed contact, unlike box inflation which was
     // tested and rejected). GGL_CC_PERSIST=0 restores per-tick manifolds.
     *V.get_or_init(|| !std::env::var("GGL_CC_PERSIST").is_ok_and(|s| s == "0"))
+}
+
+/// Bitmask: 1 = convex-vs-static-plane, 2 = other (mesh). Default 0 (A/B).
+/// Tuned ships 3. Unrelated to `GGL_CC_PERSIST`.
+fn ggl_plane_persist_mask() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GGL_PLANE_PERSIST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 impl CollisionDispatcher {
@@ -268,7 +289,48 @@ impl CollisionDispatcher {
                 }
             }
         } else if let Some(manifold) = fresh {
-            self.manifolds.push(manifold);
+            let is_plane_pair = matches!(rb0.get_collision_shape(), CollisionShapes::StaticPlane(_))
+                || matches!(rb1.get_collision_shape(), CollisionShapes::StaticPlane(_));
+            let mask = ggl_plane_persist_mask();
+            let keep = if is_plane_pair {
+                mask & 1 != 0
+            } else {
+                mask & 2 != 0
+            };
+            if !keep {
+                self.manifolds.push(manifold);
+            } else {
+                let key = (manifold.body0_idx, manifold.body1_idx);
+                let body0 = &collision_objs[manifold.body0_idx];
+                let body1 = &collision_objs[manifold.body1_idx];
+                let cached = self
+                    .plane_cache
+                    .entry(key)
+                    .or_insert_with(|| PersistentManifold::new(body0, body1));
+                cached.merge_new_points(&manifold, body0, body1);
+                self.plane_touched.insert(key);
+                if !cached.point_cache.is_empty() {
+                    self.manifolds.push(cached.clone());
+                }
+            }
+        }
+    }
+
+    fn sync_applied_impulses(&mut self) {
+        if self.plane_cache.is_empty() {
+            return;
+        }
+        for manifold in &self.manifolds {
+            let Some(cached) = self.plane_cache.get_mut(&(manifold.body0_idx, manifold.body1_idx))
+            else {
+                continue;
+            };
+            if cached.point_cache.len() != manifold.point_cache.len() {
+                continue;
+            }
+            for (cached_point, solved) in cached.point_cache.iter_mut().zip(&manifold.point_cache) {
+                cached_point.applied_impulse = solved.applied_impulse;
+            }
         }
     }
 
@@ -278,10 +340,18 @@ impl CollisionDispatcher {
         pair_cache: &mut GridBroadphase,
         contact_added_callback: &mut T,
     ) {
+        // Solver leaves last tick's manifolds so impulses can warm-start the cache.
+        self.sync_applied_impulses();
+        self.manifolds.clear();
         for entry in &mut self.cc_cache {
             entry.3 = false;
         }
+        self.plane_touched.clear();
         pair_cache.process_all_overlapping_pairs(collision_objs, self, contact_added_callback);
         self.cc_cache.retain(|(.., touched)| *touched);
+        if !self.plane_cache.is_empty() {
+            let touched = &self.plane_touched;
+            self.plane_cache.retain(|key, _| touched.contains(key));
+        }
     }
 }

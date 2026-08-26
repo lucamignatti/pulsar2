@@ -211,6 +211,7 @@ impl SeqImpulseConstraintSolver {
     ) {
         self.solve_group_setup(collision_objs, non_static_bodies, manifolds, time_step);
         self.solve_group_iterations();
+        self.write_back_contacts(manifolds);
         self.solve_group_finish(collision_objs, time_step);
     }
 
@@ -223,7 +224,7 @@ impl SeqImpulseConstraintSolver {
     ) {
         self.setup_solver_bodies(collision_objs, non_static_bodies);
 
-        for manifold in manifolds.iter_mut() {
+        for (manifold_idx, manifold) in manifolds.iter_mut().enumerate() {
             debug_assert!(manifold.body0_idx < collision_objs.len());
             debug_assert!(manifold.body1_idx < collision_objs.len());
             debug_assert_ne!(manifold.body0_idx, manifold.body1_idx);
@@ -245,7 +246,7 @@ impl SeqImpulseConstraintSolver {
             body0.companion_id = Some(solver_body_id_a);
             body1.companion_id = Some(solver_body_id_b);
 
-            for cp in &mut manifold.point_cache {
+            for (point_idx, cp) in manifold.point_cache.iter_mut().enumerate() {
                 assert!(cp.distance_1 <= manifold.contact_processing_threshold);
 
                 let rel_pos1 = cp.pos_world_on_a - body0.get_world_trans().translation;
@@ -269,17 +270,17 @@ impl SeqImpulseConstraintSolver {
                 let rb1 = solver_body_b.original_body.map(|_| &*body1);
                 let friction_idx = self.tmp_solver_contact_friction_constraint_pool.len();
 
-                self.tmp_solver_contact_constraint_pool.push(
-                    SolverConstraint::get_contact_constraint(
-                        (solver_body_id_a, solver_body_id_b),
-                        (solver_body_a, solver_body_b),
-                        (rb0, rb1),
-                        (rel_pos1, rel_pos2),
-                        cp,
-                        friction_idx,
-                        time_step,
-                    ),
+                let mut contact_constraint = SolverConstraint::get_contact_constraint(
+                    (solver_body_id_a, solver_body_id_b),
+                    (solver_body_a, solver_body_b),
+                    (rb0, rb1),
+                    (rel_pos1, rel_pos2),
+                    cp,
+                    friction_idx,
+                    time_step,
                 );
+                contact_constraint.origin = Some((manifold_idx, point_idx));
+                self.tmp_solver_contact_constraint_pool.push(contact_constraint);
 
                 cp.calc_lat_friction_dir(solver_body_a, solver_body_b, rel_pos1, rel_pos2);
 
@@ -296,7 +297,8 @@ impl SeqImpulseConstraintSolver {
             }
         }
 
-        manifolds.clear();
+        // Manifolds outlive the solve so `write_back_contacts` can warm-start
+        // the next tick. The dispatcher clears them at the next detect pass.
 
         if self.special_resolve_info.num_special_collisions > 0 {
             let body = &mut collision_objs[self.special_resolve_info.obj_idx];
@@ -583,6 +585,26 @@ impl SeqImpulseConstraintSolver {
             if self.least_squares_residual == 0.0 {
                 break;
             }
+        }
+    }
+
+    fn ggl_contact_warmstart() -> bool {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("GGL_CONTACT_WARMSTART").is_ok_and(|s| s != "0"))
+    }
+
+    /// Bullet `writeBackContacts` under `SOLVER_USE_WARMSTARTING`. Default off;
+    /// only meaningful with `GGL_PLANE_PERSIST`. Tuned corpus was +1 tick worse.
+    fn write_back_contacts(&mut self, manifolds: &mut [PersistentManifold]) {
+        if !Self::ggl_contact_warmstart() {
+            return;
+        }
+        for contact in &self.tmp_solver_contact_constraint_pool {
+            let Some((manifold_idx, point_idx)) = contact.origin else {
+                continue;
+            };
+            manifolds[manifold_idx].point_cache[point_idx].applied_impulse = contact.applied_impulse;
         }
     }
 

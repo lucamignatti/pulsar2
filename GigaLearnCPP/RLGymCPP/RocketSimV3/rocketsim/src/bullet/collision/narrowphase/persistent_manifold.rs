@@ -60,6 +60,41 @@ impl PersistentManifold {
             };
             contact_breaking_threshold += extra * crate::consts::UU_TO_BT;
         }
+        // GGL_PLANE_SLACK=<uu>: widen contact GENERATION/persistence for CAR vs
+        // static-PLANE pairs, only when chassis_scrape_ok (zero wheels, mid-flip,
+        // world contact last tick). Flip_air floor scrapes: tape keeps chassis
+        // contact while the discrete support-vertex test finds gap ≥ 1 uu and
+        // sim free-falls (T1 verr p50 3.08, n=371). Ungated promotion regresses
+        // flip+wheels / air+wheels. Compiled default 1 uu; GGL_PLANE_SLACK=0
+        // opts out. 0.5/0.75/1.0 were board-identical (gaps in [1, 1.5)).
+        else if body0.user_idx == crate::sim::UserInfoTypes::Car
+            || body1.user_idx == crate::sim::UserInfoTypes::Car
+        {
+            let plane_pair = matches!(
+                body0.get_collision_shape(),
+                crate::bullet::collision::shapes::collision_shape::CollisionShapes::StaticPlane(_)
+            ) || matches!(
+                body1.get_collision_shape(),
+                crate::bullet::collision::shapes::collision_shape::CollisionShapes::StaticPlane(_)
+            );
+            let scrape = (body0.user_idx == crate::sim::UserInfoTypes::Car
+                && body0.chassis_scrape_ok)
+                || (body1.user_idx == crate::sim::UserInfoTypes::Car
+                    && body1.chassis_scrape_ok);
+            if plane_pair && scrape {
+                let extra = {
+                    use std::sync::OnceLock;
+                    static V: OnceLock<f32> = OnceLock::new();
+                    *V.get_or_init(|| {
+                        std::env::var("GGL_PLANE_SLACK")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1.0)
+                    })
+                };
+                contact_breaking_threshold += extra * crate::consts::UU_TO_BT;
+            }
+        }
         let contact_processing_threshold = body0
             .contact_processing_threshold
             .min(body1.contact_processing_threshold);
@@ -180,6 +215,35 @@ impl PersistentManifold {
         };
 
         res.max_position()
+    }
+
+    fn get_cache_entry(&self, new_point: &ManifoldPoint) -> Option<usize> {
+        let mut shortest_dist = self.contact_breaking_threshold * self.contact_breaking_threshold;
+        let mut nearest = None;
+        for (i, mp) in self.point_cache.iter().enumerate() {
+            let diff_a = mp.local_point_a - new_point.local_point_a;
+            let dist_to_mani_point = diff_a.dot(diff_a);
+            if dist_to_mani_point < shortest_dist {
+                shortest_dist = dist_to_mani_point;
+                nearest = Some(i);
+            }
+        }
+        nearest
+    }
+
+    /// Fold this tick's detector points into a manifold kept across ticks.
+    /// `convex_plane` yields one supporting vertex per call; without this a
+    /// chassis on the floor is a box on a corner (v3-tuned part 31).
+    pub fn merge_new_points(&mut self, new_points: &Self, body0: &RigidBody, body1: &RigidBody) {
+        for point in &new_points.point_cache {
+            match self.get_cache_entry(point) {
+                Some(existing) => self.point_cache[existing] = *point,
+                None => {
+                    self.add_manifold_point(*point);
+                }
+            }
+        }
+        self.refresh_contact_points(body0, body1);
     }
 
     fn add_manifold_point(&mut self, contact: ManifoldPoint) -> usize {

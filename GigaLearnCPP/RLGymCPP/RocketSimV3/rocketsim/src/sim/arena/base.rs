@@ -579,6 +579,20 @@ impl Arena {
 
         self.contact_tracker.clear_records();
 
+        // GGL_BALL_CLAMP_TAIL: re-clamp ball speeds AFTER contact resolution.
+        // Default ON (Track 3 RESULT 8): tape |ω| stays ≤ ~6.007 through wedge
+        // bounces; pre-tick-only clamp let the solver publish |ω| up to 21.
+        // 1-step linear is bit-identical; ang error drops. `=0` restores
+        // pre-tick clamp only. Ball-only.
+        if !std::env::var("GGL_BALL_CLAMP_TAIL").is_ok_and(|s| s == "0") {
+            use consts::ball;
+            let ball_rb = &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx];
+            ball_rb.limit_vels(
+                self.config.mutators.ball_max_speed * UU_TO_BT,
+                ball::MAX_ANG_SPEED,
+            );
+        }
+
         for car in &mut self.cars {
             car.post_tick_update(&mut self.bullet_world);
             let rb = &mut self.bullet_world.bodies_mut()[car.rigid_body_idx];
@@ -720,6 +734,27 @@ impl Arena {
     /// one-tick contact history the gate depends on -- see `Car::sticky_gate_prev`).
     pub fn seed_sticky_gate_prev(&mut self, car_idx: usize, had_contact: bool) {
         self.cars[car_idx].sticky_gate_prev = had_contact;
+    }
+
+    /// Seed the chassis-scrape previous-tick world-contact gate (harness;
+    /// restore-erases-history, same as the sticky gate).
+    pub fn seed_chassis_scrape_prev(&mut self, car_idx: usize, had_contact: bool) {
+        self.cars[car_idx].chassis_scrape_prev = had_contact;
+    }
+
+    /// Seed per-wheel previous-tick contact for the touchdown exception.
+    /// Restore's `refresh_contact` rays at the restored pose; without this the
+    /// flag leaks from the previous 1-tick trial (or matches the current ray
+    /// and never fires). Pass tape wheels from tick i-1.
+    pub fn seed_touchdown_prev_contact(&mut self, car_idx: usize, had: [bool; 4]) {
+        for (wheel, h) in self.cars[car_idx]
+            .bullet_vehicle
+            .wheels
+            .iter_mut()
+            .zip(had)
+        {
+            wheel.was_in_contact_prev_tick = h;
+        }
     }
 
     /// One-tick suspension/pushback contact-normal override (`GGL_TAPE_N` harness).
@@ -1100,20 +1135,14 @@ impl Arena {
         // cars, and a bump from a direction whose car got demoed by the other
         // direction is dropped (the replica's deferred-action design).
         //
-        // Per direction:
-        //   - approach gates (speed > 0, closing on the contact, faster than the
-        //     victim retreats), then the per-victim cooldown (LastHitCar+BumpInterval)
-        //   - demo requires the supersonic flag AND forward-projected |speed| >=
-        //     MIN_DEMO_SPEED (2100); reversing attackers run every cone with the
-        //     forward axis flipped (bAllowBackwardsDemolitions = 1)
-        //   - the strict demo cone (45.573 x 36.870 deg) admits the demo; failing it
-        //     DEMOTES to a bump if the wide bump cone (70 x 36.870 deg) passes
-        //   - bump impulse: curves fed the attacker's FULL speed (GetBumpImpulse takes
-        //     Speed = VSize(OldRBState.LinearVelocity); the replica inherits stock-v2
-        //     projection input here -- the .uc decompile wins), pushed along vel_dir,
-        //     plus the up-push along the VICTIM's up axis only when it is grounded
-        //     (the .uc air branch never sets ImpulseZ; the replica's world-Z air push
-        //     is likewise inherited stock-v2 code).
+        // Per direction (soul dump / Track 2 Sessions 4–6, 2026-08-25):
+        //   - approach gates on start-of-tick centers (not contact-point)
+        //   - ShouldDemolish (rewound TOI cone) is NOT bump-cooldown gated
+        //   - then LastHitCar cooldown, then BumpCar always (zero impulse +
+        //     event + cooldown even when IsBumperHit fails)
+        //   - bump cone at Fraction=0 on RB origins; demo cone still uses TOI
+        //   - bump impulse: attacker's FULL speed along vel_dir, plus victim-up
+        //     when the victim is grounded
         // AddedCarForceMultiplier is CONFIRMED 0.0 in the CDO (2026-08-12), so the
         // absence of any scripted car-side extra force here is exact, not a gap.
         // NOT ported: demolish spawn invulnerability (mechanism known -- per-source
@@ -1141,16 +1170,21 @@ impl Arena {
                 continue;
             }
 
-            // Per-victim cooldown: a repeat contact on the SAME car inside the
-            // interval does nothing; a different car is never blocked.
-            if attacker_state.bump_cooldown_ticks > 0
-                && attacker_state.bump_last_victim == (victim_idx as u32).wrapping_add(1)
-            {
-                continue;
-            }
-
+            // ApplyCarImpactForces approach gates. Speed = |OldRBState.vel|.
             let attacker_speed = attacker_state.phys.vel.length();
             if attacker_speed <= 0.0 {
+                continue;
+            }
+            // HitDir = Normal(Other.OldLocation - OldLocation), not contact point.
+            let hit_dir =
+                (victim_state.phys.pos - attacker_state.phys.pos).normalize_or_zero();
+            let speed_towards_other_car = attacker_state.phys.vel.dot(hit_dir);
+            if speed_towards_other_car <= 0.0 {
+                continue;
+            }
+            let vel_dir = attacker_state.phys.vel / attacker_speed;
+            let other_car_away_speed = victim_state.phys.vel.dot(vel_dir);
+            if other_car_away_speed >= speed_towards_other_car {
                 continue;
             }
 
@@ -1160,20 +1194,9 @@ impl Arena {
                 manifold_point.pos_world_on_a
             } * BT_TO_UU;
 
-            let vel_dir = attacker_state.phys.vel / attacker_speed;
-            let dir_to_contact =
-                (contact_point - attacker_state.phys.pos).normalize_or_zero();
-
-            // TIME-OF-IMPACT rewind (SIM2REAL_AUDIT.md S40). The decompiled
-            // ShouldDemolish runs its angle checks on the SWEPT time-of-impact state
-            // (GetTimeOfImpact; end-of-tick state is only the sweep-miss fallback),
-            // while the states here are start-of-tick and the manifold was detected at
-            // the predicted end-of-tick transforms. At 4000+ uu/s closing speed the
-            // centers move ~35 uu inside one tick -- enough to swing the
-            // center-to-center direction by 10-20 deg at contact range and flip a
-            // marginal 45.57-deg cone decision. Estimate the first-touch fraction from
-            // the manifold penetration and the normal closing speed, and evaluate the
-            // cone direction at that instant (velocities stay OldRBState, as in RL).
+            // TOI rewind for the DEMO cone only. Bump cone is Fraction=0
+            // (InitTimeOfImpactFromOldRBState). Fractional bump-cone A/B
+            // 2026-08-25: full-tape CarImpact p99 307→370; rejected.
             let normal: Vec3A = manifold_point.normal_world_on_b;
             let rel_vel_bt = (attacker_state.phys.vel - victim_state.phys.vel) * UU_TO_BT;
             let closing = rel_vel_bt.dot(normal).abs();
@@ -1187,15 +1210,8 @@ impl Arena {
                 attacker_state.phys.pos + attacker_state.phys.vel * (toi * TICK_TIME);
             let victim_toi_pos =
                 victim_state.phys.pos + victim_state.phys.vel * (toi * TICK_TIME);
-            let dir_to_center = (victim_toi_pos - attacker_toi_pos).normalize_or_zero();
-
-            let speed_towards_other_car = attacker_state.phys.vel.dot(dir_to_contact);
-            let other_car_away_speed = victim_state.phys.vel.dot(vel_dir);
-            if speed_towards_other_car <= 0.0
-                || speed_towards_other_car <= other_car_away_speed
-            {
-                continue;
-            }
+            let dir_to_center_rewound =
+                (victim_toi_pos - attacker_toi_pos).normalize_or_zero();
 
             let forward = attacker_state.phys.rot_mat.x_axis;
             let reverse_forward = attacker_state.phys.vel.dot(forward) < 0.0;
@@ -1212,37 +1228,51 @@ impl Arena {
             if is_demo && !self.config.mutators.enable_team_demos {
                 is_demo = self.cars[attacker_idx].team != self.cars[victim_idx].team;
             }
-
-            let cone = |yaw: f32, pitch: f32| {
-                Self::car_within_forward_cone(
+            if is_demo {
+                let demo_cone_ok = Self::car_within_forward_cone(
                     forward,
                     attacker_state.phys.rot_mat.y_axis,
                     attacker_state.phys.rot_mat.z_axis,
-                    dir_to_center,
-                    yaw,
-                    pitch,
+                    dir_to_center_rewound,
+                    consts::car::bump::DEMO_CONE_YAW_DEG,
+                    consts::car::bump::DEMO_CONE_PITCH_DEG,
                     reverse_forward,
-                )
-            };
+                );
+                if demo_cone_ok {
+                    pending[usize::from(is_swapped)] = Some(Pending {
+                        attacker_idx,
+                        victim_idx,
+                        is_demo: true,
+                        bump_impulse_bt: Vec3A::ZERO,
+                        contact_point,
+                    });
+                    continue;
+                }
+            }
 
             use consts::car::bump as bc;
-            let passed = if is_demo {
-                if cone(bc::DEMO_CONE_YAW_DEG, bc::DEMO_CONE_PITCH_DEG) {
-                    true
-                } else if cone(bc::BUMP_CONE_YAW_DEG, bc::BUMP_CONE_PITCH_DEG) {
-                    is_demo = false; // demote to a bump
-                    true
-                } else {
-                    false
-                }
-            } else {
-                cone(bc::BUMP_CONE_YAW_DEG, bc::BUMP_CONE_PITCH_DEG)
-            };
-            if !passed {
+
+            // Cooldown after ShouldDemolish, before BumpCar.
+            if attacker_state.bump_cooldown_ticks > 0
+                && attacker_state.bump_last_victim == (victim_idx as u32).wrapping_add(1)
+            {
                 continue;
             }
 
-            let bump_impulse_bt = if is_demo {
+            // BumpCar always runs: cone fail → zero impulse, still cooldown + event.
+            let dir_to_center_now =
+                (victim_state.phys.pos - attacker_state.phys.pos).normalize_or_zero();
+            let bumper_hit = Self::car_within_forward_cone(
+                forward,
+                attacker_state.phys.rot_mat.y_axis,
+                attacker_state.phys.rot_mat.z_axis,
+                dir_to_center_now,
+                bc::BUMP_CONE_YAW_DEG,
+                bc::BUMP_CONE_PITCH_DEG,
+                reverse_forward,
+            );
+
+            let bump_impulse_bt = if !bumper_hit {
                 Vec3A::ZERO
             } else {
                 let ground_hit = victim_state.is_on_ground;
@@ -1266,7 +1296,7 @@ impl Arena {
             pending[usize::from(is_swapped)] = Some(Pending {
                 attacker_idx,
                 victim_idx,
-                is_demo,
+                is_demo: false,
                 bump_impulse_bt,
                 contact_point,
             });
