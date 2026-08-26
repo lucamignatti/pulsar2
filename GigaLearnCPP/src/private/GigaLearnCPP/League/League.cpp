@@ -63,8 +63,15 @@ void GGL::LeagueModule::MakeAdapters(const std::vector<Model*>& chain, AdapterSt
 			// at 1/sqrt(r) so per-rank contributions stay O(1) once B grows.
 			auto A = torch::randn({ V, r, out },
 				TensorOptions().dtype(kFloat32).device(device)) * (1.f / sqrtf((float)r));
+			// B=0 => delta identically zero => variants ARE the main at birth. Nonzero
+			// binitStd breaks that symmetry per variant (see LeagueConfig::binitStd);
+			// the exploiter slots stay at 0 since their objective is competitive, not
+			// identity-based, and they should start as clean copies of the main.
 			auto B = torch::zeros({ V, r, in },
 				TensorOptions().dtype(kFloat32).device(device));
+			if (cfg.binitStd > 0 && cfg.numDiverse > 0) {
+				B.narrow(0, 0, cfg.numDiverse).normal_(0.0, (double)cfg.binitStd);
+			}
 			A.set_requires_grad(true);
 			B.set_requires_grad(true);
 			live.A.push_back(A);

@@ -70,6 +70,18 @@ namespace GGL {
 		// gradient ("avoid what you did", never "do this instead") and death-spirals:
 		// measured as the residual gsDiv decay after the first three economy legs.
 		float silCoeff = 0.05f;
+		// SYMMETRY BREAKING. B=0 makes every variant bit-identical to the main at birth
+		// (nice for warm starts, and it is what makes the frozen control valid) -- but it
+		// also makes initial diversity EXACTLY zero, so the discriminator has nothing to
+		// learn, its gradient is noise, and nothing pushes the variants apart. The
+		// mechanism cannot bootstrap out of perfect symmetry. Measured consequence: kappa
+		// DECAYS with ||B|| in every arm (0.22 at bPol .33 -> .089 at bPol 1.84) because
+		// the shared extrinsic objective pulls all variants onto the same optimum while
+		// the diversity term has no signal to oppose it -- even at beta 3.0, where
+		// diversity was 118% of the advantage scale and still produced no separation.
+		// binitStd > 0 seeds each variant's B with its own small noise so they start
+		// DIFFERENT. Keep it small: the delta scales with it, so it is paid in competence.
+		float binitStd = 0.f;
 		// Iterations of league rows to ACCUMULATE before one adapter update. The fleet
 		// gives the main 4176 rows/rank/iter for ONE policy; the league gets 594 split
 		// across Total() variants = ~59/variant/rank, a 70x smaller batch taking the
