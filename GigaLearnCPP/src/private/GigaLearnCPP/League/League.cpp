@@ -94,11 +94,11 @@ GGL::LeagueModule::LeagueModule(ModelSet& baseModels, LeagueConfig config, torch
 			torch::nn::Linear(128, 128), torch::nn::LeakyReLU(),
 			torch::nn::Linear(128, cfg.numDiverse));
 	};
-	discPair = mkDisc(DESC_DIM * 2 + NUM_LAGS);
+	discPair = mkDisc(DESC_DIM * 2 + NUM_LAGS + AGG_DIM);
 	discMarg = mkDisc(DESC_DIM);
 	discPair->to(device);
 	discMarg->to(device);
-	discPairSnap = mkDisc(DESC_DIM * 2 + NUM_LAGS);
+	discPairSnap = mkDisc(DESC_DIM * 2 + NUM_LAGS + AGG_DIM);
 	discMargSnap = mkDisc(DESC_DIM); // CPU copies for the collect thread
 
 	std::vector<torch::Tensor> adapterParams;
@@ -304,12 +304,41 @@ std::vector<float> GGL::LeagueModule::StepRdivAndPush(const std::vector<int>& pl
 		}
 	}
 
+	// Window aggregate means over [t-lag, t], read BEFORE the push so they describe the
+	// same window the pair spans. aggMean[L] is row-major [n * AGG_DIM].
+	std::vector<float> aggMean[NUM_LAGS];
+	for (int L = 0; L < NUM_LAGS; L++)
+		aggMean[L].assign((size_t)n * AGG_DIM, 0.f);
+	for (int k = 0; k < n; k++) {
+		auto& ring = rings[players[k]];
+		for (int L = 0; L < NUM_LAGS; L++) {
+			int c = RS_MAX(1, ring.aggCount[L]);
+			for (int a = 0; a < AGG_DIM; a++)
+				aggMean[L][(size_t)k * AGG_DIM + a] = (float)(ring.aggSum[L][a] / c);
+		}
+	}
+
 	// Push d_now into rings + harvest reservoir tuples (diverse variants only; the
 	// exploiters are not identity classes, their whole point is convergence on holes).
 	for (int k = 0; k < n; k++) {
 		auto& ring = rings[players[k]];
-		std::memcpy(&ring.buf[(size_t)ring.head * DESC_DIM], &descs[(size_t)k * DESC_DIM],
-			DESC_DIM * sizeof(float));
+		const float* dNew = &descs[(size_t)k * DESC_DIM];
+		// Incremental window sums: drop the entry falling out of each window, add the
+		// new one. O(AGG_DIM) per lag, never a scan of the ring.
+		for (int L = 0; L < NUM_LAGS; L++) {
+			int w = lags[L];
+			if (ring.count >= w) {
+				int outIdx = (ring.head - w + ringCap * 2) % ringCap;
+				const float* dOut = &ring.buf[(size_t)outIdx * DESC_DIM];
+				for (int a = 0; a < AGG_DIM; a++)
+					ring.aggSum[L][a] -= dOut[AGG_IDX[a]];
+			} else {
+				ring.aggCount[L]++;
+			}
+			for (int a = 0; a < AGG_DIM; a++)
+				ring.aggSum[L][a] += dNew[AGG_IDX[a]];
+		}
+		std::memcpy(&ring.buf[(size_t)ring.head * DESC_DIM], dNew, DESC_DIM * sizeof(float));
 		ring.head = (ring.head + 1) % ringCap;
 		ring.count = RS_MIN(ring.count + 1, ringCap);
 	}
@@ -319,10 +348,12 @@ std::vector<float> GGL::LeagueModule::StepRdivAndPush(const std::vector<int>& pl
 			if (variants[k] >= cfg.numDiverse)
 				continue;
 			auto& res = reservoir;
+			const float* aggRow = &aggMean[L][(size_t)k * AGG_DIM];
 			res.seen++;
 			if (res.Size() < res.cap) {
 				res.d0.insert(res.d0.end(), &pb[L].d0[j * DESC_DIM], &pb[L].d0[j * DESC_DIM] + DESC_DIM);
 				res.d1.insert(res.d1.end(), &pb[L].d1[j * DESC_DIM], &pb[L].d1[j * DESC_DIM] + DESC_DIM);
+				res.agg.insert(res.agg.end(), aggRow, aggRow + AGG_DIM);
 				res.lag.push_back((int8_t)L);
 				res.z.push_back((int8_t)variants[k]);
 			} else {
@@ -331,6 +362,7 @@ std::vector<float> GGL::LeagueModule::StepRdivAndPush(const std::vector<int>& pl
 				if (slot < (uint64_t)res.cap) {
 					std::memcpy(&res.d0[slot * DESC_DIM], &pb[L].d0[j * DESC_DIM], DESC_DIM * sizeof(float));
 					std::memcpy(&res.d1[slot * DESC_DIM], &pb[L].d1[j * DESC_DIM], DESC_DIM * sizeof(float));
+					std::memcpy(&res.agg[slot * AGG_DIM], aggRow, AGG_DIM * sizeof(float));
 					res.lag[slot] = (int8_t)L;
 					res.z[slot] = (int8_t)variants[k];
 				}
@@ -353,7 +385,17 @@ std::vector<float> GGL::LeagueModule::StepRdivAndPush(const std::vector<int>& pl
 		auto d1 = torch::from_blob(pb[L].d1.data(), { rowsL, DESC_DIM }, kFloat32);
 		auto lagOne = torch::zeros({ rowsL, NUM_LAGS }, kFloat32);
 		lagOne.narrow(1, L, 1).fill_(1.f);
-		auto logqPair = torch::log_softmax(discPairSnap->forward(torch::cat({ d0, d1, lagOne }, 1)), -1);
+		// Window aggregates for these rows, gathered in pb order.
+		auto aggT = torch::empty({ rowsL, AGG_DIM }, kFloat32);
+		{
+			auto acc = aggT.accessor<float, 2>();
+			for (int64_t j = 0; j < rowsL; j++) {
+				const float* src = &aggMean[L][(size_t)pb[L].row[j] * AGG_DIM];
+				for (int a = 0; a < AGG_DIM; a++)
+					acc[j][a] = src[a];
+			}
+		}
+		auto logqPair = torch::log_softmax(discPairSnap->forward(torch::cat({ d0, d1, lagOne, aggT }, 1)), -1);
 		auto logqMarg = torch::log_softmax(discMargSnap->forward(d0), -1);
 		auto pairAcc = logqPair.accessor<float, 2>();
 		auto margAcc = logqMarg.accessor<float, 2>();
@@ -409,7 +451,7 @@ void GGL::LeagueModule::PrepareLearnData() {
 	}
 	statReservoirFill = reservoir.Size();
 
-	discD0 = discD1 = discLag = discZ = torch::Tensor();
+	discD0 = discD1 = discAgg = discLag = discZ = torch::Tensor();
 	int64_t sz = reservoir.Size();
 	if (sz < 256) // too few tuples to train on meaningfully
 		return;
@@ -417,10 +459,12 @@ void GGL::LeagueModule::PrepareLearnData() {
 	auto idx = torch::randint(0, sz, { b }, TensorOptions().dtype(kLong));
 	auto d0 = torch::from_blob(reservoir.d0.data(), { sz, DESC_DIM }, kFloat32).index_select(0, idx);
 	auto d1 = torch::from_blob(reservoir.d1.data(), { sz, DESC_DIM }, kFloat32).index_select(0, idx);
+	auto ag = torch::from_blob(reservoir.agg.data(), { sz, AGG_DIM }, kFloat32).index_select(0, idx);
 	auto lag = torch::from_blob(reservoir.lag.data(), { sz }, kInt8).index_select(0, idx);
 	auto z = torch::from_blob(reservoir.z.data(), { sz }, kInt8).index_select(0, idx);
 	discD0 = d0.to(device);
 	discD1 = d1.to(device);
+	discAgg = ag.to(device);
 	discLag = lag.to(device, kLong);
 	discZ = z.to(device, kLong);
 }
@@ -591,7 +635,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		// sampled batch. Trained even when no PPO rows exist this iteration.
 		if (discD0.defined()) {
 			auto lagOne = torch::one_hot(discLag, NUM_LAGS).to(kFloat32);
-			auto pairLogits = discPair->forward(torch::cat({ discD0, discD1, lagOne }, 1));
+			auto pairLogits = discPair->forward(torch::cat({ discD0, discD1, lagOne, discAgg }, 1));
 			auto margLogits = discMarg->forward(discD0);
 			auto discLoss = torch::nn::CrossEntropyLoss()(pairLogits, discZ)
 				+ torch::nn::CrossEntropyLoss()(margLogits, discZ);

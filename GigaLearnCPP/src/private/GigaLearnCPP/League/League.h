@@ -95,6 +95,20 @@ namespace GGL {
 	public:
 		static constexpr int DESC_DIM = 28;
 		static constexpr int NUM_LAGS = 2;
+		// WINDOW AGGREGATES. Two instantaneous snapshots are mostly SHARED CONTEXT: the
+		// ball and the opponent against the same main are set by the interaction, not by
+		// which variant is driving, so variant identity is buried. What actually encodes
+		// style/conduct is behaviour ACROSS the window - how much boost you burn, how
+		// much time you spend airborne, how fast you travel, how close you sit to the
+		// ball. Measured motivation: with snapshots only, the discriminator converged at
+		// kappa ~0.08-0.13 across every league size and diversity weight tried, while
+		// ||B|| more than tripled - the variants were changing in ways the descriptor
+		// could not see. These are means over [t, t+lag], maintained INCREMENTALLY
+		// (add-new / subtract-outgoing) so the collect loop stays O(1) per row per lag
+		// instead of averaging the whole ring.
+		static constexpr int AGG_DIM = 7;
+		// indices into a descriptor: selfZ, boost, onGround, speed, ballRel x/y/z
+		static constexpr int AGG_IDX[AGG_DIM] = { 8, 16, 17, 18, 19, 20, 21 };
 
 		LeagueConfig cfg;
 		torch::Device device;
@@ -122,12 +136,16 @@ namespace GGL {
 		struct DescRing {
 			std::vector<float> buf; // (lagLong+1) * DESC_DIM
 			int head = 0, count = 0;
+			// Running sums of the AGG_IDX dims over each lag window; [NUM_LAGS][AGG_DIM].
+			double aggSum[NUM_LAGS][AGG_DIM] = {};
+			int aggCount[NUM_LAGS] = {};
 		};
 		std::vector<DescRing> rings; // indexed by global player idx (only league slots used)
 
 		// Reservoir of disc training tuples (d0, d1, lagIdx, z), diverse variants only.
 		struct Reservoir {
 			std::vector<float> d0, d1;   // n * DESC_DIM
+			std::vector<float> agg;      // n * AGG_DIM, window means over the pair's span
 			std::vector<int8_t> lag, z;
 			int64_t seen = 0;
 			int64_t cap = 1 << 16;
@@ -148,7 +166,7 @@ namespace GGL {
 		double rdivSum = 0, rdivSqSum = 0; int64_t rdivCnt = 0;
 
 		// ---- barrier-prepared learn data (Learn() consumes these) ----
-		torch::Tensor discD0, discD1, discLag, discZ; // sampled disc batch, on device
+		torch::Tensor discD0, discD1, discAgg, discLag, discZ; // sampled disc batch, on device
 		// Collect-side telemetry harvested at the barrier (Learn runs concurrently with
 		// the next collection under pipelining, so it must never read the live counters).
 		float statRdivMean = 0, statRdivStd = 0;
@@ -193,8 +211,13 @@ namespace GGL {
 			const std::vector<int>& variants, const std::vector<float>& descs);
 
 		void ResetRing(int playerIdx) {
-			rings[playerIdx].head = 0;
-			rings[playerIdx].count = 0;
+			auto& r = rings[playerIdx];
+			r.head = 0;
+			r.count = 0;
+			// The window sums are part of the ring's state - leaving them would carry
+			// one episode's style statistics across a reset into the next episode.
+			std::memset(r.aggSum, 0, sizeof(r.aggSum));
+			std::memset(r.aggCount, 0, sizeof(r.aggCount));
 		}
 
 		// Barrier zone only: sample the disc batch for the coming Learn().
