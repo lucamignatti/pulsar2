@@ -883,6 +883,31 @@ void RLBotBot::update(
 				  << ",\"jt\":" << localPlayer.jumpTime
 				  << ",\"if\":" << (int)localPlayer.isFlipping
 				  << ",\"ft\":" << localPlayer.flipTime;
+				{
+					// PACKET-VS-MIRROR FLIP FLAGS (2026-08-26). ApplyMirror overwrites
+					// hasFlipped/hasJumped/hasDoubleJumped with the mirror's beliefs, but the
+					// packet delivers all three UNMASKED - the same pattern that made the
+					// mirror's isOnGround wrong on 4.66% of decisions (fixed by the
+					// authoritative-air gate). Those flags feed HasFlipOrJump(), which is BOTH
+					// an obs float and the action mask's jump-row gate, so a wrong one costs a
+					// dodge. The existing capture logs only post-mirror values, so the
+					// disagreement rate was unmeasurable; log the raw packet values beside them
+					// (pkt_hf/pkt_hj/pkt_hdj) plus the two packet fields we never consume
+					// (dodge_elapsed = flip timer, dodge_dir = flip direction, which the
+					// mirror currently reconstructs as flipTime/flipRelTorque). One short
+					// capture then decides whether to trust the packet, exactly as the ground
+					// flag was decided. See research/tools/flip_flag_eval.py.
+					const auto* rp = packet->players()->Get(index);
+					s << ",\"pkt_hf\":" << (int)rp->has_dodged()
+					  << ",\"pkt_hj\":" << (int)rp->has_jumped()
+					  << ",\"pkt_hdj\":" << (int)rp->has_double_jumped()
+					  << ",\"pkt_de\":" << rp->dodge_elapsed();
+					if (const auto* dd = rp->dodge_dir())
+						s << ",\"pkt_dd\":[" << dd->x() << "," << dd->y() << "]";
+					// mirror's reconstruction of the same two, for the paired comparison
+					s << ",\"mir_frt\":[" << localPlayer.flipRelTorque.x
+					  << "," << localPlayer.flipRelTorque.y << "]";
+				}
 				s << ",\"b\":"; AppendFloatArray(s, bp, 3);
 				s << ",\"bv\":"; AppendFloatArray(s, bv, 3);
 				// Dark-domain closure (2026-08-25): ball angVel + nearest-opponent pose.
