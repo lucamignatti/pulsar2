@@ -1053,7 +1053,37 @@ impl Car {
                 })
             }
         };
-        let press_air_ok = legacy_gate || !dodge_contact;
+        // GATE v4 (2026-08-26, scripted-chain tape): DURING the jump state a press
+        // fires from GGL_DODGE_JUMP_MIN_TICKS ticks after activation regardless of
+        // wheel contact. The deterministic chain replays (real_maneuvers.tsv, 8 real
+        // turning-wavedash chains re-executed in-game) show the real car airborne and
+        // dodging 2-3 ticks after the jump press on FLAT ground while sim contact
+        // persisted 4 more ticks and ate the dodge - every chain link degenerated to
+        // a plain jump (the user-visible "chained wavedashes don't work in game";
+        // flat level takeoff is exactly where match-play poses are tilted enough that
+        // the earlier 91.8%-agreement sweep never sampled the regime). The bare
+        // during-jump escape (v2 rev B, effectively K=1) overfired: real EATS presses
+        // 1 tick after activation (fire alignment 18/29 vs legacy 21/29). K>=2
+        // reconciles the chain tape, the mid-jump clean-trace fire at z=26.8, and the
+        // eaten +1-tick mash presses. Post-jump-state grounded presses stay eaten.
+        let k_min = {
+            static V: OnceLock<u32> = OnceLock::new();
+            *V.get_or_init(|| {
+                env::var("GGL_DODGE_JUMP_MIN_TICKS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0)
+            })
+        };
+        // k_min == 0 DISABLES the during-jump press escape (measured verdict: any
+        // small K overfires - K=2 fired 57% of z 17-21 during-jump grounded presses
+        // the real game eats; 625-edge agreement 87.7% vs 90.0% disabled. The knob
+        // stays for refits against future scripted tapes.
+        let in_jump_past_k = !legacy_gate
+            && k_min > 0
+            && self.state.is_jumping
+            && self.state.jump_ticks > k_min;
+        let press_air_ok = legacy_gate || in_jump_past_k || !dodge_contact;
 
         // The post-jump lockout only means anything if a jump actually happened:
         // air_ticks_since_jump is pinned at 0 for a car that never jumped, so gating on it
@@ -1073,6 +1103,7 @@ impl Car {
         // (grounded during-jump presses stay eaten, which the mash traces demand).
         let flip_delay_ok = !self.state.has_jumped
             || (!legacy_gate && self.state.is_jumping)
+            || in_jump_past_k
             || self.state.air_ticks_since_jump >= car_consts::jump::FLIP_MIN_DELAY_TICKS;
         if jump_pressed
             && press_air_ok
