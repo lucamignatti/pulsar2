@@ -66,6 +66,42 @@ fn ggl_dodge_contact_ext_uu() -> f32 {
     })
 }
 
+/// Minimum wheels in contact for the DODGE PRESS gate (not is_on_ground, which stays
+/// `>= 3` for air control / throttle - routing ascent-contact ticks elsewhere doubled
+/// replay error once). 3 reproduces legacy behaviour; 1 = any wheel still touching eats
+/// the press. Fit against the real press population, see the gate site below.
+/// Restrict gate v3's takeoff guard so a genuine landing still restores the flip.
+/// See the guard site for the measurement. GGL_FLIP_RESET_FIX=0 restores the v3 guard.
+fn ggl_flip_reset_fix() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_FLIP_RESET_FIX").map_or(true, |s| s != "0"))
+}
+
+/// Hold the dodge press for one tick after wheel contact breaks.
+///
+/// DEFAULT OFF - MEASURED AND REJECTED (2026-08-26). Fit on the mirror's ground trace it
+/// looked right (real fire-rate by ticks-since-ground-lost: 37% / 73% / ~100% at k=0/1/2+
+/// against a sim that fires ~100% everywhere), but replayed through the engine it moved
+/// the boundary population only 91.8% -> 87.9% and made per-event agreement WORSE
+/// (23.1% -> 19.2%). The fit did not transfer because the mirror's ground trace (resynced
+/// to real poses every tick) is not the free-running engine's: at these press poses the
+/// engine has usually been airborne for several ticks already, so a one-tick hold almost
+/// never fires. Kept as a dormant knob with its refutation, not as a live default.
+fn ggl_dodge_ground_hysteresis() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_DODGE_GROUND_HYST").is_ok_and(|s| s != "0"))
+}
+
+fn ggl_dodge_contact_wheels() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("GGL_DODGE_CONTACT_WHEELS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3)
+    })
+}
+
 /// How many ticks after touchdown keep the post-step wheel pass. Fit on real-game
 /// full-pose captures (see research/tools landing tests); default from that fit.
 fn ggl_touchdown_exc_ticks() -> u8 {
@@ -139,6 +175,10 @@ pub struct Car {
     pub(crate) state: CarState,
     /// Last tick's world-contact sticky gate (PR73). Default false.
     pub(crate) sticky_gate_prev: bool,
+    /// Last tick's is_on_ground, for the dodge-press hysteresis (see the gate site).
+    /// Lives on Car, NOT CarState: it is a within-tick bookkeeping aid, so adding it
+    /// changes no serialized state and no checkpoint/FFI layout.
+    pub(crate) ground_prev: bool,
 }
 
 impl Deref for Car {
@@ -232,6 +272,7 @@ impl Car {
                 ..Default::default()
             },
             sticky_gate_prev: false,
+            ground_prev: false,
         }
     }
 
@@ -308,6 +349,9 @@ impl Car {
         self.vel_impulse_cache = Vec3A::ZERO;
         self.state = *state;
         self.sticky_gate_prev = self.state.wheels_with_contact.iter().any(|&c| c);
+        // A restored car has no prior tick; seed from the restored flag so a SetState
+        // never manufactures a spurious contact-break (replay probes restore mid-jump).
+        self.ground_prev = self.state.is_on_ground;
     }
 
     /// Re-raycast wheels at the car's current pose and refresh contact flags.
@@ -1003,7 +1047,26 @@ impl Car {
         // Effect #2: an unsettled jump keeps the machinery live through contact.
         // has_jumped clears via update_jump's landing reset (runs earlier this tick),
         // so a true landing still resets flip state on the landing tick itself.
-        let takeoff = !legacy_gate && self.state.has_jumped;
+        // FLIP-RESET HOLE (2026-08-26, v5). The takeoff guard above was `has_jumped`
+        // alone, on the stated assumption that "has_jumped clears via update_jump's
+        // landing reset, so a true landing still resets flip state on the landing tick".
+        // That assumption fails: update_jump only clears has_jumped once
+        // jump_ticks > MIN_TIME + RESET_TIME_PAD, so after a SHORT jump the car lands
+        // with has_jumped still set, the guard suppresses the flip reset, and
+        // has_flipped is never cleared - the next press finds no dodge available.
+        // Singles rarely notice; a CHAIN is exactly a rapid land -> re-jump -> dodge
+        // cycle, so it hits at every link. Measured on 1635 unbiased real press edges:
+        // gate agreement 88.1%, errors 2:1 asymmetric toward "sim eats a press the real
+        // game converts", and 71.5% of those misses have the sim holding has_flipped
+        // while the real game grants the dodge. At 88% per-press, a 5-link chain
+        // survives only 68% of the time - which is the measured 32% link-2 chain
+        // mismatch, and the user-visible "chained wavedashes misfire in game".
+        // Restrict the guard to an ACTUAL takeoff (the jump is still live, or we have
+        // not left the ground yet), which keeps gate v3's Jumping->OnGround->InAir
+        // flicker fix while letting a genuine landing restore the flip.
+        let takeoff = !legacy_gate
+            && self.state.has_jumped
+            && (!ggl_flip_reset_fix() || self.state.is_jumping || self.state.air_ticks == 0);
         if self.state.is_on_ground && !takeoff {
             self.state.has_double_jumped = false;
             self.state.has_flipped = false;
@@ -1040,9 +1103,47 @@ impl Car {
         // Gate the press on per-wheel rays with a short reach past rest length
         // (GGL_DODGE_CONTACT_EXT uu, fit against the real fire curve; <0 restores
         // the is_on_ground gate).
+        // WHEEL-COUNT GATE (2026-08-26, v5). is_on_ground is `>= 3 wheels in contact`, but
+        // Ghidra shows RL keeps THREE separate contact queries (IsOnGround /
+        // GetNumWheelContacts / GetNumWheelWorldContacts), so the press gate need not be
+        // the is_on_ground one. Measured on the real FAILURE population - 182
+        // availability-filtered directional presses where the sim read airborne while the
+        // packet still read OnGround - the real game fires a dodge on 18.1% of them while
+        // this engine fires on 91.8% (per-event agreement 23.1%). The engine frees the
+        // dodge the moment the car drops below THREE wheels, which during takeoff is
+        // several ticks before the last wheel leaves; the policy learned those presses
+        // dodge, so in game they return as plain jumps ("jumping instead of flipping") or
+        // fire early enough to become a full flip instead of a wavedash. Requiring FEWER
+        // wheels keeps the press eaten longer, which is the real behaviour.
+        // GGL_DODGE_CONTACT_WHEELS: 3 = legacy is_on_ground semantics; 1 = any wheel.
         let dodge_contact = {
             let ext_uu = ggl_dodge_contact_ext_uu();
-            if legacy_gate || ext_uu < 0.0 {
+            let min_wheels = ggl_dodge_contact_wheels();
+            if legacy_gate {
+                self.state.is_on_ground
+            } else if ggl_dodge_ground_hysteresis() && self.ground_prev {
+                // HYSTERESIS (2026-08-26, v5): the press is still eaten on the tick that
+                // contact breaks. Fit on the real failure population, binned by ticks
+                // since this engine last had ground at the press tick (n=219/78/73):
+                //     0 ticks -> real fires  37%   (sim fired ~100%)  <- eat these
+                //     1 tick  -> real fires  73%
+                //     2+ ticks-> real fires ~100%                     <- already correct
+                // So the real gate lags ours by exactly one tick; holding the press for
+                // that single tick moves the k=0 bin from 37% agreement to 63% without
+                // touching k>=1, where we already match. Only the DODGE PRESS is gated -
+                // is_on_ground itself is untouched, so air control/throttle/steady-state
+                // are bit-identical (routing ascent-contact ticks elsewhere once doubled
+                // replay error). GGL_DODGE_GROUND_HYST=0 restores the pre-fit gate.
+                true
+            } else if min_wheels < 3 {
+                let n = self
+                    .bullet_vehicle
+                    .wheels
+                    .iter()
+                    .filter(|w| w.raycast_info.is_some())
+                    .count() as u32;
+                n >= min_wheels
+            } else if ext_uu < 0.0 {
                 self.state.is_on_ground
             } else {
                 let ext_bt = ext_uu * UU_TO_BT;
@@ -1504,6 +1605,12 @@ impl Car {
         if self.state.is_demoed {
             return;
         }
+
+        // Snapshot the ground flag BEFORE this tick's contact refresh below. The dodge
+        // gate runs in pre_tick_update and therefore reads is_on_ground as computed at
+        // the end of the PREVIOUS tick; saving the pre-refresh value here leaves
+        // ground_prev exactly one tick behind it, which is the pair the hysteresis needs.
+        self.ground_prev = self.state.is_on_ground;
 
         self.state.phys.rot_mat = rb.get_world_trans().matrix3;
 

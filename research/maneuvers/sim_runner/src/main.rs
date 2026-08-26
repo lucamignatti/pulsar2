@@ -167,8 +167,8 @@ fn main() {
                     g.wheels_with_contact[0] as u8, g.wheels_with_contact[1] as u8,
                     g.wheels_with_contact[2] as u8, g.wheels_with_contact[3] as u8,
                     g.has_jumped as u8, g.is_jumping as u8,
-                    g.jump_time, g.air_time_since_jump, g.has_flipped as u8, g.is_flipping as u8,
-                    g.flip_time, cur.jump as u8);
+                    g.jump_time(), g.air_time_since_jump(), g.has_flipped as u8, g.is_flipping as u8,
+                    g.flip_time(), cur.jump as u8);
             }
             arena.set_car_controls(car, cur);
             arena.step_tick();
