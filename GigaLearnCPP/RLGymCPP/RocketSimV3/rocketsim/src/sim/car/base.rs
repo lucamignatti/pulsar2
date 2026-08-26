@@ -77,19 +77,35 @@ fn ggl_flip_reset_fix() -> bool {
     *V.get_or_init(|| env::var("GGL_FLIP_RESET_FIX").map_or(true, |s| s != "0"))
 }
 
-/// Hold the dodge press for one tick after wheel contact breaks.
-///
-/// DEFAULT OFF - MEASURED AND REJECTED (2026-08-26). Fit on the mirror's ground trace it
-/// looked right (real fire-rate by ticks-since-ground-lost: 37% / 73% / ~100% at k=0/1/2+
-/// against a sim that fires ~100% everywhere), but replayed through the engine it moved
-/// the boundary population only 91.8% -> 87.9% and made per-event agreement WORSE
-/// (23.1% -> 19.2%). The fit did not transfer because the mirror's ground trace (resynced
-/// to real poses every tick) is not the free-running engine's: at these press poses the
-/// engine has usually been airborne for several ticks already, so a one-tick hold almost
-/// never fires. Kept as a dormant knob with its refutation, not as a live default.
-fn ggl_dodge_ground_hysteresis() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env::var("GGL_DODGE_GROUND_HYST").is_ok_and(|s| s != "0"))
+/// Eat the dodge press for N ticks after is_on_ground breaks (0 = off). DEFAULT 1: Fit on the FREE-RUNNING 120 Hz maneuver battery (restore-based replay is not
+/// valid for this knob - the restored car's ray state differs from a free-running one,
+/// which is what falsified the first 1-tick attempt). The real game keeps eating
+/// presses 1-2 ticks after this engine's contact breaks on level fast takeoffs
+/// (speed_flip: real ate a press the engine converts, 573 uu divergence; boundary
+/// population real fires 18% vs engine 92%). Suspension-ray reach CANNOT express this:
+/// at those press ticks no wheel ray reaches the ground at all (GGL_DODGE_CONTACT_EXT
+/// 2/4/6 byte-identical on the battery), so the hold is tick-based.
+/// Attitude gate for the contact hold: apply only while the car's up-vector z is at
+/// least this (level takeoffs). Tilted poses keep the plain contact gate, which already
+/// matches the real z-curve at 92.5%+.
+fn ggl_dodge_hold_min_upz() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("GGL_DODGE_HOLD_MIN_UPZ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.95)
+    })
+}
+
+fn ggl_dodge_ground_hold_ticks() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("GGL_DODGE_GROUND_HOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    })
 }
 
 fn ggl_dodge_contact_wheels() -> u32 {
@@ -183,10 +199,10 @@ pub struct Car {
     pub(crate) state: CarState,
     /// Last tick's world-contact sticky gate (PR73). Default false.
     pub(crate) sticky_gate_prev: bool,
-    /// Last tick's is_on_ground, for the dodge-press hysteresis (see the gate site).
-    /// Lives on Car, NOT CarState: it is a within-tick bookkeeping aid, so adding it
-    /// changes no serialized state and no checkpoint/FFI layout.
-    pub(crate) ground_prev: bool,
+    /// Ticks since is_on_ground last read true (saturating), for the dodge-press
+    /// contact hold (see the gate site). Lives on Car, NOT CarState: within-tick
+    /// bookkeeping only, so no serialized state / checkpoint / FFI layout change.
+    pub(crate) ticks_since_ground: u8,
     /// Last tick's chassis world contact (GGL_PLANE_SLACK scrape gate).
     /// Persistence law: promote only if there was contact before. Default false;
     pub(crate) chassis_scrape_prev: bool,
@@ -283,7 +299,7 @@ impl Car {
                 ..Default::default()
             },
             sticky_gate_prev: false,
-            ground_prev: false,
+            ticks_since_ground: u8::MAX,
             chassis_scrape_prev: false,
         }
     }
@@ -363,7 +379,7 @@ impl Car {
         self.sticky_gate_prev = self.state.wheels_with_contact.iter().any(|&c| c);
         // A restored car has no prior tick; seed from the restored flag so a SetState
         // never manufactures a spurious contact-break (replay probes restore mid-jump).
-        self.ground_prev = self.state.is_on_ground;
+        self.ticks_since_ground = if self.state.is_on_ground { 0 } else { u8::MAX };
         self.wheels_post_this_tick = false;
         self.touchdown_post_ticks = 0;
     }
@@ -1135,19 +1151,23 @@ impl Car {
             let min_wheels = ggl_dodge_contact_wheels();
             if legacy_gate {
                 self.state.is_on_ground
-            } else if ggl_dodge_ground_hysteresis() && self.ground_prev {
-                // HYSTERESIS (2026-08-26, v5): the press is still eaten on the tick that
-                // contact breaks. Fit on the real failure population, binned by ticks
-                // since this engine last had ground at the press tick (n=219/78/73):
-                //     0 ticks -> real fires  37%   (sim fired ~100%)  <- eat these
-                //     1 tick  -> real fires  73%
-                //     2+ ticks-> real fires ~100%                     <- already correct
-                // So the real gate lags ours by exactly one tick; holding the press for
-                // that single tick moves the k=0 bin from 37% agreement to 63% without
-                // touching k>=1, where we already match. Only the DODGE PRESS is gated -
-                // is_on_ground itself is untouched, so air control/throttle/steady-state
-                // are bit-identical (routing ascent-contact ticks elsewhere once doubled
-                // replay error). GGL_DODGE_GROUND_HYST=0 restores the pre-fit gate.
+            } else if self.ticks_since_ground <= ggl_dodge_ground_hold_ticks()
+                && self.state.phys.rot_mat.z_axis.z >= ggl_dodge_hold_min_upz()
+            {
+                // CONTACT HOLD (2026-08-26, v6): eat the press for one tick after this
+                // engine's contact breaks, LEVEL CARS ONLY. Fit on the free-running
+                // 120 Hz instruments (restore-based replay distorts this knob):
+                //   - speed_flip scripted tape: real eats the level-takeoff press this
+                //     engine converts; a 1-tick hold takes the divergence 1127 -> 24 uu
+                //     while leaving all 82 other battery segments byte-identical.
+                //     hold=2 breaks half_flip (18 -> 538), so N=1 is sharply identified.
+                //   - the attitude condition: on TILTED match-play poses the real game
+                //     frees the dodge exactly where our contact breaks (the 92.5%
+                //     z-curve fit), and an unconditional hold costs 2.2pp per-event
+                //     agreement there (88.2 -> 86.0 at PRE=12). Level fast takeoffs are
+                //     where the real gate outlives ours; tilt is where it does not.
+                // Chained wavedashes are strings of level fast takeoffs - this is the
+                // "chains misfire in game" fix. GGL_DODGE_GROUND_HOLD=0 disables.
                 true
             } else if min_wheels < 3 {
                 let n = self
@@ -1662,8 +1682,12 @@ impl Car {
         // Snapshot the ground flag BEFORE this tick's contact refresh below. The dodge
         // gate runs in pre_tick_update and therefore reads is_on_ground as computed at
         // the end of the PREVIOUS tick; saving the pre-refresh value here leaves
-        // ground_prev exactly one tick behind it, which is the pair the hysteresis needs.
-        self.ground_prev = self.state.is_on_ground;
+        // the counter exactly one tick behind it, which is the pair the hold needs.
+        self.ticks_since_ground = if self.state.is_on_ground {
+            0
+        } else {
+            self.ticks_since_ground.saturating_add(1)
+        };
 
         self.state.phys.rot_mat = rb.get_world_trans().matrix3;
 
