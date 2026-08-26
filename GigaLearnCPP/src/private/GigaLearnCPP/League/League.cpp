@@ -500,6 +500,10 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	// up front - with useMainCritic there is no critic loss, so every remaining
 	// consumer of these tensors is policy-side and filtering all of them is exact.
 	int64_t nEff = n;
+	if (n > 1) {
+		RG_NO_GRAD;
+		report["League/Adv Std"] = advantages.std().item<float>();
+	}
 	if (n > 3 && cfg.advFilterFrac < 1.f) {
 		RG_NO_GRAD;
 		auto thr = advantages.abs().quantile(1. - (double)cfg.advFilterFrac);
@@ -665,6 +669,16 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		auto postFlat = torch::cat(flats);
 		report["League/Adapter Update Magnitude"] = (postFlat - preFlat).abs().mean().item<float>();
 		report["League/Adapter Norm"] = postFlat.norm().item<float>();
+		// ||B|| IS the displacement from the base: the LoRA delta is (x.B^T).A^T, so
+		// B==0 means "this variant IS the main" no matter what A holds. Adapter Norm
+		// canNOT show this - it is dominated by A's random init (norm ~304), so B can
+		// grow a long way without moving it. Reported separately, and split policy-side
+		// vs critic-side because only the policy half changes BEHAVIOUR.
+		double bPol = 0, bCri = 0;
+		for (auto& t : pol.B) bPol += t.detach().pow(2).sum().item<double>();
+		for (auto& t : cri.B) bCri += t.detach().pow(2).sum().item<double>();
+		report["League/B Norm Policy"] = (float)std::sqrt(bPol);
+		report["League/B Norm Critic"] = (float)std::sqrt(bCri);
 	}
 	if (updates) {
 		report["League/Policy Loss"] = (float)(avgPolicyLoss / updates);
@@ -694,7 +708,13 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			return shareOf(statWinFor, statWinAgainst, lo, hi);
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
-			<< " adNorm=" << report["League/Adapter Norm"]
+			<< " bPol=" << report["League/B Norm Policy"]
+			// rdivStd vs advStd is the ONLY honest read of whether the diversity term is
+			// material: r_div is centred, so its MEAN is ~0 by construction and says
+			// nothing. If rdivStd << advStd the seek term is a rounding error on the
+			// extrinsic objective and no amount of rank buys diversity.
+			<< " rdivStd=" << statRdivStd
+			<< " advStd=" << report["League/Adv Std"]
 			<< " silFrac=" << (updates ? avgSilFrac / updates : -1.)
 			<< " ent=" << (updates ? avgEntropy / updates : -1.)
 			<< " discAcc=" << (report.Has("League/Disc Acc") ? report["League/Disc Acc"] : -1.)
