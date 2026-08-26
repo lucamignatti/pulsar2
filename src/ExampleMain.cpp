@@ -18,6 +18,7 @@
 #include <RLGymCPP/TerminalConditions/GoalScoreCondition.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObs.h>
 #include <RLGymCPP/ObsBuilders/AdvancedObsPadded.h>
+#include <RLGymCPP/Util/RealChannelNoise.h>
 #include <RLGymCPP/StateSetters/KickoffState.h>
 #include <RLGymCPP/StateSetters/RandomState.h>
 #include <RLGymCPP/StateSetters/BallNearCarState.h>
@@ -470,6 +471,34 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	// build — which makes the control panel's rewind unable to replay a play. Training
 	// keeps it on; the policy is trained slot-invariant, so the viewer loses nothing.
 	result.obsBuilder = new AdvancedObsPadded(MAX_PLAYERS_PER_TEAM, /*shuffleSlots=*/g_RenderTeamSize == 0);
+	// GGL_OBS_FLAG_NOISE=1 (2026-08-26): train against the REAL observation channel.
+	// The deployed client cannot observe the engine's ground flag exactly (packet
+	// masking + mirror desync during jump chains); measured wrong-flag rates on real
+	// captures: 9.0% near jump presses, ~2% steady-state (self, mirror-corrected;
+	// opponents are raw-packet and worse). Sim physics matches real to a few uu, but
+	// a policy trained on CLEAN flags mashes jump at knife-edge states and misfires
+	// only in-game ("accidental flips" - WAVEDASH_GATE.md). This wraps obs + mask in
+	// the measured corruption (deterministic per tick+car, obs and mask consistent)
+	// so the policy learns flag-noise robustness. OFF in render mode: the viewer
+	// should show the policy, not the channel.
+	// DEFAULT ON (binary-default so queued cluster hops with stale spooled sbatch
+	// scripts still get it - the Slurm spool trap); GGL_NO_OBS_FLAG_NOISE=1 opts out.
+	{
+		const char* off = std::getenv("GGL_NO_OBS_FLAG_NOISE");
+		bool noiseOn = !(off && *off && std::string(off) != "0") && g_RenderTeamSize == 0;
+		if (noiseOn) {
+			RLGC::RealChannelNoiseCfg ncfg = {};
+			result.obsBuilder = new RLGC::NoisyChannelObs(result.obsBuilder, ncfg);
+			result.actionParser = new RLGC::NoisyChannelParser(result.actionParser, ncfg);
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				RG_LOG("OBS FLAG NOISE: ON (real-channel isOnGround corruption, pNear="
+					<< ncfg.pNear << " pFar=" << ncfg.pFar
+					<< "; GGL_NO_OBS_FLAG_NOISE=1 disables)");
+			}
+		}
+	}
 	// The proven cf993b7 reset mix - effective near-ball share 0.55 (0.35 ground + 0.20 aerial
 	// drill), no drill-replay slice (that came with the drill bank in the regression).
 	// Aerial drill, REVERSE CURRICULUM: classically the car spawns ALREADY AIRBORNE and
