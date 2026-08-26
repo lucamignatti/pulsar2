@@ -1298,9 +1298,24 @@ impl Car {
 
                     // v3-tuned `RS_TUNE_DODGE_TORQUE_AT_START`: `update_air_torque`
                     // already ran with `is_flipping` still false, so the first tick
-                    // of dodge torque is otherwise lost. Shipped on 2026-08-25
-                    // (T1/211647 flip_air tie; air+wheels ang p90 drop). `=0` opts out.
-                    if !env::var("GGL_DODGE_TORQUE_START").is_ok_and(|s| s == "0") {
+                    // of dodge torque is otherwise lost. Shipped on titan-appo 2026-08-25
+                    // (T1/211647 flip_air tie; air+wheels ang p90 drop).
+                    //
+                    // DEFAULT OFF for us since 2026-08-26 (`GGL_DODGE_TORQUE_START=1`
+                    // restores it). Ported ON, then bisected out: with it ON the 528B
+                    // policy scores 10.7% vs BonkDaddy, OFF it scores 30.8% (n=150-200)
+                    // - a 3x swing from this one change, isolated by A/B while every
+                    // other ported default was ruled out (contact hold 8.2%, touchdown
+                    // exc=5 7.5%). Accuracy against the HELD-OUT real tape does not pay
+                    // for that: medians tie (p90 11.54 ON vs 11.80 OFF), OFF wins 8
+                    // segments to 4, and OFF has 17% fewer ground-flag mismatches
+                    // (345 vs 418). It genuinely helps half_flip / diag_flip /
+                    // land_during_flip_rotation and genuinely hurts flip_into /
+                    // flip_early / flip_into_wall / backwall_flip - net neutral on
+                    // position, worse on contact, catastrophic on play. Revisit only
+                    // with an angular-rate measurement against real captures, which is
+                    // the evidence titan fit it on and which we have never reproduced.
+                    if env::var("GGL_DODGE_TORQUE_START").is_ok_and(|s| s != "0") {
                         let mut rel_dodge_torque = self.state.flip_rel_torque;
                         let mut pitch_scale = 1.0;
                         if rel_dodge_torque.y != 0.0
