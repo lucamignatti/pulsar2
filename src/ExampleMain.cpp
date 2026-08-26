@@ -479,13 +479,15 @@ static EnvCreateResult MakeEnv(int playersPerTeam, bool practiceArena) {
 	// a policy trained on CLEAN flags mashes jump at knife-edge states and misfires
 	// only in-game ("accidental flips" - WAVEDASH_GATE.md). This wraps obs + mask in
 	// the measured corruption (deterministic per tick+car, obs and mask consistent)
-	// so the policy learns flag-noise robustness. OFF in render mode: the viewer
-	// should show the policy, not the channel.
+	// so the policy learns flag-noise robustness. ON in render as well - the viewer
+	// must reproduce what the bot experiences in the real game (acceptance test).
 	// DEFAULT ON (binary-default so queued cluster hops with stale spooled sbatch
 	// scripts still get it - the Slurm spool trap); GGL_NO_OBS_FLAG_NOISE=1 opts out.
 	{
 		const char* off = std::getenv("GGL_NO_OBS_FLAG_NOISE");
-		bool noiseOn = !(off && *off && std::string(off) != "0") && g_RenderTeamSize == 0;
+		// ON in render too (user acceptance test: viz must show the SAME wrong
+		// behaviour as the real game, channel corruption included).
+		bool noiseOn = !(off && *off && std::string(off) != "0");
 		if (noiseOn) {
 			RLGC::RealChannelNoiseCfg ncfg = {};
 			result.obsBuilder = new RLGC::NoisyChannelObs(result.obsBuilder, ncfg);
