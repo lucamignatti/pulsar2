@@ -393,7 +393,11 @@ static std::string MaskToHex(const std::vector<uint8_t>& mask) {
 // See RLBotClient.h. Ball is parked in a far corner to match the sim runner exactly --
 // the default kickoff ball sits at (0,0,93) with radius 91, i.e. its top is z~184, and
 // the drop segments would land on IT instead of the floor.
-static const float SCRIPT_BALL_PARK[3] = { -3500.0f, 4800.0f, 93.0f };
+// (-3500, 4800) was INSIDE the beveled corner wall (|x|+|y| = 8300 > 8064) - the
+// real game visibly spawned the ball in the wall and could eject it into play.
+// (3000, 4800) keeps ~187uu clearance from the bevel plane (> ball radius 91) and
+// sits away from the chains.script segment paths (starts cluster mid-field/blue).
+static const float SCRIPT_BALL_PARK[3] = { 3000.0f, 4800.0f, 93.0f };
 
 static std::vector<ScriptSeg> LoadScript(const std::string& path) {
 	std::vector<ScriptSeg> segs;
