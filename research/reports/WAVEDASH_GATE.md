@@ -98,3 +98,41 @@ The two never-measured regimes (ball-touch physics, car-car contact) were dark b
 the capture lacked ball angVel and opponent pose. Both now logged per decision
 (`bav`, `op/ov/of/ou/oav` — nearest opponent full pose) in RLBotClient. The next long
 real-game session makes both regimes scoreable.
+
+## Addendum 2026-08-26: the boundary hypothesis refuted; full parity table
+
+The residual-gap section above suspected sim wheel contact outlives the real dodge
+query by 1-3 ticks. A 661-press real calibration curve (fire-rate 0% below z~21, 50%
+at z~27.5, ~100% from z~31) appeared to confirm it - but replaying all 625 directional
+press edges through the engine (dodge_gate_sweep.py), the EXISTING is_on_ground gate
+matches the real curve at **91.8% per-event agreement** (mean bin error 3.1). Tilted
+real poses drop below 3-wheel contact exactly where the real game frees the dodge;
+the flat-ground level-car smoke test that motivated the hypothesis is the pathological
+case, not the typical one. GGL_DODGE_CONTACT_EXT ships default -1 (disabled).
+
+Also closed the same day:
+- **DODGE_roll impulse deficit** (battery: sim right-dv 163.9 vs real 254.4) was a
+  fire-tick misalignment in the battery harness. Timing-aligned per event: sim matches
+  real to ~2% (fwd 337.1/336.6, right 435.5/443.4, n=81).
+- **Dodge direction**: median angle error 0.0deg in every input class (n=717; an
+  apparent 177.6deg roll inversion was a cross-product order bug in the analysis).
+- **Meter v3**: zmax/rotation measured only until reground; the 0.8s window had been
+  misclassifying successful wavedashes whose follow-up left the ground.
+
+**Final parity, identical weights (528B ts1, meter v3):**
+
+| metric | real | sim (gate v3) |
+|---|---|---|
+| wavedash success | 57.7 / 58.8 / 60.1% (3 captures) | 51.2% |
+| FULLFLIP failures | 8.7-11.8% | 6.5% |
+| HIGH-hop failures | 17.6-21.6% | 27.3% |
+| NOREGROUND / NOSPEED | ~5% / ~6-7% | 8.4% / 6.6% |
+| press-gate fire curve | - | 91.8% per-event agreement |
+| dodge direction | exact | exact |
+| dodge impulse (rolled) | 336.6 / 443.4 | 337.1 / 435.5 |
+
+The failure modes the run's operator observed in-game (full flips instead of
+wavedashes, the back lifting on forward wavedashes, weak diagonals) occur in sim at
+comparable rates: they are POLICY skill, visible in viz, and trainable. Remaining
+open: DBLJUMP deep-horizon tail (n=3 clean events, not attributable until the
+ball-touch/car-car dark-domain captures land).
