@@ -64,15 +64,19 @@ def score(dec_all):
                     if (e["g"] == 0 and e["act_tuple"][5] == 1
                             and dec[j - 1]["act_tuple"][5] == 0 and e["p"][2] < 60):
                         sp0 = speed(dec[max(j - 3, 0)]["v"])
+                        # zmax measured only UNTIL reground (v3): measuring through the
+                        # full 0.8s window misclassified successful wavedashes whose
+                        # follow-up (a jump, a wall) left the ground again.
                         zmax, grounded, spg = 0, None, None
                         for k in range(j, len(dec)):
                             f = dec[k]
                             if f["t"] - e["t"] > 0.8:
                                 break
-                            zmax = max(zmax, f["p"][2])
-                            if grounded is None and f["g"] == 1 and f["t"] > e["t"] + 0.05:
-                                grounded = f["t"] - e["t"]
-                                spg = speed(f["v"])
+                            if grounded is None:
+                                zmax = max(zmax, f["p"][2])
+                                if f["g"] == 1 and f["t"] > e["t"] + 0.05:
+                                    grounded = f["t"] - e["t"]
+                                    spg = speed(f["v"])
                         ok = bool(zmax < 70 and grounded and grounded < 0.45 and spg is not None
                                   and (spg > sp0 + 50 or (spg > 2200 and spg > sp0 - 60)))
                         rows.append((1000 * (e["t"] - d["t"]), 1 if ok else 0))

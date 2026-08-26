@@ -47,6 +47,25 @@ fn ggl_no_touchdown_exc() -> bool {
     *V.get_or_init(|| env::var("GGL_NO_TOUCHDOWN_EXC").is_ok_and(|s| s != "0"))
 }
 
+/// Extra suspension extension (uu) beyond rest length within which a ray-touching
+/// wheel still counts as CONTACT for the DODGE PRESS GATE. DEFAULT -1 = DISABLED:
+/// the press gate uses is_on_ground, and that is MEASURED CORRECT - replaying 625
+/// real press edges, is_on_ground matches the real fire-rate-by-z curve at 91.8%
+/// per-event agreement (mean bin error 3.1%); every shorter-reach variant broke it
+/// (research/tools/dodge_gate_sweep.py). The z~31-33 over-eating seen in the
+/// flat-ground smoke test does not occur on real poses: tilted cars drop below
+/// 3-wheel contact exactly where the real game frees the dodge. Knob kept for
+/// future refits only.
+fn ggl_dodge_contact_ext_uu() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("GGL_DODGE_CONTACT_EXT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1.0)
+    })
+}
+
 /// How many ticks after touchdown keep the post-step wheel pass. Fit on real-game
 /// full-pose captures (see research/tools landing tests); default from that fit.
 fn ggl_touchdown_exc_ticks() -> u8 {
@@ -1011,7 +1030,30 @@ impl Car {
         // agreement 18/29 vs legacy's 21/29). The real gate is the contact query at
         // the press tick, full stop; the clean-trace dodge that fired mid-Jumping did
         // so because ITS contact had already broken (z=26.8 at the press).
-        let press_air_ok = legacy_gate || !self.state.is_on_ground;
+        //
+        // BUT it is a SHORTER contact query than is_on_ground (v4, 2026-08-26):
+        // 661 real press edges give fire-rate 0% below z~21, 50% at z~27.5, ~100%
+        // from z~31 (level Octane, rest 17), while is_on_ground's ray reach kept
+        // eating presses to z~31-33. The policy had learned those presses are FREE
+        // in sim; in the real game each one fires a dodge 1-3 ticks early - full
+        // flips instead of wavedashes, the back lifting on forward wavedashes.
+        // Gate the press on per-wheel rays with a short reach past rest length
+        // (GGL_DODGE_CONTACT_EXT uu, fit against the real fire curve; <0 restores
+        // the is_on_ground gate).
+        let dodge_contact = {
+            let ext_uu = ggl_dodge_contact_ext_uu();
+            if legacy_gate || ext_uu < 0.0 {
+                self.state.is_on_ground
+            } else {
+                let ext_bt = ext_uu * UU_TO_BT;
+                self.bullet_vehicle.wheels.iter().any(|w| {
+                    w.raycast_info
+                        .as_ref()
+                        .is_some_and(|r| r.suspension_length < w.suspension_rest_length_1 + ext_bt)
+                })
+            }
+        };
+        let press_air_ok = legacy_gate || !dodge_contact;
 
         // The post-jump lockout only means anything if a jump actually happened:
         // air_ticks_since_jump is pinned at 0 for a car that never jumped, so gating on it
