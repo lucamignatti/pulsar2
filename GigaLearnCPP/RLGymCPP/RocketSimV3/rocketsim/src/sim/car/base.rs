@@ -37,6 +37,11 @@ fn env_f32(name: &'static str, default: f32) -> f32 {
 /// stack (SIM2REAL_LOOP.md 2026-08-23 22:00) together with apply-time forces,
 /// no graze-damp fade, tuned ray, steer-at-apply, and uncapped pushback.
 /// DEFAULT ON since 2026-08-23; `GGL_WHEELS_PRE=0` restores post-step wheels.
+fn ggl_legacy_dodge_gate() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env::var("GGL_LEGACY_DODGE_GATE").is_ok_and(|s| s != "0"))
+}
+
 fn ggl_no_touchdown_exc() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| env::var("GGL_NO_TOUCHDOWN_EXC").is_ok_and(|s| s != "0"))
@@ -949,7 +954,38 @@ impl Car {
         jump_pressed: bool,
         forward_speed_uu: f32,
     ) {
-        if self.state.is_on_ground {
+        // RL-PARITY DODGE GATE v3 (2026-08-25). Per-tick real-game traces
+        // (research/tools/wavedash_trace.py + earlypress_probe.py on
+        // pulsar-gco-ts1-bot/debug.3914029) show the game's wheel contact has THREE
+        // decoupled effects that the legacy single ground early-return bundled:
+        //
+        //   1. contact EATS dodge presses - always, jump state does NOT override
+        //      (fire-tick alignment: a during-jump press escape fired on
+        //      masked-ground presses the real game ate; the clean-trace mid-Jumping
+        //      dodge fired because its contact had already broken). Legacy already
+        //      had this right via the contact gate.
+        //   2. contact does NOT reset the dodge window or flip state during takeoff:
+        //      dodge_timeout kept counting straight through an AirState
+        //      Jumping->OnGround->InAir flicker. State resets only with the landing
+        //      reset that clears has_jumped (update_jump). Legacy reset both on
+        //      every contact tick.
+        //   3. contact cancels active flip torque only on the way DOWN (that cancel
+        //      is the wavedash mechanic itself); a takeoff dodge keeps its dodge
+        //      state through ascent contact flicker. Legacy cancelled on any contact.
+        //
+        // History: gate v1 (reverted) escaped press-eating during is_jumping AND
+        // re-based the window on jump start - both wrong, sim wavedash fell 23->6%.
+        // v2 rev B kept the is_jumping press escape - fire agreement 18/29 vs
+        // legacy 21/29. v3 keeps legacy's press gating (contact only) and fixes
+        // only #2/#3. The residual real-vs-sim gap is contact-model persistence
+        // (sim wheel contact outlives RL's by 1-3 ticks during takeoff), not gating.
+        // GGL_LEGACY_DODGE_GATE=1 restores the full legacy bundle.
+        let legacy_gate = ggl_legacy_dodge_gate();
+        // Effect #2: an unsettled jump keeps the machinery live through contact.
+        // has_jumped clears via update_jump's landing reset (runs earlier this tick),
+        // so a true landing still resets flip state on the landing tick itself.
+        let takeoff = !legacy_gate && self.state.has_jumped;
+        if self.state.is_on_ground && !takeoff {
             self.state.has_double_jumped = false;
             self.state.has_flipped = false;
             self.state.air_ticks = 0;
@@ -960,11 +996,22 @@ impl Car {
 
         self.state.air_ticks += 1;
 
-        if self.state.has_jumped && !self.state.is_jumping {
+        // Window counts from jump-state END in both modes (matches the packet's
+        // dodge_timeout: at the first tick after a flicker it read 1.25 minus the
+        // time since jump end, not since takeoff).
+        let counts = self.state.has_jumped && !self.state.is_jumping;
+        if counts {
             self.state.air_ticks_since_jump += 1;
         } else {
             self.state.air_ticks_since_jump = 0;
         }
+        // Effect #1: presses are eaten by wheel contact, ALWAYS - the jump state does
+        // NOT override. Fire-tick alignment vs real (29 clean events): a press escape
+        // during is_jumping fired on masked-ground presses the real game ate (v2 rev B
+        // agreement 18/29 vs legacy's 21/29). The real gate is the contact query at
+        // the press tick, full stop; the clean-trace dodge that fired mid-Jumping did
+        // so because ITS contact had already broken (z=26.8 at the press).
+        let press_air_ok = legacy_gate || !self.state.is_on_ground;
 
         // The post-jump lockout only means anything if a jump actually happened:
         // air_ticks_since_jump is pinned at 0 for a car that never jumped, so gating on it
@@ -972,9 +1019,21 @@ impl Car {
         // disproved (corner_flip_into shows the real car taking a +280.8 uu/s jump impulse
         // in mid-air having never grounded). Measured: without this guard stall regresses
         // 9.3 -> 240.6 uu and corner_flip_into 11.1 -> 106.5 uu.
+        // RL gate v2 addition: a rising-edge press DURING the jump state dodges
+        // immediately (real: press 17ms after a ground jump -> AirState Dodging one
+        // packet-tick later, mid-Jumping). The edge itself guarantees >=1 tick since
+        // jump activation, so the FLIP_MIN_DELAY intent is preserved; atsj is pinned
+        // 0 while is_jumping, hence the explicit is_jumping escape.
+        // A press during the jump state with contact already broken fires in the real
+        // game (clean trace: press 2 ticks after a ground jump at z=26.8, AirState
+        // Dodging one packet-tick later). atsj is pinned 0 while is_jumping, so that
+        // case needs an explicit escape; press_air_ok above keeps it airborne-only
+        // (grounded during-jump presses stay eaten, which the mash traces demand).
         let flip_delay_ok = !self.state.has_jumped
+            || (!legacy_gate && self.state.is_jumping)
             || self.state.air_ticks_since_jump >= car_consts::jump::FLIP_MIN_DELAY_TICKS;
         if jump_pressed
+            && press_air_ok
             && flip_delay_ok
             && self.state.air_ticks_since_jump < car_consts::jump::DOUBLEJUMP_MAX_TICKS
         {
@@ -1243,8 +1302,23 @@ impl Car {
 
             self.update_wheels(rb, num_wheels_in_contact, forward_speed_uu);
 
+            // RL gate v2 effect #3: contact cancels a flip only on the way DOWN (the
+            // wavedash flatten). During a jump's ascent the wheels still register
+            // contact for a few ticks, but the real game keeps the dodge alive
+            // (trace: instant takeoff dodge held AirState Dodging for 300+ms through
+            // contact heights). Direction, not contact, is the landing discriminator.
+            // NOTE: only the CANCEL is skipped; air control/throttle stay gated by
+            // is_on_ground exactly as legacy. Routing ascent-contact ticks into
+            // update_air_torque applied air control + air throttle on the 1-2 sticky
+            // ticks of EVERY jump and doubled the early-press probe's t+5 error
+            // (2.4u -> 4.9u) - the real game, like legacy, applies none there.
+            let takeoff_rise = !ggl_legacy_dodge_gate()
+                && self.state.has_jumped
+                && rb.lin_vel.dot(self.state.get_up_dir()) > 0.0;
             if self.state.is_on_ground {
-                self.state.is_flipping = false;
+                if !takeoff_rise {
+                    self.state.is_flipping = false;
+                }
             } else if !env_on("GGL_FLIP_THEN_AIR") {
                 self.update_air_torque(
                     rb,

@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <sstream>
 #include <unistd.h>
 
@@ -479,8 +480,41 @@ void RLBotBot::ApplyMirror(unsigned index, Player& pl, const Action& controls, i
 		return;
 
 	if (!mirrorArena) {
-		// Arena::Create is safe here: RocketSim::Init already ran for the InferUnit path.
-		mirrorArena = Arena::Create(GameMode::SOCCAR);
+		// RocketSim::Init has NOT run in the RLBot process - the InferUnit path never
+		// touches the engine (only the trainer calls Init). Creating an arena first is a
+		// FATAL error, which is exactly how this shipped broken the first time: the bot
+		// aborted with code 134 and simply never moved.
+		// Meshes: GGL_COLLISION_MESHES, else <exe dir>/collision_meshes, else the repo
+		// build dir. If none resolve, disable the mirror rather than kill the bot.
+		try {
+			if (GetStage() != RocketSimStage::INITIALIZED) {
+				std::filesystem::path meshes;
+				if (const char* m = std::getenv("GGL_COLLISION_MESHES"); m && *m) {
+					meshes = m;
+				} else {
+					std::error_code ec;
+					auto exeDir = std::filesystem::read_symlink("/proc/self/exe", ec).parent_path();
+					if (!ec && std::filesystem::exists(exeDir / "collision_meshes"))
+						meshes = exeDir / "collision_meshes";
+					else
+						meshes = "collision_meshes";
+				}
+				if (!std::filesystem::exists(meshes)) {
+					RG_LOG("SIM MIRROR: collision meshes not found at \"" << meshes
+						<< "\" - mirror DISABLED, using packet flags "
+						"(set GGL_COLLISION_MESHES=<dir> to enable)");
+					mirrorEnabled = false;
+					return;
+				}
+				Init(meshes, true);
+			}
+			mirrorArena = Arena::Create(GameMode::SOCCAR);
+		} catch (const std::exception& e) {
+			RG_LOG("SIM MIRROR: init failed (" << e.what() << ") - mirror DISABLED, "
+				"using packet flags");
+			mirrorEnabled = false;
+			return;
+		}
 		if (!mirrorArena) {
 			RG_LOG("SIM MIRROR: arena creation failed; falling back to packet flags");
 			mirrorEnabled = false;
@@ -807,6 +841,36 @@ void RLBotBot::update(
 				  << ",\"ft\":" << localPlayer.flipTime;
 				s << ",\"b\":"; AppendFloatArray(s, bp, 3);
 				s << ",\"bv\":"; AppendFloatArray(s, bv, 3);
+				// Dark-domain closure (2026-08-25): ball angVel + nearest-opponent pose.
+				// Ball-touch physics and car-car contact were the two regimes the
+				// fidelity program could never score because the capture lacked
+				// exactly these fields (see SIM2REAL_AUDIT).
+				{
+					float bav[3] = { gs.ball.angVel.x, gs.ball.angVel.y, gs.ball.angVel.z };
+					s << ",\"bav\":"; AppendFloatArray(s, bav, 3);
+					const Player* opp = nullptr;
+					float bestD2 = 1e18f;
+					for (auto& pl2 : gs.players) {
+						if (pl2.team == localPlayer.team) continue;
+						float dx = pl2.pos.x - localPlayer.pos.x,
+						      dy = pl2.pos.y - localPlayer.pos.y,
+						      dz = pl2.pos.z - localPlayer.pos.z;
+						float d2 = dx * dx + dy * dy + dz * dz;
+						if (d2 < bestD2) { bestD2 = d2; opp = &pl2; }
+					}
+					if (opp) {
+						float op[3] = { opp->pos.x, opp->pos.y, opp->pos.z };
+						float ov[3] = { opp->vel.x, opp->vel.y, opp->vel.z };
+						float of[3] = { opp->rotMat.forward.x, opp->rotMat.forward.y, opp->rotMat.forward.z };
+						float ou[3] = { opp->rotMat.up.x, opp->rotMat.up.y, opp->rotMat.up.z };
+						float oav[3] = { opp->angVel.x, opp->angVel.y, opp->angVel.z };
+						s << ",\"op\":"; AppendFloatArray(s, op, 3);
+						s << ",\"ov\":"; AppendFloatArray(s, ov, 3);
+						s << ",\"of\":"; AppendFloatArray(s, of, 3);
+						s << ",\"ou\":"; AppendFloatArray(s, ou, 3);
+						s << ",\"oav\":"; AppendFloatArray(s, oav, 3);
+					}
+				}
 				s << ",\"mask\":\"" << MaskToHex(dbg.actionMask) << "\"";
 				s << ",\"obs\":"; AppendFloatArray(s, dbg.obs.data(), dbg.obs.size());
 				s << "}";

@@ -53,9 +53,12 @@ int main(int argc, char** argv) {
 			car->controls = cc;
 			arena->Step(1);
 			CarState o = car->GetState();
-			printf("S %.4f %.4f %.4f %.4f %.4f %.4f %d %.5f %.5f %.5f\n",
+			// Trailing 4 columns appended 2026-08-25 (hasFlipped, isFlipping, isJumping,
+			// airTimeSinceJump) - existing drivers index the first 10 positionally.
+			printf("S %.4f %.4f %.4f %.4f %.4f %.4f %d %.5f %.5f %.5f %d %d %d %.4f\n",
 				o.pos.x, o.pos.y, o.pos.z, o.vel.x, o.vel.y, o.vel.z, (int)o.isOnGround,
-				o.rotMat.forward.x, o.rotMat.forward.y, o.rotMat.forward.z);
+				o.rotMat.forward.x, o.rotMat.forward.y, o.rotMat.forward.z,
+				(int)o.hasFlipped, (int)o.isFlipping, (int)o.isJumping, o.airTimeSinceJump);
 		}
 	}
 	return 0;

@@ -77,6 +77,11 @@ struct Fighter {
 
 int main() {
 	RocketSim::Init("collision_meshes", true);
+	FILE* jsonl = nullptr;
+	if (const char* jp = getenv("GGL_XP_JSONL"); jp && *jp) {
+		jsonl = fopen(jp, "w");
+		printf("decision JSONL -> %s\n", jp);
+	}
 	int targetEps = EnvI("GGL_XP_GOALS", 200);
 
 	Fighter A = Fighter::Make(EnvS("GGL_XP_A_KIND", "gco"), EnvS("GGL_XP_A", ""), EnvI("GGL_XP_A_TS", 1));
@@ -113,6 +118,28 @@ int main() {
 					Fighter* f = ci == 0 ? blue : orange;
 					Player& p = gs.players[ci];
 					p.prevAction = f->controls;
+					// GGL_XP_JSONL: emit the SAME per-decision record the RLBot client logs,
+					// so research/tools wavedash + fidelity meters run unmodified on SIM play.
+					// This is the control for "flips look fine in viz, wrong in game": identical
+					// weights, identical meter, only the world differs.
+					if (jsonl && ci == 0) {
+						fprintf(jsonl,
+							"{\"type\":\"decision\",\"t\":%.6f,\"i\":0,\"g\":%d,\"boost\":%.3f,"
+							"\"hf\":%d,\"hj\":%d,\"hdj\":%d,\"atsj\":%.4f,\"flip\":%d,"
+							"\"p\":[%.3f,%.3f,%.3f],\"v\":[%.3f,%.3f,%.3f],"
+							"\"f\":[%.5f,%.5f,%.5f],\"u\":[%.5f,%.5f,%.5f],"
+							"\"b\":[%.3f,%.3f,%.3f],"
+							"\"act_tuple\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]}\n",
+							tick / 120.0, (int)p.isOnGround, p.boost,
+							(int)p.hasFlipped, (int)p.hasJumped, (int)p.hasDoubleJumped,
+							p.airTimeSinceJump, (int)p.HasFlipOrJump(),
+							p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z,
+							p.rotMat.forward.x, p.rotMat.forward.y, p.rotMat.forward.z,
+							p.rotMat.up.x, p.rotMat.up.y, p.rotMat.up.z,
+							gs.ball.pos.x, gs.ball.pos.y, gs.ball.pos.z,
+							f->controls[0], f->controls[1], f->controls[2], f->controls[3],
+							f->controls[4], f->controls[5], f->controls[6], f->controls[7]);
+					}
 					if (f->ticks >= f->tickSkip || f->ticks == -1) {
 						f->action = f->unit->InferAction(p, gs, /*deterministic=*/true);
 						f->ticks = 0;
@@ -143,6 +170,7 @@ int main() {
 		}
 		delete arena;
 	}
+	if (jsonl) fclose(jsonl);
 	int dec = aGoals + bGoals;
 	printf("FINAL: A %d - %d B  -> A share %.1f%% over %d episodes (%d capped)\n",
 		aGoals, bGoals, 100.0 * aGoals / RS_MAX(dec, 1), eps, capped);

@@ -675,6 +675,22 @@ int main(int argc, char* argv[]) {
 	// own deployment with the two rate traps above pre-registered. Every "6.0 ts1" marker
 	// below now carries a "7.0b ts8" line with the back-derivation.
 	cfg.tickSkip = 8;
+	// GGL_TICK_SKIP: override the decision rate WITHOUT editing constants. Added
+	// 2026-08-25 for the viewer: the live cluster run is ts1 while this tree is ts8, and
+	// rendering a ts1 policy at 15 Hz makes a healthy bot look broken. Render/eval only -
+	// it deliberately does NOT re-derive gaeGamma/gaeLambda/goalCritic.gamma or the
+	// per-step reward weights, so DO NOT use it to train (see the ts1 block above for
+	// the full re-derivation checklist).
+	if (const char* ts = std::getenv("GGL_TICK_SKIP"); ts && *ts) {
+		int v = std::atoi(ts);
+		if (v >= 1 && v <= 12) {
+			cfg.tickSkip = v;
+			RG_LOG("GGL_TICK_SKIP: decision rate overridden to tickSkip " << v
+				<< " (" << (120 / v) << " Hz) - RENDER/EVAL ONLY, gammas NOT re-derived");
+		} else {
+			RG_ERR_CLOSE("GGL_TICK_SKIP must be 1..12, got \"" << ts << "\"");
+		}
+	}
 	cfg.actionDelay = 0;
 
 	// KICKOFF SCRIPT (2026-08-13, user-directed; KickoffScript.h has the full story).
