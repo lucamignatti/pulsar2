@@ -22,6 +22,29 @@ static GGL::Dist::Session::Stream LeagueCudaStream(const torch::Tensor& t) {
 	return nullptr;
 }
 
+// Collapse a RANK-LOCAL predicate into a globally identical one: true only if EVERY
+// rank passed true. This exists because both league optimizer steps are gated on
+// predicates that are NOT lockstep ("do I have PPO rows this window", "did I sample a
+// discriminator batch") while the step itself calls allreduce_avg_grads - a collective.
+// A rank that skips a collective its peers call hangs the job forever, which is exactly
+// what happened on the first 32-node league deploy (2026-08-27): the run banked rows
+// for accumEvery iterations, then died the instant the first update fired. Single-rank
+// runs cannot express the bug, which is why local validation was clean.
+//
+// Unanimity rather than "any rank has data" is deliberate: with "any", a rank holding
+// no rows still joins the allreduce and averages in a zero gradient, silently shrinking
+// the step by the fraction of empty ranks. Requiring all ranks keeps every contribution
+// real. This is itself a collective, so it MUST be called unconditionally by all ranks.
+static bool LeagueAgreeAllRanks(GGL::Dist::Session* dist, bool local, const torch::Device& dev) {
+	if (!dist || !dist->distributed())
+		return local;
+	// Sum the NEGATION so the reduction is "how many ranks objected"; 0 means unanimous.
+	auto flag = torch::full({ 1 }, local ? 0.f : 1.f,
+		torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+	dist->allreduce_sum_device(flag.data_ptr<float>(), 1, LeagueCudaStream(flag));
+	return flag.item<float>() == 0.f;
+}
+
 // Masking constants mirror InferActionsFromModels exactly - variant sampling must obey
 // the same action-legality semantics as the main policy.
 static constexpr float ACTION_MIN_PROB = 1e-11f;
@@ -529,7 +552,18 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			pendTargets.push_back(targetValues);
 	}
 	accumCount++;
-	const bool doUpdate = (accumCount >= RS_MAX(1, cfg.accumEvery)) && !pendStates.empty();
+	// accumCount is lockstep across ranks, but pendStates is NOT - variant rows depend
+	// on this rank's arenas and episode boundaries - and this decision gates a
+	// collective. Agree globally before deciding (see LeagueAgreeAllRanks).
+	const bool doUpdate = LeagueAgreeAllRanks(dist,
+		(accumCount >= RS_MAX(1, cfg.accumEvery)) && !pendStates.empty(), device);
+	// The discriminator has the same hazard: its batch is drawn from a RANK-LOCAL
+	// reservoir that bails out below 256 tuples, so whether discD0 exists varies by
+	// rank, and its optimizer step is collective too. One globally-agreed flag gates
+	// both the training block and the allreduce - which additionally keeps discUpdates
+	// (the r_div warmup counter) identical across ranks, where diverging would make the
+	// diversity reward switch on at different times on different ranks.
+	const bool doDisc = LeagueAgreeAllRanks(dist, discD0.defined(), device);
 	int64_t n = 0;
 	if (doUpdate) {
 		states = torch::cat(pendStates, 0);
@@ -737,7 +771,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 
 		// Discriminator CE (pair + marginal heads), once per epoch on the barrier-
 		// sampled batch. Trained even when no PPO rows exist this iteration.
-		if (discD0.defined()) {
+		if (doDisc) {
 			auto lagOne = torch::one_hot(discLag, NUM_LAGS).to(kFloat32);
 			auto pairLogits = discPair->forward(torch::cat({ discD0, discD1, lagOne, discAgg }, 1));
 			auto margLogits = discMarg->forward(discD0);
@@ -788,7 +822,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			adapterOptim->step();
 			adapterOptim->zero_grad();
 		}
-		if (discD0.defined()) {
+		if (doDisc) {
 			fnAllreduce(DiscParams());
 			discOptim->step();
 			discOptim->zero_grad();
