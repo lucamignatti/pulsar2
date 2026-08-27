@@ -1,0 +1,37 @@
+---
+description: Demo cone is a convex sweep (GetTimeOfImpact); bumps stay OldRB. Hull sweep shipped.
+alwaysApply: true
+---
+
+# Demo TOI ≠ physics CCD
+
+`RBActor_TA.GetTimeOfImpact` is a **UScript query** (native convex sweep,
+poses ×50 UU, `t∈[0,1]`). Only xref is `execGetTimeOfImpact`. **Not** called
+from `PhysicsScene_Step`. Car–ball CCD is `GenerateSweptContacts`
+(`scene+0x1A5`). Ordinary `BumpCar` / `ApplyBallImpactForces` do not call it.
+
+`ShouldDemolish.uc` (soul): after the demo-speed gate, sweep; if `Fraction >= 1`
+then `InitTimeOfImpactFromOldRBState`. Cone checks run on `FTimeOfImpactData`
+either way. `Fraction` is fractional on a hit.
+
+Live CE Season 23 (PID 14280, 2026-08-26): hardware execute on TOI entry +
+`movss [OutData.Fraction], t` (only if `t<1`). Bumps: 0 TOI, AddImpulse fired.
+Demos: entry **and** `t<1` store (2/2). Sweep hits; those demolitions are not
+the OldRB fallback.
+
+**Shipped (2026-08-26):** demo cone = hull overlap OldRB→post-step
+(`hull_compound_toi`); miss / `t=0` overlap → OldRB. Bump cone stays
+Fraction=0. `GGL_DEMO_SWEEP=0` restores linear COM. 1-tick A/B on 211647 / T1 /
+T6 `[0,25000)` was **bit-id** (CarImpact p90 13.816, same REALDEMO ticks).
+
+```
+// ❌ BAD — treat GetTimeOfImpact as car–ball CCD, or rewind bump cones
+GGL_CAR_TOI / GenerateSweptContacts ≡ ShouldDemolish
+GGL_BUMP_TOI / demo_cone(end_of_tick)
+
+// ✅ GOOD — demo cone at convex-sweep poses; bump Fraction=0
+```
+
+Do not ship `GGL_CAR_TOI` or `GGL_BUMP_TOI`. Future: Bakkes freeplay plugin
+that stages two cars and hooks `GetTimeOfImpact` / `ShouldDemolish` to log
+`Fraction` + poses (not a second sim; do not call TOI on bump ticks).
