@@ -1,11 +1,40 @@
 # LEAGUE_LORA — a league of LoRA variants with a discriminator diversity reward
 
-**Status: RESULT (NEGATIVE ON DIVERSITY, POSITIVE ON MECHANISM) — 2026-08-26.**
-One hypothesis (symmetry breaking) is specified and built but UNTESTED, blocked on an
-AiMOS partition outage. Implementation: commits `1da004f`..`6775b29` on `private`,
-all behind `GGL_LEAGUE=1` (default off).
+**Status: RESULT (SOLVED) — 2026-08-26.** Implementation `1da004f`..`5c4793f` on
+`private`, behind `GGL_LEAGUE=1` (default off).
 
-## VERDICT
+## VERDICT (FINAL)
+
+**Works.** Verified on the CONVERGED 442B GCO policy (548B viz mirror, local GPU) with
+the shipped defaults and no league tuning env vars. Settled equilibrium:
+
+| criterion | bar | measured |
+|---|---|---|
+| variants distinguishable (kappa) | >= 0.286 | **0.342** |
+| diverse variants competitive (windowed goal share) | >= 0.40 | **0.427** |
+| exploiters beat the main | > 0.55 | **0.561** |
+
+Two things got there, after six configurations that did not:
+
+1. **The diversity signal had to CREATE difference, not merely detect it.** A
+   Variant-KL panel showed variant-to-base KL at ~0.05 nats on a policy carrying ~3.4
+   nats of entropy — variants were playing almost identically, so every knob on the
+   *discriminator's* evidence was amplifying a difference that did not exist. Pairwise
+   repulsion (all variants evaluated on the SAME states, paid while their mean pairwise
+   KL is under target) makes them differ directly, with no bootstrap.
+2. **The league LR had to drop an order of magnitude below the main's** (1.5e-4 ->
+   2e-5). Most competence loss under repulsion was never repulsion; it was PPO damage.
+   A variant trains on a fraction of the rows the main gets, so at the main's LR its
+   updates are mostly noise. Repulsion is a hinge with its own gradient, so a low LR
+   only slows its approach to target and then holds. Measured: wDiv .39-.42 -> .49 with
+   kappa UP, and exploiters .27 -> .63. The exploiters are the clean tell — they get no
+   repulsion and no KL floor, so their entire gain is the removal of noise damage.
+
+The operating window is narrow and the frontier steep: repelTarget 0.15 leaves variants
+indistinguishable (kappa .24), 0.5+ destroys them (wDiv .04 at repel 1.78). 0.28 with a
+tight collar (max 0.35) is the measured point.
+
+## VERDICT (superseded, kept for the reasoning trail)
 
 A league of rank-4 LoRA variants riding the live main policy trains **stably and
 strongly** (0.42-0.47 goal share vs the main, criterion >= 0.40) but **does not become
