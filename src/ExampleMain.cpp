@@ -1216,6 +1216,16 @@ int main(int argc, char* argv[]) {
 
 	cfg.ppo.policyLR = 1.5e-4;
 	cfg.ppo.criticLR = 1.5e-4;
+	// GGL_MAIN_LR: override both, for short offline A/B runs that RESUME a converged
+	// policy. Resuming without optimizer state restarts Adam cold, and at the production
+	// LR the first updates wreck a mature policy (measured: goal share vs its own frozen
+	// start fell to .19 within ~25 minutes). Lowering it lets a short run measure the
+	// effect of an intervention instead of the effect of the restart. Never set in
+	// production - the schedule there is deliberate.
+	if (const char* s = std::getenv("GGL_MAIN_LR"); s && *s) {
+		cfg.ppo.policyLR = cfg.ppo.criticLR = std::strtof(s, nullptr);
+		RG_LOG("GGL_MAIN_LR: policy/critic LR overridden to " << cfg.ppo.policyLR);
+	}
 
 	// ASYMMETRIC RESIDUAL NETS (2026-07-24 cold start, user-directed). Three changes at once,
 	// all shape-breaking, so this needs its own checkpoint folder (see cfg.checkpointFolder):

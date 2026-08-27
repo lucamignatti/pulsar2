@@ -34,6 +34,39 @@ The operating window is narrow and the frontier steep: repelTarget 0.15 leaves v
 indistinguishable (kappa .24), 0.5+ destroys them (wDiv .04 at repel 1.78). 0.28 with a
 tight collar (max 0.35) is the measured point.
 
+## DOES IT MAKE THE MAIN BETTER? (A/B, 2026-08-27)
+
+Both arms start from the SAME converged 563B checkpoint, run identical configs for equal
+wall clock, and are scored on goal share against the SAME frozen copy of that start
+(`policy_versions/ref_563659776000`). That anchor is the only yardstick CLAUDE.md trusts —
+`Rating/1v1` inflates because its pool tracks the agent, and **Nexto is unusable here: the
+policy beats it 40-0, a total ceiling**. The comparison is honest about cost: with the
+league on the main gets only ~75% of the arenas.
+
+| main LR | control (self-play) | league | |
+|---|---|---|---|
+| 1.5e-4 (production) | **0.190** (203-864) | **0.291** (256-624) | league clearly better |
+| 1.5e-5 (1/10) | 0.491 (479-497) | 0.491 (135-140) | neither moves; no harm |
+
+**At production LR the league-trained main is substantially stronger than the
+self-play-trained main** — a 10-point gap on ~1000 goals per arm, z ~ 2.3 even after
+inflating the SE 5x for episode-cluster variance, and it wins while training on a quarter
+less data.
+
+**Caveat, stated plainly:** both arms scored BELOW 0.5, i.e. both degraded and the league
+merely degraded far less. That is a harness artifact, not the league — resuming without
+optimizer state restarts Adam cold, and at production LR its first updates wreck a mature
+policy. Confirmed by dropping the LR 10x, which restored the control to ~0.49 (stable).
+So the measured claim is **the league makes training markedly more robust**, which is what
+diverse opponents should do, and it is a real difference between two policies trained
+identically apart from the league. The low-LR arm is a null control only: 25 minutes at
+1/10 LR cannot move a 563B policy, and both arms sit at 0.491.
+
+Loading the real optimizer state locally FAILS (shape mismatch 256 vs 1280 — those tensors
+carry the cluster's net config, not the local build's), so the clean version of this
+experiment wants a cluster run where training resumes genuinely. `GGL_MAIN_LR` exists for
+offline A/Bs of this shape and must never be set in production.
+
 ## VERDICT (superseded, kept for the reasoning trail)
 
 A league of rank-4 LoRA variants riding the live main policy trains **stably and
