@@ -54,6 +54,60 @@ we learned to read cumulative shares only.
 
 **This control was built after four rounds of patching. It should have been first.**
 
+## THE ROOT CAUSE, and the mechanism that addresses it (2026-08-26, `d0e7d71`)
+
+Adding a **Variant-KL** panel — mean KL(variant || base) over real rows — produced the
+number that reframed the whole study: **~0.05 nats**, on a 90-action policy carrying
+~3.4 nats of entropy. The variants were playing *almost identically* to the main.
+
+That is why all six levers were inert. Beta, league size, descriptor, symmetry breaking
+and rank were every one of them trying to amplify *evidence* of a difference that did
+not behaviourally exist. The discriminator was not failing; it was reporting the truth.
+**||B|| (parameter distance) was the wrong instrument all along** — post-LN blocks can
+make large parameter movement behaviourally nearly free, so an adapter can travel a long
+way in weight space and barely change the policy.
+
+Two direct, dense, differentiable terms now CREATE the difference, leaving the
+discriminator only to MEASURE it:
+
+- **`repelCoeff`** — evaluate every diverse variant on the SAME sampled states (one extra
+  batched per-row LoRA forward) and pay while their mean pairwise KL is below target.
+  This makes variants differ from EACH OTHER, and needs no bootstrap: unlike the
+  discriminator reward, it does not require variants to already be different in order to
+  make them different.
+- **`klCoeff`** — a hinge floor on KL(variant || base), applied to EXPLOITERS TOO. An
+  exploiter at KL 0.05 effectively IS the main, and a mirror match is 0.5 by
+  construction — which is exactly where exploiter goal share sat (0.40-0.53) in every
+  arm. The hinge is a floor on deviation, not a direction; the zero-sum objective still
+  chooses where that deviation goes.
+
+Both are two-sided bands (push below target, pull back above max), so the objective is
+"be different but remain a policy" rather than a race away from each other.
+
+**Measured locally (CPU smoke, corrected units):**
+
+| repelCoeff | KL(var‖base) | mean pairwise | entropy |
+|---|---|---|---|
+| 0 | .044 -> .062 | .038 -> .097 | .763 |
+| 0.5 | .110 -> **.244** | .061 -> **.471** | .736 |
+| 2.0 | .119 -> **.242** | .065 -> **.422** | .736 |
+
+Separation reaches the target and HOLDS there without overshoot; 0.5 and 2.0 converge to
+the same place, which is the saturation the hinge is designed to produce. Entropy cost
+~0.03. Combined repel+KL run: KL .355, pairwise .384, no crashes.
+
+**STILL UNVALIDATED — the competence question.** Every number above comes from a smoke
+whose base policy is randomly initialised. Whether forcing KL ~0.3-0.5 on a CONVERGED
+442B policy preserves goal share is the one thing that decides whether this works, and it
+has not been run. It needs either the cluster or a local run against a full checkpoint.
+
+**Two instrumentation bugs found, each of which had already produced a wrong conclusion:**
+- The repel panel divided by `V*(V-1)` while summing over `V*V*S`, under-dividing by
+  S=128. A healthy 0.29 nats read as a 37-nat runaway and prompted a "fix" for a problem
+  that did not exist.
+- The `postLN` hypothesis (delta after LayerNorm rather than at the Linear) measured
+  NEUTRAL: KL .045-.079 vs .032-.072. Falsified; the option defaults off.
+
 ## Results
 
 Settled values at matched displacement (`||B||` ~ 1.8), diverse variants only:
@@ -100,7 +154,26 @@ competence of any arm (0.419). That is what a large reward pointing nowhere look
    displacement was never the constraint (`B` climbs 0.23 -> 0.34 in 16 iterations, and
    to 2.5 over a run). Cancelled on the measurement.
 
-## The untested hypothesis (built, blocked)
+## Symmetry breaking — TESTED, ALSO NEGATIVE (job 4647161)
+
+`GGL_LEAGUE_BINIT=1e-3`, 3 variants, beta 1.0. Birth displacement verified numerically
+(first-update `||B||` 0.282 vs 0.053 for a B=0 arm) rather than from the log — the
+`GGL_LEAGUE_FRESH` banner claimed "B=0" unconditionally and could not distinguish the
+two configurations (fixed in `8753534`).
+
+Settled at `||B||` ~1.9-2.0: **kappa 0.105-0.113, goal share 0.454**. Nominally the best
+of the six arms and still 2.5x short of target, inside the spread of everything else.
+Trajectory 0.202 (bPol .49) -> 0.165 (.84) -> 0.111 (1.44) -> ~0.11 settled: the same
+decay curve as every other arm, and BELOW baseline at matched displacement.
+
+**The result that matters most here is incidental**: `||B||` = 0.28 of *random*
+perturbation produced no more discriminability than a *trained* variant of the same
+magnitude. Random and learned low-rank deltas are equally invisible to the
+discriminator. That argues the limit is **the low-rank family itself**, not what the
+diversity objective does inside it — and it undercuts the bootstrap story this arm was
+built on (the variants were never stuck for lack of an initial difference).
+
+## The original framing of that hypothesis (kept for the reasoning trail)
 
 `B = 0` at init makes every variant **bit-identical at birth**, so initial diversity is
 *exactly* zero: nothing to discriminate -> no signal -> the diversity gradient is noise
