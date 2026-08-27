@@ -40,8 +40,21 @@ namespace GGL {
 		int numExploiters = 2;
 		int rank = 4;             // LoRA rank r
 		float arenaFrac = 0.25f;  // share of arenas hosting main-vs-variant play
-		float divBeta = 0.1f;     // r_div scale (raw centered log-prob units)
-		float adapterLR = 3e-4f; // adapters walk FAST at rank 4 (deltas reach O(hidden) within ~1k steps at 1e-3); keep near the main's policy LR scale
+		// 1.0. The discriminator reward is no longer what CREATES diversity (repulsion is),
+		// so this is now a secondary shaping term that biases variants toward differences
+		// the discriminator can actually name, rather than arbitrary ones. It was inert at
+		// 0.1 and is harmless at 1.0 now that it is not carrying the mechanism alone.
+		float divBeta = 1.0f;     // r_div scale (raw centered log-prob units)
+		// 2e-5, an order of magnitude BELOW the main's policy LR, and that is the single
+		// most important number here. Most of the competence loss under repulsion was not
+		// the repulsion itself but PPO damage: a variant trains on a fraction of the rows
+		// the main gets, so at the main's LR its updates are mostly noise and it degrades.
+		// Repulsion is a HINGE and carries its own gradient, so a low LR only means it
+		// reaches its target more slowly and then holds -- separation is preserved while
+		// the damage goes away. Measured on the converged policy: at 1.5e-4 the variants
+		// sat at wDiv .39-.42, at 2e-5 they sit at .49 with HIGHER kappa, and exploiters
+		// went from .27 (losing badly) to .63 (beating the main).
+		float adapterLR = 2e-5f;
 		float discLR = 1e-3f;
 		int lagShort = 300;       // decision steps (~2.5s at ts1 120Hz)
 		int lagLong = 1080;       // decision steps (~9s at ts1 120Hz)
@@ -81,7 +94,13 @@ namespace GGL {
 		// diversity was 118% of the advantage scale and still produced no separation.
 		// binitStd > 0 seeds each variant's B with its own small noise so they start
 		// DIFFERENT. Keep it small: the delta scales with it, so it is paid in competence.
-		float binitStd = 0.f;
+		// 1e-3 by default (||B|| ~0.32 at birth). Not for its own sake -- symmetry breaking
+		// alone was a measured negative -- but because it lets REPULSION start from
+		// variants that are already slightly apart. From exact symmetry the repulsion term
+		// has to force them apart from scratch, which takes larger and more damaging
+		// updates: measured wDiv .398 and falling at binit=0 versus .46 stable at 1e-3,
+		// same targets and LR.
+		float binitStd = 1e-3f;
 		// Apply the LoRA delta AFTER the block's LayerNorm instead of at the Linear.
 		// See ForwardLora: post-norm blocks normalise the delta away, and LayerNorm is
 		// scale-invariant, so magnitude levers cannot work at all without this.
@@ -107,8 +126,11 @@ namespace GGL {
 		// pairwise KL between them is below repelTarget. Dense, differentiable, and free of
 		// the discriminator bootstrap: it does not need variants to already be different in
 		// order to make them different.
-		float repelCoeff = 0.f;
-		float repelTarget = 0.5f;  // nats, mean pairwise
+		// ON by default: this is the mechanism that makes the league work at all. Target
+		// 0.28 is the measured operating point -- the frontier is steep, and 0.15 leaves
+		// variants indistinguishable (kappa .24) while 0.5+ destroys them (wDiv .04).
+		float repelCoeff = 0.5f;
+		float repelTarget = 0.28f;  // nats, mean pairwise
 		// UPPER BOUND. A one-sided hinge only ever pushes variants apart and never pulls
 		// them back, so once they clear repelTarget nothing restrains them: measured
 		// overshoot to 37 nats against a 0.5 target within a few updates, i.e. policies
@@ -116,7 +138,7 @@ namespace GGL {
 		// divergence, and on a converged policy it is paid for entirely in competence.
 		// Above repelMax the sign flips and pulls them back, making the objective a BAND
 		// (be different, but stay a policy) rather than a race away from each other.
-		float repelMax = 1.5f;     // nats
+		float repelMax = 0.35f;    // nats; a tight collar - 1.5 allowed a runaway to 1.78
 		int repelStates = 256;     // states sampled per update
 		// Iterations of league rows to ACCUMULATE before one adapter update. The fleet
 		// gives the main 4176 rows/rank/iter for ONE policy; the league gets 594 split
