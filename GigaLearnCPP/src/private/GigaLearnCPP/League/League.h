@@ -131,6 +131,11 @@ namespace GGL {
 		// version of this panel read 0/-1 forever and was unreadable. The window must
 		// be long enough to hold goals but short enough to still show a slope.
 		int winResetEvery = 200;
+		// The league's OWN minibatch, independent of the main's GGL_MINIBATCH. It must be
+		// tunable because the per-row LoRA gather materialises [rows, r, in] per Linear,
+		// which scales with BOTH rows and rank: at rank 32 with ~12k accumulated rows that
+		// is ~2GB per layer-tensor and OOMs a 16GB card, while rank 4 fits comfortably.
+		// Raising rank therefore requires lowering this in step.
 		int64_t miniBatch = 32768;
 
 		int Total() const { return numDiverse + numExploiters; }

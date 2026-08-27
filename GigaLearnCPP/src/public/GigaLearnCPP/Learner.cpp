@@ -433,6 +433,7 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.repelTarget = envF("GGL_LEAGUE_REPELTARGET", lc.repelTarget);
 		lc.repelMax = envF("GGL_LEAGUE_REPELMAX", lc.repelMax);
 		lc.repelStates = envI("GGL_LEAGUE_REPELSTATES", lc.repelStates);
+		lc.miniBatch = (int64_t)envI("GGL_LEAGUE_MINIBATCH", (int)lc.miniBatch);
 		lc.clipRange = config.ppo.clipRange;
 		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);
