@@ -372,6 +372,60 @@ if (car->flags_0x7F8 & 1) {                        // (A) CACHED car-level bit
 return 0;
 ```
 
+**Follow-through (same session) — the first reading was WRONG, recorded so it is not
+repeated.**
+
+The initial conclusion was "CanActivate never queries wheel contact, so the ground term is
+a cached bit (`car+0x7F8` bit 0), and a cache written at a different tick phase explains
+our fitted 1-tick hold." That is **refuted**:
+
+- `FUN_140eca110` and `FUN_140eca200` are structurally identical to Dodge's `CanActivate`
+  — they are the `CanActivate` overrides of the *other* car components (Jump,
+  DoubleJump). **All three test `car+0x7F8 & 1` as their first gate.** A flag shared by
+  Jump *and* DoubleJump *and* Dodge cannot be a ground/air flag; those have opposite
+  ground requirements. Bit 0 is a car-level "active / driving / controllable" gate.
+  (Corroborating: `FUN_140ef2a30` tests the same bit purely to guard an allocation.)
+- So `CanActivate` genuinely has **no** ground condition — but that is because the ground
+  check lives one level up, in the caller.
+
+**The dispatcher does query ground, live.** `FUN_140f1abc0` (a CarComponent tick/activation
+path) contains:
+
+```c
+if ((comp->flags_0x348 & 2) == 0 ||                       // per-component "requires ground"
+    (**(code **)(*(longlong *)comp->Car + 0x838))() != 0)  // car->IsOnGround()  <-- LIVE virtual
+{ ...timers, event... }
+if ((car->flags_0x818 & 4) == 0) return;                   // input/press bit
+if ((**(code **)(*comp + 0x698))(comp) == 0) return;       // CanActivate
+/* -> activate */
+```
+
+`comp[0x51]` is byte offset 0x288 (the Car) and car vtable **+0x838 is `IsOnGround`** — the
+exact slot `AVehicle_TAexecIsOnGround` (`0x140e8cfe0`) dispatches to.
+
+**What this means for our dodge fix** (`GGL_DODGE_GROUND_HOLD`, WAVEDASH_GATE.md):
+
+1. RL evaluates ground with a **live virtual call at activation time**, not a cached flag.
+   Our engine also gates the press on a live `is_on_ground`. The architecture matches —
+   there is no cache-vs-live discrepancy to port.
+2. Therefore our 1-tick hold has **no structural counterpart in the game**. It is a pure
+   empirical fit compensating for either (a) what RL's `IsOnGround` computes differing from
+   our `num_wheels_in_contact >= 3`, or (b) tick-phase placement of the evaluation. It
+   should be treated as provisional until (a) is read out.
+3. **The single open question is now one function**: RL's `IsOnGround` implementation at
+   Car vtable +0x838. Read it and we know exactly what "on ground" means to the game —
+   which is also the most likely explanation for the residual `tilt_on_side` error (32% of
+   its ticks), where our 3-wheel threshold is most likely to disagree.
+
+**How to close it (needs the game running, ~seconds).** A static anchor for the *Car*
+vtable was not found — `GetNumWheelContacts` (`FUN_140ef3330`) and `GetTimeOnGround`
+(`FUN_140ef3970`) are called directly by their thunks, not through the vtable, and appear
+nowhere in `.rdata`. So use §7: find a live `Car_TA` instance (or its CDO/archetype), read
+`*(void**)car` to get the vtable, then read `vtable + 0x838` and decompile that address.
+One read closes it.
+
+**The original load-bearing observation, corrected:**
+
 **The load-bearing observation: `CanActivate` never queries wheel contact.** There is no
 `IsOnGround`, no `GetNumWheelContacts`, no raycast — the ground term is a **cached bit**
 (`car+0x7F8` bit 0; the same bitfield holds `bSuperSonic` at bit 0x20, confirmed
@@ -379,15 +433,8 @@ separately). Our engine gates the dodge press on a **live** `is_on_ground` recom
 tick, which is a different thing: a cache written at a different point in the tick is
 exactly a one-tick offset.
 
-That is a candidate *mechanism* for the empirically-fitted 1-tick level-takeoff contact
-hold in `GGL_DODGE_GROUND_HOLD` (see `WAVEDASH_GATE.md`) — but it is **not yet proof**.
-Open, and the next step if this is ever picked up:
-
-- What is `car+0x7F8` bit 0, and **when in the tick is it written?** 26 `test byte
-  [reg+0x7F8], imm8` read sites exist; there are no immediate-mode `or`/`and` writers, so
-  it is written via a computed value and needs either careful analysis of the read sites or
-  a live hardware BP (§9) correlating the bit against wheel state.
-- If the bit turns out to be a ground cache latched at a specific tick phase, the fitted
-  hold should be **replaced by a port of that latch** — which would likely also address the
-  residual `tilt_on_side` contact error (32% of its ticks), since a cached flag does not
-  care about per-wheel tilt the way our live 3-wheel query does.
+...but see the follow-through above: the ground check is in the CALLER, done live. For
+the record, `car+0x7F8` bit 0 is written by read-modify-write pairs (`and dword [r+7F8],
+~mask` / `or dword [r+7F8], reg`); the neighbouring bit setters `FUN_140efefc0` and
+`FUN_140eff070` write bits 4 and 5 by the same pattern, and bit 5 (0x20) is `bSuperSonic`,
+independently confirmed — which is what establishes this is the right bitfield.
