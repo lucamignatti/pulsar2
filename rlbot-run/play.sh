@@ -107,20 +107,46 @@ EAC_MATCH=""   # set by eac_active() to the offending "pid: cmdline" for logging
 # NOTE: Proton hides the Windows .exe name from /proc/pid/comm (15-char truncated) and
 # /proc/pid/exe (points at the wine loader). The FULL Windows path only shows up in
 # /proc/pid/cmdline, so we must match on that.
+# PERFORMANCE (2026-08-27): this used to walk /proc/[0-9]*/cmdline in shell, forking
+# basename + dirname + cat + tr PER PROCESS. Measured on this box (~800 procs): 1748 ms
+# and ~2400 forks for ONE scan - on a 1 s loop, i.e. it never finished before restarting
+# and pegged a core continuously. That is scheduler noise straight into a 120 Hz bot loop
+# and a game that needs a stable frame time, and it was a direct cause of the in-game
+# rate dipping below 100%. `pgrep -f` does the same match in the kernel: 29 ms, 2 forks.
+#
+# CLAUDE.md's "never use pgrep -f" rule is about finding the TRAINER, where the pattern
+# (build/GigaLearnBot) appears in the searching command's own cmdline. It does not apply
+# here: these patterns never appear in play.sh's cmdline, and pgrep excludes its own pid.
 eac_active() { # true iff a REAL anti-cheat process is running (not the installer)
 	EAC_MATCH=""
-	local self=$$
-	for c in /proc/[0-9]*/cmdline; do
-		local pid; pid=$(basename "$(dirname "$c")")
-		[ "$pid" = "$self" ] && continue
-		# `cat 2>/dev/null` (not shell `< "$c"`) so a process exiting mid-scan is silent.
-		local line; line=$(cat "$c" 2>/dev/null | tr '\0' ' ') || continue
-		case "$line" in *[Ss]etup*) continue ;; esac        # EAC installer - harmless, ignore
-		case "$line" in
-			*RocketLeague_EAC.exe*|*EasyAntiCheat_EOS.exe*|*EasyAntiCheatBootstrapper*)
-				EAC_MATCH="$pid: ${line:0:100}"; return 0 ;;
-		esac
-	done
+	# The EAC *installer* (EasyAntiCheat_EOS_Setup.exe) runs in BOTH modes and must be
+	# ignored - matching it broadly is what false-aborted a session. Two guards, same as
+	# before: "EasyAntiCheat_EOS\.exe" cannot match "..._Setup.exe" (underscore, not dot),
+	# and the grep -v drops any remaining *setup* line (e.g. a setup bootstrapper).
+	# A CMDLINE MATCH ALONE IS NOT ENOUGH, and this is the trap that makes the naive
+	# one-liner dangerous. `pgrep -f` matches on cmdline, so ANY process whose command line
+	# merely MENTIONS these names is a hit - a grep in a terminal, an editor, an analysis
+	# script. Here a hit means HARD ABORT: the game gets killed mid-match. Verified during
+	# the 2026-08-27 rewrite: an unrelated shell matched on the first try. (The old /proc
+	# walk had the same hole and only papered over it by skipping its own pid; an ANCESTOR
+	# shell defeated that, so pid-based self-exclusion is not sufficient either.)
+	#
+	# The real discriminator is semantic: EAC is a WINDOWS binary and can only be running
+	# under Proton, so its /proc/<pid>/exe resolves to a wine loader
+	# (".../wine/x86_64-unix/wine64-preloader", ".../bin/wineserver"). Anything mentioning
+	# the name from Linux userspace has exe=/usr/bin/bash, /usr/bin/grep, java, etc.
+	# Requiring "is actually a wine process" is both stricter than the old check and
+	# immune to every text-mention false positive. Candidates are ~always 0, so the
+	# readlink fork per candidate costs nothing.
+	local pid rest exe
+	while read -r pid rest; do
+		[ -n "$pid" ] || continue
+		exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+		case "$exe" in *wine*) ;; *) continue ;; esac   # not a Windows process - text mention
+		EAC_MATCH="${pid}: ${rest:0:100}"
+		return 0
+	done < <(pgrep -af 'RocketLeague_EAC\.exe|EasyAntiCheat_EOS\.exe|EasyAntiCheatBootstrapper' 2>/dev/null \
+		| grep -vi setup)
 	return 1
 }
 # The trainer saturates all 24 cores (1024 env threads) and 10-13 GB of the 16 GB GPU.
@@ -339,6 +365,19 @@ kill_all() {
 	# launches those directly - so a handicap run that ended without this cleanup
 	# would silently disable the kickoff tape (or bug Nexto) in the next viz session.
 	rm -f nexto/HANDICAPS pulsar-bot/HANDICAPS 2>/dev/null
+	# THE PROC LOGGER MUST DIE HERE. It only used to be killed on the "RLBotServer exited"
+	# path at the bottom of the script, so every Ctrl-C (the normal way a session ends,
+	# via the INT trap -> kill_all -> exit) ORPHANED it to run forever. Found 2026-08-27:
+	# 34 of them alive, the oldest 48 h, each spinning a full /proc fork-walk every second
+	# -> 8773 forks/s system-wide and ~1 core burned permanently, degrading every match
+	# played afterwards. Kill its direct children (the in-flight sleep/pgrep) by PARENT,
+	# not by process group: this script runs without job control, so the subshell is NOT
+	# a group leader and `kill -- -$PROCLOG` would either no-op or signal an unrelated
+	# process group that happens to hold that id.
+	if [ -n "${PROCLOG:-}" ]; then
+		pkill -P "$PROCLOG" 2>/dev/null
+		kill "$PROCLOG" 2>/dev/null
+	fi
 	pkill -f 'RocketLeague_EAC\.exe' 2>/dev/null
 	pkill -f 'EasyAntiCheat_EOS\.exe' 2>/dev/null
 	pkill -f GigaLearnRLBot 2>/dev/null
@@ -539,17 +578,17 @@ if trainer_active; then
 fi
 
 # --- background process logger: snapshot RL/EAC procs every 1s (pure diagnostics) ----
+# Same fork-storm fix as eac_active above, and for the same reason: this loop is PURE
+# DIAGNOSTICS, and in its shell-scan form it cost more CPU than everything it was
+# watching. One pgrep replaces the per-process fork walk. Interval relaxed 1 s -> 2 s:
+# nothing here needs sub-second resolution.
 (
 	while true; do
 		ts=$(date '+%H:%M:%S')
-		for c in /proc/[0-9]*/cmdline; do
-			line=$(cat "$c" 2>/dev/null | tr '\0' ' ') || continue
-			case "$line" in *RocketLeague*|*EasyAntiCheat*|*RLBotServer*|*GigaLearnRLBot*)
-				echo "$ts $(basename "$(dirname "$c")") ${line:0:110}" >> procs.log ;;
-			esac
-		done
+		pgrep -af 'RocketLeague|EasyAntiCheat|RLBotServer|GigaLearnRLBot' 2>/dev/null \
+			| cut -c1-110 | sed "s/^/$ts /" >> procs.log
 		echo "$ts ----" >> procs.log
-		sleep 1
+		sleep 2
 	done
 ) &
 PROCLOG=$!

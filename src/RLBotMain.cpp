@@ -61,6 +61,24 @@ int main(int argc, char** argv) {
 
 	bool useGPU = EnvFlag("GGL_USE_GPU");
 
+	// CPU INFERENCE MUST BE SINGLE-THREADED, and the launcher is responsible for it.
+	// This is a batch-1, 230-dim MLP evaluated at up to 120 Hz; libtorch defaults intra-op
+	// threads to the core count (24 on this box), and splitting each layer's GEMM that
+	// wide costs far more in fork/join and barrier traffic than the arithmetic it saves,
+	// while idle OMP workers spin on cores Rocket League needs.
+	//
+	// It is NOT pinned here on purpose: this target links GigaLearnCPP without libtorch's
+	// include dirs (kept lean deliberately), and the OMP pool is sized at library init
+	// anyway, so an at::set_num_threads() call from main() would be both awkward to build
+	// and too late to be the real guarantee. run.sh exports OMP_NUM_THREADS=1 (plus MKL /
+	// OPENBLAS / OMP_WAIT_POLICY=PASSIVE) before exec, which is the mechanism that
+	// actually works. If you launch this binary by hand for a CPU run, export them too.
+	// Verify with:  ls /proc/<pid>/task | wc -l   (should be single digits, not ~30).
+	if (!useGPU && !std::getenv("OMP_NUM_THREADS"))
+		RG_LOG("WARNING: CPU inference with OMP_NUM_THREADS unset - libtorch will use one "
+			"intra-op thread per core, which at 120 Hz is pure overhead and starves the "
+			"game. Export OMP_NUM_THREADS=1 (run.sh does).");
+
 	// Team-canonical, fixed-width padded obs (4.0/5.0 team-play lineage) - same builder
 	// AdvancedObsPadded(3) ExampleMain.cpp's MakeEnv() uses, so 1v1/2v2/3v3 checkpoints
 	// all load through the same obs shape.

@@ -361,8 +361,17 @@ void RLBotBot::DebugLogLine(const std::string& line) {
 				RG_LOG("RLBotBot: debug JSONL logging to " << path);
 		}
 	}
+	// NO PER-LINE FLUSH (2026-08-27). This ran `<< std::flush` on every record, i.e. a
+	// blocking write() syscall per decision, at 120 Hz, INSIDE the packet callback that
+	// owes the game a controller state. Measured 193 KB/s of actual disk writes and ~151
+	// write syscalls/s during a live ts1 match. The stream's own buffer coalesces these
+	// into far fewer, larger writes at no cost to the data: ofstream flushes on close, and
+	// the bot's exit paths are RG_ERR_CLOSE/normal return, both of which run destructors.
+	// A hard SIGKILL now loses the last few KB - an acceptable trade for a capture file
+	// that exists to be analysed offline, and the reason the flush was there (surviving a
+	// segfault mid-match) is better served by the bot.<pid>.log, which is still unbuffered.
 	if (debugLog.is_open())
-		debugLog << line << "\n" << std::flush;
+		debugLog << line << "\n";
 }
 
 static void AppendFloatArray(std::ostringstream& s, const float* v, size_t n) {
@@ -1072,8 +1081,19 @@ void RLBotClient::Run(const RLBotParams& params) {
 
 	RG_LOG("RLBotClient: connecting to RLBotServer at " << host << ":" << port << " as \"" << agentId << "\"...");
 
+	// BALL PREDICTION IS NOT REQUESTED, DELIBERATELY (2026-08-27). update() takes a
+	// BallPrediction argument and immediately discards it ((void)ballPrediction) - the
+	// policy is a pure obs->action MLP and has never consumed a prediction. Requesting it
+	// anyway cost, per tick: a ~6 s / 720-slice ball rollout inside RLBotServer, its
+	// flatbuffer serialisation, and a ~115 KB push to this client that we parse and drop.
+	// Measured live on a 1v1 at ts1: OUR socket took 4676 KB/s while the opponent bot -
+	// same server, same tick, no prediction requested - took 136 KB/s. 34x, all waste, and
+	// it landed on the core's per-tick critical path (this is what held RLBot at ~80%) and
+	// on ours inside the latency-critical packet callback.
+	// If a future policy or a debug overlay ever needs prediction, flip this back to true
+	// and re-measure the core's rate - it is not free.
 	rlbot::BotManager<RLBotBot> manager{false /* batchHivemind */};
-	if (!manager.connect(host, port, agentId, true /* request ball prediction */))
+	if (!manager.connect(host, port, agentId, false /* request ball prediction */))
 		RG_ERR_CLOSE("RLBotClient: failed to connect to RLBotServer at " << host << ":" << port);
 
 	// connect() returns once connected; the manager blocks on its service threads until
