@@ -82,6 +82,42 @@ namespace GGL {
 		// binitStd > 0 seeds each variant's B with its own small noise so they start
 		// DIFFERENT. Keep it small: the delta scales with it, so it is paid in competence.
 		float binitStd = 0.f;
+		// Apply the LoRA delta AFTER the block's LayerNorm instead of at the Linear.
+		// See ForwardLora: post-norm blocks normalise the delta away, and LayerNorm is
+		// scale-invariant, so magnitude levers cannot work at all without this.
+		bool postLN = false;   // measured neutral (KL .045-.079 vs .032-.072); kept as an option
+		// DIRECT BEHAVIOURAL DIVERGENCE PUSH. Measured: variant-to-base KL sat at ~0.05
+		// nats on a 90-action policy carrying ~3.4 nats of entropy -- the variants were
+		// playing almost identically to the main, so no discriminator could ever separate
+		// them. That is why every knob on the DISCRIMINATOR's signal (beta, league size,
+		// descriptor, symmetry, rank) was inert: they were all trying to amplify evidence
+		// of a difference that did not exist behaviourally.
+		// klCoeff pushes KL(variant || base) UP toward klTarget and then stops (hinge, not
+		// maximisation) so variants become genuinely different without being driven
+		// arbitrarily far from a policy that works. This supplies the MAGNITUDE of
+		// behavioural change; the discriminator term supplies the DIRECTION diversity that
+		// keeps variants different from EACH OTHER rather than all fleeing the same way.
+		float klCoeff = 0.f;
+		float klTarget = 0.5f;   // nats
+		// PAIRWISE REPULSION. klCoeff alone pushes every variant away from the base, which
+		// fixes magnitude but not DIRECTION -- all variants can drift the same way and stay
+		// mutually indistinguishable, which is precisely what the discriminator needs to
+		// separate. This evaluates ALL variants on the SAME sampled states (the batched
+		// per-row LoRA forward makes that a single extra forward) and pays while the mean
+		// pairwise KL between them is below repelTarget. Dense, differentiable, and free of
+		// the discriminator bootstrap: it does not need variants to already be different in
+		// order to make them different.
+		float repelCoeff = 0.f;
+		float repelTarget = 0.5f;  // nats, mean pairwise
+		// UPPER BOUND. A one-sided hinge only ever pushes variants apart and never pulls
+		// them back, so once they clear repelTarget nothing restrains them: measured
+		// overshoot to 37 nats against a 0.5 target within a few updates, i.e. policies
+		// that place ~zero mass where the others place theirs. That is unbounded
+		// divergence, and on a converged policy it is paid for entirely in competence.
+		// Above repelMax the sign flips and pulls them back, making the objective a BAND
+		// (be different, but stay a policy) rather than a race away from each other.
+		float repelMax = 1.5f;     // nats
+		int repelStates = 256;     // states sampled per update
 		// Iterations of league rows to ACCUMULATE before one adapter update. The fleet
 		// gives the main 4176 rows/rank/iter for ONE policy; the league gets 594 split
 		// across Total() variants = ~59/variant/rank, a 70x smaller batch taking the

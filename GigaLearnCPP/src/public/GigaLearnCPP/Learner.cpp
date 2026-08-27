@@ -426,6 +426,13 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.accumEvery = envI("GGL_LEAGUE_ACCUM", lc.accumEvery);
 		lc.winResetEvery = envI("GGL_LEAGUE_WIN", lc.winResetEvery);
 		lc.binitStd = envF("GGL_LEAGUE_BINIT", lc.binitStd);
+		lc.postLN = envI("GGL_LEAGUE_POSTLN", lc.postLN ? 1 : 0) != 0;
+		lc.klCoeff = envF("GGL_LEAGUE_KL", lc.klCoeff);
+		lc.klTarget = envF("GGL_LEAGUE_KLTARGET", lc.klTarget);
+		lc.repelCoeff = envF("GGL_LEAGUE_REPEL", lc.repelCoeff);
+		lc.repelTarget = envF("GGL_LEAGUE_REPELTARGET", lc.repelTarget);
+		lc.repelMax = envF("GGL_LEAGUE_REPELMAX", lc.repelMax);
+		lc.repelStates = envI("GGL_LEAGUE_REPELSTATES", lc.repelStates);
 		lc.clipRange = config.ppo.clipRange;
 		lc.entropyScale = envF("GGL_LEAGUE_ENT", config.ppo.entropyScale);
 		league = new LeagueModule(ppo->models, lc, device, envSet->state.numPlayers);

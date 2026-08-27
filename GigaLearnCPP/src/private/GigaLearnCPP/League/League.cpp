@@ -4,6 +4,7 @@
 
 #include <torch/csrc/api/include/torch/serialize.h>
 #include <torch/nn/modules/loss.h>
+#include <torch/nn/modules/normalization.h>   // LayerNormImpl, for post-norm delta injection
 #include <cstring>
 #ifdef RG_CUDA_SUPPORT
 #include <c10/cuda/CUDAStream.h>
@@ -229,6 +230,15 @@ torch::Tensor GGL::LeagueModule::ForwardLora(Model* m, torch::Tensor x, const Ad
 	// rank r and usable WITH grad (the caller decides via NoGradGuard).
 	const float scale = 1.f; // alpha/r folded into A's init scale
 	std::vector<torch::Tensor> saved(m->residualSpans.size());
+	// POST-LN INJECTION (cfg.postLN). These blocks are Linear -> LayerNorm -> act, and a
+	// delta added at the Linear is then RE-NORMALISED by the LayerNorm. LayerNorm is
+	// scale-invariant -- LN(c*x) == LN(x) -- so the MAGNITUDE of the delta is discarded
+	// outright, and only its direction survives, attenuated. That single fact explains
+	// why every magnitude lever failed identically (beta 1%->128% of advantage scale,
+	// binit, rank 4->32 all move magnitude and nothing else): the policy is invariant to
+	// exactly the quantity they change. Deferring the delta until AFTER the norm makes it
+	// an actual shift of the normalised activations, which cannot be normalised away.
+	torch::Tensor pendingDelta;
 	for (int i = 0; i < (int)m->seq->size(); i++) {
 		for (int s = 0; s < (int)m->residualSpans.size(); s++)
 			if (m->residualSpans[s].first == i)
@@ -241,13 +251,24 @@ torch::Tensor GGL::LeagueModule::ForwardLora(Model* m, torch::Tensor x, const Ad
 			auto Ag = stack.A[(size_t)li].index_select(0, rowVariant); // [rows, r, out]
 			auto Bg = stack.B[(size_t)li].index_select(0, rowVariant); // [rows, r, in]
 			auto u = (Bg * xin.unsqueeze(1)).sum(-1);                  // [rows, r]
-			x = x + (u.unsqueeze(-1) * Ag).sum(1) * scale;             // [rows, out]
+			auto delta = (u.unsqueeze(-1) * Ag).sum(1) * scale;        // [rows, out]
+			if (cfg.postLN)
+				pendingDelta = delta;   // applied after the LayerNorm below
+			else
+				x = x + delta;
 			li++;
+		} else if (pendingDelta.defined()
+			&& std::dynamic_pointer_cast<torch::nn::LayerNormImpl>(modPtr)) {
+			x = x + pendingDelta;
+			pendingDelta = torch::Tensor();
 		}
 		for (int s = 0; s < (int)m->residualSpans.size(); s++)
 			if (m->residualSpans[s].second == i && saved[s].defined())
 				x = x + saved[s];
 	}
+	// A Linear with no LayerNorm after it (the output head) never got its delta applied.
+	if (pendingDelta.defined())
+		x = x + pendingDelta;
 	return x;
 }
 
@@ -543,7 +564,7 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 	// part of the main run's tuned economy (returnStd scaling, entropyScale balance);
 	// the league must inherit it, not invent its own.
 	double avgPolicyLoss = 0, avgCriticLoss = 0, avgEntropy = 0, avgDiscLoss = 0;
-	double avgClipFrac = 0, avgSilFrac = 0;
+	double avgClipFrac = 0, avgSilFrac = 0, avgKlPush = 0, avgRepel = 0;
 	int64_t updates = 0;
 	(void)V;
 
@@ -611,6 +632,33 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 			if (criticLoss.defined())
 				loss = loss + criticLoss * 0.5f;
 
+			// DIRECT DIVERGENCE PUSH (see LeagueConfig::klCoeff). Hinge, not maximisation:
+			// pay only while KL(variant || base) is BELOW klTarget, so variants are driven
+			// to be genuinely different and then left alone rather than pushed arbitrarily
+			// far from a policy that works. Exploiter rows are excluded -- their objective
+			// is to beat the main, and forcing them away from it would fight that directly.
+			if (cfg.klCoeff > 0) {
+				torch::Tensor baseLogits;
+				{
+					RG_NO_GRAD;
+					baseLogits = sl(states);
+					for (Model* bm : PolicyChain(ppo->models))
+						baseLogits = bm->Forward(baseLogits, false);
+				}
+				auto logPv = torch::log_softmax(logits.to(torch::kFloat32), -1);
+				auto logPb = torch::log_softmax(baseLogits.to(torch::kFloat32), -1).detach();
+				auto klRows = (logPv.exp() * (logPv - logPb)).sum(-1);
+				// Applies to EXPLOITERS TOO, deliberately. An exploiter at KL 0.05 from the
+				// main effectively IS the main, and a mirror match is 0.5 by construction --
+				// it cannot beat a policy it is a copy of, which is exactly where exploiter
+				// goal share sat (0.40-0.53) across every arm. This is a FLOOR on deviation,
+				// not a direction: the hinge stops paying at klTarget and the exploiter's own
+				// zero-sum objective decides where that deviation goes.
+				auto deficit = torch::relu(cfg.klTarget - klRows);
+				loss = loss + cfg.klCoeff * deficit.mean();
+				avgKlPush += klRows.mean().item<float>();
+			}
+
 			// SIL (see LeagueConfig::silCoeff). Success-only consolidation: mean BC on
 			// conversion rows, mirroring PPOLearner's form with the advantage residual
 			// standing in for (R - V_exp) - no gap sensor exists for variants.
@@ -629,6 +677,55 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 				loss = loss + silLoss;
 				avgSilFrac += (nConv / (float)RS_MAX((int64_t)1, stop - start)).item<float>();
 			}
+			// PAIRWISE REPULSION (see LeagueConfig::repelCoeff). Evaluate every DIVERSE
+			// variant on the SAME states so their policies are directly comparable, then
+			// pay while their mean pairwise KL is below target. This is what makes them
+			// different from EACH OTHER rather than merely far from the base.
+			// Measured ALWAYS (when there is more than one variant), pushed only when
+			// repelCoeff > 0 -- otherwise the natural, unpushed separation is invisible
+			// and there is no baseline to judge the push against.
+			if (cfg.numDiverse > 1) {
+				int64_t S = RS_MIN((int64_t)cfg.repelStates, stop - start);
+				auto sObs = sl(states).slice(0, 0, S);
+				auto sMask = sl(actionMasks).slice(0, 0, S);
+				const int V2 = cfg.numDiverse;
+				// [V*S, obs] with rowVariant = 0,0,..,1,1,.. so one batched forward covers
+				// every variant on every sampled state.
+				auto repObs = sObs.repeat({ V2, 1 });
+				auto repVar = torch::arange(V2, torch::TensorOptions()
+					.dtype(torch::kInt64).device(sObs.device()))
+					.repeat_interleave(S);
+				auto repLogits = PolicyLogitsLora(ppo->models, repObs, pol, repVar);
+				auto repMask = sMask.repeat({ V2, 1 });
+				auto repProbs = torch::softmax(
+					repLogits.to(torch::kFloat32)
+					+ ACTION_DISABLED_LOGIT * repMask.to(torch::kBool).logical_not(), -1)
+					.clamp(ACTION_MIN_PROB, 1);
+				auto logP = repProbs.log().view({ V2, S, -1 });   // [V, S, A]
+				auto P = repProbs.view({ V2, S, -1 });
+				// KL(i||j) for all ordered pairs: sum_a P_i (logP_i - logP_j)
+				auto ent_i = (P * logP).sum(-1);                                  // [V, S]
+				auto cross = torch::einsum("isa,jsa->ijs", { P, logP });          // [V, V, S]
+				auto klPair = ent_i.unsqueeze(1) - cross;                         // [V, V, S]
+				auto offDiag = 1.f - torch::eye(V2, klPair.options()).unsqueeze(-1);
+				// Divide by ordered-pairs * STATES. offDiag is [V,V,1] so offDiag.sum() is
+				// V*(V-1) and omits S entirely -- that under-division inflated this panel by
+				// exactly S (=128), turning a healthy 0.29 nats into an apparent 37-nat
+				// runaway and prompting a "fix" for a problem that did not exist.
+				auto meanPair = (klPair * offDiag).sum()
+					/ std::max(1.0, (double)V2 * (V2 - 1) * (double)S);
+				// Two-sided band: push apart below target, pull back above repelMax.
+				// SCALE MATTERS: at coeff 1.0 the deficit term is ~0.5 while the PPO
+				// policy loss is ~0.01-0.1, so repulsion outweighed the objective ~10x and
+				// blew past the band inside two updates (measured 37 nats vs a 0.5 target).
+				// Keep coeff small enough that this is a nudge alongside the objective.
+				if (cfg.repelCoeff > 0) {
+					loss = loss + cfg.repelCoeff * (torch::relu(cfg.repelTarget - meanPair)
+						+ torch::relu(meanPair - cfg.repelMax));
+				}
+				avgRepel += meanPair.item<float>();
+			}
+
 			loss.backward();
 
 			avgPolicyLoss += policyLoss.item<float>();
@@ -730,6 +827,24 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		for (auto& t : cri.B) bCri += t.detach().pow(2).sum().item<double>();
 		report["League/B Norm Policy"] = (float)std::sqrt(bPol);
 		report["League/B Norm Critic"] = (float)std::sqrt(bCri);
+		// BEHAVIOURAL divergence: mean KL(variant || base) over a sample of real rows.
+		// This is the quantity the whole design depends on, and it was never measured --
+		// ||B|| is parameter distance, which post-LN normalisation can make behaviourally
+		// FREE. A variant with large ||B|| and ~0 KL is a variant that is not actually
+		// playing differently, which is precisely the state every earlier arm was in.
+		if (states.defined() && states.size(0) > 1) {
+			int64_t ns = RS_MIN((int64_t)2048, states.size(0));
+			auto sObs = states.slice(0, 0, ns);
+			auto sVar = rowVariant.slice(0, 0, ns);
+			auto lv = PolicyLogitsLora(ppo->models, sObs, pol, sVar);
+			torch::Tensor lb = sObs;
+			for (Model* bm : PolicyChain(ppo->models))
+				lb = bm->Forward(lb, false);   // plain base policy, no delta
+			auto pv = torch::log_softmax(lv.to(torch::kFloat32), -1);
+			auto pb = torch::log_softmax(lb.to(torch::kFloat32), -1);
+			auto kl = (pv.exp() * (pv - pb)).sum(-1).mean();
+			report["League/Variant KL"] = kl.item<float>();
+		}
 	}
 	if (updates) {
 		report["League/Policy Loss"] = (float)(avgPolicyLoss / updates);
@@ -760,6 +875,11 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
 			<< " bPol=" << report["League/B Norm Policy"]
+			// KL is the BEHAVIOURAL divergence; bPol is only parameter distance. A large
+			// bPol with ~0 KL means the delta is being normalised away and the variant is
+			// not actually playing differently.
+			<< " KL=" << report["League/Variant KL"]
+			<< " repel=" << (updates ? avgRepel / updates : -1.)
 			// rdivStd vs advStd is the ONLY honest read of whether the diversity term is
 			// material: r_div is centred, so its MEAN is ~0 by construction and says
 			// nothing. If rdivStd << advStd the seek term is a rounding error on the
