@@ -150,3 +150,20 @@ skip bias, entropy on the control marginal only, LoRA league (theta-run settings
 at 1B steps/version. No pooling exists on this branch. Watchdog kills a hop that never
 iterates (20 min) or stalls (25 min). This branch had never run on the cluster before
 this job; the first hop's boot is the smoke test.
+
+## 11:00 update — true-VTS first contact: three bugs, all fixed on `vts-true-skip`
+
+The branch had never run on the cluster. Three failures in sequence, each found by a
+2-node 20-minute smoke (`truevts_smoke.sbatch` in `~/scratch/pulsar2-vts`):
+
+1. `356bf42` **League KL push term**: base policy chain forward ends at the 95-wide factored
+   layer, variant logits are the 450 table → `sub` size error on every learner.
+2. `72cb4dc` **Ring column assert ordering** (`LearnerAsync.cpp` `ErasePrefix`): the
+   `isDec/ticks` length check ran AFTER the main columns were trimmed, comparing pre- and
+   post-erase lengths; fired on every collector at the first tick-budget cut (~25 s). Data was
+   consistent. Check moved before the erases (with a sizes message).
+3. `37c7fbb` **League Variant-KL telemetry**: the same unexpanded base forward as (1).
+   All `PolicyChain` forwards now go through `ExpandFactoredLogits`.
+
+Also `be42ee9`: a 3-shot minibatch shape log in `LeagueModule::Learn` (note: RG_LOG goes to
+block-buffered stdout under mpirun, so it is lost on abort — stderr `what()` is what you see).
