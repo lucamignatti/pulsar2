@@ -3323,7 +3323,9 @@ void GGL::Learner::Start() {
 					collectReport["ToVec Time"] = toVecTime;
 					collectWallTime = collectionTimer.Elapsed();
 					collectReport["Collection Time"] = collectWallTime;
-					{
+					// Rank 0 only: ungated this line is one row per rank per iteration and a
+					// 96-rank 6h hop writes ~500MB of it (the 7.9-gco logs reached 8GB once).
+					if (DistRank() == 0) {
 						const int ticks = (numRealPlayers > 0) ? (int)(collectSteps / numRealPlayers) : 0;
 						RG_LOG("[DIST][COLLECT] rank=" << DistRank()
 							<< " nreal=" << numRealPlayers
