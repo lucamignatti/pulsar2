@@ -1,5 +1,8 @@
 #include "Models.h"
 #include "MoE.h"
+#include <torch/version.h>
+#include <torch/optim/adam.h>
+#include <torch/optim/sgd.h>
 #include "../PPO/CudaGraphPolicy.h"
 
 #include <torch/csrc/api/include/torch/serialize.h>
@@ -413,9 +416,68 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 		if (std::filesystem::exists(optimPath)) {
 			std::ifstream testStream = std::ifstream(optimPath, std::istream::ate | std::ios::binary);
 			if (testStream.tellg() > 0) {
-				torch::serialize::InputArchive optimArchive;
-				optimArchive.load_from(optimPath.string(), device);
-				optim->load(optimArchive);
+				// OPTIMIZER-STATE SHAPE GUARD (22b-compat, 2026-09-01). libtorch remaps saved
+				// per-param state onto the new process's params by the param-group ORDER, keyed
+				// by stringified TensorImpl pointers. Archives written by one libtorch generation
+				// and read by another can mis-key (2.1 writes "0x..." hex keys that 2.9's stoull
+				// parses as 0 — every state collapses onto one param), and the failure surfaces
+				// only inside the first optimizer step as a tensor-size error, which on an
+				// unattended chain is a crash-loop. Validate every mapped state against its
+				// param; on any mismatch (or a load exception) reset THIS model's optimizer
+				// state — the same thing GGL_FRESH_OPTIM=1 does, scoped to the broken model —
+				// and say so loudly. Weights are untouched either way.
+				std::string why;
+				bool ok = true;
+				try {
+					torch::serialize::InputArchive optimArchive;
+					optimArchive.load_from(optimPath.string(), device);
+					optim->load(optimArchive);
+				} catch (const std::exception& e) {
+					ok = false;
+					why = std::string("load exception: ") + e.what();
+				}
+				if (ok) {
+					int checked = 0;
+					for (auto& group : optim->param_groups()) {
+						for (auto& p : group.params()) {
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 2)
+							const auto key = c10::guts::to_string(p.unsafeGetTensorImpl());
+#else
+							const auto key = p.unsafeGetTensorImpl();
+#endif
+							auto it = optim->state().find(key);
+							if (it == optim->state().end())
+								continue;
+							if (!it->second) {
+								ok = false;
+								why = "null state entry after load (key collision)";
+								break;
+							}
+							torch::Tensor ref;
+							if (config.optimType == ModelOptimType::ADAM)
+								ref = static_cast<torch::optim::AdamParamState&>(*it->second).exp_avg();
+							else
+								ref = static_cast<torch::optim::SGDParamState&>(*it->second).momentum_buffer();
+							if (ref.defined() && ref.sizes() != p.sizes()) {
+								std::stringstream ss;
+								ss << "state " << ref.sizes() << " vs param " << p.sizes();
+								why = ss.str();
+								ok = false;
+								break;
+							}
+							checked++;
+						}
+						if (!ok)
+							break;
+					}
+					if (ok)
+						RG_LOG("Optimizer state for \"" << modelName << "\" loaded (" << checked << " param states verified)");
+				}
+				if (!ok) {
+					optim->state().clear();
+					RG_LOG("WARNING: optimizer state for \"" << modelName << "\" at " << optimPath
+						<< " does not match this build's params (" << why << ") - RESET to fresh for this model only");
+				}
 			} else {
 				RG_LOG("WARNING: Saved optimizer at " << optimPath << " is empty, optimizer will be reset");
 			}
