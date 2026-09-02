@@ -122,21 +122,30 @@ int main() {
 					// so research/tools wavedash + fidelity meters run unmodified on SIM play.
 					// This is the control for "flips look fine in viz, wrong in game": identical
 					// weights, identical meter, only the world differs.
-					if (jsonl && ci == 0) {
+					// Log FIGHTER A's decisions (not "the blue car": sides swap at half time,
+					// so ci==0 logged the opponent for the whole second half), plus the
+					// opponent's pose and both demolished flags so contact/demo meters can run.
+					if (jsonl && f == &A) {
+						const Player& o = gs.players[1 - ci];
 						fprintf(jsonl,
-							"{\"type\":\"decision\",\"t\":%.6f,\"i\":0,\"g\":%d,\"boost\":%.3f,"
+							"{\"type\":\"decision\",\"t\":%.6f,\"ep\":%d,\"i\":0,\"g\":%d,\"boost\":%.3f,"
 							"\"hf\":%d,\"hj\":%d,\"hdj\":%d,\"atsj\":%.4f,\"flip\":%d,"
 							"\"p\":[%.3f,%.3f,%.3f],\"v\":[%.3f,%.3f,%.3f],"
 							"\"f\":[%.5f,%.5f,%.5f],\"u\":[%.5f,%.5f,%.5f],"
 							"\"b\":[%.3f,%.3f,%.3f],"
+							"\"op\":[%.3f,%.3f,%.3f],\"ov\":[%.3f,%.3f,%.3f],\"of\":[%.5f,%.5f,%.5f],"
+							"\"de\":%d,\"ode\":%d,\"oss\":%d,\"ss\":%d,"
 							"\"act_tuple\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]}\n",
-							tick / 120.0, (int)p.isOnGround, p.boost,
+							tick / 120.0, eps, (int)p.isOnGround, p.boost,
 							(int)p.hasFlipped, (int)p.hasJumped, (int)p.hasDoubleJumped,
 							p.airTimeSinceJump, (int)p.HasFlipOrJump(),
 							p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z,
 							p.rotMat.forward.x, p.rotMat.forward.y, p.rotMat.forward.z,
 							p.rotMat.up.x, p.rotMat.up.y, p.rotMat.up.z,
 							gs.ball.pos.x, gs.ball.pos.y, gs.ball.pos.z,
+							o.pos.x, o.pos.y, o.pos.z, o.vel.x, o.vel.y, o.vel.z,
+							o.rotMat.forward.x, o.rotMat.forward.y, o.rotMat.forward.z,
+							(int)p.isDemoed, (int)o.isDemoed, (int)o.isSupersonic, (int)p.isSupersonic,
 							f->controls[0], f->controls[1], f->controls[2], f->controls[3],
 							f->controls[4], f->controls[5], f->controls[6], f->controls[7]);
 					}
