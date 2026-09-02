@@ -126,3 +126,27 @@ slope, Policy Entropy (0.56 at hop 1), Policy/Critic Update Magnitude (~0.4), KL
 Bonk crossplay on synced checkpoints. `Rating/1v1` is inflated by construction; read
 `Ref/Oldest Share` for the ring. If the halved batch destabilises, the revert is v1's
 per-rank split (mb 2088 at 16 nodes) with everything else kept.
+
+## 10:35 update — hop 2 (v2) measured; from-scratch true-VTS run launched
+
+**Hop 2 (`4678207`, v2)** started 10:25 on 16 healthy of a 28-node dcs-2024 draw. Banners
+confirm pipelined ON, version ring ON (`GGL_TS_PER_VERSION: 1000000000`, skill fleet 16
+arenas), mb 1044, epochs 3. Measured: collection 0.53 s now fully overlapped (join 0), PPO
+learn 0.89 s (24 updates vs 8 — dispatch-bound per the platform law), iteration 1.06 s,
+~760k steps/s. So ~15% fewer steps/s than v1 but ~2.5× more optimizer updates per second.
+A 32-node draw will cut rows per minibatch in half and shrink the learn pass.
+
+**From-scratch true-VTS run** (user: "private, not titan; GCO; vts and everything"):
+branch `vts-true-skip` + `private` HEAD merged (`26753b0`, clean merge), cluster tree
+`~/scratch/pulsar2-vts` (git worktree of pulsar2-private-luca, own build), launcher
+`pulsar2_gco_truevts_cs.sbatch` (copy in `tools/aimos/`), chain `4678218 → 19 → 20 → 21`
+(el8,dcs-2024, 16–34 nodes, NEED = all healthy ≤ 32, learners = 1/3 of ranks). Lineage
+`~/scratch-shared/checkpoints_gco_truevts_cs` (fresh, verified absent), wandb
+`7.9-gco-truevts-cs`, logs `~/scratch-shared/logs/gco_truevts_<jobid>.out`. Config: GCO
+sparse, APPO (global batch 800k decision rows, lag 64, epochs 1, 128 arenas/collector),
+true VTS factored head with buckets {1,2,4,8,16} ticks and per-tick gammas, no advantage
+skip bias, entropy on the control marginal only, LoRA league (theta-run settings, repulsion
+0), reach/SIL/vdag/gap/goal-critic from birth, all three team modes pinned on, version ring
+at 1B steps/version. No pooling exists on this branch. Watchdog kills a hop that never
+iterates (20 min) or stalls (25 min). This branch had never run on the cluster before
+this job; the first hop's boot is the smoke test.
