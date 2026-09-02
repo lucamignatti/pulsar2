@@ -91,3 +91,15 @@ newest complete numbered dir into `~/scratch-shared/checkpoints_gco_220b/` befor
 starts (the loader takes the newest numbered dir), so the cluster continues the desktop
 progress; (c) scancel the chain and keep training locally. Desktop-written `*_OPTIM.lt`
 load on the cluster (string keys remap by order) but carry the cold-restarted moments.
+
+## 04:35 update — cluster hop 1 running, desktop stopgap stopped
+
+Hop `4677970` got a dcs-2024 allocation at 04:31 (24 nodes drawn, 7 banned excluded,
+16 used). NCCL self-tests passed, config banner correct (174 arenas / 8352 rows / mb 2088),
+and **all 10 optimizer states loaded with shapes verified on every rank, zero resets, zero
+"will be reset"** — confirming the libtorch-key diagnosis. Throughput ~890–910k steps/s,
+0.9 s/iteration. The desktop stopgap was stopped at 04:34 at 236,926,730,240 steps; its
+folder `pulsar2-22b/build/checkpoints_gco_220b_local` is kept but is now a dead branch
+(the cluster resumed from the 235.7B bundle and overtakes it within ~25 min). Harmless log
+oddity: the node-hygiene `pkill -f build/GigaLearnBot` sweep matches its own srun shell and
+prints `Killed`; the `|| true` absorbs it (fix later: `pkill -f "[b]uild/GigaLearnBot"`).
