@@ -1628,6 +1628,15 @@ int main(int argc, char* argv[]) {
 		cfg.skillTracker.enabled = false;
 		RG_LOG("GGL_NO_VERSIONS: version ring + skill tracker disabled");
 	}
+	// GGL_TS_PER_VERSION: steps between archived versions. The 25M default is a DESKTOP
+	// cadence (~125 iterations at 200k steps/iter); at cluster speed (800k steps/iter,
+	// ~1 iter/s) it would archive every ~30s and the 32-deep ring would span ~15 minutes
+	// of history - useless as an anti-cycling pool. Set per run so the ring covers hours.
+	if (const char* s = std::getenv("GGL_TS_PER_VERSION"); s && *s && std::atoll(s) > 0) {
+		cfg.tsPerVersion = std::atoll(s);
+		RG_LOG("GGL_TS_PER_VERSION: " << cfg.tsPerVersion << " steps/version ("
+			<< (cfg.tsPerVersion * cfg.maxOldVersions / 1e9) << "B-step ring window)");
+	}
 
 	// GGL_SMOKE re-application (MUST live here, after the production assignments above - the
 	// smoke block higher up runs first and would be clobbered). At production cadence a version
