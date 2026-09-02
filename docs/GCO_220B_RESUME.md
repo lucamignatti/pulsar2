@@ -64,3 +64,30 @@ and on the Desktop.
 
 Known leftovers: job `4677876` (`gco-build`, 1 node, pending since 14:01) is the previous
 session's VTS build job in the `pulsar2-gco` tree; it does not touch this run.
+
+## 00:20 update — cluster blocked, desktop stopgap running
+
+SLURM's own estimate (`squeue --start`, confirmed with `sbatch --test-only` at 4/6/8/16
+nodes and a 1h wall) puts **every** job of ours at 2026-09-03 afternoon/evening: the 15
+idle nodes are held for higher-priority jobs invisible to `squeue`. No cluster training
+was going to happen by morning at any size, so the chain `4677970-73` stays queued and
+untouched, and a **desktop stopgap** of the same resume was started at 00:24:
+
+| | |
+|---|---|
+| binary / branch | `pulsar2-22b/build/GigaLearnBot`, `22b-compat` (same as the cluster) |
+| folder | `pulsar2-22b/build/checkpoints_gco_220b_local` (seeded from the bundle, keep 8, save every 40 iters ≈ 8M steps) |
+| semantics | identical env contract; 1024 arenas; 200k rows/iter, mb 12.5k grad-accum → 2 updates/iter = 1 update per 100k steps at ~200k effective batch, the same update density and effective batch as the cluster split; GAE window 98 steps vs the cluster's 24 |
+| optimizer | all 10 states reset by the guard (desktop libtorch cannot read the cluster-written archives) — i.e. a cold-momentum restart, the same thing `GGL_FRESH_OPTIM=1` would do |
+| speed | ~80–100k steps/s → ~2.5–3B steps overnight |
+| wandb | `7.9-gco-220b-desktop`; note it **resumes wandb run id `739468ux`** (from RUNNING_STATS), the original lineage's run — the cluster run will append to the same id when it starts |
+| wrapper | `tools/run_trainer.sh` (nohup fallback, crash-restart); log `pulsar2-22b/run_logs/latest.log`; stop with `RUN_TRAINER_LOG_DIR=/home/luca/Projects/pulsar2-22b/run_logs tools/run_trainer.sh --stop` |
+
+**The fork to resolve in the morning (your call, nothing automated):** if the cluster
+chain starts while the desktop run is alive, both continue from 235.7B independently and
+both write to wandb id `739468ux`. Options: (a) stop the desktop run and let the cluster
+proceed from the bundle (discard the desktop steps); (b) stop the desktop run, copy its
+newest complete numbered dir into `~/scratch-shared/checkpoints_gco_220b/` before hop 1
+starts (the loader takes the newest numbered dir), so the cluster continues the desktop
+progress; (c) scancel the chain and keep training locally. Desktop-written `*_OPTIM.lt`
+load on the cluster (string keys remap by order) but carry the cold-restarted moments.
