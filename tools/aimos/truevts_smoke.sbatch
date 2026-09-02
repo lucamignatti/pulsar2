@@ -1,14 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=gco-truevts
-#SBATCH --nodes=16-34
+#SBATCH --job-name=truevts-smoke
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=6
 #SBATCH --gres=gpu:6
-#SBATCH --partition=el8,dcs-2024
-#SBATCH --time=06:00:00
+#SBATCH --partition=el8
+#SBATCH --time=00:20:00
 #SBATCH --exclusive
-#SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/logs/gco_truevts_%j.out
+#SBATCH --output=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/logs/truevts_smoke_%j.out
 
 # ============================================================================
 # FROM-SCRATCH GCO cold start on branch vts-true-skip (private HEAD 133169b merged in
@@ -60,7 +59,7 @@ export GGL_THETA=0                    # theta-commit is disabled under GGL_VTS r
 unset GGL_TICK_SKIP                   # has no meaning under GGL_VTS (fatal if set)
 
 # ===== LEAGUE (theta-run settings; repulsion 0 under sparse GCO - see pulsar-gco-run notes) =====
-export GGL_LEAGUE=1   # league ON (factored-head crashes fixed 356bf42/37c7fbb, smoke 4678233 clean)
+export GGL_LEAGUE=1   # smoke: league ON to reproduce the factored-head crash
 export GGL_LEAGUE_DIVERSE=4
 export GGL_LEAGUE_EXPLOITERS=2
 export GGL_LEAGUE_RANK=4
@@ -103,14 +102,15 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # FRESH LINEAGE. Shape-breaking head (95 outputs / 450 table): must never share a folder
 # with a 90-way lineage. Verified absent before the first submit.
-export GGL_CHECKPOINT_FOLDER=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/checkpoints_gco_truevts_cs
-export GGL_RUN_NAME=7.9-gco-truevts-cs
+export GGL_CHECKPOINT_FOLDER=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/checkpoints_truevts_smoke_${SLURM_JOB_ID}
+export GGL_RUN_NAME=SMOKE-truevts
+export WANDB_MODE=disabled
 export GGL_METRICS_GROUP_NAME=gco-truevts
 
 # ===== WANDB (online through the proxy; rank 0 only) =====
 [ -n "${WANDB_API_KEY:-}" ] || eval "$(grep WANDB_API_KEY "$HOME/.bashrc" | tail -1)"
 export WANDB_API_KEY
-export WANDB_MODE=online
+export WANDB_MODE=disabled
 export WANDB_INIT_TIMEOUT=180
 export WANDB__SERVICE_WAIT=300
 export WANDB_DIR=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/wandb_gco_truevts
@@ -132,7 +132,7 @@ chmod +x ./pulsar2_numa_rank.sh ./gpucheck.sh ./gpuhealth 2>/dev/null || true
 
 # ---- WATCHDOG (theta-run pattern): a sick allocation that never iterates, or a hung
 # save, would otherwise hold the whole 6h wall. Kill the hop so the chain advances.
-( WDLOG=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/logs/gco_truevts_${SLURM_JOB_ID}.out
+( WDLOG=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/logs/truevts_smoke_${SLURM_JOB_ID}.out
   last=0; stall=0; started=0; boot=0
   while true; do
     sleep 300
@@ -162,13 +162,13 @@ NHEALTH=$(echo "$HEALTHY" | grep -c .)
 [ "$NEED" -le 32 ] || NEED=32
 echo "[PREFLIGHT] allocated=${SLURM_JOB_NUM_NODES} healthy=${NHEALTH} need=${NEED}"
 echo "[PREFLIGHT] unhealthy/banned: $(comm -23 <(scontrol show hostnames "$SLURM_JOB_NODELIST" | sort -u) <(echo "$HEALTHY") | tr "\n" " ")"
-if [ "$NHEALTH" -lt "${GGL_NEED_FLOOR:-12}" ]; then
-  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, floor ${GGL_NEED_FLOOR:-12}; holding 30 min so the chain does not cascade"
-  kill $WATCHDOG_PID 2>/dev/null; sleep 1800; exit 1
+if [ "$NHEALTH" -lt "${GGL_NEED_FLOOR:-2}" ]; then
+  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, floor ${GGL_NEED_FLOOR:-16}; holding 30 min so the chain does not cascade"
+  kill $WATCHDOG_PID 2>/dev/null; sleep 5; exit 1
 fi
 [ "$NHEALTH" -lt "$NEED" ] && NEED=$NHEALTH
 echo "$HEALTHY" | head -n "$NEED" | sed "s/$/ slots=6/" > "$HOSTFILE"
-if [ ! -s "$HOSTFILE" ]; then echo "[PREFLIGHT] FATAL: hostfile empty"; kill $WATCHDOG_PID 2>/dev/null; sleep 1800; exit 1; fi
+if [ ! -s "$HOSTFILE" ]; then echo "[PREFLIGHT] FATAL: hostfile empty"; kill $WATCHDOG_PID 2>/dev/null; sleep 5; exit 1; fi
 NP_USE=$(( NEED * 6 ))
 export GGL_ASYNC_N_LEARNERS=${GGL_ASYNC_N_LEARNERS:-$(( NP_USE / 3 ))}
 echo "[PREFLIGHT] np=${NP_USE} nL=${GGL_ASYNC_N_LEARNERS} hostfile=${HOSTFILE}: $(tr '\n' ' ' < "$HOSTFILE")"
@@ -176,7 +176,7 @@ echo "[PREFLIGHT] np=${NP_USE} nL=${GGL_ASYNC_N_LEARNERS} hostfile=${HOSTFILE}: 
 srun --ntasks-per-node=1 bash -c 'pkill -9 -f "[b]uild/GigaLearnBot" || true; sleep 3' 2>/dev/null || true
 
 # MILESTONE ARCHIVE (policy files only, never rotated)
-A=/gpfs/u/home/RLFR/RLFRlcmg/scratch-shared/checkpoints_gco_truevts_cs_archive
+A=/tmp/none_${SLURM_JOB_ID}
 N=$(ls "$GGL_CHECKPOINT_FOLDER" 2>/dev/null | grep -E "^[0-9]+$" | sort -n | tail -1)
 if [ -n "$N" ] && [ ! -d "$A/$N" ]; then
   mkdir -p "$A/$N.tmp" && cp "$GGL_CHECKPOINT_FOLDER/$N"/{POLICY.lt,SHARED_HEAD.lt,RUNNING_STATS.json} "$A/$N.tmp/" 2>/dev/null && mv "$A/$N.tmp" "$A/$N" && echo "ARCHIVED $N"
@@ -213,7 +213,7 @@ done
 ELAPSED=$(( $(date +%s) - HOP_T0 ))
 if [ "$ELAPSED" -lt "$MIN_OK_SECS" ]; then
   echo "=== hop failed to launch 3x (${ELAPSED}s); holding so the chain does not cascade ==="
-  sleep 1800
+  sleep 5
 fi
 kill $WATCHDOG_PID 2>/dev/null
 echo "PULSAR2_GCO_TRUEVTS_HOP_DONE rc=${RC} $(date)"
