@@ -103,3 +103,26 @@ folder `pulsar2-22b/build/checkpoints_gco_220b_local` is kept but is now a dead 
 (the cluster resumed from the 235.7B bundle and overtakes it within ~25 min). Harmless log
 oddity: the node-hygiene `pkill -f build/GigaLearnBot` sweep matches its own srun shell and
 prints `Killed`; the `|| true` absorbs it (fix later: `pkill -f "[b]uild/GigaLearnBot"`).
+
+## 10:00 update — v2 config from hop 2 (user-directed "learn faster": items 1,2,3,4,6)
+
+Hop 1 (`4677970`, v1 config) runs to its wall at ~10:31; hops 2–5 were re-queued on
+`pulsar2_gco_220b_v2.sbatch` (copies of both sbatch versions in `tools/aimos/`). Measured
+v1 split: collect 0.52 s (env 0.47) + learn 0.37 s, sequential, 0.90 s/iter.
+
+| # | change | how |
+|---|---|---|
+| 1 | pipelined collection ON | `GGL_PIPELINED_COLLECTION=1` (iteration → max of the two phases) |
+| 2 | up to 32 nodes | `--nodes=16-34`; preflight NEED table {32,24,16,12} recomputes arenas/rows/mb per rank so the fleet is always 16,704 arenas / 801,792 steps/iter / 24-step GAE window |
+| 3 | effective batch halved to **100,224** | mb/rank 522/696/1044/1392 by N (was 200,448) — 2× updates per step; LR unchanged (tuned at 200k: the one deliberate deviation) |
+| 4 | epochs 2 → 3 | `GGL_PPO_EPOCHS=3` → 24 updates/iter (was 8) |
+| 6 | version ring ON | `GGL_NO_VERSIONS=0`, train vs old versions 0.30 (Nexto stays 0), `GGL_TS_PER_VERSION=1e9` (new env override; the 25M default is a desktop cadence and would give a ~15-minute ring at cluster speed) |
+
+Declined by the user: seek injection (7) and any reward shaping (8). Also fixed: the
+node-hygiene `pkill -f` now uses `"[b]uild/GigaLearnBot"` so it cannot match its own shell.
+
+Gates to watch from hop 2 on (compare against hop 1's 236–252B stretch): Episode Length
+slope, Policy Entropy (0.56 at hop 1), Policy/Critic Update Magnitude (~0.4), KL/clip, and
+Bonk crossplay on synced checkpoints. `Rating/1v1` is inflated by construction; read
+`Ref/Oldest Share` for the ring. If the halved batch destabilises, the revert is v1's
+per-rank split (mb 2088 at 16 nodes) with everything else kept.
