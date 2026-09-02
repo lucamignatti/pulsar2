@@ -59,7 +59,7 @@ export GGL_THETA=0                    # theta-commit is disabled under GGL_VTS r
 unset GGL_TICK_SKIP                   # has no meaning under GGL_VTS (fatal if set)
 
 # ===== LEAGUE (theta-run settings; repulsion 0 under sparse GCO - see pulsar-gco-run notes) =====
-export GGL_LEAGUE=1
+export GGL_LEAGUE=1   # league ON (factored-head fixes 356bf42/37c7fbb/38fc963)
 export GGL_LEAGUE_DIVERSE=4
 export GGL_LEAGUE_EXPLOITERS=2
 export GGL_LEAGUE_RANK=4
@@ -161,8 +161,8 @@ NHEALTH=$(echo "$HEALTHY" | grep -c .)
 [ "$NEED" -le 32 ] || NEED=32
 echo "[PREFLIGHT] allocated=${SLURM_JOB_NUM_NODES} healthy=${NHEALTH} need=${NEED}"
 echo "[PREFLIGHT] unhealthy/banned: $(comm -23 <(scontrol show hostnames "$SLURM_JOB_NODELIST" | sort -u) <(echo "$HEALTHY") | tr "\n" " ")"
-if [ "$NHEALTH" -lt "${GGL_NEED_FLOOR:-16}" ]; then
-  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, floor ${GGL_NEED_FLOOR:-16}; holding 30 min so the chain does not cascade"
+if [ "$NHEALTH" -lt "${GGL_NEED_FLOOR:-12}" ]; then
+  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, floor ${GGL_NEED_FLOOR:-12}; holding 30 min so the chain does not cascade"
   kill $WATCHDOG_PID 2>/dev/null; sleep 1800; exit 1
 fi
 [ "$NHEALTH" -lt "$NEED" ] && NEED=$NHEALTH
