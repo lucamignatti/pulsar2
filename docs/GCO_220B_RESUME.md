@@ -1,0 +1,66 @@
+# GCO "220b" resume on `22b-compat` — 16 nodes, launched 2026-09-01 night
+
+*Status doc for the morning check-in. Companion to `docs/GCO_RESUME.md` (the earlier
+VTS/league plan, NOT what is running) and the bundle's `GCO_CONFIG.md` (the contract).*
+
+## What is running
+
+| | |
+|---|---|
+| Seed | `~/Desktop/pulsar2-gco-FULL-235.7B/checkpoint/235726848000` — the **only** FULL (resumable) GCO bundle on the Desktop; the `pulsar2-gco-220.8B` folder is policy-only and cannot be resumed (recovery doctrine: full checkpoint or nothing). Cluster copy `barn-shared/pulsar2-gco/RESTORE_ts8_235726848000` is md5-identical to the Desktop manifest; it was copied to the run folder, the RESTORE dir stays as the pinned restore point. |
+| Branch | `22b-compat` = `private` HEAD `133169b` + 2 commits (below). **No VTS, no league, no titan.** |
+| Cluster tree | `~/scratch/pulsar2-private-luca` (branch `22b-compat`, own `build/`). The `pulsar2-gco` tree stays on the VTS branch, untouched. |
+| Run folder | `~/scratch-shared/checkpoints_gco_220b` (keep 5, save every 500 iters); policy milestones in `checkpoints_gco_220b_archive/<ts>` once per hop |
+| Logs | `~/scratch-shared/logs/gco_220b_<jobid>.out` |
+| wandb | run `7.9-gco-220b-16n`, group `gco-220b`, online via the proxy (rank 0) |
+| sbatch | `~/scratch/pulsar2-private-luca/pulsar2_gco_220b.sbatch`, 6h hops chained with `afterany`, partitions `el8,dcs-2024`, elastic 16–24 nodes, preflight + banned list, NEED=16 (degrades to 12 with the same effective batch) |
+
+## The two commits on top of `private`
+
+1. **Optimizer-state shape guard** (`Models.cpp` `Load`). The checkpoint's `*_OPTIM.lt`
+   were written by the cluster's older libtorch (2.1-style hex TensorImpl keys). The
+   desktop's libtorch 2.9 parses those keys with `stoull` → every state collapses onto
+   one param → scrambled moments → `Adam::step` size error on iteration 1 (this is the
+   "256 vs 1280" crash the previous session attributed to branch drift; it reproduces on
+   plain `private` and is a desktop-only artifact). The cluster's own libtorch remaps
+   correctly — the original run resumed these same archives at every hop. The guard
+   validates each mapped state against its param and resets **that model's** state only
+   on mismatch, logging either `Optimizer state for "X" loaded (N param states verified)`
+   or `WARNING: optimizer state for "X" ... RESET`. Grep the first hop log for which.
+2. `[DIST][COLLECT]` per-iteration log line on rank 0 only (96 ranks × 6h ≈ 500MB otherwise).
+
+## Config decisions (all in the sbatch header too)
+
+- **Semantic six unchanged**: `GGL_GCO=1 GGL_NO_REACH=1 GGL_HULL=0 GGL_NO_VERSIONS=1
+  GGL_NEXTO_SERVE_FRAC=0 GGL_TRAIN_AGAINST_OLD_CHANCE=0`, plus `GGL_LEAGUE=0` explicit.
+- **Effective batch held at 200,448** (what the LR was tuned at): 96 ranks × 2088 mb,
+  8352 rows/iter/rank, 174 arenas/rank. Same 801,792 fleet steps/iter, 8 updates/iter,
+  24-step GAE window as the 32-node original. Cost: ~2× per-iteration collect wall.
+  Alternative not taken: keep 87 arenas/rank and run at half the effective batch.
+- **Engine = HEAD defaults** (corrected physics, dodge torque off, obs-flag noise off).
+  Per `GCO_RESUME.md` D1: every engine commit post-dates the checkpoint, ≈12% relative
+  eval dip expected to adapt out; not reverted because the corrected physics was
+  validated against real-game traces and real matches are the objective.
+- `GGL_FRESH_OPTIM=0` (state loads correctly on the cluster; the guard is the backstop).
+- tickSkip 8 / γ 0.9969 / λ 0.95 / goal γ 0.9994 are compiled in on `private` (verified).
+
+## Local smoke (desktop, `GGL_SMOKE=1`, CUDA, `GGL_FRESH_OPTIM=0`)
+
+Booted with **zero unexpected "will be reset"** lines, the guard reset all 10 optimizer
+states (desktop key-collision, expected), then 9+ iterations from `Total Timesteps
+2.357269e+11 / Total Iterations 294,001` with saves rotating every 2 iters, no NaN.
+
+## Morning checklist
+
+```bash
+ssh aimos 'squeue -u $USER -o "%.10i %.12P %.10j %.3t %.10M %.6D %R"'
+ssh aimos 'ls -t ~/scratch-shared/logs/gco_220b_*.out | head -1 | xargs grep -E "PREFLIGHT|optimizer state|will be reset|Total Timesteps|Episode Length|FATAL|NaN" | tail -40'
+ssh aimos 'ls ~/scratch-shared/checkpoints_gco_220b'
+```
+Healthy = timesteps climbing past 235,726,848,000, new numbered dirs appearing, Episode
+Length trending down (inverse goal rate; mean reward is 0 by construction under GCO).
+The pinned restore point is untouched at `barn-shared/pulsar2-gco/RESTORE_ts8_235726848000`
+and on the Desktop.
+
+Known leftovers: job `4677876` (`gco-build`, 1 node, pending since 14:01) is the previous
+session's VTS build job in the `pulsar2-gco` tree; it does not touch this run.
