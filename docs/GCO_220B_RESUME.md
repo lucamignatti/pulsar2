@@ -186,3 +186,17 @@ Deployment: old chain cancelled at the 3.6B save; new chain `4683363 → 64 → 
 in 30 min and was skipped: the change is three lines on a reward scalar and the hop has its
 own retry/watchdog/chain guard; the boot banner `PER-DECISION COST: 0.001` and first
 iterations are verified directly instead.
+
+## 18:20 update — two experiments branched off the 220b lineage (user: "2ts and mm")
+
+Seed: the newest full 220b save `270604800000` copied into two new lineages on
+scratch-shared. Main 220b chain untouched (16–32 nodes). Both experiments run the same
+`22b-compat` sync trainer, v2 config (pipelined, half batch 100,224, epochs 3, version ring),
+elastic 8–16 nodes, 4 hops each; launchers in `tools/aimos/`.
+
+| | 2ts (`checkpoints_gco_220b_ts2`, wandb `7.9-gco-220b-ts2`) | mm (`checkpoints_gco_220b_mm`, wandb `7.9-gco-220b-mm`) |
+|---|---|---|
+| change | `GGL_TRAIN_TICK_SKIP=2`: tickSkip 2 (60 Hz) with gaeGamma 0.9969^(1/4), gaeLambda re-derived to keep the γλ horizon, goalCritic γ 0.9994^(1/4), entropyScale 0.14/4 — wall-clock horizons preserved (commit `ada5c20`) | `GGL_MULTI_MODE=1`: 1v1/2v2/3v3 arenas 1/3 each from the first iteration (PHASE_B_ENABLED is compiled false, so the marker alone cannot; the env pins g_PhaseB) |
+| per-rank split @16 nodes | 48 arenas → 96 players × 87 steps = 8352 rows (GAE window ≈1.45 s of game, vs 1.6 s at ts8) | 87 arenas → 29×(2+4+6) = 348 players × 24 steps = 8352 rows (same window as main) |
+| what it tests | the 8→2 curriculum step on a mature policy: expect a competence dip then recovery (the 08-23 8→1 jump recovered in ~8 h); read goals per game-second and Bonk crossplay at matched game-time | transfer of a 1v1-only policy to team play; read per-mode Rating/Ref shares and Episode Length by mode |
+| not changed | reset mix, GCO reward, NoTouch(20 s), reach off, hull off | same |
