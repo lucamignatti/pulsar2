@@ -167,3 +167,22 @@ The branch had never run on the cluster. Three failures in sequence, each found 
 
 Also `be42ee9`: a 3-shot minibatch shape log in `LeagueModule::Learn` (note: RG_LOG goes to
 block-buffered stdout under mpirun, so it is lost on abort — stderr `what()` is what you see).
+
+## 15:40 update — true-VTS skip collapse diagnosed; per-decision cost deployed (user: "do 2")
+
+Diagnosis (details in `vts-true-skip:research/reports/TRUE_VTS_DECISION_COST.md`): at
+2.9B rows the run's learning meters sat where the ts2-mm APPO baseline sat at the same
+stage (flat through its first ~7B steps), so "not learning" was premature; but the factored
+skip head was collapsing toward 1-tick holds (mean chosen ticks 3.9 → 2.7, 1-tick share
+0.33 → 0.47, ~86 decisions per game-second, 55–67% filler rows in the batch, ~3× less
+game-time per wall-hour than ts2). Cause: goal-only reward puts no price on a decision, so
+the shortest hold is weakly optimal; the toy study only got a skip optimum with a per-decision
+cost. Chosen lever (option 2): `GGL_VTS_DECISION_COST=0.001`, subtracted from every DECISION
+row's stored reward in the collector (`bcc66e8` on `vts-true-skip`), pre-registered with
+gates at 5B/10B rows (mean ticks ≥ 4.5, 1-tick share < 0.25, sim-seconds/s ≥ 2×, touches/s
+not below 0.010–0.013). Learner split left at NP/3 on purpose (one lever at a time).
+Deployment: old chain cancelled at the 3.6B save; new chain `4683363 → 64 → 66 → 67 → 68 →
+71` on the cost launcher (copies in `tools/aimos/`). The 2-node smoke could not get nodes
+in 30 min and was skipped: the change is three lines on a reward scalar and the hop has its
+own retry/watchdog/chain guard; the boot banner `PER-DECISION COST: 0.001` and first
+iterations are verified directly instead.
