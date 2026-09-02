@@ -2063,7 +2063,41 @@ int main(int argc, char* argv[]) {
 	// PHASE_B_ENABLED guards the READ as well as the trigger, so an inherited or hand-copied
 	// marker cannot engage team modes behind your back.
 	g_PhaseB = PHASE_B_ENABLED && std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
+	// GGL_MULTI_MODE=1 (2026-09-02, the "mm" experiment off the 220b lineage): all three
+	// team modes from the first iteration, unconditionally - the same pin the 7.9-gco-ts2-mm
+	// cold start used. PHASE_B_ENABLED is compiled false on this branch (no curriculum, no
+	// rating trigger), so the marker file alone cannot engage team modes; this can.
+	if (const char* mm = std::getenv("GGL_MULTI_MODE"); mm && *mm && std::string(mm) != "0") {
+		g_PhaseB = true;
+		RG_LOG("GGL_MULTI_MODE: all three team modes on (1/3 each), TEAM_SPIRIT 0.6");
+	}
 	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
+	// GGL_TRAIN_TICK_SKIP=<ts> (2026-09-02, the "2ts" experiment off the 220b lineage): change
+	// the decision rate FOR TRAINING with every rate-derived constant re-derived from the ts8
+	// production values so wall-clock horizons are preserved (the checklist the "6.0 ts1" /
+	// "7.0b ts8" markers above document; GGL_TICK_SKIP deliberately does NOT do this and is
+	// render/eval only). Sits here, after every production assignment, on purpose.
+	//   gaeGamma          = 0.9969 ^ (ts/8)              (~14.9 s half-life)
+	//   gaeLambda         : keep (gamma*lambda) horizon  -> (0.9969*0.95)^(ts/8) / gaeGamma
+	//   goalCritic.gamma  = 0.9994 ^ (ts/8)              (~77 s)
+	//   entropyScale      = 0.14 * (ts/8)                (per-step density, the 6.0/7.0b rule)
+	// Not touched because they are already wall-clock or off in this lineage: NoTouch(20 s),
+	// skill-tracker simTime, the reset mix, GCO's terminal-only reward, reach (off).
+	if (const char* ts = std::getenv("GGL_TRAIN_TICK_SKIP"); ts && *ts) {
+		const int v = std::atoi(ts);
+		if (v < 1 || v > 8)
+			RG_ERR_CLOSE("GGL_TRAIN_TICK_SKIP must be 1..8, got \"" << ts << "\"");
+		const double r = (double)v / 8.0;
+		const double g8 = 0.9969, l8 = 0.95, gg8 = 0.9994, e8 = 0.14;
+		cfg.tickSkip = v;
+		cfg.ppo.gaeGamma = (float)std::pow(g8, r);
+		cfg.ppo.gaeLambda = (float)(std::pow(g8 * l8, r) / std::pow(g8, r));
+		cfg.ppo.goalCritic.gamma = (float)std::pow(gg8, r);
+		cfg.ppo.entropyScale = (float)(e8 * r);
+		RG_LOG("GGL_TRAIN_TICK_SKIP: tickSkip " << v << " (" << (120 / v) << " Hz) for TRAINING - re-derived"
+			<< " gaeGamma=" << cfg.ppo.gaeGamma << " gaeLambda=" << cfg.ppo.gaeLambda
+			<< " goalGamma=" << cfg.ppo.goalCritic.gamma << " entropyScale=" << cfg.ppo.entropyScale);
+	}
 	if (const char* n = std::getenv("GGL_NUM_GAMES"); n && *n)
 		cfg.numGames = std::atoi(n);
 	if (const char* c = std::getenv("GGL_CHECKPOINT_FOLDER"); c && *c)
