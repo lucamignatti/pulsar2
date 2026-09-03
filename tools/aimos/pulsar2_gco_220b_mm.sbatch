@@ -192,19 +192,33 @@ mpirun -np "${NP_USE}" --hostfile "${HOSTFILE}" \
   -x GGL_RUN_NAME -x GGL_METRICS_GROUP_NAME \
   ./pulsar2_numa_rank.sh
 }
-RC=0
-for ATTEMPT in 1 2 3; do
+# Hop end from SLURM (absolute); fallback = 6h from HOP_T0. A mid-hop crash relaunches
+# from the newest save for as long as the allocation has >= MIN_RESTART_SECS left
+# (ts2 hops 4685597/4685598 segfaulted mid-hop and the old loop ended the hop each
+# time, burning a chain link per crash). Three consecutive fast failures still hold.
+WALL_END=$(date -d "$(squeue -h -j "$SLURM_JOB_ID" -o %e 2>/dev/null | head -1)" +%s 2>/dev/null || true)
+[ -n "$WALL_END" ] && [ "$WALL_END" -gt "$HOP_T0" ] 2>/dev/null || WALL_END=$(( HOP_T0 + 21600 ))
+MIN_RESTART_SECS=${MIN_RESTART_SECS:-900}
+echo "=== hop wall ends $(date -d @$WALL_END) ($(( WALL_END - HOP_T0 ))s from now) ==="
+RC=0; ATTEMPT=0; FAST_FAILS=0
+while :; do
+  ATTEMPT=$(( ATTEMPT + 1 )); T_A=$(date +%s)
   echo "=== launch attempt ${ATTEMPT} $(date) ==="
   RC=0; run_mpi || RC=$?
-  ELAPSED=$(( $(date +%s) - HOP_T0 ))
-  if [ "$ELAPSED" -ge "$MIN_OK_SECS" ]; then break; fi
-  echo "=== attempt ${ATTEMPT} died after ${ELAPSED}s (rc=${RC}); sweeping, retrying ==="
+  NOW=$(date +%s); A_EL=$(( NOW - T_A ))
+  [ "$RC" -eq 0 ] && break
+  if [ "$A_EL" -lt "$MIN_OK_SECS" ]; then FAST_FAILS=$(( FAST_FAILS + 1 )); else FAST_FAILS=0; fi
+  if [ "$FAST_FAILS" -ge 3 ]; then
+    echo "=== 3 consecutive fast failures (last rc=${RC}); holding so the chain does not cascade ==="
+    sleep 1800; break
+  fi
+  REMAIN=$(( WALL_END - NOW ))
+  if [ "$REMAIN" -lt "$MIN_RESTART_SECS" ]; then
+    echo "=== attempt ${ATTEMPT} died after ${A_EL}s (rc=${RC}) with ${REMAIN}s of allocation left; ending hop ==="
+    break
+  fi
+  echo "=== attempt ${ATTEMPT} died after ${A_EL}s (rc=${RC}); sweeping, relaunching from the newest save (${REMAIN}s left) ==="
   srun --ntasks-per-node=1 bash -c 'pkill -9 -f "[b]uild/GigaLearnBot" || true; sleep 3' 2>/dev/null || true
   sleep 30
 done
-ELAPSED=$(( $(date +%s) - HOP_T0 ))
-if [ "$ELAPSED" -lt "$MIN_OK_SECS" ]; then
-  echo "=== hop failed to launch 3x (${ELAPSED}s); holding so the chain does not cascade ==="
-  sleep 1800
-fi
 echo "PULSAR2_GCO220B_HOP_DONE rc=${RC} $(date)"
