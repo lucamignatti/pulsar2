@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=gco-220b-mm
-#SBATCH --nodes=8-18
+#SBATCH --nodes=4-18
 #SBATCH --ntasks-per-node=6
 #SBATCH --gres=gpu:6
 #SBATCH --partition=el8,dcs-2024
@@ -147,8 +147,10 @@ echo "[PREFLIGHT] unhealthy/banned: $(comm -23 <(scontrol show hostnames "$SLURM
 if   [ "$NHEALTH" -ge 16 ]; then NEED=16; export GGL_NUM_GAMES=87  GGL_TS_PER_ITR=8352  GGL_MINIBATCH=1044
 elif [ "$NHEALTH" -ge 12 ]; then NEED=12; export GGL_NUM_GAMES=116 GGL_TS_PER_ITR=11136 GGL_MINIBATCH=1392
 elif [ "$NHEALTH" -ge 8 ];  then NEED=8;  export GGL_NUM_GAMES=174 GGL_TS_PER_ITR=16704 GGL_MINIBATCH=2088
+elif [ "$NHEALTH" -ge 6 ];  then NEED=6;  export GGL_NUM_GAMES=232 GGL_TS_PER_ITR=22272 GGL_MINIBATCH=2784
+elif [ "$NHEALTH" -ge 4 ];  then NEED=4;  export GGL_NUM_GAMES=348 GGL_TS_PER_ITR=33408 GGL_MINIBATCH=4176
 else
-  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, need >= 12; holding 30 min so the chain does not cascade"
+  echo "[PREFLIGHT] FATAL: only ${NHEALTH} healthy nodes, need >= 4; holding 30 min so the chain does not cascade"
   sleep 1800
   exit 1
 fi
