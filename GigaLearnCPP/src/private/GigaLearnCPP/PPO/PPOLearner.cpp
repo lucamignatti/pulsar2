@@ -1157,7 +1157,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor sumGuidingLoss = zmet(), sumClip = zmet(), sumDivergence = zmet();
 	torch::Tensor sumVdagLoss = zmet(), sumVdagTwinSpread = zmet(), sumRhatLoss = zmet();
 	torch::Tensor sumReachLoss = zmet(), sumReachCarStateLoss = zmet();
-	torch::Tensor lastEntGate, lastSilLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
+	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
 	torch::Tensor nRelEntropy = zmet();
 	int metricPolicySteps = 0, metricCriticSteps = 0, metricGoalSteps = 0;
 	int metricKlSteps = 0, metricClipSteps = 0, metricGuidingSteps = 0;
@@ -1414,6 +1414,21 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 						silLoss = silLoss * (nConv > 0).to(silLoss.dtype());
 						lastSilLoss = silLoss.detach();
 						ppoLoss = ppoLoss + silLoss;
+					}
+
+					// DIP SEARCH imitation (Util/DipSearch.h): the search-found prefixes, weighted
+					// by their held-out gain. Same shape as SIL (positive-only BC, silCoeff), on
+					// rows that live OUTSIDE the experience buffer: they never see the critic,
+					// the advantages, or the PPO ratio. The whole (small) set is forwarded every
+					// minibatch, batchSizeRatio-scaled so accumulation matches a full-batch pass.
+					if (dipRows.states.defined() && dipRows.states.size(0) > 0) {
+						auto dProbs = InferPolicyProbsFromModels(models, dipRows.states, dipRows.masks,
+							config.policyTemperature, false);
+						auto dLogp = dProbs.log().gather(-1, dipRows.actions.unsqueeze(-1)).flatten();
+						auto dipLoss = (-(dLogp) * dipRows.weights).sum()
+							/ (float)dipRows.weights.size(0) * config.silCoeff * batchSizeRatio;
+						lastDipLoss = dipLoss.detach();
+						ppoLoss = ppoLoss + dipLoss;
 					}
 
 					if (config.useGuidingPolicy) {
@@ -2038,6 +2053,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		dbgEntGate = lastEntGate.item<float>();
 	if (lastSilLoss.defined())
 		dbgSilLoss = lastSilLoss.item<float>();
+	float dbgDipLoss = -1.f;
+	if (lastDipLoss.defined())
+		dbgDipLoss = lastDipLoss.item<float>();
 	if (lastAuxNLL.defined())
 		dbgAuxNLL = lastAuxNLL.item<float>();
 	if (lastYvAbs.defined())
@@ -2115,6 +2133,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["Headroom/Ent Gate"] = dbgEntGate;
 		if (dbgSilLoss >= 0.f)
 			report["SIL/Loss"] = dbgSilLoss;
+		if (dbgDipLoss >= 0.f)
+			report["DipSearch/Loss"] = dbgDipLoss;
 		if (dbgHullNLL > -900.f)
 			report["Hull/Chart NLL"] = dbgHullNLL;
 		if (dbgHullL1 >= 0.f)

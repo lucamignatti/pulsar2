@@ -29,6 +29,8 @@ Status vocabulary:
 
 | Report | Date | Run | Topic | Status |
 |---|---|---|---|---|
+| [HEADROOM_SEARCH.md](HEADROOM_SEARCH.md) | 09-03 | 7.9-gco ts1 @ 611B | **Search from banked states: H does NOT mark fixable states** (pre-registered P1 failed twice: Spearman(H, gain) ≈ 0, top-5 % H contrast < 0.5); **value dips DO** (P2 passed twice, +0.92/+0.53 units vs uniform, 12–15 % fat tail of full-goal fixes, all aerial). Best predictor of realizable gain is V_real − Monte Carlo (ρ +0.37 both runs) — the critic overestimates dip states by 1.2–1.4 units. Tool: `headroom_search.py` (snapshot/restore prefix search, held-out re-eval) | **RESULT** |
+| [MM_SLOW_LEARNING.md](MM_SLOW_LEARNING.md) | 09-03 | mm branch off 7.9-gco-220b @ 299.5B vs main @ 302.7B | **Why multi-mode learns slowly: its 1v1 REGRESSED** (20% goal share vs its own 269.4B ancestor; main 56%). Headroom-gated SIL puts 57-64% of its weight on airborne passengers in 2v2/3v3; teammates' H is 0.93-correlated (joint gating, not one agent pushed); H's top decile marks conceding states in every mode; per-iteration KL 2.7x smaller. Opponent-embedding and gate-imbalance leads closed. | **RESULT** |
 | [LEAGUE_LORA.md](LEAGUE_LORA.md) | 08-26 | league arm off 7.9-gco @ 442B | **LoRA-variant league: SOLVED.** Diversity had to be CREATED (pairwise KL repulsion on shared states), not just detected — variant-to-base KL was ~0.05 nats, so six levers on the discriminator's evidence were amplifying a difference that did not exist. Second key: league LR 10x BELOW the main's (variants train on a fraction of the rows, so at the main's LR their updates are noise). Verified on the converged policy: kappa .342, variant goal share .427, exploiters .561 | **RESULT (solved)** |
 | [RL_UFUNCTION_RE.md](RL_UFUNCTION_RE.md) | 08-26 | RocketLeague.exe (Aug-10 build) | How to read RL's own UFunctions: SDK -> Native-vs-UScript -> vtable native or Script bytecode. Appendix: static-only vtable resolution (no injection) that reached `CarComponent_Dodge_TA::CanActivate` - which gates the dodge on a CACHED car bit, not a live wheel-contact query | **REFERENCE** |
 | [WAVEDASH_GATE.md](WAVEDASH_GATE.md) | 08-25 | 7.9-gco ts1 @ 470B | The dodge-gate arc: the "sim can't wavedash" gap was three meter artifacts (real 42.3% = sim 41.3/42.3%); real per-tick traces decouple wheel contact's three effects -> **gate v3 shipped**, v1 post-mortem, spool-trap deploy incident | **RESULT** |
@@ -77,3 +79,4 @@ tested and why it was parked; none should be used to justify a new change.
 
 `archive/STEERING_ROADMAP.md` in particular is explicitly flagged stale in `CLAUDE.md` —
 it plans a program that no longer exists.
+

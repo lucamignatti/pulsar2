@@ -165,6 +165,12 @@ namespace GGL {
 		ObsMirror::Map mirrorMap;
 		torch::Tensor oppCtxLive;          // [oppCtxDim] on device; zeros = self-play
 		torch::Tensor oppCtxCollected;     // CPU; written by the collect worker at its draw
+		// DIP SEARCH imitation rows (Util/DipSearch.h): set by learn-prep, consumed by every
+		// minibatch as a SIL-shaped term (-log pi(a|s) * w, silCoeff-scaled). Undefined = none
+		// this iteration. Device tensors: states [n, obs], actions [n] int64, masks [n, A]
+		// uint8, weights [n] float (critic units, already capped).
+		struct DipImitationRows { torch::Tensor states, actions, masks, weights; } dipRows;
+
 		torch::Tensor oppCtxForLearn;      // CPU; barrier-copied so learn sees ITS iteration
 		float valueEvEma = 0.f;            // explained-variance EMA (drives the epi blend)
 		torch::Tensor geoResRet;           // reservoir returns column (episodic blend)

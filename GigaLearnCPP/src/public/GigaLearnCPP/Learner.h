@@ -43,6 +43,11 @@ namespace GGL {
 		int obsSize;
 		int numActions;
 
+		// Dip search (LearnerConfig::dipSearch): the rolling snapshot bank the collect worker
+		// fills and the private search pool learn-prep uses. Null unless enabled.
+		class DipSnapshotBank* dipBank = nullptr;
+		class DipSearch* dipSearch = nullptr;
+
 		struct WelfordStat* returnStat;
 		struct BatchedWelfordStat* obsStat;
 

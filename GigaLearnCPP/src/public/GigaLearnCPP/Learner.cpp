@@ -26,6 +26,7 @@
 #include <private/GigaLearnCPP/League/League.h>
 
 #include "Util/KeyPressDetector.h"
+#include "Util/DipSearch.h"
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 
 #include <algorithm>
@@ -1213,6 +1214,11 @@ void GGL::Learner::Start() {
 			std::vector<uint8_t> steerPractice;
 			std::vector<uint8_t> steerMode;
 
+			// DIP SEARCH (Util/DipSearch.h): per-row snapshot handle, bankId * 16 + player slot,
+			// -1 when the arena is not in the snapshot subset. Carried through Append() so
+			// learn-prep can restore the exact physics state a dipping row was observed in.
+			std::vector<int64_t> dipSnapId;
+
 
 			// GGL-2 Clear(): drop contents, keep allocations. `*this = Trajectory()` was
 			// reallocating every episode (512 players × ~1800-step episodes).
@@ -1255,6 +1261,7 @@ void GGL::Learner::Start() {
 				srcStep.clear();
 				steerPractice.clear();
 				steerMode.clear();
+				dipSnapId.clear();
 			}
 
 			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
@@ -1301,6 +1308,7 @@ void GGL::Learner::Start() {
 
 				steerPractice.reserve(rows); // cheap; populated only when steering is on
 				steerMode.reserve(rows);
+				dipSnapId.reserve(rows);
 			}
 
 			void Append(const Trajectory& other) {
@@ -1338,6 +1346,7 @@ void GGL::Learner::Start() {
 				drillIds += other.drillIds;
 				srcPlayer += other.srcPlayer;
 				srcStep += other.srcStep;
+				dipSnapId += other.dipSnapId;
 			}
 
 			// Every per-row column must have exactly one entry per action row; a missed append
@@ -1364,6 +1373,8 @@ void GGL::Learner::Start() {
 				}
 				if (!steerPractice.empty())
 					RG_ASSERT(steerPractice.size() == n && steerMode.size() == n);
+				if (!dipSnapId.empty())
+					RG_ASSERT(dipSnapId.size() == n);
 			}
 
 			size_t Length() const {
@@ -1373,6 +1384,29 @@ void GGL::Learner::Start() {
 
 		auto trajectories = std::vector<Trajectory>(numPlayers, Trajectory{});
 		int maxEpisodeLength = (int)(config.ppo.maxEpisodeDuration * (120.f / config.tickSkip));
+
+		// ===== DIP SEARCH (Util/DipSearch.h; research/reports/HEADROOM_SEARCH.md) =====
+		// A fixed arena subset banks a snapshot every step; learn-prep searches the dips.
+		const bool dipOn = !render && config.dipSearch.enabled;
+		std::vector<uint8_t> dipArenaSel(envSet->arenas.size(), 0);
+		std::vector<int64_t> dipArenaSnapId(envSet->arenas.size(), -1);
+		if (dipOn) {
+			RG_ASSERT(numPlayers / (int)envSet->arenas.size() <= 16); // slot packs into 4 bits
+			int stride = RS_MAX(1, (int)std::lround(1.0 / RS_CLAMP(config.dipSearch.arenaFrac, 0.01f, 1.f)));
+			size_t nSel = 0;
+			for (size_t a = 0; a < envSet->arenas.size(); a++)
+				if (a % (size_t)stride == 0) { dipArenaSel[a] = 1; nSel++; }
+			// Two iterations of steps plus one max episode: a row can outlive its iteration
+			// (episodes are appended whole at finalize) but never the bank.
+			size_t stepsPerItr = (size_t)config.ppo.tsPerItr / (size_t)RS_MAX(1, numPlayers) + 1;
+			size_t cap = nSel * (2 * stepsPerItr + (size_t)maxEpisodeLength);
+			dipBank = new DipSnapshotBank(cap);
+			dipSearch = new DipSearch(config.dipSearch, envCreateFn, config.tickSkip, config.actionDelay,
+				obsSize, numActions, config.ppo.gaeGamma);
+			RG_LOG("DipSearch: ON - " << nSel << "/" << envSet->arenas.size() << " arenas banked/step, bank cap "
+				<< cap << " snapshots, k=" << config.dipSearch.k << " q=" << config.dipSearch.dipQuantile
+				<< " maxStates=" << config.dipSearch.maxStates << " budget " << config.dipSearch.budgetSecs << "s");
+		}
 		const size_t expectedStepsPerEpisode = (size_t)RS_MAX(1, (int)(maxEpisodeLength * 1.2f));
 
 		// Reachability collection extras
@@ -2707,12 +2741,27 @@ void GGL::Learner::Start() {
 						if (!render) {
 							// Parallel per-player: each body writes only trajectories[newPlayerIdx]
 							Timer prepTimer = {};
+							if (dipOn) {
+								// Snapshot the pre-step arena: the state the obs row below describes
+								// and the one the policy is about to act in.
+								fnParallelFor((int)envSet->arenas.size(), [&](int a) {
+									if (!dipArenaSel[(size_t)a]) { dipArenaSnapId[(size_t)a] = -1; return; }
+									ArenaSnapshot snap = {};
+									snap.CaptureFrom(envSet->arenas[(size_t)a]);
+									dipArenaSnapId[(size_t)a] = dipBank->Push(std::move(snap));
+								});
+							}
 							fnParallelFor((int)newPlayerIndices.size(), [&](int k) {
 								int newPlayerIdx = newPlayerIndices[k];
 								if (ksSuppress[newPlayerIdx]) // scripted car: rows are training-poison
 									return;
 								fnAppendObsRow(trajectories[newPlayerIdx].states, newPlayerIdx);
 								fnAppendMaskRow(trajectories[newPlayerIdx].actionMasks, newPlayerIdx);
+								if (dipOn) {
+									int64_t id = dipArenaSnapId[(size_t)playerArenaIdx[newPlayerIdx]];
+									trajectories[newPlayerIdx].dipSnapId.push_back(
+										id < 0 ? -1 : id * 16 + playerSlotIdx[newPlayerIdx]);
+								}
 
 								if (reachOn) {
 									auto& traj = trajectories[newPlayerIdx];
@@ -3484,6 +3533,8 @@ void GGL::Learner::Start() {
 			{
 				Timer glueTimer = {};
 				std::swap(combinedTraj, combinedTrajNext);
+				if (dipBank)
+					dipBank->Trim(); // barrier zone: no pushes in flight
 				if (league) {
 					// Barrier zone (worker joined): hand the league rows to the learn side,
 					// freeze adapters+disc for the next collection, and sample the disc
@@ -4734,6 +4785,128 @@ void GGL::Learner::Start() {
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G_gap_done\n");
 					}
 
+					// ===== DIP SEARCH (Util/DipSearch.h; research/reports/HEADROOM_SEARCH.md) =====
+					// Trigger = the realised k-step advantage (the quantity the study found
+					// predictive), NOT H (the quantity it found uncorrelated with fixable states).
+					ppo->dipRows = {};
+					if (dipOn && dipSearch && !combinedTraj.dipSnapId.empty()) {
+						RG_NO_GRAD;
+						Timer dipTimer = {};
+						const auto& dcfg = config.dipSearch;
+						const int64_t nR = (int64_t)combinedTraj.Length();
+						const int K = RS_MAX(1, dcfg.k);
+						const float g = config.ppo.gaeGamma;
+						const float rScale = 1.f / RS_MAX(returnStat ? returnStat->GetSTD() : 1.f, 1e-6f);
+						const float rClip = config.ppo.rewardClipRange;
+						auto vpC = tValPreds.to(torch::kCPU, torch::kFloat32).flatten().contiguous();
+						const float* V = vpC.data_ptr<float>();
+						const auto& rew = combinedTraj.rewards;
+						const auto& term = combinedTraj.terminals;
+						RG_ASSERT((int64_t)combinedTraj.dipSnapId.size() == nR && vpC.size(0) == nR);
+						std::vector<float> aK((size_t)nR, 0.f);
+						std::vector<uint8_t> aOk((size_t)nR, 0);
+						std::vector<float> aVals;
+						std::vector<int64_t> cand;
+						for (int64_t i = 0; i + K < nR; i++) {
+							bool ok = true; float ret = 0, disc = 1;
+							for (int j = 0; j < K; j++) {
+								if (term[(size_t)(i + j)]) { ok = false; break; }
+								float r = rew[(size_t)(i + j)] * rScale;
+								if (rClip > 0) r = RS_CLAMP(r, -rClip, rClip);
+								ret += disc * r; disc *= g;
+							}
+							if (!ok) continue;
+							aK[(size_t)i] = ret + disc * V[i + K] - V[i];
+							aOk[(size_t)i] = 1;
+							aVals.push_back(aK[(size_t)i]);
+							if (combinedTraj.dipSnapId[(size_t)i] >= 0)
+								cand.push_back(i);
+						}
+						float thr = 0.f;
+						if (!aVals.empty()) {
+							size_t qi = (size_t)RS_CLAMP((double)aVals.size() * dcfg.dipQuantile, 0.0, (double)(aVals.size() - 1));
+							std::nth_element(aVals.begin(), aVals.begin() + (ptrdiff_t)qi, aVals.end());
+							thr = aVals[qi];
+						}
+						std::vector<int64_t> dips;
+						for (int64_t i : cand)
+							if (aK[(size_t)i] <= thr) dips.push_back(i);
+						std::sort(dips.begin(), dips.end(), [&](int64_t a, int64_t b) { return aK[(size_t)a] < aK[(size_t)b]; });
+						// one state per k-row window (adjacent rows of one dip are the same mistake)
+						std::vector<int64_t> picked;
+						for (int64_t i : dips) {
+							bool near = false;
+							for (int64_t p : picked) if (std::llabs(p - i) < K) { near = true; break; }
+							if (near) continue;
+							picked.push_back(i);
+							if ((int)picked.size() >= dcfg.maxStates) break;
+						}
+						std::vector<DipSearchState> states;
+						int evicted = 0;
+						for (int64_t i : picked) {
+							DipSearchState st = {};
+							int64_t id = combinedTraj.dipSnapId[(size_t)i];
+							if (!dipBank->Get(id / 16, st.snap)) { evicted++; continue; }
+							st.slot = (int)(id % 16);
+							st.row = i;
+							st.aK = aK[(size_t)i];
+							states.push_back(std::move(st));
+						}
+						// obs normalisation: same clamp as the collect path, so the pool's obs match
+						std::vector<double> nMean, nStd;
+						const std::vector<double>* pMean = nullptr, * pStd = nullptr;
+						if (obsStat) {
+							nMean = obsStat->GetMean(); nStd = obsStat->GetSTD();
+							for (double& f : nMean) f = RS_CLAMP(f, -config.maxObsMeanRange, config.maxObsMeanRange);
+							for (double& f : nStd) f = RS_MAX(f, (double)config.minObsSTD);
+							pMean = &nMean; pStd = &nStd;
+						}
+						std::vector<DipSearchResult> res;
+						if (!states.empty())
+							dipSearch->Run(states, ppo, pMean, pStd, rScale, rClip, res, dcfg.budgetSecs);
+						int nSearched = 0, nAccepted = 0, nGoodHalf = 0; double gSum = 0, bG = 0, sG = 0, bC = 0, sC = 0;
+						std::vector<float> rObs; std::vector<int64_t> rAct; std::vector<uint8_t> rMask; std::vector<float> rW;
+						for (auto& r : res) {
+							if (!r.searched) continue;
+							nSearched++; gSum += r.gain; nGoodHalf += r.gain >= 0.5f;
+							bG += r.baseGoal; sG += r.bestGoal; bC += r.baseConcede; sC += r.bestConcede;
+							if (!r.accepted || r.nRows == 0) continue;
+							nAccepted++;
+							float w = RS_MIN(r.gain, dcfg.weightCap);
+							rObs.insert(rObs.end(), r.obs.begin(), r.obs.end());
+							for (int32_t a : r.actions) rAct.push_back((int64_t)a);
+							rMask.insert(rMask.end(), r.masks.begin(), r.masks.end());
+							rW.insert(rW.end(), (size_t)r.nRows, w);
+						}
+						if (!rAct.empty()) {
+							int64_t n = (int64_t)rAct.size();
+							ppo->dipRows.states = torch::from_blob(rObs.data(), { n, (int64_t)obsSize }, torch::kFloat32)
+								.to(ppo->device, false, true);
+							ppo->dipRows.actions = torch::from_blob(rAct.data(), { n }, torch::kInt64)
+								.to(ppo->device, false, true);
+							ppo->dipRows.masks = torch::from_blob(rMask.data(), { n, (int64_t)numActions }, torch::kUInt8)
+								.to(ppo->device, false, true);
+							ppo->dipRows.weights = torch::from_blob(rW.data(), { n }, torch::kFloat32)
+								.to(ppo->device, false, true);
+						}
+						report["DipSearch/Candidates"] = (float)dips.size();
+						report["DipSearch/Picked"] = (float)picked.size();
+						report["DipSearch/Evicted"] = (float)evicted;
+						report["DipSearch/Searched"] = (float)nSearched;
+						report["DipSearch/Accepted"] = (float)nAccepted;
+						report["DipSearch/Rows"] = (float)rAct.size();
+						report["DipSearch/Mean Gain"] = nSearched ? (float)(gSum / nSearched) : 0.f;
+						report["DipSearch/Frac Gain>0.5"] = nSearched ? nGoodHalf / (float)nSearched : 0.f;
+						report["DipSearch/Base Goal"] = nSearched ? (float)(bG / nSearched) : 0.f;
+						report["DipSearch/Best Goal"] = nSearched ? (float)(sG / nSearched) : 0.f;
+						report["DipSearch/Base Concede"] = nSearched ? (float)(bC / nSearched) : 0.f;
+						report["DipSearch/Best Concede"] = nSearched ? (float)(sC / nSearched) : 0.f;
+						report["DipSearch/A_k Thr"] = thr;
+						report["DipSearch/Bank Size"] = (float)dipBank->Size();
+						report["DipSearch/Waves"] = (float)dipSearch->lastWaves;
+						report["DipSearch/Time"] = dipTimer.Elapsed();
+					}
+
 					// Set experience buffer
 					experience.data.actions = tActions;
 					experience.data.logProbs = tLogProbs;
@@ -5138,6 +5311,18 @@ void GGL::Learner::Start() {
 						"-Vdag Infer Time",
 						"-Hull Time",
 						"-SIL Time",
+						"DipSearch/Candidates",
+						"DipSearch/Searched",
+						"DipSearch/Accepted",
+						"DipSearch/Rows",
+						"DipSearch/Mean Gain",
+						"DipSearch/Frac Gain>0.5",
+						"DipSearch/Base Goal",
+						"DipSearch/Best Goal",
+						"DipSearch/Base Concede",
+						"DipSearch/Best Concede",
+						"DipSearch/Loss",
+						"-DipSearch/Time",
 						"-Dist Sync Time",
 						"-Gap/Time",
 						"-Reach Read Time",
@@ -5171,6 +5356,8 @@ GGL::Learner::~Learner() {
 		envSet = nullptr;
 	}
 	delete ppo;
+	delete dipSearch;
+	delete dipBank;
 	delete league;
 	delete versionMgr;
 	delete metricSender;
