@@ -150,7 +150,33 @@ GAE arrays the trainer already holds. The `dip` stratum is that quantity at k = 
    samples, so the fixes are robust to opponent noise, but not to state perturbation), and the
    v3-engine numbers (this ran on pip RocketSim v2).
 
-## 6. Reproduce
+## 6. Deployment (2026-09-03)
+
+Implemented in the trainer on `private` (commit `DipSearch: search-and-imitate from value
+dips`) and ported to `private-titan` (`vts-true-skip-titan` worktree). Default OFF;
+`GGL_DIPSEARCH=1` enables, `GGL_DIPSEARCH_{K,QUANTILE,MAX_STATES,POOL,HORIZON,MACRO,
+BUDGET_S,THREADS,MIN_GAIN,WEIGHT_CAP,IMITATE_ROLLOUTS,ARENA_FRAC}` tune. Module:
+`GigaLearnCPP/src/public/GigaLearnCPP/Util/DipSearch.{h,cpp}`.
+
+- **Sync path** (both branches): a fixed arena subset banks an `ArenaSnapshot` every step
+  into a rolling id-addressed bank; rows carry `bankId*16+slot`; learn-prep computes the
+  k-step realised advantage from the GAE arrays, restores the bottom-quantile rows into a
+  private arena pool, runs the search of §1 (baseline / open-loop + temperature prefixes /
+  fresh finalists / held-out winner) and hands accepted prefix steps to `PPOLearner::dipRows`.
+- **Async path** (titan, MPI learner/collector roles): the collector serialises the
+  snapshot into the fragment (`kFragFlagSnapshots`, header v7 `player_slot`/`snap_bytes`);
+  the LEARNER rank scans fragments for dips with per-tick discounting under true variable
+  tickskip and searches in a VTS-aware pool (hold buckets, per-tick gamma, prefixes are
+  successive self decisions). Obs are raw there (normalisation lives in the model).
+- **Consumer**: `-log pi(a|s) * min(gain, cap)` averaged over the imitation rows,
+  `silCoeff`-scaled, added to the policy loss every minibatch; never touches the critic,
+  the advantages or the PPO ratio. Panels `DipSearch/*` (Searched, Accepted, Rows, Mean
+  Gain, Frac Gain>0.5, Base/Best Goal and Concede, Loss, Time).
+- **Smoke** (private, `GGL_SMOKE`, GPU, birth policy, 8 states/iteration, pool 128):
+  ~1.6 s per iteration, accepted states produce rows and the loss term fires. The titan
+  async path is compile-verified only (no MPI on the desktop).
+
+## 7. Reproduce
 
 ```bash
 cd build && ../research/.venv/bin/python ../research/tools/headroom_search.py \
