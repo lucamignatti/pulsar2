@@ -154,8 +154,29 @@ static void BuildRows(DipSearch* self, int obsSize, int numActions, RLGC::ObsBui
 
 void DipSearch::Restore(Slot& s, const ArenaSnapshot& snap) {
 	bool ok = snap.ApplyTo(s.arena);
+	if (!ok && snap.cars.size() == s.arena->_cars.size() && snap.pads.size() == s.arena->_boostPads.size()) {
+		// Same shape, different car ids (the engine hands out ids per arena or globally
+		// depending on the build): remap by index. Team order must agree, or the row's
+		// player slot would land on the wrong car.
+		ArenaSnapshot re = snap;
+		std::map<uint32_t, uint32_t> idMap;
+		bool teamsOk = true;
+		for (size_t i = 0; i < re.cars.size(); i++) {
+			teamsOk &= re.cars[i].team == s.arena->_cars[i]->team;
+			idMap[re.cars[i].id] = s.arena->_cars[i]->id;
+			re.cars[i].id = s.arena->_cars[i]->id;
+		}
+		for (auto& pd : re.pads)
+			if (pd.lockedCarId) {
+				auto it = idMap.find(pd.lockedCarId);
+				pd.lockedCarId = it == idMap.end() ? 0 : it->second;
+			}
+		ok = teamsOk && re.ApplyTo(s.arena);
+	}
 	if (!ok)
-		RG_ERR_CLOSE("DipSearch: snapshot does not match the pool arena (car/pad count)");
+		RG_ERR_CLOSE("DipSearch: snapshot does not match the pool arena (snapshot cars=" << snap.cars.size()
+			<< " pads=" << snap.pads.size() << ", arena cars=" << s.arena->_cars.size()
+			<< " pads=" << s.arena->_boostPads.size() << ")");
 	// The obs's prevAction is the action whose controls the snapshot's cars still hold
 	// (pending controls == the previously parsed action), exactly what the banked row saw.
 	for (size_t i = 0; i < s.arena->_cars.size(); i++)
