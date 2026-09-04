@@ -4,6 +4,7 @@
 #include "PPO/PPOLearnerConfig.h"
 #include "SkillTrackerConfig.h"
 #include "Util/VizControl.h" // VizBotEntry, the finder callback's return type
+#include "Util/DipSearchConfig.h"
 
 #include <memory>
 
@@ -196,6 +197,10 @@ namespace GGL {
 		// objective absorbs. REVERT to exact sequential behavior by setting this false.
 		// Auto-disabled in render mode and with the proposer/practice machinery (unaudited overlap).
 		bool pipelinedCollection = false;
+
+		// DIP SEARCH: search-and-imitate from value dips (Util/DipSearch.h; the study is
+		// research/reports/HEADROOM_SEARCH.md). Default OFF; GGL_DIPSEARCH=1 in ExampleMain.
+		DipSearchConfig dipSearch;
 
 		// Standardize the obs values (doesn't seem to help much from my testing)
 		bool standardizeObs = false;

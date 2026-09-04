@@ -1499,6 +1499,41 @@ int main(int argc, char* argv[]) {
 	                              // (imitated overcommits are the un-derisked hazard --
 	                              // the steering-v1 ratchet; watch Ref shares + SIL/*)
 
+	// ===== DIP SEARCH (2026-09-03; research/reports/HEADROOM_SEARCH.md) =====
+	// Search-and-imitate from VALUE DIPS. The pre-registered study on 7.9-gco @611B found
+	// that search from high-H states realises nothing (H failed on two seeds) while search
+	// from realised-advantage dips finds a fat tail of full-goal fixes (+0.92/+0.53 critic
+	// units over uniform, 12-15% of dip states worth >= 0.4 goal, all aerial). Trigger =
+	// the k-step realised advantage; consumer = a SIL-shaped imitation term on the
+	// search-found prefix steps, weighted by held-out gain (silCoeff-scaled, so SIL's
+	// coefficient governs both). Default OFF. Records the C2 conflict with
+	// COMPOSITION_CRITIC.md deliberately (Util/DipSearch.h header).
+	if (const char* d = std::getenv("GGL_DIPSEARCH"); d && *d && std::string(d) != "0") {
+		auto envF = [](const char* n, float dflt) {
+			const char* e = std::getenv(n); return (e && *e) ? (float)std::atof(e) : dflt;
+		};
+		auto envI = [](const char* n, int dflt) {
+			const char* e = std::getenv(n); return (e && *e) ? std::atoi(e) : dflt;
+		};
+		auto& ds = cfg.dipSearch;
+		ds.enabled = true;
+		ds.arenaFrac = envF("GGL_DIPSEARCH_ARENA_FRAC", ds.arenaFrac);
+		ds.k = envI("GGL_DIPSEARCH_K", ds.k);
+		ds.dipQuantile = envF("GGL_DIPSEARCH_QUANTILE", ds.dipQuantile);
+		ds.maxStates = envI("GGL_DIPSEARCH_MAX_STATES", ds.maxStates);
+		ds.poolSize = envI("GGL_DIPSEARCH_POOL", ds.poolSize);
+		ds.horizon = envI("GGL_DIPSEARCH_HORIZON", ds.horizon);
+		ds.macro = envI("GGL_DIPSEARCH_MACRO", ds.macro);
+		ds.budgetSecs = envF("GGL_DIPSEARCH_BUDGET_S", ds.budgetSecs);
+		ds.threads = envI("GGL_DIPSEARCH_THREADS", ds.threads);
+		ds.minGain = envF("GGL_DIPSEARCH_MIN_GAIN", ds.minGain);
+		ds.weightCap = envF("GGL_DIPSEARCH_WEIGHT_CAP", ds.weightCap);
+		ds.imitateRollouts = envI("GGL_DIPSEARCH_IMITATE_ROLLOUTS", ds.imitateRollouts);
+		RG_LOG("GGL_DIPSEARCH: ON - k=" << ds.k << " q=" << ds.dipQuantile << " maxStates=" << ds.maxStates
+			<< " pool=" << ds.poolSize << " horizon=" << ds.horizon << " budget=" << ds.budgetSecs
+			<< "s minGain=" << ds.minGain << " (imitation coeff = silCoeff " << cfg.ppo.silCoeff << ")");
+	}
+
 	// ===== HULL OPERATOR (2026-08-07; canonical: research/reports/EPSILON_CRITIC.md s7) =====
 	// The record-licensed relaxed Bellman operator on the V-dagger targets: the bootstrap is
 	// maxed over the real next state plus hullK candidates built by transplanting eps-scaled
