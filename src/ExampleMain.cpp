@@ -2077,6 +2077,24 @@ int main(int argc, char* argv[]) {
 		cfg.ppo.silEnabled = false;
 		RG_LOG("GGL_NO_SIL: self-imitation off (vdag/gap measurement stays live)");
 	}
+	// ONE-SIDED HEADROOM + CONTRIBUTION CREDIT (2026-09-03; research/reports/MM_SLOW_LEARNING.md,
+	// PPOLearnerConfig::vdagPosEnabled / silCreditGate). Experiment-branch levers, default OFF.
+	// Both live behind the composition critic (they read its trunk and gate ITS consumer, SIL).
+	if (const char* s = std::getenv("GGL_HPOS"); s && *s && std::string(s) != "0") {
+		cfg.ppo.vdagPosEnabled = cfg.ppo.vdagEnabled;
+		if (const char* w = std::getenv("GGL_HPOS_WARMUP"); w && *w) cfg.ppo.vdagPosWarmupIters = std::atoi(w);
+		if (const char* w = std::getenv("GGL_HPOS_RMIN"); w && *w) cfg.ppo.vdagPosRewardMin = std::strtof(w, nullptr);
+		RG_LOG("GGL_HPOS: one-sided headroom " << (cfg.ppo.vdagPosEnabled ? "ON" : "OFF (vdag disabled)")
+			<< " - V+/V-dagger+ heads (detached), SIL gate reads H+ after " << cfg.ppo.vdagPosWarmupIters << " updates");
+	}
+	if (const char* s = std::getenv("GGL_SIL_CREDIT"); s && *s && std::string(s) != "0") {
+		cfg.ppo.silCreditGate = cfg.ppo.vdagEnabled && cfg.ppo.silEnabled;
+		if (const char* w = std::getenv("GGL_SIL_CREDIT_WINDOW_S"); w && *w) cfg.ppo.silCreditWindowS = std::strtof(w, nullptr);
+		if (const char* w = std::getenv("GGL_SIL_CREDIT_WARMUP"); w && *w) cfg.ppo.silCreditWarmupIters = std::atoi(w);
+		RG_LOG("GGL_SIL_CREDIT: contribution-credit SIL gate " << (cfg.ppo.silCreditGate ? "ON" : "OFF (SIL/vdag disabled)")
+			<< " - COMA credit head (detached), window " << cfg.ppo.silCreditWindowS << "s, warm-up "
+			<< cfg.ppo.silCreditWarmupIters << " updates");
+	}
 	// GGL_NO_REACH: reachability off (its cadenced K-action rho evaluation is one of
 	// the periodic allocators on the MoE memory ceiling; not needed for MoE bring-up).
 	if (const char* nr = std::getenv("GGL_NO_REACH"); nr && *nr && std::string(nr) != "0") {

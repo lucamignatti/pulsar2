@@ -135,7 +135,13 @@ namespace GGL {
 		// opp_embed is added only for critic / goal critic.
 		void InferValueFamily(
 			torch::Tensor obs, torch::Tensor* outCritic, torch::Tensor* outGoalCritic,
-			torch::Tensor* outVdagMin, torch::Tensor* outGeoV);
+			torch::Tensor* outVdagMin, torch::Tensor* outGeoV,
+			// ONE-SIDED HEADROOM / CONTRIBUTION CREDIT (2026-09-03): V+, min V-dagger+, the
+			// all-action Q head [n, numActions], and the policy probs off the same shared_head
+			// forward (needs actionMasks); any may be null/undefined to skip
+			torch::Tensor* outVpos = nullptr, torch::Tensor* outVdagPosMin = nullptr,
+			torch::Tensor* outQcred = nullptr, torch::Tensor actionMasks = {},
+			torch::Tensor* outPolicyProbs = nullptr);
 		// Reservoir over (obs, nextObs, scaledReward) for the STATIONARY world-facing fits
 		// (r_hat, Sigma). Reward and one-step displacement spread are properties of the
 		// environment; only where we sample them moves as the policy changes. Fitting them on
@@ -177,6 +183,10 @@ namespace GGL {
 		float dbgAuxNLL = -999.f, dbgTwinDisagree = -1.f;
 		// ARCHIVE of field-ascent transitions (persistent; re-scored at replay).
 		float rhatMaxObserved = 0.f;
+		// Learn() calls in which the one-sided headroom heads / the credit head trained
+		// (warm-up counters for the SIL gate; both start at 0 on a fresh-init head)
+		int vdagPosUpdates = 0;
+		int qcredUpdates = 0;
 		float dbgVdagRows = -1.f, dbgRhatRows = -1.f, dbgRhatEntry = -9.f, dbgVdagRaw = -9.f, dbgYvAbs = -9.f;   // bound on hypothesis magnitude (never invent)
 
 		// ===== IMPLICIT WORLD MODEL =====

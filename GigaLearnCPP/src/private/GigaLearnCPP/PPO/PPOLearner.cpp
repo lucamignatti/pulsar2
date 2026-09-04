@@ -150,6 +150,21 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 		ModelConfig vc = models["critic"]->config;
 		models.Add(new Model("vdag1", vc, device));
 		models.Add(new Model("vdag2", vc, device));
+		// ONE-SIDED HEADROOM heads (PPOLearnerConfig::vdagPosEnabled): scoring-only value V+
+		// and its expectile twins. Trained on a DETACHED trunk read, so they can only act
+		// through the SIL gate. Mirror the critic head like the twins.
+		if (config.vdagPosEnabled) {
+			models.Add(new Model("vpos", vc, device));
+			models.Add(new Model("vdagpos1", vc, device));
+			models.Add(new Model("vdagpos2", vc, device));
+		}
+		// CONTRIBUTION CREDIT head (PPOLearnerConfig::silCreditGate): Q(s, a) for every
+		// action on the detached value trunk (COMA counterfactual credit for SIL).
+		if (config.silCreditGate) {
+			ModelConfig qc = models["critic"]->config;
+			qc.numOutputs = numActions;
+			models.Add(new Model("qcred", qc, device));
+		}
 		// THEORY: twin optimistic reward models (same head shape, own outputs)
 		if (config.vdagTheoryEnabled) {
 			models.Add(new Model("rhat1", vc, device));
@@ -616,7 +631,9 @@ torch::Tensor GGL::PPOLearner::InferVdagMin(torch::Tensor obs) {
 // shares the chunk's HOST->DEVICE upload even though it reads raw obs, not the trunk.
 void GGL::PPOLearner::InferValueFamily(
 	torch::Tensor obs, torch::Tensor* outCritic, torch::Tensor* outGoalCritic,
-	torch::Tensor* outVdagMin, torch::Tensor* outGeoV) {
+	torch::Tensor* outVdagMin, torch::Tensor* outGeoV,
+	torch::Tensor* outVpos, torch::Tensor* outVdagPosMin, torch::Tensor* outQcred,
+	torch::Tensor actionMasks, torch::Tensor* outPolicyProbs) {
 
 	RG_NO_GRAD;
 	bool hp = config.useHalfPrecision;
@@ -629,11 +646,18 @@ void GGL::PPOLearner::InferValueFamily(
 
 	bool needTrunk = (outCritic && models["critic"])
 		|| (outGoalCritic && models["goal_critic"])
-		|| (outVdagMin && models["vdag1"] && models["vdag2"]);
+		|| (outVdagMin && models["vdag1"] && models["vdag2"])
+		|| (outVpos && models["vpos"])
+		|| (outVdagPosMin && models["vdagpos1"] && models["vdagpos2"])
+		|| (outQcred && models["qcred"])
+		|| (outPolicyProbs && actionMasks.defined());
 	if (!needTrunk)
 		return;
 
-	auto vtBare = ValueTrunk(obsDev, hp);              // THE one trunk + critic_trunk forward
+	// shared_head ONCE: the value family and (credit gate) the policy probs both read it -
+	// this is ValueTrunk() split so the h2 tap can be handed to InferPolicyProbsFromModels
+	torch::Tensor h2 = models["shared_head"] ? models["shared_head"]->Forward(obsDev, hp) : obsDev;
+	auto vtBare = models["critic_trunk"] ? models["critic_trunk"]->Forward(h2, hp) : h2;
 	// Learn and InferVdagMin read V-dagger off the unconditioned trunk. Critic / goal
 	// critic get opp_embed on a copy (vtL = trunk + embed). Do not fold embed into
 	// vtBare or consume-side min(V1,V2) would disagree with the trained heads.
@@ -662,6 +686,18 @@ void GGL::PPOLearner::InferValueFamily(
 		auto b = models["vdag2"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
 		*outVdagMin = torch::minimum(a, b);
 	}
+	if (outVpos && models["vpos"])
+		*outVpos = models["vpos"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
+	if (outVdagPosMin && models["vdagpos1"] && models["vdagpos2"]) {
+		auto a = models["vdagpos1"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
+		auto b = models["vdagpos2"]->Forward(vtBare, hp).flatten().to(torch::kFloat32);
+		*outVdagPosMin = torch::minimum(a, b);
+	}
+	if (outQcred && models["qcred"])
+		*outQcred = models["qcred"]->Forward(vtBare, hp).to(torch::kFloat32);
+	if (outPolicyProbs && actionMasks.defined())
+		*outPolicyProbs = InferPolicyProbsFromModels(models, obsDev,
+			actionMasks.to(device, /*non_blocking=*/true), 1.f, hp, {}, nullptr, h2).to(torch::kFloat32);
 }
 
 torch::Tensor GGL::PPOLearner::InferRhatMax(torch::Tensor obs) {
@@ -1156,12 +1192,14 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor sumRelEntropyLoss = zmet(), sumCriticLoss = zmet(), sumGoalCriticLoss = zmet();
 	torch::Tensor sumGuidingLoss = zmet(), sumClip = zmet(), sumDivergence = zmet();
 	torch::Tensor sumVdagLoss = zmet(), sumVdagTwinSpread = zmet(), sumRhatLoss = zmet();
+	torch::Tensor sumVposLoss = zmet(), sumQcredLoss = zmet();
 	torch::Tensor sumReachLoss = zmet(), sumReachCarStateLoss = zmet();
 	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
 	torch::Tensor nRelEntropy = zmet();
 	int metricPolicySteps = 0, metricCriticSteps = 0, metricGoalSteps = 0;
 	int metricKlSteps = 0, metricClipSteps = 0, metricGuidingSteps = 0;
 	int metricVdagSteps = 0, metricTwinSteps = 0, metricRhatSteps = 0;
+	int metricVposSteps = 0, metricQcredSteps = 0;
 	int metricReachSteps = 0, metricReachCSSteps = 0;
 
 	// GGL_CONSUME_TIMERS: component profile of the learn pass, for cadence work where
@@ -1665,6 +1703,41 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					lastYvAbs = yv.abs().mean().detach();
 				}
 
+				// ONE-SIDED HEADROOM: V+ (MSE) and the V-dagger+ twins (expectile, same tau) on the
+				// DETACHED value trunk - these heads never reshape the representation.
+				torch::Tensor vposLoss;
+				if (batch.vposTargets.defined() && models["vpos"]) {
+					auto trunkD = fnValueTrunk().detach();
+					auto yp = take(batch.vposTargets).flatten();
+					auto pp = models["vpos"]->Forward(trunkD, false).flatten().to(torch::kFloat32);
+					vposLoss = (yp - pp).square().mean() * batchSizeRatio;
+					if (batch.vdagPosTargets.defined() && models["vdagpos1"] && models["vdagpos2"]) {
+						auto yd = take(batch.vdagPosTargets).flatten();
+						for (Model* vh : { models["vdagpos1"], models["vdagpos2"] }) {
+							auto pd = vh->Forward(trunkD, false).flatten().to(torch::kFloat32);
+							auto u = yd - pd;
+							auto w = torch::where(u > 0,
+								torch::full_like(u, config.vdagTau), torch::full_like(u, 1.f - config.vdagTau));
+							vposLoss = vposLoss + (w * u * u).mean() * batchSizeRatio;
+						}
+					}
+					sumVposLoss += vposLoss.detach();
+					metricVposSteps++;
+				}
+				// CONTRIBUTION CREDIT: Q(s, a_taken) regressed on the critic's own value targets,
+				// detached trunk. Consumed at learn-prep as Q(s,a) - E_pi Q(s,.) (the SIL credit gate).
+				torch::Tensor qcredLoss;
+				if (models["qcred"] && batch.targetValues.defined() && batch.actions.defined()) {
+					auto trunkD = fnValueTrunk().detach();
+					auto q = models["qcred"]->Forward(trunkD, false).to(torch::kFloat32);
+					auto acts = take(batch.actions).to(torch::kLong).flatten();
+					auto qa = q.gather(-1, acts.unsqueeze(-1)).flatten();
+					auto yq = take(batch.targetValues).to(torch::kFloat32).flatten();
+					qcredLoss = (yq - qa).square().mean() * batchSizeRatio;
+					sumQcredLoss += qcredLoss.detach();
+					metricQcredSteps++;
+				}
+
 				// ===================== GEOMETRY: the HJB residual =====================
 				// (1 - gamma) V(s) = r_hat(s) + gamma * || grad_s V(s) ||_Sigma(s)
 				//
@@ -1827,6 +1900,10 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					totalLoss = totalLoss.defined() ? totalLoss + carStateLoss : carStateLoss;
 				if (vdagLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + vdagLoss : vdagLoss;
+				if (vposLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + vposLoss : vposLoss;
+				if (qcredLoss.defined())
+					totalLoss = totalLoss.defined() ? totalLoss + qcredLoss : qcredLoss;
 				if (rhatLoss.defined())
 					totalLoss = totalLoss.defined() ? totalLoss + rhatLoss : rhatLoss;
 				if (geoLoss.defined())
@@ -1924,7 +2001,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			// this list, which was harmless only because their LR was 0 - the moment the LR is
 			// wired (same commit) 16.1M params would otherwise be the only unclipped block in
 			// the model, on an expectile loss whose targets are the widest-scale ones here.
-			for (const char* n : { "vdag1", "vdag2" })
+			for (const char* n : { "vdag1", "vdag2", "vpos", "vdagpos1", "vdagpos2", "qcred" })
 				if (models[n])
 					nn::utils::clip_grad_norm_(models[n]->parameters(), 0.5f);
 
@@ -2109,11 +2186,22 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 		if (avgReachCarStateLoss.count > 0)
 			report["Reach/Car State Loss"] = avgReachCarStateLoss.Get();
 		report["Reach/Aux Loss"] = avgReachLoss.Get();
+	}  // end if (reach)  [2026-09-03: this brace used to sit after the V-dagger report block, hiding Headroom/Vdag Loss / Twin Spread / Update Magnitude on every NO_REACH run]
 	if (models["vdag1"]) {
 		report["Headroom/Vdag Loss"] = avgVdagLoss.Get();
 		// Must be > 0. It was exactly 0 for the whole run until the LR was wired (2026-07-25);
 		// if it reads 0 again, HEADROOM is inert and its 0.15-sigma injection is noise.
 		report["Headroom/Vdag Update Magnitude"] = vdagUpdateMagnitude;
+		if (metricVposSteps > 0) {
+			report["Headroom/Vpos Loss"] = sumVposLoss.item<float>() / (float)metricVposSteps;
+			vdagPosUpdates++;
+		}
+		if (metricQcredSteps > 0) {
+			report["SIL/Qcred Loss"] = sumQcredLoss.item<float>() / (float)metricQcredSteps;
+			qcredUpdates++;
+		}
+		if (models["vpos"]) report["Headroom/Vpos Updates"] = (float)vdagPosUpdates;
+		if (models["qcred"]) report["SIL/Qcred Updates"] = (float)qcredUpdates;
 		// Must stay clearly above 0 - read it against Headroom/Yv Abs (the target scale).
 		// 0 means the twins have converged to a single function and min(V1,V2) has stopped
 		// being a pessimism operator, which is how the seek term inflates with nothing
@@ -2170,7 +2258,6 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["Geo/V Mean"] = dbgGeoMean;
 			report["Geo/Reservoir Fill"] = (float)geoResFill;
 		}
-	}
 	}
 
 	// Assemble and return report
@@ -2303,7 +2390,7 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	// shared trunk. Found by the 2026-07-25 audit. Wiring this turns HEADROOM on for the
 	// FIRST time - treat a regression here as a new deployment, not a fix gone wrong.
 	// They mirror the critic's architecture and target scale, so they take criticLR.
-	for (const char* n : { "vdag1", "vdag2" })
+	for (const char* n : { "vdag1", "vdag2", "vpos", "vdagpos1", "vdagpos2", "qcred" })
 		if (models[n])
 			models[n]->SetOptimLR(criticLR);
 
@@ -2345,7 +2432,8 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 		// "critic_trunk" is the value-side shared body - value-only, like the heads that read it.
 		// Eval/act paths never touch it (InferPolicyProbsFromModels reads shared_head + policy),
 		// and at 4.76M params it would otherwise be cloned into all 32 archived versions.
-		if (name == "critic" || name == "goal_critic" || name == "critic_trunk")
+		if (name == "critic" || name == "goal_critic" || name == "critic_trunk"
+			|| name == "vpos" || name == "qcred")   // one-sided headroom / credit heads: value-side only
 			continue;
 
 		// HEADROOM V-dagger twins mirror the CRITIC head's config, so they are value heads and

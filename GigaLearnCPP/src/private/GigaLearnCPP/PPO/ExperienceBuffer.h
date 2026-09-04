@@ -24,6 +24,9 @@ namespace GGL {
 			practiceMask,
 			// HEADROOM: one-iteration-frozen V-dagger TD targets (undefined unless vdagEnabled)
 			vdagTargets,
+			// ONE-SIDED HEADROOM (2026-09-03): one-step TD targets for the scoring-only value V+
+			// and its expectile twins V-dagger+ (undefined unless vdagPosEnabled)
+			vposTargets, vdagPosTargets,
 			// THEORY: scaled per-step reward that LANDED on this row's arrival state
 			// (r-hat regression target; undefined unless vdagTheoryEnabled)
 			rhatTargets,

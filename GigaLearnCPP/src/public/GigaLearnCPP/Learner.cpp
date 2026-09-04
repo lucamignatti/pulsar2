@@ -4174,6 +4174,9 @@ void GGL::Learner::Start() {
 					Timer gaeTimer = {};
 					// Run GAE
 					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights, tSilWeights;
+					// ONE-SIDED HEADROOM / CONTRIBUTION CREDIT (2026-09-03): V+ / V-dagger+ TD targets,
+					// H+ = relu(min V-dagger+ - V+), and the per-row COMA credit Q(s,a) - E_pi Q(s,.)
+					torch::Tensor tVposTargets, tVdagPosTargets, tHpos, tCredit;
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -4305,6 +4308,65 @@ void GGL::Learner::Start() {
 						float vScale = tTargetVals.abs().to(torch::kFloat32).quantile(0.99).item<float>();
 						tVdagTargets = (scaledR + g * cont * vdagN)
 							.clamp(-2.f * RS_MAX(vScale, 1.f), 2.f * RS_MAX(vScale, 1.f));
+
+						// ===== ONE-SIDED HEADROOM + CONTRIBUTION CREDIT (PPOLearnerConfig::vdagPosEnabled /
+						// silCreditGate; research/reports/MM_SLOW_LEARNING.md). One extra chunked
+						// shared_head + critic_trunk pass over the batch (TODO: fold into the fused
+						// value-pred loop above once the mechanism is validated). V+ / V-dagger+ read
+						// the unconditioned trunk like the V-dagger twins; targets are the POSITIVE part
+						// of the reconstructed scaled reward (own goals only) with the same one-step,
+						// one-iteration-frozen bootstrap (min-twin for V-dagger+). The credit is the
+						// COMA counterfactual of the row's own action under the current policy.
+						if (config.ppo.vdagPosEnabled || config.ppo.silCreditGate) {
+							Timer posTimer = {};
+							const bool wantPos = config.ppo.vdagPosEnabled && ppo->models["vpos"]
+								&& ppo->models["vdagpos1"] && ppo->models["vdagpos2"];
+							const bool wantCred = config.ppo.silCreditGate && ppo->models["qcred"];
+							torch::Tensor vpos, vdpos, credit;
+							if (wantPos) { vpos = torch::empty({ nR }, torch::kFloat32); vdpos = torch::empty({ nR }, torch::kFloat32); }
+							if (wantCred) credit = torch::empty({ nR }, torch::kFloat32);
+							for (int64_t i0 = 0; i0 < nR; i0 += VCH) {
+								int64_t i1 = RS_MIN(i0 + VCH, nR);
+								torch::Tensor vp, vd, q, pr;
+								auto sDev = tStates.slice(0, i0, i1).to(ppo->device, true);
+								ppo->InferValueFamily(sDev, nullptr, nullptr, nullptr, nullptr,
+									wantPos ? &vp : nullptr, wantPos ? &vd : nullptr,
+									wantCred ? &q : nullptr,
+									wantCred ? tActionMasks.slice(0, i0, i1) : torch::Tensor(),
+									wantCred ? &pr : nullptr);
+								if (vp.defined() && vd.defined()) {
+									vpos.slice(0, i0, i1).copy_(vp.to(torch::kCPU));
+									vdpos.slice(0, i0, i1).copy_(vd.to(torch::kCPU));
+								}
+								if (q.defined() && pr.defined()) {
+									auto acts = tActions.slice(0, i0, i1).to(q.device()).to(torch::kLong);
+									auto qa = q.gather(-1, acts.unsqueeze(-1)).flatten();
+									credit.slice(0, i0, i1).copy_((qa - (pr * q).sum(-1)).to(torch::kCPU));
+								}
+							}
+							if (vpos.defined()) {
+								auto rPos = scaledR * (scaledR > config.ppo.vdagPosRewardMin).to(torch::kFloat32);
+								auto vposN = torch::cat({ vpos.slice(0, 1, nR), z1 });
+								auto vdposN = torch::cat({ vdpos.slice(0, 1, nR), z1 });
+								const float pScale = 2.f * RS_MAX(vScale, 1.f);
+								tVposTargets = (rPos + g * cont * vposN).clamp(-pScale, pScale);
+								tVdagPosTargets = (rPos + g * cont * vdposN).clamp(-pScale, pScale);
+								tHpos = torch::relu(vdpos - vpos);
+								report["Headroom/Hpos Mean"] = tHpos.mean().item<float>();
+								report["Headroom/Hpos P90"] = tHpos.quantile(0.9).item<float>();
+								report["Headroom/Hpos Frac Pos"] = (tHpos > 0).to(torch::kFloat32).mean().item<float>();
+								report["Headroom/Vpos Mean"] = vpos.mean().item<float>();
+								report["Headroom/VdagPos Mean"] = vdpos.mean().item<float>();
+								report["Headroom/Rpos Frac"] = (rPos > 0).to(torch::kFloat32).mean().item<float>();
+							}
+							if (credit.defined()) {
+								tCredit = credit;
+								report["SIL/Credit Mean"] = credit.mean().item<float>();
+								report["SIL/Credit Abs Mean"] = credit.abs().mean().item<float>();
+								report["SIL/Credit Pos Frac"] = (credit > 0).to(torch::kFloat32).mean().item<float>();
+							}
+							report["Headroom/Pos Time"] = posTimer.Elapsed();
+						}
 						// SEEK POTENTIAL = V-dagger ITSELF, not the headroom gap.
 						// Measured (rltest chain L=20): Phi = relu(Vdag - Vreal) goes to ZERO
 						// at success (Vreal catches Vdag), so the term is NEGATIVE on the final
@@ -4485,10 +4547,49 @@ void GGL::Learner::Start() {
 							auto unit = [](const torch::Tensor& x) {
 								return x / (x.std() + 1e-8f);
 							};
+							// ONE-SIDED HEADROOM: once V+/V-dagger+ are warm the gate reads H+ (scoring
+							// headroom) instead of H, whose top decile marks conceding states.
+							const bool useHpos = config.ppo.vdagPosEnabled && tHpos.defined()
+								&& ppo->vdagPosUpdates >= config.ppo.vdagPosWarmupIters;
+							const torch::Tensor& hGate = useHpos ? tHpos : tH;
 							auto hMix = tHGeo.defined()
-								? (0.5f * unit(tHGeo) + 0.5f * unit(tH)) : unit(tH);
+								? (0.5f * unit(tHGeo) + 0.5f * unit(hGate)) : unit(hGate);
 							auto hQ = hMix.quantile((double)config.ppo.silGateQ);
 							auto conv = (tgtF > vexp) & (hMix >= hQ);
+							report["SIL/Gate Uses Hpos"] = useHpos ? 1.f : 0.f;
+							// CONTRIBUTION CREDIT GATE: a row converts only if its own counterfactual
+							// credit, plus the mean credit over the player's next K decisions in the same
+							// episode segment, is positive. Segments are row-contiguous per player and
+							// end where cont == 0.
+							const bool useCredit = config.ppo.silCreditGate && tCredit.defined()
+								&& ppo->qcredUpdates >= config.ppo.silCreditWarmupIters;
+							report["SIL/Gate Uses Credit"] = useCredit ? 1.f : 0.f;
+							if (useCredit) {
+								const float nConvPre = conv.to(torch::kFloat32).sum().item<float>();
+								const int K = RS_MAX(1, (int)std::lround(
+									config.ppo.silCreditWindowS * 120.f / (float)config.tickSkip));
+								auto cr = tCredit.contiguous();
+								auto cf = cont.contiguous();
+								const float* c = cr.data_ptr<float>();
+								const float* ct = cf.data_ptr<float>();
+								std::vector<int64_t> segEnd((size_t)nR);
+								for (int64_t i = nR - 1; i >= 0; i--)
+									segEnd[i] = (i == nR - 1 || ct[i] == 0.f) ? i : segEnd[i + 1];
+								std::vector<double> pre((size_t)nR + 1, 0.0);
+								for (int64_t i = 0; i < nR; i++) pre[i + 1] = pre[i] + c[i];
+								auto tMask = torch::zeros({ nR }, torch::kFloat32);
+								float* m = tMask.data_ptr<float>();
+								for (int64_t i = 0; i < nR; i++) {
+									int64_t j1 = RS_MIN(i + K, segEnd[i]);
+									double w = c[i];
+									if (j1 > i) w += (pre[j1 + 1] - pre[i + 1]) / (double)(j1 - i);
+									m[i] = w > 0.0 ? 1.f : 0.f;
+								}
+								conv = conv & (tMask > 0.5f);
+								const float nConvPost = conv.to(torch::kFloat32).sum().item<float>();
+								report["SIL/Credit Pass Frac"] = tMask.mean().item<float>();
+								report["SIL/Conv Kept By Credit"] = nConvPre > 0 ? nConvPost / nConvPre : 1.f;
+							}
 							auto resid = tgtF - vpF;
 							float cap = config.ppo.silWCapSigma
 								* (resid.std().item<float>() + 1e-8f);
@@ -4923,6 +5024,10 @@ void GGL::Learner::Start() {
 					report["Headroom/Rows N"] = (float)tStates.size(0);
 					if (tVdagTargets.defined())
 						experience.data.vdagTargets = tVdagTargets;
+					if (tVposTargets.defined()) {
+						experience.data.vposTargets = tVposTargets;
+						experience.data.vdagPosTargets = tVdagPosTargets;
+					}
 					if (tRhatTargets.defined())
 						experience.data.rhatTargets = tRhatTargets;
 					// Assigned unconditionally (undefined included): the learn pass reads

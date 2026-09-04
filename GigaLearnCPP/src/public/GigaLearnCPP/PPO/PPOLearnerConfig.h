@@ -378,6 +378,23 @@ namespace GGL {
 		// deploys). Revert = set false here and rebuild.
 		bool vdagEnabled = true;
 		float vdagTau = 0.75f;
+		// ONE-SIDED HEADROOM (2026-09-03, research/reports/MM_SLOW_LEARNING.md s3.2 and
+		// HEADROOM_SEARCH.md s4): H = relu(min V-dagger - V_real) is largest where V_real is
+		// most NEGATIVE (the expectile twins shrink the bad tail), so its top decile scores 4%
+		// and concedes 83% - it marks pessimism, not unrealised capability. V+ / V-dagger+
+		// train on the POSITIVE part of the scaled reward only (own goals), one-step TD like
+		// the twins, on a DETACHED trunk read (probes never reshape the trunk); H+ =
+		// relu(min V-dagger+ - V+) is headroom in SCORING and replaces H in the SIL gate once
+		// the heads have vdagPosWarmupIters updates. Heads fresh-init on old checkpoints
+		// (allowNotExist load). Default OFF; GGL_HPOS=1 enables.
+		bool vdagPosEnabled = false;
+		int vdagPosWarmupIters = 20;
+		// Positive-reward threshold in critic units. The scaled reward is RECONSTRUCTED from the
+		// GAE arrays (A_i - gamma*lambda*A_{i+1} - gamma*V_{i+1} + V_i), which carries the advantage
+		// blend's residue on every row (measured: 17% of GCO rows read > 0 although only the
+		// terminal goal row is rewarded); relu of that noise would bias V+ up everywhere. A GCO
+		// goal is ~6 units (150 / Returns-STD 25), so 1.0 keeps goals and drops the residue.
+		float vdagPosRewardMin = 1.0f;
 		// Dose curve measured (rltest, n=2/point, 25M): inverted-U, optimum 0.30-0.45.
 		// 0.15 -> 0.30 gave touch +45% / air +93%. beta >= 1.0 is WORSE THAN BASE (the
 		// +-3sigma clamp binds, clipped potential diffs stop telescoping, PBRS
@@ -589,6 +606,21 @@ namespace GGL {
 		// for that reason; watch RatingWatch/Ref shares for the signature.
 		bool silEnabled = false;
 		float silCoeff = 0.05f;
+		// CONTRIBUTION CREDIT GATE (2026-09-03, MM_SLOW_LEARNING.md s3.3): under the shared
+		// team reward a teammate's goal is a positive surprise for every player on the team,
+		// so 57-64% of SIL's weight in 2v2/3v3 landed on passengers (82-84% airborne) - SIL
+		// was cloning "wait in the air while my teammate scores". The general fix is the COMA
+		// counterfactual: a head Q(s, a) over all actions on the detached value trunk, trained
+		// on the critic's value targets at the taken action; credit = Q(s,a) - sum_a pi(a|s)
+		// Q(s,a) = how much THIS player's own decision moved the team's expected return with
+		// everyone else held fixed (demos, pressure, positioning all count if the critic has
+		// learned them). A row may convert only if its credit, plus the mean credit over the
+		// player's next silCreditWindowS of decisions in the same episode, is positive. 1v1:
+		// near no-op. Warm-up: the gate reads H/unfiltered until silCreditWarmupIters updates.
+		// Default OFF; GGL_SIL_CREDIT=1 enables.
+		bool silCreditGate = false;
+		float silCreditWindowS = 1.0f;
+		int silCreditWarmupIters = 20;
 		float silGateQ = 0.70f;        // headroom-mix quantile above which rows may imitate
 		float silWCapSigma = 2.0f;     // weight cap, in units of std(R - V)
 

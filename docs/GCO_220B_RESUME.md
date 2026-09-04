@@ -200,3 +200,84 @@ elastic 8–16 nodes, 4 hops each; launchers in `tools/aimos/`.
 | per-rank split @16 nodes | 48 arenas → 96 players × 87 steps = 8352 rows (GAE window ≈1.45 s of game, vs 1.6 s at ts8) | 87 arenas → 29×(2+4+6) = 348 players × 24 steps = 8352 rows (same window as main) |
 | what it tests | the 8→2 curriculum step on a mature policy: expect a competence dip then recovery (the 08-23 8→1 jump recovered in ~8 h); read goals per game-second and Bonk crossplay at matched game-time | transfer of a 1v1-only policy to team play; read per-mode Rating/Ref shares and Episode Length by mode |
 | not changed | reset mix, GCO reward, NoTouch(20 s), reach off, hull off | same |
+
+## 2026-09-03 04:12-04:45 — ts2 mid-hop segfaults; launchers now relaunch within the allocation
+
+- **ts2 hop 2 (`4685597`) died at 04:12** after 40 min: rank 34 on dcs214, SIGSEGV with a
+  null function pointer inside `at::isfinite` (TensorIterator build) called from
+  libGigaLearnCPP on a `std::thread` (the collect worker). Last save `284636160000`.
+- **ts2 hop 3 (`4685598`) died at 04:24** after 12 min, before any save: rank 14 on dcs180,
+  SIGSEGV inside `posix_memalign` (corrupted malloc arena) under `empty_cpu` from a
+  comparison op. Same 16-node set as every ts2 hop; two different nodes.
+- Both stacks are heap-corruption-shaped, on CPU tensor ops in the collect thread. Only the
+  tickSkip-2 runs have crashed so far: ts2 2× in ~3h, ts2mm 1× (the 03:06 SVD/LAPACK abort
+  — that exception is caught hundreds of times per hop on every run, it escaped once),
+  main/mm 0× in ~15h. Not root-caused. Episode buffers DO scale with tickSkip
+  (`maxEpisodeLength = maxEpisodeDuration * 120/tickSkip`, Learner.cpp:1375), so the
+  "ts8-sized buffer overflows at ts2" hypothesis is out.
+- **Launcher bug exposed:** the 3-attempt loop only retried deaths inside the first 300 s of
+  the hop, so each mid-hop crash ended the hop and burned a chain link; ts2 went from hop 2
+  to hop 4 (`4685599`) in 13 min and had NO queued hops left behind it.
+- **Fix (`586f595`):** `_ts2/_mm/_ts2mm.sbatch` relaunch from the newest save while >= 15 min
+  of allocation remains (wall end from `squeue -o %e`, fallback HOP_T0+6h); 3 consecutive
+  fast failures still hold 30 min. Queued mm/ts2mm hops keep the old script (spool trap)
+  but have not crashed; new ts2 hops `4685675 -> 4685676 -> 4685677` (6h each, 6-18 nodes)
+  chained after `4685599`, which covers 19:00 with margin. A crash now costs ~1 min plus
+  the progress since the last save (~7 min at 400M/save).
+
+## 2026-09-03 08:15 — mm crashed too; the crash site is the collect worker's obs finite check
+
+- **mm hop 3 (`4685573`) died at 08:15** (SIGABRT, rank 45 on dcs247) after ~4.7h, last save
+  `284515200000`. This time the trainer's own handler printed the cause:
+  `FATAL: collect worker exception: Expected all tensors to be on the same device, but found
+  at least two devices, cuda:3 and cpu!`, raised from `TensorIterator::compute_types` under
+  `at::isfinite` ← `Learner::Start()::{lambda#18}` on the pipelined-collection thread
+  (`{lambda#22}`, symbolized with addr2line on the cluster .so).
+- That is the **obs NaN guard** at `Learner.cpp:2628-2634`: every 4th step the collect worker
+  wraps `envSet->state.obs.data` with `torch::from_blob` (CPU, float32) and calls
+  `isfinite(...).all()`. Nothing in that expression can legitimately be on `cuda:3` — a
+  fresh CPU `from_blob` tensor and two CPU bool intermediates — so a device mismatch there
+  means a **TensorImpl with garbage metadata**, i.e. heap corruption in the collect process.
+  The ts2 hop-2 segfault (null function pointer inside the same `isfinite` → `mul` →
+  `build_borrowing_binary_op`, same two libGigaLearnCPP frame offsets `+0x2504d4/+0x2574c8`)
+  and the ts2 hop-3 `posix_memalign` arena corruption are the same corruption seen from
+  three angles. The guard is the most frequent allocator-heavy CPU op on that thread, so it
+  is where the damage surfaces, not necessarily where it originates.
+- Tally: ts2 2 crashes / ~5h, mm 1 / ~9h, ts2mm 0 segfaults / ~8h (its 03:06 abort was the
+  SVD/LAPACK exception escaping — different), **main 0 / ~30h**. So it is not tickSkip-2
+  specific; the main run's config (PHASE A, 174 arenas/rank, 20 nodes) has not shown it.
+- **Not root-caused; no code change deployed** — a fix means rebuilding the shared
+  `libGigaLearnCPP.so` that the LIVE main trainer has mapped, which the user said not to
+  touch. Next diagnostic step (needs approval): an ASan/`-g` build in a separate cluster tree
+  under a 2-node smoke with `GGL_MULTI_MODE=1`, and audit the collect-thread writers indexed
+  by player/arena (`ksSuppress/ksArenaCar`, ring-opponent rows) for out-of-bounds on
+  multi-mode arenas.
+- **Chains hardened instead:** fixed-launcher hops appended — mm `4685700` (after `4685600`),
+  ts2mm `4685701` (after `4685601`); ts2 already had `4685675-77`. Queued old-launcher hops
+  (`4685574`, `4685600`, `4685589`, `4685601`) still end on a crash but the chain continues.
+- **10:10 — mm hop 4 (`4685574`) died again after 1h** (last save `285707520000`), same
+  handler, a different libtorch complaint: `collect worker exception: Index is supposed to
+  be an empty tensor or a vector`, from CUDA `index_select` in the same collect lambda
+  (`+0x24de8c`, `{lambda#18}`) — the `tdStates.index_select(0, idxNew/idxOld)` opponent
+  split at `Learner.cpp:2763-2797`. A 1-D index tensor built every iteration reading as
+  non-1-D is the same "TensorImpl metadata is garbage" symptom. mm's interval is now ~2h.
+- Ruled out from the launchers: `GGL_OPP_PARALLEL` (the known-broken side-thread opponent
+  inference) is set nowhere; the mm/ts2 environments differ from the crash-free main
+  launcher only in `GGL_MULTI_MODE` / `GGL_TRAIN_TICK_SKIP` / `GGL_TS_PER_VERSION` and the
+  per-node-count arena rows. **Stopping log forensics here** — four distinct libtorch
+  symptoms from one thread is a heap-corruption signature that only an ASan/`-g` build will
+  localize. Recommendation for the user: approve a 2-node ASan smoke of the private tree
+  with `GGL_MULTI_MODE=1` (that reproduces fastest, ~2h) in a separate cluster build dir.
+
+## 2026-09-03 18:xx — all three experiments log into the MAIN run's wandb id (739468ux)
+
+Found while pulling telemetry for the mm-vs-1v1 analysis: `gco_220b_mm/ts2/ts2mm` were seeded
+by copying a main checkpoint folder, and `RUNNING_STATS.json` carries `"run_id": "739468ux"`,
+so every experiment resumes the main run's wandb run. Four processes write interleaved rows
+into one history; wandb's upload appears to have stalled at ~13:45 for all of them. The rows
+are separable offline (each run's exact time->steps curve from the hop logs is in
+`research/results/mm_slow_learning_20260903/ref_series.txt`; the split history is
+`wandb_739468ux_split_by_run.json`), but the live dashboard for the main run is polluted.
+Fix (NOT applied — user said change nothing): delete/replace `run_id` in each experiment's
+newest checkpoint `RUNNING_STATS.json` (or set a fresh `GGL_RUN_NAME` + clear the id) before
+their next hop; each would then start its own wandb run.
