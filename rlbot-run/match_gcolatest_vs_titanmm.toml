@@ -1,0 +1,29 @@
+#:schema https://rlbot.org/schemas/match.json
+# GCO LATEST vs Titan 36755 ("Test0.5") - the MULTI-MODE Titan build, unzipped from
+# ~/Downloads/rlbot 36755.zip on 2026-09-04 into gglbots/titan-mm and wired for Linux the
+# same way titan58 is (Proton launcher + the shared CUDA dll set symlinked from kiyo).
+# Pass a team size to play.sh (2 or 3) to exercise what both sides trained multi-mode for;
+# with no argument this is 1v1. Blue is pulsar-gco-latest-bot, synced from GGL_GCO_ROOT.
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-gco-latest-bot/bot.toml"
+team = 0
+
+[[cars]]
+config_file = "gglbots/titan-mm/bot.toml"
+team = 1
