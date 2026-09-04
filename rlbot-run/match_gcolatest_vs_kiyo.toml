@@ -1,0 +1,27 @@
+#:schema https://rlbot.org/schemas/match.json
+# GCO LATEST vs Kiyo - companion to match_gco_vs_kiyo (which fields the FROZEN pulsar-gco-bot);
+# this one fields pulsar-gco-latest-bot, which play.sh SYNCS to the newest checkpoint in
+# GGL_GCO_ROOT, so it tracks whichever lineage you point that at. Created 2026-09-04.
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-gco-latest-bot/bot.toml"
+team = 0
+
+[[cars]]
+config_file = "gglbots/kiyo/rlbot/bot.toml"
+team = 1
