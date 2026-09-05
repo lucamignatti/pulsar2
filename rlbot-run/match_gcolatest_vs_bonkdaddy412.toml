@@ -1,0 +1,29 @@
+#:schema https://rlbot.org/schemas/match.json
+# GCO LATEST vs BonkDaddy V4.12 - the shipped Windows build (Auboy10, 1v1, CPU-only torch),
+# unzipped from ~/Downloads/BonkDaddyV4.12-win64.zip on 2026-09-04 into gglbots/bonkdaddy412
+# and run under Proton like titan58. Self-contained: no CUDA dlls to borrow. The V4.5 in
+# gglbots/bonkdaddy (built from source) stays the CrossPlay-calibrated anchor; use
+# match_gcolatest_vs_bonkdaddy for that one. Blue is pulsar-gco-latest-bot from GGL_GCO_ROOT.
+[rlbot]
+launcher = "NoLaunch"
+auto_start_agents = true
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+enable_rendering = true
+existing_match_behavior = "Restart"
+instant_start = true
+enable_state_setting = true
+skip_replays = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "pulsar-gco-latest-bot/bot.toml"
+team = 0
+
+[[cars]]
+config_file = "gglbots/bonkdaddy412/bot.toml"
+team = 1
