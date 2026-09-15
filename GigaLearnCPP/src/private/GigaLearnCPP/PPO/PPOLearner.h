@@ -46,6 +46,7 @@ namespace GGL {
 			float goalGain = 0, goalDist = 0, goalDistDecisions = 0, goalValidFrac = 0, goalRarity = 0, goalProgress = 0;
 			float silMeanWeight = 0, silRows = 0, silValidFrac = 0, silLoss = 0, silWindows = 0;
 			float bankGoals = 0, bankRecords = 0, bankMeanBest = 0, bankRetired = 0, bankAdmitted = 0;
+			float goalMassFrac = 0, fieldContrast = 0;
 			int targetsClamped = 0;
 			bool trained = false, silActive = false;
 		};
@@ -57,12 +58,12 @@ namespace GGL {
 		// THE RATCHET (FrontierConfig::goalBankEnabled). One entry per persistent goal: the
 		// target state, the closest approach ever achieved toward it, and the prefix that
 		// achieved it. All CPU - this is memory, not maths.
+		// One banked prefix: a run of the policy's OWN executed play, the field value it reached,
+		// and the latent of where it started (for the spacing rule that keeps the bank diverse).
 		struct FrontierGoal {
-			torch::Tensor goalObs;                      // [obsSize]
-			torch::Tensor recStates, recActions, recMasks;  // the record-setting prefix
-			float bestDist = 1e18f;                     // the record itself
-			float admitDist = 0.f;                      // distance when admitted (for reporting)
-			int stale = 0;                              // iterations since the record improved
+			torch::Tensor recStates, recActions, recMasks;
+			torch::Tensor startZ;                       // [latent], CPU
+			float phi = -1e18f;                         // gravity reached by this prefix
 			int age = 0;
 		};
 		std::vector<FrontierGoal> frontierBank;

@@ -118,11 +118,42 @@ namespace GGL {
 		// better approach arrives. Entropy supplies the forward step; the mechanism only has to
 		// stop the policy forgetting what it already stumbled into.
 		bool goalBankEnabled = true;
-		int bankSize = 16;              // Goals held at once
-		float bankRecordEps = 0.02f;    // Min improvement (metric units) to count as a new record
-		int goalMaxStale = 200;         // Iterations without a new record before a goal retires
-		float goalRetireLpFrac = 0.4f;  // Retire once lp(goal) falls below this x the pool mean:
-		                                // the map has finished learning there, so it is done.
+		int bankSize = 16;              // Prefixes rehearsed at once (a DOSE, not a claim about
+		                                // how many places matter - the field covers all of them)
+
+		// ===== THE GRAVITY FIELD =====
+		// Goal mass is BINARY and decided by what the map believes, not by a quantile of
+		// convenience: a state is a goal if the map does not KNOW it (twin disagreement high), or
+		// if the map thinks it is GOOD but we have not proven it (value above median, visits
+		// below median). A state the map knows and rates poorly is not a goal.
+		//
+		//   phi(s) = sum over goals of exp( -d(s->g) / (gravityRangeDecisions * localD) )
+		//
+		// Summing rather than taking the nearest is the point: a clump of unlearned states pulls
+		// harder than an isolated one, and separate clumps combine. As a region is learned its
+		// members stop qualifying, its mass decays, and the pull redistributes elsewhere - so the
+		// field is exhausted only when there is nothing left unknown or unproven.
+		//
+		// Range measured 2026-09-15 over 57.6k frames: field contrast (phi p90/p10) is 12.2 at 5
+		// decisions, 1.76 at 50, and 1.37 at 100 - at 100 the field is nearly FLAT because typical
+		// pair distances are ~75 decisions, so every goal pulls on everything equally. 50 keeps a
+		// usable gradient AND peaks aerial-contest enrichment (0.406 vs a 0.205 pool base).
+		float gravityRangeDecisions = 50.0f;
+		float unknownQuantile = 0.90f;  // twin disagreement above this = the map does not know it
+		int goalCandidates = 512;       // goals sampled from the pool per iteration (compute cap)
+
+		// Visitation, for "good but unproven". A fixed random projection of the quasimetric latent
+		// into visitBits, with decaying per-bucket counts. 2^14 = 16384 buckets against ~16.7k rows
+		// per iteration per rank is ~1 sample/bucket/iteration - finer would be all zeros, coarser
+		// would blur distinct manoeuvres together. decay 0.99 gives a ~100-iteration memory, the
+		// same horizon as progressLagIters.
+		int visitBits = 14;
+		float visitDecay = 0.99f;
+
+		// Bank spacing: a new prefix only DISPLACES a stored one if it starts within this many
+		// decisions of it; otherwise it takes its own slot. Without it the bank becomes N copies
+		// of whatever sits in the deepest well, and coverage - the whole objective - is lost.
+		float bankSpacingDecisions = 10.0f;
 		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
 
 		// OPPONENT CONDITIONING. The environment is RocketSim PLUS an opponent, and the opponent

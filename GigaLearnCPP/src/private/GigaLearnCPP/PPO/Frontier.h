@@ -35,6 +35,19 @@ namespace GGL {
 		torch::Tensor WithCtx(torch::Tensor obs, torch::Tensor ctx);
 		void RefreshLag();
 
+		// ===== VISITATION =====
+		// Fixed random projection of the latent -> visitBits sign bits -> bucket index, with
+		// decaying counts. This is how "we think it is good but have not proven it" is measured:
+		// good by V, unproven by how rarely the policy is anywhere near it.
+		torch::Tensor visitProj;    // [latent, bits], fixed at construction
+		torch::Tensor visitCount;   // [2^bits]
+		torch::Tensor VisitKey(torch::Tensor latent);       // [n] int64 bucket ids
+		void VisitObserve(torch::Tensor latent);            // accumulate, then decay
+		torch::Tensor VisitOf(torch::Tensor latent);        // [n] counts
+
+		// Twin disagreement = epistemic uncertainty = "the map does not know this".
+		torch::Tensor Disagreement(torch::Tensor obs, torch::Tensor ctx);
+
 		FrontierModule(int obsSize, const FrontierConfig& config, torch::Device device, ModelSet& outModels);
 
 		// --- value map -------------------------------------------------------------------------

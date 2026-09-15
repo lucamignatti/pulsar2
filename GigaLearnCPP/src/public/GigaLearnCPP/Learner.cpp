@@ -5875,6 +5875,11 @@ void GGL::Learner::Start() {
 						// strictly closer approach THIS iteration (the ratchet turning); Mean Best
 						// = the mean record distance, which must fall over time or nothing is
 						// being consolidated; Retired = goals whose map region finished learning.
+						// THE FIELD. Goal Mass Frac = share of the pool that is unknown-or-unproven;
+						// it should DECAY as the map completes. Field Contrast = phi p90/p10; a flat
+						// field (near 1) has no gradient and the pull is undirected.
+						report["Frontier/Goal Mass Frac"] = fr.goalMassFrac;
+						report["Frontier/Field Contrast"] = fr.fieldContrast;
 						report["Frontier/Bank Goals"] = fr.bankGoals;
 						report["Frontier/Bank Records"] = fr.bankRecords;
 						report["Frontier/Bank Mean Best"] = fr.bankMeanBest;
@@ -5893,8 +5898,8 @@ void GGL::Learner::Start() {
 							<< " win " << fr.silWindows << " rows " << fr.silRows
 							<< " loss " << fr.silLoss
 							<< " | bank " << fr.bankGoals << " rec " << fr.bankRecords
-							<< " best " << fr.bankMeanBest << " adm " << fr.bankAdmitted
-							<< " ret " << fr.bankRetired);
+							<< " phi " << fr.bankMeanBest << " mass " << fr.goalMassFrac
+							<< " contrast " << fr.fieldContrast);
 					}
 				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();

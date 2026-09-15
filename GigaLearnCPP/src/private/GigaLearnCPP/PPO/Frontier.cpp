@@ -50,7 +50,43 @@ namespace GGL {
 		// starts it equal to valueA reads zero learning progress for one lag period, which is
 		// strictly better than carrying a stale snapshot across runs.
 		valueSlow = valueA->MakeClone();
+		{   // Fixed projection: seeded so every rank hashes identically and a resume is stable.
+			RG_NO_GRAD;
+			auto gen = at::detail::createCPUGenerator(0xF00D5EED);
+			auto proj = torch::randn({ config.latentAsym + config.latentSym, config.visitBits },
+				gen, torch::TensorOptions().dtype(torch::kFloat32));
+			visitProj = proj.to(device);
+			visitCount = torch::zeros({ (int64_t)1 << config.visitBits },
+				torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		}
 		valueSlow->modelName = oc ? "frontier_value_slow_oc" : "frontier_value_slow";  // never saved
+	}
+
+	torch::Tensor FrontierModule::VisitKey(torch::Tensor latent) {
+		torch::NoGradGuard noGrad;
+		auto bits = (latent.matmul(visitProj) > 0).to(torch::kLong);        // [n, B]
+		auto pow2 = torch::pow(2, torch::arange(visitProj.size(1),
+			torch::TensorOptions().dtype(torch::kLong).device(device)));
+		return (bits * pow2.unsqueeze(0)).sum(-1);                          // [n]
+	}
+
+	void FrontierModule::VisitObserve(torch::Tensor latent) {
+		torch::NoGradGuard noGrad;
+		auto k = VisitKey(latent);
+		visitCount.index_add_(0, k, torch::ones_like(k, visitCount.options()));
+		visitCount.mul_(config.visitDecay);
+	}
+
+	torch::Tensor FrontierModule::VisitOf(torch::Tensor latent) {
+		torch::NoGradGuard noGrad;
+		return visitCount.index_select(0, VisitKey(latent));
+	}
+
+	torch::Tensor FrontierModule::Disagreement(torch::Tensor obs, torch::Tensor ctx) {
+		torch::NoGradGuard noGrad;
+		auto x = WithCtx(obs, ctx);
+		return (valueA->Forward(x, false).squeeze(-1)
+			- valueB->Forward(x, false).squeeze(-1)).abs();
 	}
 
 	void FrontierModule::RefreshLag() {

@@ -2262,8 +2262,12 @@ int main(int argc, char* argv[]) {
 			cfg.ppo.frontier.progressLagIters = std::atoi(v);
 		if (const char* v = std::getenv("GGL_FRONTIER_BANK"); v && *v && std::atoi(v) >= 0)
 			cfg.ppo.frontier.bankSize = std::atoi(v);
-		if (const char* v = std::getenv("GGL_FRONTIER_BANK_STALE"); v && *v && std::atoi(v) > 0)
-			cfg.ppo.frontier.goalMaxStale = std::atoi(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_GRAVITY"); v && *v)
+			cfg.ppo.frontier.gravityRangeDecisions = (float)std::atof(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_SPACING"); v && *v)
+			cfg.ppo.frontier.bankSpacingDecisions = (float)std::atof(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_UNKNOWN_Q"); v && *v)
+			cfg.ppo.frontier.unknownQuantile = (float)std::atof(v);
 		// Opponent conditioning REQUIRES the privileged context the composite critic already
 		// builds; without it the map averages over the whole version ring and nothing can go
 		// stale when the opponent changes.
@@ -2282,8 +2286,10 @@ int main(int argc, char* argv[]) {
 			<< "] decisions, pool " << cfg.ppo.frontier.candidatePool
 			<< ", oppCond " << (cfg.ppo.frontier.oppCond ? "ON" : "off")
 			<< ", lag " << cfg.ppo.frontier.progressLagIters
-			<< ", bank " << cfg.ppo.frontier.bankSize << " goals (stale " << cfg.ppo.frontier.goalMaxStale
-			<< ", retireLp " << cfg.ppo.frontier.goalRetireLpFrac << ")"
+			<< ", bank " << cfg.ppo.frontier.bankSize << " prefixes (spacing "
+			<< cfg.ppo.frontier.bankSpacingDecisions << " dec), gravity range "
+			<< cfg.ppo.frontier.gravityRangeDecisions << " dec, unknown q "
+			<< cfg.ppo.frontier.unknownQuantile
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
