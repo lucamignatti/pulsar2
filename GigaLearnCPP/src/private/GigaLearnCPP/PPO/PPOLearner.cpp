@@ -2459,11 +2459,9 @@ void GGL::PPOLearner::FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, t
 
 void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor actions, torch::Tensor masks, torch::Tensor cont) {
 	frontierRows = {};
-	lastFrontier.silActive = false;
-	lastFrontier.silRows = 0;
-	lastFrontier.silMeanWeight = 0;
-	lastFrontier.silValidFrac = 0;
-	lastFrontier.silWindows = 0;
+	auto& R = lastFrontier;
+	R.silActive = false; R.silRows = 0; R.silMeanWeight = 0; R.silValidFrac = 0; R.silWindows = 0;
+	R.bankGoals = 0; R.bankRecords = 0; R.bankMeanBest = 0; R.bankRetired = 0; R.bankAdmitted = 0;
 	if (!frontier || !config.frontier.silEnabled)
 		return;
 	if (!frontierCandidates.defined() || frontierCandidates.size(0) < 64)
@@ -2476,17 +2474,14 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	const int64_t minLen = RS_MAX((int64_t)2, (int64_t)cfg.silMinWindow);
 	if (nR < minLen + 1)
 		return;
-	auto longOpts = torch::TensorOptions().dtype(torch::kLong).device(device);
+	auto cpuLong = torch::TensorOptions().dtype(torch::kLong);
+	const float lD = frontier->LocalD();
+	const float bandLo = cfg.bandLowDecisions * lD, bandHi = cfg.bandHighDecisions * lD;
 
-	// --- sample window starts, each truncated at the first episode boundary inside it ----------
-	// Episodes are appended whole and row-contiguous, so consecutive rows are the same player
-	// until cont == 0. A fixed non-overlapping chunking (the first version) threw away every
-	// window that straddled a boundary, which at a 22s window is most of them; truncating
-	// instead keeps the usable prefix of each.
+	// ---- sample windows, each truncated at the first episode boundary inside it -------------
 	auto contC = cont.to(torch::kCPU, torch::kFloat32).flatten().contiguous();
 	const float* cp = contC.data_ptr<float>();
 	std::vector<int64_t> starts, lens;
-	starts.reserve(cfg.silWindows); lens.reserve(cfg.silWindows);
 	std::uniform_int_distribution<int64_t> pick(0, nR - minLen - 1);
 	for (int w = 0; w < cfg.silWindows; w++) {
 		int64_t s0 = pick(frontierRng);
@@ -2497,93 +2492,146 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	}
 	if (starts.empty()) {
 		RG_LOG("Frontier SIL: NO usable windows (goalTtl " << T << ", minWindow " << minLen
-			<< ", rows " << nR << ") - every sampled window hit an episode boundary before "
-			<< minLen << " steps. The credit window is longer than the episodes.");
+			<< ", rows " << nR << ") - the credit window is longer than the episodes.");
 		return;
 	}
 	const int64_t nW = (int64_t)starts.size();
-	lastFrontier.silWindows = (float)nW;
+	R.silWindows = (float)nW;
 
-	// Goal pool: a random slice so the [chunk, m] distance matrix stays small AND so the goals
-	// are drawn from the whole retained pool rather than its oldest rows.
-	auto cand = frontierCandidates;
-	const int64_t mCap = 1024;
-	if (cand.size(0) > mCap)
-		cand = cand.index_select(0, torch::randperm(cand.size(0), longOpts).slice(0, 0, mCap));
-
-	const float lD = frontier->LocalD();
-	const float bandLo = cfg.bandLowDecisions * lD, bandHi = cfg.bandHighDecisions * lD;
-
-	// Index construction stays on the HOST, because `states` is the pinned CPU trajectory
-	// tensor: a device index against a CPU tensor is a hard device-mismatch. The gathered
-	// chunk is what moves to the GPU, not the indices.
-	auto cpuLong = torch::TensorOptions().dtype(torch::kLong);
+	// ---- encode every window ONCE; all goals are scored against the same latents -------------
 	auto startT = torch::tensor(starts, cpuLong);
 	auto lenT = torch::tensor(lens, cpuLong);
-	auto tIdx = torch::arange(T, cpuLong);                               // [T]
+	auto tIdx = torch::arange(T, cpuLong);
+	auto rows = startT.unsqueeze(1) + tIdx.unsqueeze(0);            // [W, T]
+	auto live = tIdx.unsqueeze(0) < lenT.unsqueeze(1);              // [W, T]
+	rows = torch::where(live, rows, startT.unsqueeze(1));
+	auto liveD = live.to(device);
 
-	std::vector<torch::Tensor> weightParts, bestParts, validParts;
-	const int64_t CH = 32;   // 32 x 330 x 230 floats ~ 10MB per chunk
+	std::vector<torch::Tensor> zParts;
+	const int64_t CH = 32;
 	for (int64_t w0 = 0; w0 < nW; w0 += CH) {
 		int64_t w1 = RS_MIN(w0 + CH, nW);
-		auto st = startT.slice(0, w0, w1);                                // [c]
-		auto ln = lenT.slice(0, w0, w1);                                  // [c]
-		auto rows = st.unsqueeze(1) + tIdx.unsqueeze(0);                  // [c, T]
-		auto live = tIdx.unsqueeze(0) < ln.unsqueeze(1);                  // [c, T] real rows
-		rows = torch::where(live, rows, st.unsqueeze(1));                 // pad with the start row
-		auto chunk = states.index_select(0, rows.flatten()).to(device, torch::kFloat32)
-			.reshape({ w1 - w0, T, obsDim });
-		auto liveD = live.to(device);
-		auto pick2 = frontier->SelectGoals(chunk.select(1, 0), cand, bandLo, bandHi, cfg.goalSelect,
-			FrontierCtx());
-		auto prog = frontier->PrefixProgress(chunk, pick2.goals, liveD, FrontierCtx());
-		weightParts.push_back(prog.weight);
-		bestParts.push_back(prog.bestIndex);
-		validParts.push_back(pick2.valid);
+		auto chunk = states.index_select(0, rows.slice(0, w0, w1).flatten())
+			.to(device, torch::kFloat32).reshape({ w1 - w0, T, obsDim });
+		zParts.push_back(frontier->Encode(chunk.reshape({ (w1 - w0) * T, obsDim }), FrontierCtx())
+			.reshape({ w1 - w0, T, -1 }));
 	}
-	auto weight = torch::cat(weightParts).to(torch::kCPU, torch::kFloat32);
-	auto best = torch::cat(bestParts).to(torch::kCPU, torch::kLong);
-	auto valid = torch::cat(validParts).to(torch::kCPU) & (weight > 0);
-	lastFrontier.silValidFrac = valid.to(torch::kFloat32).mean().item<float>();
-	if (!valid.any().item<bool>()) {
-		RG_LOG("Frontier SIL: " << nW << " windows, but NONE closed any distance to its goal "
-			"(in-band " << torch::cat(validParts).to(torch::kFloat32).mean().item<float>()
-			<< ") - the pull has nothing to grip.");
-		return;
-	}
+	auto zWin = torch::cat(zParts, 0);                              // [W, T, latent]
 
-	// Keep the best windows by weight until silRows rows are filled; each contributes its prefix
-	// up to and including the step that came closest to the goal.
-	auto scored = torch::where(valid, weight, torch::zeros_like(weight));
-	auto ord = std::get<1>(scored.sort(0, /*descending=*/true));
-	std::vector<int64_t> rowIdx;
-	std::vector<float> rowW;
-	float wSum = 0.f; int64_t nKept = 0;
-	for (int64_t k = 0; k < ord.size(0) && (int64_t)rowIdx.size() < cfg.silRows; k++) {
-		int64_t w = ord[k].item<int64_t>();
-		float wv = scored[w].item<float>();
-		if (wv <= 0.f) break;
-		int64_t last = RS_MIN(best[w].item<int64_t>(), lens[w] - 1);
-		for (int64_t t = 0; t <= last && (int64_t)rowIdx.size() < cfg.silRows; t++) {
-			rowIdx.push_back(starts[w] + t);
-			rowW.push_back(wv);
+	// ---- retire finished goals ---------------------------------------------------------------
+	auto cand = frontierCandidates;
+	if (cand.size(0) > 2048)
+		cand = cand.index_select(0, torch::randperm(cand.size(0),
+			torch::TensorOptions().dtype(torch::kLong).device(device)).slice(0, 0, 2048));
+	const float poolLp = frontier->LearningProgress(cand, FrontierCtx()).mean().item<float>();
+	{
+		std::vector<FrontierGoal> keep;
+		for (auto& g : frontierBank) {
+			// A goal is DONE when the map has finished learning there (that is the objective),
+			// and ABANDONED when the policy has stopped improving on it for a long time.
+			float lp = frontier->LearningProgress(g.goalObs.unsqueeze(0).to(device), FrontierCtx())
+				.item<float>();
+			bool learned = lp < cfg.goalRetireLpFrac * poolLp;
+			bool stuck = g.stale > cfg.goalMaxStale;
+			if (learned || stuck) { R.bankRetired += 1.f; continue; }
+			keep.push_back(std::move(g));
 		}
-		wSum += wv; nKept++;
+		frontierBank = std::move(keep);
 	}
-	if (rowIdx.empty())
-		return;
-	auto idx = torch::tensor(rowIdx, torch::kLong);
-	auto wRows = torch::tensor(rowW, torch::kFloat32);
-	wRows = wRows / wRows.mean().clamp_min(1e-6f);            // mean 1: silCoeff is the dose
 
-	frontierRows.states = states.index_select(0, idx).to(device, torch::kFloat32);
-	frontierRows.actions = actions.index_select(0, idx).to(device, torch::kLong);
-	frontierRows.masks = masks.index_select(0, idx).to(device);
-	frontierRows.weights = wRows.to(device);
+	// ---- admit new goals to fill the bank -----------------------------------------------------
+	if ((int)frontierBank.size() < cfg.bankSize) {
+		auto probe = zWin.select(1, 0);                             // [W, latent] window starts
+		auto zc = frontier->Encode(cand, FrontierCtx());
+		auto D = frontier->Distance(probe.unsqueeze(1).expand({ nW, zc.size(0), probe.size(-1) }),
+			zc.unsqueeze(0).expand({ nW, zc.size(0), zc.size(-1) }));       // [W, m]
+		auto inBand = (D >= bandLo) & (D <= bandHi);
+		auto lpc = frontier->LearningProgress(cand, FrontierCtx());         // [m]
+		// Admissible = reachable from SOMEWHERE the policy actually is, ranked by how much the
+		// map is still learning there. Same signal as the diagnostic selector, made persistent.
+		auto reachable = inBand.any(0);                                     // [m]
+		auto score = torch::where(reachable, lpc, torch::full_like(lpc, -1e18f));
+		int want = cfg.bankSize - (int)frontierBank.size();
+		auto top = score.topk(RS_MIN((int64_t)want, score.size(0)));
+		auto ti = std::get<1>(top).to(torch::kCPU);
+		for (int64_t k = 0; k < ti.size(0); k++) {
+			if (std::get<0>(top)[k].item<float>() <= -1e17f) break;
+			FrontierGoal g;
+			g.goalObs = cand.index_select(0, ti[k].to(device).unsqueeze(0))
+				.squeeze(0).to(torch::kCPU, torch::kFloat32);
+			g.bestDist = 1e18f;
+			frontierBank.push_back(std::move(g));
+			R.bankAdmitted += 1.f;
+		}
+	}
+	if (frontierBank.empty())
+		return;
+
+	// ---- score every window against every goal; a strictly closer approach sets a RECORD ------
+	std::vector<torch::Tensor> gObs;
+	for (auto& g : frontierBank) gObs.push_back(g.goalObs);
+	auto goalsT = torch::stack(gObs, 0).to(device, torch::kFloat32);        // [G, obs]
+	auto zGoal = frontier->Encode(goalsT, FrontierCtx());                   // [G, latent]
+	const int64_t G = zGoal.size(0);
+	auto big = torch::full({ nW, T }, 1e18f, zWin.options());
+
+	for (int64_t gi = 0; gi < G; gi++) {
+		auto zg = zGoal[gi].view({ 1, 1, -1 }).expand({ nW, T, zGoal.size(-1) });
+		auto dd = torch::where(liveD, frontier->Distance(zWin, zg), big);   // [W, T]
+		auto flat = dd.flatten();
+		auto mn = flat.min(0);
+		float best = std::get<0>(mn).item<float>();
+		int64_t arg = std::get<1>(mn).item<int64_t>();
+		auto& g = frontierBank[(size_t)gi];
+		if (g.admitDist <= 0.f) g.admitDist = best;
+		g.age++;
+		if (best < g.bestDist - cfg.bankRecordEps) {
+			// NEW RECORD: remember the prefix that achieved it, replacing the old one.
+			int64_t w = arg / T, t = arg % T;
+			int64_t s0 = starts[(size_t)w];
+			auto idx = torch::arange(s0, s0 + t + 1, cpuLong);
+			g.recStates = states.index_select(0, idx).to(torch::kCPU).clone();
+			g.recActions = actions.index_select(0, idx).to(torch::kCPU).clone();
+			g.recMasks = masks.index_select(0, idx).to(torch::kCPU).clone();
+			g.bestDist = best;
+			g.stale = 0;
+			R.bankRecords += 1.f;
+		} else {
+			g.stale++;
+		}
+	}
+
+	// ---- rehearse every stored record ---------------------------------------------------------
+	std::vector<torch::Tensor> st, ac, mk;
+	int64_t total = 0; float sumBest = 0.f; int nWith = 0;
+	for (auto& g : frontierBank) {
+		sumBest += (g.bestDist < 1e17f ? g.bestDist : 0.f);
+		if (!g.recStates.defined()) continue;
+		int64_t take = RS_MIN(g.recStates.size(0), (int64_t)cfg.silRows - total);
+		if (take <= 0) break;
+		// Keep the CLOSEST part of the approach: the tail that ends at the record.
+		int64_t off = g.recStates.size(0) - take;
+		st.push_back(g.recStates.slice(0, off)); ac.push_back(g.recActions.slice(0, off));
+		mk.push_back(g.recMasks.slice(0, off));
+		total += take; nWith++;
+	}
+	R.bankGoals = (float)frontierBank.size();
+	R.bankMeanBest = frontierBank.empty() ? 0.f : sumBest / (float)frontierBank.size();
+	R.silValidFrac = frontierBank.empty() ? 0.f : (float)nWith / (float)frontierBank.size();
+	if (st.empty()) {
+		RG_LOG("Frontier SIL: " << frontierBank.size() << " goals banked but NO record prefix yet "
+			"- no window has approached any of them.");
+		return;
+	}
+	// Uniform weight: the ratchet lives in WHICH prefix is stored, not in how it is weighted.
+	frontierRows.states = torch::cat(st, 0).to(device, torch::kFloat32);
+	frontierRows.actions = torch::cat(ac, 0).to(device, torch::kLong);
+	frontierRows.masks = torch::cat(mk, 0).to(device);
+	frontierRows.weights = torch::ones({ total }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	frontierRows.coeff = cfg.silCoeff;
-	lastFrontier.silActive = true;
-	lastFrontier.silRows = (float)rowIdx.size();
-	lastFrontier.silMeanWeight = nKept > 0 ? wSum / (float)nKept : 0.f;
+	R.silActive = true;
+	R.silRows = (float)total;
+	R.silMeanWeight = 1.f;
 }
 
 void GGL::PPOLearner::TrainFrontier() {
@@ -2663,6 +2711,11 @@ void GGL::PPOLearner::TrainFrontier() {
 	rep.silMeanWeight = lastFrontier.silMeanWeight;
 	rep.silValidFrac = lastFrontier.silValidFrac;
 	rep.silWindows = lastFrontier.silWindows;
+	rep.bankGoals = lastFrontier.bankGoals;
+	rep.bankRecords = lastFrontier.bankRecords;
+	rep.bankMeanBest = lastFrontier.bankMeanBest;
+	rep.bankRetired = lastFrontier.bankRetired;
+	rep.bankAdmitted = lastFrontier.bankAdmitted;
 	rep.silLoss = dbgFrontierSilLoss;
 	lastFrontier = rep;
 

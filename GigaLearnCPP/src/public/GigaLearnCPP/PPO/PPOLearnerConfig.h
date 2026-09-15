@@ -104,6 +104,25 @@ namespace GGL {
 		int silRows = 1024;        // Rows sampled into each minibatch
 		int silWindows = 256;      // Candidate prefix windows scored per iteration
 		int silMinWindow = 30;     // A window shorter than this (episode ended) is unusable
+
+		// ===== THE RATCHET =====
+		// A per-iteration attraction term has no memory: if the policy stops reaching a good
+		// approach, the credit vanishes with it and PPO is free to discard the capability. That
+		// is the failure this program already measured - PPO found EV 0.984 four times in the toy
+		// and threw it away every time - and it is why the rehearsal bank, not the attraction
+		// term, is what solved the toy acquisition wall.
+		//
+		// So goals PERSIST, and each one remembers the closest approach ever achieved toward it
+		// (the RECORD) together with the prefix that achieved it. That prefix is rehearsed every
+		// iteration so the policy cannot regress off it, and is replaced only when a strictly
+		// better approach arrives. Entropy supplies the forward step; the mechanism only has to
+		// stop the policy forgetting what it already stumbled into.
+		bool goalBankEnabled = true;
+		int bankSize = 16;              // Goals held at once
+		float bankRecordEps = 0.02f;    // Min improvement (metric units) to count as a new record
+		int goalMaxStale = 200;         // Iterations without a new record before a goal retires
+		float goalRetireLpFrac = 0.4f;  // Retire once lp(goal) falls below this x the pool mean:
+		                                // the map has finished learning there, so it is done.
 		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
 
 		// OPPONENT CONDITIONING. The environment is RocketSim PLUS an opponent, and the opponent

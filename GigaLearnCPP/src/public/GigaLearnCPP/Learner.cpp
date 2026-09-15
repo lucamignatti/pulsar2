@@ -5871,6 +5871,15 @@ void GGL::Learner::Start() {
 						report["Frontier/SIL Mean W"] = fr.silMeanWeight;
 						report["Frontier/SIL Valid Frac"] = fr.silValidFrac;
 						report["Frontier/SIL Windows"] = fr.silWindows;
+						// THE RATCHET. Goals = persistent targets held; Records = how many set a
+						// strictly closer approach THIS iteration (the ratchet turning); Mean Best
+						// = the mean record distance, which must fall over time or nothing is
+						// being consolidated; Retired = goals whose map region finished learning.
+						report["Frontier/Bank Goals"] = fr.bankGoals;
+						report["Frontier/Bank Records"] = fr.bankRecords;
+						report["Frontier/Bank Mean Best"] = fr.bankMeanBest;
+						report["Frontier/Bank Retired"] = fr.bankRetired;
+						report["Frontier/Bank Admitted"] = fr.bankAdmitted;
 						report["Frontier/SIL Loss"] = fr.silLoss;
 						// Also to stdout: this module is new, its whole failure mode is looking
 						// healthy while doing nothing, and wandb is not always attached.
@@ -5881,8 +5890,11 @@ void GGL::Learner::Start() {
 							<< "  lp " << fr.goalProgress
 							<< "  valid " << fr.goalValidFrac
 							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
-							<< " win " << fr.silWindows << " rows " << fr.silRows << " meanW " << fr.silMeanWeight
-							<< " valid " << fr.silValidFrac << " loss " << fr.silLoss);
+							<< " win " << fr.silWindows << " rows " << fr.silRows
+							<< " loss " << fr.silLoss
+							<< " | bank " << fr.bankGoals << " rec " << fr.bankRecords
+							<< " best " << fr.bankMeanBest << " adm " << fr.bankAdmitted
+							<< " ret " << fr.bankRetired);
 					}
 				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();
