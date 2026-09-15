@@ -131,11 +131,15 @@ namespace GGL {
 		// members stop qualifying, its mass decays, and the pull redistributes elsewhere - so the
 		// field is exhausted only when there is nothing left unknown or unproven.
 		//
-		// Range measured 2026-09-15 over 57.6k frames: field contrast (phi p90/p10) is 12.2 at 5
-		// decisions, 1.76 at 50, and 1.37 at 100 - at 100 the field is nearly FLAT because typical
-		// pair distances are ~75 decisions, so every goal pulls on everything equally. 50 keeps a
-		// usable gradient AND peaks aerial-contest enrichment (0.406 vs a 0.205 pool base).
-		float gravityRangeDecisions = 50.0f;
+		// Range is SCALE-FREE: sigma is a fraction of the state distribution's OWN median pairwise
+		// distance, re-measured every iteration. Stating it in decisions does NOT transfer, and
+		// silently mis-scales here too, because the metric's spread grows the whole time it trains
+		// (Quasi Spread went 0.97 -> 39 in one run). The AirLine port proved it: the same "50
+		// decisions" produced sigma far larger than that toy's entire distance distribution and the
+		// field went flat at contrast 1.09; a fraction of the median took it to 3.1-3.5.
+		// 0.67 is the ratio that measured contrast 1.76 on the 591.7B rollout (sigma 23.5 units
+		// against a 35-unit median pair distance), which is where aerial enrichment peaked.
+		float gravityFrac = 0.67f;
 		float unknownQuantile = 0.90f;  // twin disagreement above this = the map does not know it
 		int goalCandidates = 512;       // goals sampled from the pool per iteration (compute cap)
 

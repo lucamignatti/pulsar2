@@ -5880,6 +5880,9 @@ void GGL::Learner::Start() {
 						// field (near 1) has no gradient and the pull is undirected.
 						report["Frontier/Goal Mass Frac"] = fr.goalMassFrac;
 						report["Frontier/Field Contrast"] = fr.fieldContrast;
+						// sigma must TRACK Quasi Spread as the metric trains; if it flatlines
+						// while spread grows, contrast dies and the pull goes undirected.
+						report["Frontier/Field Sigma"] = fr.fieldSigma;
 						// Mean field value of the rows actually imitated. Against Field Contrast
 						// this says whether the pull is landing on the field's peaks or its bulk.
 						report["Frontier/Imitated Phi"] = fr.bankMeanBest;
@@ -5896,7 +5899,7 @@ void GGL::Learner::Start() {
 							<< " win " << fr.silWindows << " rows " << fr.silRows
 							<< " loss " << fr.silLoss
 							<< " | phi " << fr.bankMeanBest << " mass " << fr.goalMassFrac
-							<< " contrast " << fr.fieldContrast);
+							<< " contrast " << fr.fieldContrast << " sigma " << fr.fieldSigma);
 					}
 				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();

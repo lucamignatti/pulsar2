@@ -2462,7 +2462,7 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto& R = lastFrontier;
 	R.silActive = false; R.silRows = 0; R.silMeanWeight = 0; R.silValidFrac = 0; R.silWindows = 0;
 	R.bankMeanBest = 0;
-	R.goalMassFrac = 0; R.fieldContrast = 0;
+	R.goalMassFrac = 0; R.fieldContrast = 0; R.fieldSigma = 0;
 	if (!frontier || !config.frontier.silEnabled)
 		return;
 	if (!frontierCandidates.defined() || frontierCandidates.size(0) < 256)
@@ -2478,7 +2478,6 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto cpuLong = torch::TensorOptions().dtype(torch::kLong);
 	auto devLong = torch::TensorOptions().dtype(torch::kLong).device(device);
 	const float lD = frontier->LocalD();
-	const float sigma = RS_MAX(1e-3f, cfg.gravityRangeDecisions * lD);
 
 	// ---- windows: contiguous runs of one player's play, cut at the first episode boundary -----
 	auto contC = cont.to(torch::kCPU, torch::kFloat32).flatten().contiguous();
@@ -2523,6 +2522,9 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	const int64_t mSample = RS_MIN((int64_t)cfg.goalCandidates * 4, cand.size(0));
 	cand = cand.index_select(0, torch::randperm(cand.size(0), devLong).slice(0, 0, mSample));
 	auto zc = frontier->Encode(cand, FrontierCtx());
+	frontier->UpdateScale(zc);                         // sigma tracks the pool's own spread
+	const float sigma = frontier->Sigma();
+	R.fieldSigma = sigma;
 	auto vc = frontier->Value(cand, FrontierCtx());
 	auto dis = frontier->Disagreement(cand, FrontierCtx());
 	auto vis = frontier->VisitOf(zc);
@@ -2687,6 +2689,7 @@ void GGL::PPOLearner::TrainFrontier() {
 	rep.bankMeanBest = lastFrontier.bankMeanBest;
 	rep.goalMassFrac = lastFrontier.goalMassFrac;
 	rep.fieldContrast = lastFrontier.fieldContrast;
+	rep.fieldSigma = lastFrontier.fieldSigma;
 	rep.silLoss = dbgFrontierSilLoss;
 	lastFrontier = rep;
 

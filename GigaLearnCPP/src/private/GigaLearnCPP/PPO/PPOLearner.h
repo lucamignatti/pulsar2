@@ -46,7 +46,7 @@ namespace GGL {
 			float goalGain = 0, goalDist = 0, goalDistDecisions = 0, goalValidFrac = 0, goalRarity = 0, goalProgress = 0;
 			float silMeanWeight = 0, silRows = 0, silValidFrac = 0, silLoss = 0, silWindows = 0;
 			float bankMeanBest = 0;   // mean field value of the rows actually imitated
-			float goalMassFrac = 0, fieldContrast = 0;
+			float goalMassFrac = 0, fieldContrast = 0, fieldSigma = 0;
 			int targetsClamped = 0;
 			bool trained = false, silActive = false;
 		};

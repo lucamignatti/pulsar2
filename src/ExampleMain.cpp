@@ -2261,7 +2261,7 @@ int main(int argc, char* argv[]) {
 		if (const char* v = std::getenv("GGL_FRONTIER_LAG"); v && *v && std::atoi(v) > 0)
 			cfg.ppo.frontier.progressLagIters = std::atoi(v);
 		if (const char* v = std::getenv("GGL_FRONTIER_GRAVITY"); v && *v)
-			cfg.ppo.frontier.gravityRangeDecisions = (float)std::atof(v);
+			cfg.ppo.frontier.gravityFrac = (float)std::atof(v);
 		if (const char* v = std::getenv("GGL_FRONTIER_UNKNOWN_Q"); v && *v)
 			cfg.ppo.frontier.unknownQuantile = (float)std::atof(v);
 		// Opponent conditioning REQUIRES the privileged context the composite critic already
@@ -2282,8 +2282,8 @@ int main(int argc, char* argv[]) {
 			<< "] decisions, pool " << cfg.ppo.frontier.candidatePool
 			<< ", oppCond " << (cfg.ppo.frontier.oppCond ? "ON" : "off")
 			<< ", lag " << cfg.ppo.frontier.progressLagIters
-			<< ", gravity range "
-			<< cfg.ppo.frontier.gravityRangeDecisions << " dec, unknown q "
+			<< ", gravity frac "
+			<< cfg.ppo.frontier.gravityFrac << " of median pair dist, unknown q "
 			<< cfg.ppo.frontier.unknownQuantile
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}

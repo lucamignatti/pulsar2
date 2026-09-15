@@ -88,6 +88,12 @@ namespace GGL {
 		float LocalD() const { return localDEma > 1e-3f ? localDEma : 1.0f; }
 		float localDEma = 1.0f;
 
+		// Gravity length scale, EMA'd from the MEDIAN PAIRWISE distance of the candidate pool.
+		// This is what sets field contrast, and it has to track the metric's spread as it trains.
+		float Sigma() const { return sigmaEma > 1e-3f ? sigmaEma : 1.0f; }
+		void UpdateScale(torch::Tensor latents);
+		float sigmaEma = 0.f;
+
 		// Progress of an executed prefix toward its goal, in [0, 1]: 1 - dBest / dStart.
 		// Returns the per-row weight exp(sharpness * progress) and the index of the best step.
 		// live is [n, T] bool: false for padded steps past the window's episode boundary, which

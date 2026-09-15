@@ -82,6 +82,18 @@ namespace GGL {
 		return visitCount.index_select(0, VisitKey(latent));
 	}
 
+	void FrontierModule::UpdateScale(torch::Tensor latents) {
+		torch::NoGradGuard noGrad;
+		const int64_t k = RS_MIN((int64_t)256, latents.size(0));
+		if (k < 16) return;
+		auto a = latents.slice(0, 0, k);
+		auto pw = Distance(a.unsqueeze(1).expand({ k, k, a.size(-1) }),
+			a.unsqueeze(0).expand({ k, k, a.size(-1) })).flatten();
+		float med = torch::quantile(pw, 0.5f).item<float>() * config.gravityFrac;
+		if (!(med > 1e-6f)) return;
+		sigmaEma = sigmaEma > 1e-6f ? 0.9f * sigmaEma + 0.1f * med : med;
+	}
+
 	torch::Tensor FrontierModule::Disagreement(torch::Tensor obs, torch::Tensor ctx) {
 		torch::NoGradGuard noGrad;
 		auto x = WithCtx(obs, ctx);
