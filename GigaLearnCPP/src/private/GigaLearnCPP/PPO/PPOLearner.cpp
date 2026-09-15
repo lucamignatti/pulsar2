@@ -2461,7 +2461,7 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	frontierRows = {};
 	auto& R = lastFrontier;
 	R.silActive = false; R.silRows = 0; R.silMeanWeight = 0; R.silValidFrac = 0; R.silWindows = 0;
-	R.bankGoals = 0; R.bankRecords = 0; R.bankMeanBest = 0; R.bankRetired = 0; R.bankAdmitted = 0;
+	R.bankMeanBest = 0;
 	R.goalMassFrac = 0; R.fieldContrast = 0;
 	if (!frontier || !config.frontier.silEnabled)
 		return;
@@ -2479,7 +2479,6 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto devLong = torch::TensorOptions().dtype(torch::kLong).device(device);
 	const float lD = frontier->LocalD();
 	const float sigma = RS_MAX(1e-3f, cfg.gravityRangeDecisions * lD);
-	const float spacing = cfg.bankSpacingDecisions * lD;
 
 	// ---- windows: contiguous runs of one player's play, cut at the first episode boundary -----
 	auto contC = cont.to(torch::kCPU, torch::kFloat32).flatten().contiguous();
@@ -2575,81 +2574,36 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto bestIdx = std::get<1>(best).to(torch::kCPU);            // [W]
 	auto z0 = zWin.select(1, 0).to(torch::kCPU);                 // [W, L] window starts
 
-	// ---- RATCHET: a prefix enters if it beats a NEARBY stored one, else takes its own slot ----
-	auto dCPU = [&](const torch::Tensor& a, const torch::Tensor& b) {
-		auto asym = torch::relu(b.narrow(0, 0, cfg.latentAsym) - a.narrow(0, 0, cfg.latentAsym)).max();
-		auto sym = (b.narrow(0, cfg.latentAsym, cfg.latentSym)
-			- a.narrow(0, cfg.latentAsym, cfg.latentSym)).norm();
-		return (asym + sym).item<float>();
-	};
-	auto ord = std::get<1>(bestPhi.sort(0, true));
-	for (int64_t k = 0; k < ord.size(0); k++) {
-		int64_t w = ord[k].item<int64_t>();
-		float p = bestPhi[w].item<float>();
-		if (p < -1e17f) continue;
-		auto sz = z0[w];
-		int near = -1;
-		for (size_t i = 0; i < frontierBank.size(); i++) {
-			float dAB = RS_MIN(dCPU(frontierBank[i].startZ, sz), dCPU(sz, frontierBank[i].startZ));
-			if (dAB < spacing) { near = (int)i; break; }
-		}
-		bool take = false; int slot = -1;
-		if (near >= 0) {                       // same manoeuvre: only a BETTER one replaces it
-			if (p > frontierBank[near].phi) { take = true; slot = near; }
-		} else if ((int)frontierBank.size() < cfg.bankSize) {
-			frontierBank.push_back(FrontierGoal{}); take = true; slot = (int)frontierBank.size() - 1;
-			R.bankAdmitted += 1.f;
-		} else {                               // full: displace the weakest, if this beats it
-			int worst = 0;
-			for (size_t i = 1; i < frontierBank.size(); i++)
-				if (frontierBank[i].phi < frontierBank[worst].phi) worst = (int)i;
-			if (p > frontierBank[worst].phi) { take = true; slot = worst; R.bankRetired += 1.f; }
-		}
-		if (!take) continue;
-		int64_t s0 = starts[(size_t)w];
-		int64_t t = RS_MIN(bestIdx[w].item<int64_t>(), lens[(size_t)w] - 1);
-		auto idx = torch::arange(s0, s0 + t + 1, cpuLong);
-		auto& g = frontierBank[(size_t)slot];
-		g.recStates = states.index_select(0, idx).to(torch::kCPU).clone();
-		g.recActions = actions.index_select(0, idx).to(torch::kCPU).clone();
-		g.recMasks = masks.index_select(0, idx).to(torch::kCPU).clone();
-		g.startZ = sz.clone();
-		g.phi = p;
-		g.age = 0;
-		R.bankRecords += 1.f;
-	}
-	if (frontierBank.empty())
+	// ---- SIL BY PROXIMITY. No bank, no slots, no records: every row the policy actually played
+	// this iteration is a candidate, and the ones that got CLOSEST to the field's mass are the
+	// ones imitated. "Top silRows by phi" introduces no new constant - silRows is already the
+	// dose. The memory lives in the candidate POOL, which keeps goal states alive as gravity
+	// sources long after the arena that found them moved on. -------------------------------------
+	auto phiFlat = phi.flatten();                                // [W*T], dead steps at -1e18
+	int64_t nLive = liveD.sum().item<int64_t>();
+	int64_t take = RS_MIN((int64_t)cfg.silRows, nLive);
+	if (take < 8) {
+		RG_LOG("Frontier SIL: only " << nLive << " live window rows - nothing to imitate.");
 		return;
+	}
+	auto top = phiFlat.topk(take);
+	auto sel = std::get<1>(top).to(torch::kCPU);                 // flat (window, step) indices
+	R.bankMeanBest = std::get<0>(top).mean().item<float>();      // mean phi of what we imitate
 
-	// ---- rehearse every stored prefix, newest-closest part first ------------------------------
-	std::vector<torch::Tensor> st, ac, mk;
-	int64_t total = 0; float sumPhi = 0.f;
-	for (auto& g : frontierBank) {
-		g.age++;
-		sumPhi += g.phi;
-		if (!g.recStates.defined()) continue;
-		int64_t take = RS_MIN(g.recStates.size(0), (int64_t)cfg.silRows - total);
-		if (take <= 0) break;
-		int64_t off = g.recStates.size(0) - take;      // keep the tail: closest to the field peak
-		st.push_back(g.recStates.slice(0, off));
-		ac.push_back(g.recActions.slice(0, off));
-		mk.push_back(g.recMasks.slice(0, off));
-		total += take;
-	}
-	R.bankGoals = (float)frontierBank.size();
-	R.bankMeanBest = frontierBank.empty() ? 0.f : sumPhi / (float)frontierBank.size();
-	if (st.empty())
-		return;
-	frontierRows.states = torch::cat(st, 0).to(device, torch::kFloat32);
-	frontierRows.actions = torch::cat(ac, 0).to(device, torch::kLong);
-	frontierRows.masks = torch::cat(mk, 0).to(device);
-	frontierRows.weights = torch::ones({ total },
+	// flat index -> the row in the trajectory it came from
+	auto selW = sel.div(T, "floor"), selT = sel.remainder(T);
+	auto rowsFlat = rowIdxAll.flatten().index_select(0, selW * T + selT);
+
+	frontierRows.states = states.index_select(0, rowsFlat).to(device, torch::kFloat32);
+	frontierRows.actions = actions.index_select(0, rowsFlat).to(device, torch::kLong);
+	frontierRows.masks = masks.index_select(0, rowsFlat).to(device);
+	frontierRows.weights = torch::ones({ take },
 		torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	frontierRows.coeff = cfg.silCoeff;
 	R.silActive = true;
-	R.silRows = (float)total;
+	R.silRows = (float)take;
 	R.silMeanWeight = 1.f;
-	R.silValidFrac = 1.f;
+	R.silValidFrac = (float)nLive / (float)(nW * T);
 }
 
 void GGL::PPOLearner::TrainFrontier() {
@@ -2730,11 +2684,7 @@ void GGL::PPOLearner::TrainFrontier() {
 	rep.silMeanWeight = lastFrontier.silMeanWeight;
 	rep.silValidFrac = lastFrontier.silValidFrac;
 	rep.silWindows = lastFrontier.silWindows;
-	rep.bankGoals = lastFrontier.bankGoals;
-	rep.bankRecords = lastFrontier.bankRecords;
 	rep.bankMeanBest = lastFrontier.bankMeanBest;
-	rep.bankRetired = lastFrontier.bankRetired;
-	rep.bankAdmitted = lastFrontier.bankAdmitted;
 	rep.goalMassFrac = lastFrontier.goalMassFrac;
 	rep.fieldContrast = lastFrontier.fieldContrast;
 	rep.silLoss = dbgFrontierSilLoss;

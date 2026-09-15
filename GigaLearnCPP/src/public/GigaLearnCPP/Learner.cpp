@@ -5880,11 +5880,9 @@ void GGL::Learner::Start() {
 						// field (near 1) has no gradient and the pull is undirected.
 						report["Frontier/Goal Mass Frac"] = fr.goalMassFrac;
 						report["Frontier/Field Contrast"] = fr.fieldContrast;
-						report["Frontier/Bank Goals"] = fr.bankGoals;
-						report["Frontier/Bank Records"] = fr.bankRecords;
-						report["Frontier/Bank Mean Best"] = fr.bankMeanBest;
-						report["Frontier/Bank Retired"] = fr.bankRetired;
-						report["Frontier/Bank Admitted"] = fr.bankAdmitted;
+						// Mean field value of the rows actually imitated. Against Field Contrast
+						// this says whether the pull is landing on the field's peaks or its bulk.
+						report["Frontier/Imitated Phi"] = fr.bankMeanBest;
 						report["Frontier/SIL Loss"] = fr.silLoss;
 						// Also to stdout: this module is new, its whole failure mode is looking
 						// healthy while doing nothing, and wandb is not always attached.
@@ -5897,8 +5895,7 @@ void GGL::Learner::Start() {
 							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
 							<< " win " << fr.silWindows << " rows " << fr.silRows
 							<< " loss " << fr.silLoss
-							<< " | bank " << fr.bankGoals << " rec " << fr.bankRecords
-							<< " phi " << fr.bankMeanBest << " mass " << fr.goalMassFrac
+							<< " | phi " << fr.bankMeanBest << " mass " << fr.goalMassFrac
 							<< " contrast " << fr.fieldContrast);
 					}
 				}

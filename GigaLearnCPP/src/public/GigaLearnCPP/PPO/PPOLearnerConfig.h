@@ -117,9 +117,6 @@ namespace GGL {
 		// iteration so the policy cannot regress off it, and is replaced only when a strictly
 		// better approach arrives. Entropy supplies the forward step; the mechanism only has to
 		// stop the policy forgetting what it already stumbled into.
-		bool goalBankEnabled = true;
-		int bankSize = 16;              // Prefixes rehearsed at once (a DOSE, not a claim about
-		                                // how many places matter - the field covers all of them)
 
 		// ===== THE GRAVITY FIELD =====
 		// Goal mass is BINARY and decided by what the map believes, not by a quantile of
@@ -150,10 +147,6 @@ namespace GGL {
 		int visitBits = 14;
 		float visitDecay = 0.99f;
 
-		// Bank spacing: a new prefix only DISPLACES a stored one if it starts within this many
-		// decisions of it; otherwise it takes its own slot. Without it the bank becomes N copies
-		// of whatever sits in the deepest well, and coverage - the whole objective - is lost.
-		float bankSpacingDecisions = 10.0f;
 		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
 
 		// OPPONENT CONDITIONING. The environment is RocketSim PLUS an opponent, and the opponent
