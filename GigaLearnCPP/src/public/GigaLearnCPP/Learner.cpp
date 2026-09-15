@@ -5854,6 +5854,12 @@ void GGL::Learner::Start() {
 						// mode that produced exactly zero acquisition in four separate rankings.
 						report["Frontier/Goal Gain"] = fr.goalGain;
 						report["Frontier/Goal Dist"] = fr.goalDist;
+						// The band is specified in decisions, so this is the number to read.
+						report["Frontier/Goal Dist Decisions"] = fr.goalDistDecisions;
+						// > 1 means the chosen goals are LESS visited than a random candidate,
+						// i.e. the mechanism is exploring. Under goalSelect=value this reads ~1
+						// or below, which is the signature of exploiting the map instead.
+						report["Frontier/Goal Rarity"] = fr.goalRarity;
 						report["Frontier/Goal Valid Frac"] = fr.goalValidFrac;
 						// The actuator. Rows > 0 with a nonzero loss is the pull; if silActive is
 						// false while GGL_FRONTIER_SIL is set, the band is empty or no prefix closed
@@ -5861,12 +5867,14 @@ void GGL::Learner::Start() {
 						report["Frontier/SIL Rows"] = fr.silRows;
 						report["Frontier/SIL Mean W"] = fr.silMeanWeight;
 						report["Frontier/SIL Valid Frac"] = fr.silValidFrac;
+						report["Frontier/SIL Windows"] = fr.silWindows;
 						report["Frontier/SIL Loss"] = fr.silLoss;
 						// Also to stdout: this module is new, its whole failure mode is looking
 						// healthy while doing nothing, and wandb is not always attached.
 						RG_LOG("Frontier: V " << fr.meanValue << " (|tgt|max " << fr.maxAbsTarget
 							<< ", clamped " << fr.targetsClamped << ")  localD " << fr.meanLocal
 							<< "  goalGain " << fr.goalGain << " @ d" << fr.goalDist
+							<< " (" << fr.goalDistDecisions << " dec)  rarity " << fr.goalRarity
 							<< "  valid " << fr.goalValidFrac
 							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
 							<< " rows " << fr.silRows << " meanW " << fr.silMeanWeight

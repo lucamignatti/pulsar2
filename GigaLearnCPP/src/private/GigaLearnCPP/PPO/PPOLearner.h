@@ -1,4 +1,5 @@
 #pragma once
+#include <random>
 #include "ExperienceBuffer.h"
 #include "CudaGraphPolicy.h"
 #include <GigaLearnCPP/Util/Report.h>
@@ -42,8 +43,8 @@ namespace GGL {
 		struct FrontierReport {
 			float valueLoss = 0, meanValue = 0, maxAbsTarget = 0;
 			float quasiLoss = 0, meanLocal = 0, violation = 0, meanSpread = 0;
-			float goalGain = 0, goalDist = 0, goalValidFrac = 0;
-			float silMeanWeight = 0, silRows = 0, silValidFrac = 0, silLoss = 0;
+			float goalGain = 0, goalDist = 0, goalDistDecisions = 0, goalValidFrac = 0, goalRarity = 0;
+			float silMeanWeight = 0, silRows = 0, silValidFrac = 0, silLoss = 0, silWindows = 0;
 			int targetsClamped = 0;
 			bool trained = false, silActive = false;
 		};
@@ -222,6 +223,10 @@ namespace GGL {
 		// form as the bank rows but with config.frontier.silCoeff. THE actuator of the frontier.
 		DipImitationRows frontierRows;
 		float dbgFrontierSilLoss = 0.f;
+		// Persistent engine for window sampling. NOT RocketSim's Math::RandFloat - that is a
+		// thread_local reseeded from the millisecond clock, which turned an earlier per-iteration
+		// roll into a wall-clock sawtooth (see the opponent-cascade note in CLAUDE.md).
+		std::mt19937_64 frontierRng{ 0x5eed1234u };
 		void FrontierBuildSilRows(torch::Tensor states, torch::Tensor actions, torch::Tensor masks, torch::Tensor cont);
 
 		torch::Tensor oppCtxForLearn;      // CPU; barrier-copied so learn sees ITS iteration

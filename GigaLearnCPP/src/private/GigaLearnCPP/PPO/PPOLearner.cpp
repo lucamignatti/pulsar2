@@ -2457,6 +2457,7 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	lastFrontier.silRows = 0;
 	lastFrontier.silMeanWeight = 0;
 	lastFrontier.silValidFrac = 0;
+	lastFrontier.silWindows = 0;
 	if (!frontier || !config.frontier.silEnabled)
 		return;
 	if (!frontierCandidates.defined() || frontierCandidates.size(0) < 64)
@@ -2465,61 +2466,86 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	const auto& cfg = config.frontier;
 	const int64_t T = RS_MAX((int64_t)2, (int64_t)cfg.goalTtl);
 	const int64_t nR = states.size(0);
-	const int64_t nW = nR / T;
-	if (nW < 1)
+	const int64_t obsDim = states.size(1);
+	const int64_t minLen = RS_MAX((int64_t)2, (int64_t)cfg.silMinWindow);
+	if (nR < minLen + 1)
 		return;
 	auto longOpts = torch::TensorOptions().dtype(torch::kLong).device(device);
 
-	// Windows of T consecutive rows. Episodes are appended whole and row-contiguous, so a window
-	// is one player's next T decisions unless an episode boundary falls inside it: cont == 0 on
-	// any interior row means the tail is a goal->kickoff teleport, not an executed prefix.
-	auto contW = cont.to(torch::kCPU, torch::kFloat32).flatten().slice(0, 0, nW * T).reshape({ nW, T });
-	auto interior = std::get<0>(contW.narrow(1, 0, T - 1).min(1)) > 0.5f;      // [nW] CPU bool
-	const int64_t obsDim = states.size(1);
-	auto win = states.slice(0, 0, nW * T).to(device, torch::kFloat32).reshape({ nW, T, obsDim });
+	// --- sample window starts, each truncated at the first episode boundary inside it ----------
+	// Episodes are appended whole and row-contiguous, so consecutive rows are the same player
+	// until cont == 0. A fixed non-overlapping chunking (the first version) threw away every
+	// window that straddled a boundary, which at a 22s window is most of them; truncating
+	// instead keeps the usable prefix of each.
+	auto contC = cont.to(torch::kCPU, torch::kFloat32).flatten().contiguous();
+	const float* cp = contC.data_ptr<float>();
+	std::vector<int64_t> starts, lens;
+	starts.reserve(cfg.silWindows); lens.reserve(cfg.silWindows);
+	std::uniform_int_distribution<int64_t> pick(0, nR - minLen - 1);
+	for (int w = 0; w < cfg.silWindows; w++) {
+		int64_t s0 = pick(frontierRng);
+		int64_t L = 1;
+		while (L < T && s0 + L < nR && cp[s0 + L - 1] > 0.5f)
+			L++;
+		if (L >= minLen) { starts.push_back(s0); lens.push_back(L); }
+	}
+	if (starts.empty())
+		return;
+	const int64_t nW = (int64_t)starts.size();
+	lastFrontier.silWindows = (float)nW;
 
-	// Goal pool: a random slice of the candidate pool so the [chunk, m] distance matrix stays small.
+	// Goal pool: a random slice so the [chunk, m] distance matrix stays small AND so the goals
+	// are drawn from the whole retained pool rather than its oldest rows.
 	auto cand = frontierCandidates;
 	const int64_t mCap = 1024;
 	if (cand.size(0) > mCap)
 		cand = cand.index_select(0, torch::randperm(cand.size(0), longOpts).slice(0, 0, mCap));
 
+	const float lD = frontier->LocalD();
+	const float bandLo = cfg.bandLowDecisions * lD, bandHi = cfg.bandHighDecisions * lD;
+
+	auto startT = torch::tensor(starts, torch::TensorOptions().dtype(torch::kLong)).to(device);
+	auto lenT = torch::tensor(lens, torch::TensorOptions().dtype(torch::kLong)).to(device);
+	auto tIdx = torch::arange(T, longOpts);                              // [T]
+
 	std::vector<torch::Tensor> weightParts, bestParts, validParts;
-	const int64_t CH = 256;
+	const int64_t CH = 32;   // 32 x 330 x 230 floats ~ 10MB per chunk
 	for (int64_t w0 = 0; w0 < nW; w0 += CH) {
 		int64_t w1 = RS_MIN(w0 + CH, nW);
-		auto chunk = win.slice(0, w0, w1);                       // [c, T, obs]
-		auto pick = frontier->SelectGoals(chunk.select(1, 0), cand);
-		auto prog = frontier->PrefixProgress(chunk, pick.goals);
+		auto st = startT.slice(0, w0, w1);                                // [c]
+		auto ln = lenT.slice(0, w0, w1);                                  // [c]
+		auto rows = st.unsqueeze(1) + tIdx.unsqueeze(0);                  // [c, T]
+		auto live = tIdx.unsqueeze(0) < ln.unsqueeze(1);                  // [c, T] real rows
+		rows = torch::where(live, rows, st.unsqueeze(1));                 // pad with the start row
+		auto chunk = states.index_select(0, rows.flatten()).to(device, torch::kFloat32)
+			.reshape({ w1 - w0, T, obsDim });
+		auto pick2 = frontier->SelectGoals(chunk.select(1, 0), cand, bandLo, bandHi, cfg.goalSelect);
+		auto prog = frontier->PrefixProgress(chunk, pick2.goals, live);
 		weightParts.push_back(prog.weight);
 		bestParts.push_back(prog.bestIndex);
-		validParts.push_back(pick.valid);
+		validParts.push_back(pick2.valid);
 	}
-	auto weight = torch::cat(weightParts).to(torch::kCPU, torch::kFloat32);   // exp(sharpness * progress), 0 if no progress
+	auto weight = torch::cat(weightParts).to(torch::kCPU, torch::kFloat32);
 	auto best = torch::cat(bestParts).to(torch::kCPU, torch::kLong);
-	auto valid = torch::cat(validParts).to(torch::kCPU) & interior & (weight > 0);
-	const float validFrac = valid.to(torch::kFloat32).mean().item<float>();
-	lastFrontier.silValidFrac = validFrac;
+	auto valid = torch::cat(validParts).to(torch::kCPU) & (weight > 0);
+	lastFrontier.silValidFrac = valid.to(torch::kFloat32).mean().item<float>();
 	if (!valid.any().item<bool>())
 		return;
 
-	// Keep the K best windows by weight (silRows bounds the row count), whole prefix up to and
-	// including the closest step. Rows carry their window's weight.
+	// Keep the best windows by weight until silRows rows are filled; each contributes its prefix
+	// up to and including the step that came closest to the goal.
 	auto scored = torch::where(valid, weight, torch::zeros_like(weight));
-	const int64_t K = RS_MAX((int64_t)1, (int64_t)cfg.silRows / T);
-	auto top = scored.topk(RS_MIN(K, nW));
-	auto topW = std::get<0>(top);
-	auto topI = std::get<1>(top);
+	auto ord = std::get<1>(scored.sort(0, /*descending=*/true));
 	std::vector<int64_t> rowIdx;
 	std::vector<float> rowW;
 	float wSum = 0.f; int64_t nKept = 0;
-	for (int64_t k = 0; k < topI.size(0); k++) {
-		float wv = topW[k].item<float>();
+	for (int64_t k = 0; k < ord.size(0) && (int64_t)rowIdx.size() < cfg.silRows; k++) {
+		int64_t w = ord[k].item<int64_t>();
+		float wv = scored[w].item<float>();
 		if (wv <= 0.f) break;
-		int64_t w = topI[k].item<int64_t>();
-		int64_t last = best[w].item<int64_t>();
-		for (int64_t t = 0; t <= last; t++) {
-			rowIdx.push_back(w * T + t);
+		int64_t last = RS_MIN(best[w].item<int64_t>(), lens[w] - 1);
+		for (int64_t t = 0; t <= last && (int64_t)rowIdx.size() < cfg.silRows; t++) {
+			rowIdx.push_back(starts[w] + t);
 			rowW.push_back(wv);
 		}
 		wSum += wv; nKept++;
@@ -2590,11 +2616,19 @@ void GGL::PPOLearner::TrainFrontier() {
 	// which is the order every previous version of this got wrong.
 	if (frontierCandidates.defined() && frontierCandidates.size(0) >= 64) {
 		auto probe = frontierObs.slice(0, 0, RS_MIN((int64_t)512, n));
-		auto cand = frontierCandidates.slice(0, 0, RS_MIN((int64_t)1024, frontierCandidates.size(0)));
-		auto pick = frontier->SelectGoals(probe, cand);
+		// Sample the candidate pool rather than taking its head: the pool is now 65k deep and its
+		// head is the OLDEST slice, which would make the diagnostic a stale-state readout.
+		auto cand = frontierCandidates;
+		if (cand.size(0) > 1024)
+			cand = cand.index_select(0, torch::randperm(cand.size(0), longOpts).slice(0, 0, 1024));
+		const float lD = frontier->LocalD();
+		auto pick = frontier->SelectGoals(probe, cand, cfg.bandLowDecisions * lD,
+			cfg.bandHighDecisions * lD, cfg.goalSelect);
 		rep.goalGain = pick.meanGain;
 		rep.goalDist = pick.meanDist;
+		rep.goalDistDecisions = pick.meanDist / RS_MAX(lD, 1e-3f);
 		rep.goalValidFrac = pick.valid.to(torch::kFloat32).mean().item<float>();
+		rep.goalRarity = pick.meanRarity;
 	}
 
 	rep.trained = true;
@@ -2603,6 +2637,7 @@ void GGL::PPOLearner::TrainFrontier() {
 	rep.silRows = lastFrontier.silRows;
 	rep.silMeanWeight = lastFrontier.silMeanWeight;
 	rep.silValidFrac = lastFrontier.silValidFrac;
+	rep.silWindows = lastFrontier.silWindows;
 	rep.silLoss = dbgFrontierSilLoss;
 	lastFrontier = rep;
 

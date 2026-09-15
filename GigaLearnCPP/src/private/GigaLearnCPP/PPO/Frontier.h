@@ -50,12 +50,22 @@ namespace GGL {
 		// inside [bandLow, bandHigh]. Returns the chosen candidate rows and a validity mask.
 		// Candidates outside the band are rejected because the toy measured that distances to
 		// states outside forward reach carry no usable gradient at all.
-		struct GoalPick { torch::Tensor goals; torch::Tensor valid; float meanGain = 0, meanDist = 0; };
-		GoalPick SelectGoals(torch::Tensor obs, torch::Tensor candidates);
+		struct GoalPick { torch::Tensor goals; torch::Tensor valid; float meanGain = 0, meanDist = 0, meanRarity = 0; };
+		// bandLo/bandHi are in METRIC UNITS; the caller converts from decisions via LocalD().
+		// mode is FrontierConfig::GoalSelect.
+		GoalPick SelectGoals(torch::Tensor obs, torch::Tensor candidates, float bandLo, float bandHi, int mode);
+
+		// Live one-step distance, EMA'd over TrainQuasi calls. This is the metric's SCALE: one
+		// executed decision costs this much, so a band in decisions becomes a band in units by
+		// multiplying. Seeded at 1 (the constraint's own target) so the first iteration is sane.
+		float LocalD() const { return localDEma > 1e-3f ? localDEma : 1.0f; }
+		float localDEma = 1.0f;
 
 		// Progress of an executed prefix toward its goal, in [0, 1]: 1 - dBest / dStart.
 		// Returns the per-row weight exp(sharpness * progress) and the index of the best step.
+		// live is [n, T] bool: false for padded steps past the window's episode boundary, which
+		// must not be allowed to win the closest-approach argmin.
 		struct Progress { torch::Tensor weight; torch::Tensor bestIndex; };
-		Progress PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal);
+		Progress PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal, torch::Tensor live);
 	};
 }

@@ -12,8 +12,11 @@ namespace GGL {
 			RG_ERR_CLOSE("FrontierConfig::valueAbsMax must be > 0 (bounded bootstrap target is required)");
 		if (!(config.valueExpectile > 0.5f && config.valueExpectile < 1.0f))
 			RG_ERR_CLOSE("FrontierConfig::valueExpectile must be in (0.5, 1) - 0.5 is a mean, which is the wrong question");
-		if (config.bandLow <= 0 || config.bandHigh <= config.bandLow)
-			RG_ERR_CLOSE("FrontierConfig band must satisfy 0 < bandLow < bandHigh");
+		if (config.bandLowDecisions <= 0 || config.bandHighDecisions <= config.bandLowDecisions)
+			RG_ERR_CLOSE("FrontierConfig band must satisfy 0 < bandLowDecisions < bandHighDecisions");
+		if (config.goalTtl < config.silMinWindow)
+			RG_ERR_CLOSE("FrontierConfig::goalTtl (" << config.goalTtl << ") < silMinWindow ("
+				<< config.silMinWindow << "): every window would be rejected and SIL would be inert");
 
 		ModelConfig valueConfig = config.value;
 		valueConfig.numInputs = obsSize;
@@ -120,12 +123,14 @@ namespace GGL {
 
 		stats.loss = loss.item<float>();
 		stats.meanLocal = ((local * keep).sum() / nKeep).item<float>();
+		localDEma = 0.99f * localDEma + 0.01f * stats.meanLocal;
 		stats.violation = violation.item<float>();
 		stats.meanSpread = spread.mean().item<float>();
 		return stats;
 	}
 
-	FrontierModule::GoalPick FrontierModule::SelectGoals(torch::Tensor obs, torch::Tensor candidates) {
+	FrontierModule::GoalPick FrontierModule::SelectGoals(torch::Tensor obs, torch::Tensor candidates,
+		float bandLo, float bandHi, int mode) {
 		torch::NoGradGuard noGrad;
 		GoalPick pick = {};
 
@@ -142,8 +147,25 @@ namespace GGL {
 		                     zCand.unsqueeze(0).expand({ n, m, zCand.size(-1) }));
 		auto gain = vCand.unsqueeze(0) - vObs.unsqueeze(1);
 
-		auto inBand = (dist >= config.bandLow) & (dist <= config.bandHigh);
-		auto score = torch::where(inBand, gain, torch::full_like(gain, -1e18f));
+		auto inBand = (dist >= bandLo) & (dist <= bandHi);
+
+		// Rarity: mean distance from the CURRENT state population to each candidate. Large means
+		// the policy rarely gets near it. Free - it is a reduction of the matrix already built.
+		auto rarity = dist.mean(0);                 // [m]
+
+		torch::Tensor pref;
+		switch (mode) {
+			case FrontierConfig::GOALSEL_RANDOM:
+				pref = torch::rand_like(gain);
+				break;
+			case FrontierConfig::GOALSEL_RARITY:
+				pref = rarity.unsqueeze(0).expand_as(gain);
+				break;
+			default:
+				pref = gain;                        // GOALSEL_VALUE
+				break;
+		}
+		auto score = torch::where(inBand, pref, torch::full_like(pref, -1e18f));
 		auto best = score.argmax(1);
 
 		pick.valid = inBand.any(1);
@@ -156,10 +178,18 @@ namespace GGL {
 		auto denom = validF.sum().clamp_min(1.0f);
 		pick.meanDist = (chosenDist * validF).sum().item<float>() / denom.item<float>();
 		pick.meanGain = (chosenGain * validF).sum().item<float>() / denom.item<float>();
+		// Rarity of what was chosen, relative to the pool's mean rarity: > 1 means the goals are
+		// less-visited than a random candidate. Under GOALSEL_VALUE this reads ~1 or below, which
+		// is the diagnostic that the mechanism is exploiting rather than exploring.
+		auto chosenRarity = rarity.index_select(0, best);
+		float poolRarity = rarity.mean().item<float>();
+		pick.meanRarity = poolRarity > 1e-6f
+			? ((chosenRarity * validF).sum().item<float>() / denom.item<float>()) / poolRarity : 0.f;
 		return pick;
 	}
 
-	FrontierModule::Progress FrontierModule::PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal) {
+	FrontierModule::Progress FrontierModule::PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal,
+		torch::Tensor live) {
 		torch::NoGradGuard noGrad;
 		Progress out = {};
 
@@ -170,6 +200,8 @@ namespace GGL {
 		auto zPrefix = Encode(prefixObs.reshape({ n * T, obsSize })).reshape({ n, T, -1 });
 		auto zGoal = Encode(goal).unsqueeze(1).expand({ n, T, -1 });
 		auto dist = Distance(zPrefix, zGoal);                   // [n, T]
+		if (live.defined())
+			dist = torch::where(live, dist, torch::full_like(dist, 1e18f));
 
 		auto dStart = dist.narrow(1, 0, 1).clamp_min(1e-6f);
 		auto best = dist.min(1);

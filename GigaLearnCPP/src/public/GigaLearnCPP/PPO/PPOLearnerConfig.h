@@ -59,20 +59,41 @@ namespace GGL {
 		int quasiSteps = 8;
 		int quasiBatch = 2048;
 
-		// Goal selection: among candidate states inside the reachability band, take the largest
-		// value gain over where the agent already is. The band matters - the toy measured that
-		// distances to states outside forward reach carry NO usable gradient (every action scored
-		// negative), so a goal must be near enough that the metric still means something.
-		float bandLow = 1.5f;
-		float bandHigh = 6.0f;
-		int candidatePool = 4096;  // Recent observations retained as goal candidates
-		int goalTtl = 12;          // Decisions a goal is held before reselection
+		// Goal selection. The band is in DECISIONS and is converted to metric units at use time
+		// by multiplying the module's live one-step distance (Frontier/Quasi Local D). It was
+		// fixed in metric units until 2026-09-15, which was wrong twice over: the metric's scale
+		// drifts as it trains (localD 0.42 -> 0.53 in one hop, silently shrinking the band), and
+		// [1.5, 6.0] units measured against a real rollout pool covered only the nearest 1% of
+		// candidate pairs - the median pair sits at 35 units / 75 decisions. A band pinned to the
+		// bottom percentile can only ever select states the policy is about to reach anyway,
+		// which is exactly what the 591.7B inspection found it doing.
+		float bandLowDecisions = 6.0f;
+		float bandHighDecisions = 100.0f;
+
+		// How the goal is chosen among the in-band candidates.
+		//   VALUE  - largest value gain. Exploits the map; measured to select "ball fast toward
+		//            the net" and to pick flip-reset states at 0.46x their base rate.
+		//   RANDOM - uniform. The cheapest test of "pull regardless of value".
+		//   RARITY - the in-band candidate FARTHEST from the current state population, i.e. the
+		//            reachable place the policy least often goes. Self-limiting: once the policy
+		//            goes there often it stops being rare and the pull moves on.
+		enum GoalSelect { GOALSEL_VALUE = 0, GOALSEL_RANDOM = 1, GOALSEL_RARITY = 2 };
+		int goalSelect = GOALSEL_VALUE;
+
+		// Recent observations retained as goal candidates. At 4096 against 16,704 rows/iter/rank
+		// the pool was a QUARTER of one iteration, so anything rare was evicted within seconds -
+		// a 1-in-100k state was present ~4% of the time. Cross-arena transfer of rare states is
+		// the whole discovery mechanism here, and it needs the pool to actually retain them.
+		int candidatePool = 65536;
+		int goalTtl = 330;         // Decisions a goal is held / credited over: 22s at 15Hz
 
 		// Progress-weighted self-imitation. W161 measured the ORIGINAL endpoint-prefix rule
 		// beating per-transition credit 2 seeds to 1, so the prefix rule is what is ported.
 		float silSharpness = 6.0f; // weight = exp(sharpness * progress), progress in [0,1]
 		float silCoeff = 0.005f;
 		int silRows = 1024;        // Rows sampled into each minibatch
+		int silWindows = 256;      // Candidate prefix windows scored per iteration
+		int silMinWindow = 30;     // A window shorter than this (episode ended) is unusable
 		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
 
 		PartialModelConfig value, quasi;

@@ -2237,9 +2237,33 @@ int main(int argc, char* argv[]) {
 			cfg.ppo.frontier.silEnabled = true;
 		if (const char* fc = std::getenv("GGL_FRONTIER_SIL_COEFF"); fc && *fc)
 			cfg.ppo.frontier.silCoeff = (float)std::atof(fc);
+		// GGL_FRONTIER_GOALSEL = value | random | rarity. See FrontierConfig::GoalSelect.
+		// "value" is the 591.7B behaviour: measured to aim at ball-fast-toward-net and to pick
+		// flip-reset states at 0.46x their base rate - it exploits the map instead of completing
+		// it. "rarity" is the exploration form: the reachable candidate the policy least often
+		// gets near, which stops being selected once the policy goes there often.
+		if (const char* gs = std::getenv("GGL_FRONTIER_GOALSEL"); gs && *gs) {
+			std::string v = gs;
+			if (v == "random") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_RANDOM;
+			else if (v == "rarity") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_RARITY;
+			else if (v == "value") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_VALUE;
+			else RG_ERR_CLOSE("GGL_FRONTIER_GOALSEL must be value|random|rarity, got \"" << v << "\"");
+		}
+		if (const char* b = std::getenv("GGL_FRONTIER_BAND_LO"); b && *b)
+			cfg.ppo.frontier.bandLowDecisions = (float)std::atof(b);
+		if (const char* b = std::getenv("GGL_FRONTIER_BAND_HI"); b && *b)
+			cfg.ppo.frontier.bandHighDecisions = (float)std::atof(b);
+		if (const char* v = std::getenv("GGL_FRONTIER_TTL"); v && *v && std::atoi(v) > 0)
+			cfg.ppo.frontier.goalTtl = std::atoi(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_POOL"); v && *v && std::atoi(v) > 0)
+			cfg.ppo.frontier.candidatePool = std::atoi(v);
 		RG_LOG("GGL_FRONTIER: value map + quasimetric ON, SIL " << (cfg.ppo.frontier.silEnabled ? "ON" : "off")
 			<< " (coeff " << cfg.ppo.frontier.silCoeff << ", rows " << cfg.ppo.frontier.silRows
-			<< ", ttl " << cfg.ppo.frontier.goalTtl << ", sharpness " << cfg.ppo.frontier.silSharpness << ")"
+			<< ", ttl " << cfg.ppo.frontier.goalTtl << " decisions, sharpness " << cfg.ppo.frontier.silSharpness << ")"
+			<< ", goalSel " << (cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_RARITY ? "RARITY"
+				: cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_RANDOM ? "RANDOM" : "value")
+			<< ", band [" << cfg.ppo.frontier.bandLowDecisions << ", " << cfg.ppo.frontier.bandHighDecisions
+			<< "] decisions, pool " << cfg.ppo.frontier.candidatePool
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
