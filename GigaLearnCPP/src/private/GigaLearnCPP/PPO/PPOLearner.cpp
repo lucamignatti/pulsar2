@@ -2489,8 +2489,12 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 			L++;
 		if (L >= minLen) { starts.push_back(s0); lens.push_back(L); }
 	}
-	if (starts.empty())
+	if (starts.empty()) {
+		RG_LOG("Frontier SIL: NO usable windows (goalTtl " << T << ", minWindow " << minLen
+			<< ", rows " << nR << ") - every sampled window hit an episode boundary before "
+			<< minLen << " steps. The credit window is longer than the episodes.");
 		return;
+	}
 	const int64_t nW = (int64_t)starts.size();
 	lastFrontier.silWindows = (float)nW;
 
@@ -2504,9 +2508,13 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	const float lD = frontier->LocalD();
 	const float bandLo = cfg.bandLowDecisions * lD, bandHi = cfg.bandHighDecisions * lD;
 
-	auto startT = torch::tensor(starts, torch::TensorOptions().dtype(torch::kLong)).to(device);
-	auto lenT = torch::tensor(lens, torch::TensorOptions().dtype(torch::kLong)).to(device);
-	auto tIdx = torch::arange(T, longOpts);                              // [T]
+	// Index construction stays on the HOST, because `states` is the pinned CPU trajectory
+	// tensor: a device index against a CPU tensor is a hard device-mismatch. The gathered
+	// chunk is what moves to the GPU, not the indices.
+	auto cpuLong = torch::TensorOptions().dtype(torch::kLong);
+	auto startT = torch::tensor(starts, cpuLong);
+	auto lenT = torch::tensor(lens, cpuLong);
+	auto tIdx = torch::arange(T, cpuLong);                               // [T]
 
 	std::vector<torch::Tensor> weightParts, bestParts, validParts;
 	const int64_t CH = 32;   // 32 x 330 x 230 floats ~ 10MB per chunk
@@ -2519,8 +2527,9 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 		rows = torch::where(live, rows, st.unsqueeze(1));                 // pad with the start row
 		auto chunk = states.index_select(0, rows.flatten()).to(device, torch::kFloat32)
 			.reshape({ w1 - w0, T, obsDim });
+		auto liveD = live.to(device);
 		auto pick2 = frontier->SelectGoals(chunk.select(1, 0), cand, bandLo, bandHi, cfg.goalSelect);
-		auto prog = frontier->PrefixProgress(chunk, pick2.goals, live);
+		auto prog = frontier->PrefixProgress(chunk, pick2.goals, liveD);
 		weightParts.push_back(prog.weight);
 		bestParts.push_back(prog.bestIndex);
 		validParts.push_back(pick2.valid);
@@ -2529,8 +2538,12 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto best = torch::cat(bestParts).to(torch::kCPU, torch::kLong);
 	auto valid = torch::cat(validParts).to(torch::kCPU) & (weight > 0);
 	lastFrontier.silValidFrac = valid.to(torch::kFloat32).mean().item<float>();
-	if (!valid.any().item<bool>())
+	if (!valid.any().item<bool>()) {
+		RG_LOG("Frontier SIL: " << nW << " windows, but NONE closed any distance to its goal "
+			"(in-band " << torch::cat(validParts).to(torch::kFloat32).mean().item<float>()
+			<< ") - the pull has nothing to grip.");
 		return;
+	}
 
 	// Keep the best windows by weight until silRows rows are filled; each contributes its prefix
 	// up to and including the step that came closest to the goal.

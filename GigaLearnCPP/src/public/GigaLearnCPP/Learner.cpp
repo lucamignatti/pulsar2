@@ -5877,7 +5877,7 @@ void GGL::Learner::Start() {
 							<< " (" << fr.goalDistDecisions << " dec)  rarity " << fr.goalRarity
 							<< "  valid " << fr.goalValidFrac
 							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
-							<< " rows " << fr.silRows << " meanW " << fr.silMeanWeight
+							<< " win " << fr.silWindows << " rows " << fr.silRows << " meanW " << fr.silMeanWeight
 							<< " valid " << fr.silValidFrac << " loss " << fr.silLoss);
 					}
 				}
