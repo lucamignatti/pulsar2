@@ -1254,7 +1254,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor sumGuidingLoss = zmet(), sumClip = zmet(), sumDivergence = zmet();
 	torch::Tensor sumVdagLoss = zmet(), sumVdagTwinSpread = zmet(), sumRhatLoss = zmet();
 	torch::Tensor sumReachLoss = zmet(), sumReachCarStateLoss = zmet();
-	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastBankLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
+	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastBankLoss, lastFrontierSilLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
 	torch::Tensor nRelEntropy = zmet();
 	int metricPolicySteps = 0, metricCriticSteps = 0, metricGoalSteps = 0;
 	int metricKlSteps = 0, metricClipSteps = 0, metricGuidingSteps = 0;
@@ -1540,6 +1540,19 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 							/ (float)bankRows.weights.size(0) * bCoeff * batchSizeRatio;
 						lastBankLoss = bankLoss.detach();
 						ppoLoss = ppoLoss + bankLoss;
+					}
+					// FRONTIER SIL (PPO/Frontier.h): the actuator. Rows are the policy's own executed
+					// prefixes that closed reachability distance toward a value-map goal; weights are
+					// normalised to mean 1 so config.frontier.silCoeff is the whole dose. Out-of-buffer
+					// like the bank rows: never sees the critic, the advantages or the PPO ratio.
+					if (frontierRows.states.defined() && frontierRows.states.size(0) > 0) {
+						auto fProbs = InferPolicyProbsFromModels(models, frontierRows.states, frontierRows.masks,
+							config.policyTemperature, false, {}, nullptr, {}, false, frontierRows.intentFeat, frontierRows.intentIds);
+						auto fLogp = fProbs.log().gather(-1, frontierRows.actions.unsqueeze(-1)).flatten();
+						auto fLoss = (-(fLogp) * frontierRows.weights).sum()
+							/ (float)frontierRows.weights.size(0) * config.frontier.silCoeff * batchSizeRatio;
+						lastFrontierSilLoss = fLoss.detach();
+						ppoLoss = ppoLoss + fLoss;
 					}
 
 					if (config.useGuidingPolicy) {
@@ -2192,6 +2205,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	float dbgBankLoss = -1.f;
 	if (lastBankLoss.defined())
 		dbgBankLoss = lastBankLoss.item<float>();
+	dbgFrontierSilLoss = lastFrontierSilLoss.defined() ? lastFrontierSilLoss.item<float>() : 0.f;
+	lastFrontierSilLoss = torch::Tensor();
 	if (lastAuxNLL.defined())
 		dbgAuxNLL = lastAuxNLL.item<float>();
 	if (lastYvAbs.defined())
@@ -2436,6 +2451,95 @@ void GGL::PPOLearner::FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, t
 		frontierCandidates = frontierCandidates.slice(0, frontierCandidates.size(0) - cap);
 }
 
+void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor actions, torch::Tensor masks, torch::Tensor cont) {
+	frontierRows = {};
+	lastFrontier.silActive = false;
+	lastFrontier.silRows = 0;
+	lastFrontier.silMeanWeight = 0;
+	lastFrontier.silValidFrac = 0;
+	if (!frontier || !config.frontier.silEnabled)
+		return;
+	if (!frontierCandidates.defined() || frontierCandidates.size(0) < 64)
+		return;   // first iteration: no pool yet
+	torch::NoGradGuard noGrad;
+	const auto& cfg = config.frontier;
+	const int64_t T = RS_MAX((int64_t)2, (int64_t)cfg.goalTtl);
+	const int64_t nR = states.size(0);
+	const int64_t nW = nR / T;
+	if (nW < 1)
+		return;
+	auto longOpts = torch::TensorOptions().dtype(torch::kLong).device(device);
+
+	// Windows of T consecutive rows. Episodes are appended whole and row-contiguous, so a window
+	// is one player's next T decisions unless an episode boundary falls inside it: cont == 0 on
+	// any interior row means the tail is a goal->kickoff teleport, not an executed prefix.
+	auto contW = cont.to(torch::kCPU, torch::kFloat32).flatten().slice(0, 0, nW * T).reshape({ nW, T });
+	auto interior = std::get<0>(contW.narrow(1, 0, T - 1).min(1)) > 0.5f;      // [nW] CPU bool
+	const int64_t obsDim = states.size(1);
+	auto win = states.slice(0, 0, nW * T).to(device, torch::kFloat32).reshape({ nW, T, obsDim });
+
+	// Goal pool: a random slice of the candidate pool so the [chunk, m] distance matrix stays small.
+	auto cand = frontierCandidates;
+	const int64_t mCap = 1024;
+	if (cand.size(0) > mCap)
+		cand = cand.index_select(0, torch::randperm(cand.size(0), longOpts).slice(0, 0, mCap));
+
+	std::vector<torch::Tensor> weightParts, bestParts, validParts;
+	const int64_t CH = 256;
+	for (int64_t w0 = 0; w0 < nW; w0 += CH) {
+		int64_t w1 = RS_MIN(w0 + CH, nW);
+		auto chunk = win.slice(0, w0, w1);                       // [c, T, obs]
+		auto pick = frontier->SelectGoals(chunk.select(1, 0), cand);
+		auto prog = frontier->PrefixProgress(chunk, pick.goals);
+		weightParts.push_back(prog.weight);
+		bestParts.push_back(prog.bestIndex);
+		validParts.push_back(pick.valid);
+	}
+	auto weight = torch::cat(weightParts).to(torch::kCPU, torch::kFloat32);   // exp(sharpness * progress), 0 if no progress
+	auto best = torch::cat(bestParts).to(torch::kCPU, torch::kLong);
+	auto valid = torch::cat(validParts).to(torch::kCPU) & interior & (weight > 0);
+	const float validFrac = valid.to(torch::kFloat32).mean().item<float>();
+	lastFrontier.silValidFrac = validFrac;
+	if (!valid.any().item<bool>())
+		return;
+
+	// Keep the K best windows by weight (silRows bounds the row count), whole prefix up to and
+	// including the closest step. Rows carry their window's weight.
+	auto scored = torch::where(valid, weight, torch::zeros_like(weight));
+	const int64_t K = RS_MAX((int64_t)1, (int64_t)cfg.silRows / T);
+	auto top = scored.topk(RS_MIN(K, nW));
+	auto topW = std::get<0>(top);
+	auto topI = std::get<1>(top);
+	std::vector<int64_t> rowIdx;
+	std::vector<float> rowW;
+	float wSum = 0.f; int64_t nKept = 0;
+	for (int64_t k = 0; k < topI.size(0); k++) {
+		float wv = topW[k].item<float>();
+		if (wv <= 0.f) break;
+		int64_t w = topI[k].item<int64_t>();
+		int64_t last = best[w].item<int64_t>();
+		for (int64_t t = 0; t <= last; t++) {
+			rowIdx.push_back(w * T + t);
+			rowW.push_back(wv);
+		}
+		wSum += wv; nKept++;
+	}
+	if (rowIdx.empty())
+		return;
+	auto idx = torch::tensor(rowIdx, torch::kLong);
+	auto wRows = torch::tensor(rowW, torch::kFloat32);
+	wRows = wRows / wRows.mean().clamp_min(1e-6f);            // mean 1: silCoeff is the dose
+
+	frontierRows.states = states.index_select(0, idx).to(device, torch::kFloat32);
+	frontierRows.actions = actions.index_select(0, idx).to(device, torch::kLong);
+	frontierRows.masks = masks.index_select(0, idx).to(device);
+	frontierRows.weights = wRows.to(device);
+	frontierRows.coeff = cfg.silCoeff;
+	lastFrontier.silActive = true;
+	lastFrontier.silRows = (float)rowIdx.size();
+	lastFrontier.silMeanWeight = nKept > 0 ? wSum / (float)nKept : 0.f;
+}
+
 void GGL::PPOLearner::TrainFrontier() {
 	if (!frontier)
 		return;
@@ -2494,6 +2598,12 @@ void GGL::PPOLearner::TrainFrontier() {
 	}
 
 	rep.trained = true;
+	// The SIL fields were filled at learn-prep (FrontierBuildSilRows) for THIS iteration; keep them.
+	rep.silActive = lastFrontier.silActive;
+	rep.silRows = lastFrontier.silRows;
+	rep.silMeanWeight = lastFrontier.silMeanWeight;
+	rep.silValidFrac = lastFrontier.silValidFrac;
+	rep.silLoss = dbgFrontierSilLoss;
 	lastFrontier = rep;
 
 	frontierObs = torch::Tensor();

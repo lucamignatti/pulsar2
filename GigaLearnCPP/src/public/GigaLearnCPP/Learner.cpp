@@ -4789,6 +4789,9 @@ void GGL::Learner::Start() {
 								tStates.slice(0, 1, nR),
 								(arrivalF * contPrevF).slice(0, 1, nR),
 								1.0f - cont.slice(0, 0, nR - 1));
+							// FRONTIER SIL rows for THIS iteration's learn pass, scored by the map and
+							// metric as fitted through the previous iteration.
+							ppo->FrontierBuildSilRows(tStates, tActions, tActionMasks, cont);
 						}
 						if (config.ppo.vdagTheoryEnabled) {
 							auto z0 = torch::zeros({ 1 }, scaledR.options());
@@ -5850,12 +5853,22 @@ void GGL::Learner::Start() {
 						report["Frontier/Goal Gain"] = fr.goalGain;
 						report["Frontier/Goal Dist"] = fr.goalDist;
 						report["Frontier/Goal Valid Frac"] = fr.goalValidFrac;
+						// The actuator. Rows > 0 with a nonzero loss is the pull; if silActive is
+						// false while GGL_FRONTIER_SIL is set, the band is empty or no prefix closed
+						// distance - the pull has nothing to grip yet, which is a map problem.
+						report["Frontier/SIL Rows"] = fr.silRows;
+						report["Frontier/SIL Mean W"] = fr.silMeanWeight;
+						report["Frontier/SIL Valid Frac"] = fr.silValidFrac;
+						report["Frontier/SIL Loss"] = fr.silLoss;
 						// Also to stdout: this module is new, its whole failure mode is looking
 						// healthy while doing nothing, and wandb is not always attached.
 						RG_LOG("Frontier: V " << fr.meanValue << " (|tgt|max " << fr.maxAbsTarget
 							<< ", clamped " << fr.targetsClamped << ")  localD " << fr.meanLocal
 							<< "  goalGain " << fr.goalGain << " @ d" << fr.goalDist
-							<< "  valid " << fr.goalValidFrac);
+							<< "  valid " << fr.goalValidFrac
+							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
+							<< " rows " << fr.silRows << " meanW " << fr.silMeanWeight
+							<< " valid " << fr.silValidFrac << " loss " << fr.silLoss);
 					}
 				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();

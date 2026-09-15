@@ -2235,7 +2235,11 @@ int main(int argc, char* argv[]) {
 		// (localD ~1, valid > 0, goalGain > 0), never in the same hop that first boots the map.
 		if (const char* fs = std::getenv("GGL_FRONTIER_SIL"); fs && *fs && std::string(fs) != "0")
 			cfg.ppo.frontier.silEnabled = true;
+		if (const char* fc = std::getenv("GGL_FRONTIER_SIL_COEFF"); fc && *fc)
+			cfg.ppo.frontier.silCoeff = (float)std::atof(fc);
 		RG_LOG("GGL_FRONTIER: value map + quasimetric ON, SIL " << (cfg.ppo.frontier.silEnabled ? "ON" : "off")
+			<< " (coeff " << cfg.ppo.frontier.silCoeff << ", rows " << cfg.ppo.frontier.silRows
+			<< ", ttl " << cfg.ppo.frontier.goalTtl << ", sharpness " << cfg.ppo.frontier.silSharpness << ")"
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {

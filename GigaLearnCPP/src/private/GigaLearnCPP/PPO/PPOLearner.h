@@ -43,7 +43,7 @@ namespace GGL {
 			float valueLoss = 0, meanValue = 0, maxAbsTarget = 0;
 			float quasiLoss = 0, meanLocal = 0, violation = 0, meanSpread = 0;
 			float goalGain = 0, goalDist = 0, goalValidFrac = 0;
-			float silMeanWeight = 0, silRows = 0;
+			float silMeanWeight = 0, silRows = 0, silValidFrac = 0, silLoss = 0;
 			int targetsClamped = 0;
 			bool trained = false, silActive = false;
 		};
@@ -216,6 +216,13 @@ namespace GGL {
 		// shape and loss as dipRows (weighted -log pi on rows outside the buffer). Weights =
 		// clamp(target - V, 0, cap), recomputed at learn-prep with the current critic.
 		DipImitationRows bankRows;
+		// FRONTIER SIL rows (PPO/Frontier.h): executed prefixes that closed quasimetric distance
+		// toward a value-map goal, the whole prefix up to its closest step credited by
+		// exp(silSharpness * progress). Built at learn-prep by FrontierBuildSilRows, same loss
+		// form as the bank rows but with config.frontier.silCoeff. THE actuator of the frontier.
+		DipImitationRows frontierRows;
+		float dbgFrontierSilLoss = 0.f;
+		void FrontierBuildSilRows(torch::Tensor states, torch::Tensor actions, torch::Tensor masks, torch::Tensor cont);
 
 		torch::Tensor oppCtxForLearn;      // CPU; barrier-copied so learn sees ITS iteration
 		float valueEvEma = 0.f;            // explained-variance EMA (drives the epi blend)
