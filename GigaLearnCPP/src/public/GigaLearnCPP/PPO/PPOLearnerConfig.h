@@ -77,8 +77,18 @@ namespace GGL {
 		//   RARITY - the in-band candidate FARTHEST from the current state population, i.e. the
 		//            reachable place the policy least often goes. Self-limiting: once the policy
 		//            goes there often it stops being rare and the pull moves on.
-		enum GoalSelect { GOALSEL_VALUE = 0, GOALSEL_RANDOM = 1, GOALSEL_RARITY = 2 };
+		//   PROGRESS - the in-band candidate where the map is still LEARNING, |V - V_lagged|.
+		//            This is the map-completion signal, and it is the only novelty-shaped one
+		//            that survives measurement here: count-based rarity is NEGATIVELY correlated
+		//            with learning progress (-0.32 over 57.6k frames), because this policy's rare
+		//            states are degenerate (ball idle in a corner) and therefore already learned.
+		//            Under opponent conditioning it is also what re-fires when the opponent
+		//            changes: a region settled against an old version is unlearned against a new
+		//            one, so "the map goes blank there" becomes a measurable quantity.
+		enum GoalSelect { GOALSEL_VALUE = 0, GOALSEL_RANDOM = 1, GOALSEL_RARITY = 2,
+		                  GOALSEL_PROGRESS = 3 };
 		int goalSelect = GOALSEL_VALUE;
+		int progressLagIters = 100;  // refresh interval of the lagged value snapshot
 
 		// Recent observations retained as goal candidates. At 4096 against 16,704 rows/iter/rank
 		// the pool was a QUARTER of one iteration, so anything rare was evicted within seconds -
@@ -95,6 +105,16 @@ namespace GGL {
 		int silWindows = 256;      // Candidate prefix windows scored per iteration
 		int silMinWindow = 30;     // A window shorter than this (episode ended) is unusable
 		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
+
+		// OPPONENT CONDITIONING. The environment is RocketSim PLUS an opponent, and the opponent
+		// is a changing version of ourselves, so the map is only valid relative to who is being
+		// played. Conditioning makes the value map and the metric functions of (state, opponent):
+		// regions mapped against an old version go stale against a new one instead of being
+		// silently averaged over the whole version ring. Fed from PPOLearnerConfig::oppCtxDim
+		// ([isSelf, isOld, isExt, oppAgeFrac]) - the SAME privileged context the composite value
+		// critic already receives, and equally never visible to the policy.
+		bool oppCond = true;
+		int oppCtxDim = 0;         // set from cfg.ppo.oppCtxDim at boot; 0 = unconditioned
 
 		PartialModelConfig value, quasi;
 	};

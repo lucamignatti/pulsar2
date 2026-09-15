@@ -18,29 +18,75 @@ namespace GGL {
 			RG_ERR_CLOSE("FrontierConfig::goalTtl (" << config.goalTtl << ") < silMinWindow ("
 				<< config.silMinWindow << "): every window would be rejected and SIL would be inert");
 
+		ctxDim = config.oppCond ? config.oppCtxDim : 0;
+		const int inDim = obsSize + ctxDim;
+
 		ModelConfig valueConfig = config.value;
-		valueConfig.numInputs = obsSize;
+		valueConfig.numInputs = inDim;
 		valueConfig.numOutputs = 1;
 		valueConfig.addOutputLayer = true;
 
 		ModelConfig quasiConfig = config.quasi;
-		quasiConfig.numInputs = obsSize;
+		quasiConfig.numInputs = inDim;
 		quasiConfig.numOutputs = config.latentAsym + config.latentSym;
 		quasiConfig.addOutputLayer = true;
 
-		valueA = new Model("frontier_value_a", valueConfig, device);
-		valueB = new Model("frontier_value_b", valueConfig, device);
-		quasi = new Model("frontier_quasi", quasiConfig, device);
+		// SELF-MIGRATING NAMES. Conditioning widens every input by ctxDim, and a present-but-
+		// reshaped file is FATAL on load - worse, the loader's fallback then renames perfectly
+		// good checkpoints corrupt_<ts> and can eat the whole rotation window (the 2026-09-04
+		// incident). Conditioned nets therefore live under their own names: the unconditioned
+		// files are simply never looked for, stay on disk as a rollback, and the new heads
+		// fresh-init through the ordinary allowNotExist path.
+		const bool oc = ctxDim > 0;   // Model::modelName is a const char*, so these stay literals
+		valueA = new Model(oc ? "frontier_value_a_oc" : "frontier_value_a", valueConfig, device);
+		valueB = new Model(oc ? "frontier_value_b_oc" : "frontier_value_b", valueConfig, device);
+		quasi  = new Model(oc ? "frontier_quasi_oc"   : "frontier_quasi",   quasiConfig, device);
 
 		outModels.Add(valueA);
 		outModels.Add(valueB);
 		outModels.Add(quasi);
+
+		// Measurement-only lagged snapshot; deliberately NOT added to outModels. A resume that
+		// starts it equal to valueA reads zero learning progress for one lag period, which is
+		// strictly better than carrying a stale snapshot across runs.
+		valueSlow = valueA->MakeClone();
+		valueSlow->modelName = oc ? "frontier_value_slow_oc" : "frontier_value_slow";  // never saved
 	}
 
-	torch::Tensor FrontierModule::Value(torch::Tensor obs) {
+	void FrontierModule::RefreshLag() {
+		RG_NO_GRAD;
+		auto from = valueA->parameters();
+		auto to = valueSlow->parameters();
+		for (size_t i = 0; i < from.size() && i < to.size(); i++)
+			to[i].copy_(from[i], true);
+		sinceLagRefresh = 0;
+	}
+
+	torch::Tensor FrontierModule::WithCtx(torch::Tensor obs, torch::Tensor ctx) {
+		if (ctxDim <= 0)
+			return obs;
+		if (!ctx.defined())
+			RG_ERR_CLOSE("FrontierModule: opponent conditioning is on but no context was supplied");
+		auto c = ctx.to(obs.options());
+		while (c.dim() < obs.dim())
+			c = c.unsqueeze(0);
+		std::vector<int64_t> shape(obs.sizes().begin(), obs.sizes().end());
+		shape.back() = ctxDim;
+		return torch::cat({ obs, c.expand(shape) }, -1);
+	}
+
+	torch::Tensor FrontierModule::LearningProgress(torch::Tensor obs, torch::Tensor ctx) {
 		torch::NoGradGuard noGrad;
-		auto a = valueA->Forward(obs, false).squeeze(-1);
-		auto b = valueB->Forward(obs, false).squeeze(-1);
+		auto x = WithCtx(obs, ctx);
+		return (valueA->Forward(x, false).squeeze(-1)
+			- valueSlow->Forward(x, false).squeeze(-1)).abs();
+	}
+
+	torch::Tensor FrontierModule::Value(torch::Tensor obs, torch::Tensor ctx) {
+		torch::NoGradGuard noGrad;
+		auto x = WithCtx(obs, ctx);
+		auto a = valueA->Forward(x, false).squeeze(-1);
+		auto b = valueB->Forward(x, false).squeeze(-1);
 		return torch::minimum(a, b);
 	}
 
@@ -54,17 +100,19 @@ namespace GGL {
 	}
 
 	FrontierModule::ValueStats FrontierModule::TrainValue(
-		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done) {
+		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done, torch::Tensor ctx) {
 
 		ValueStats stats = {};
 		const float bound = config.valueAbsMax;
+		auto xObs = WithCtx(obs, ctx);
+		auto xNext = WithCtx(nextObs, ctx);
 
 		torch::Tensor target;
 		{
 			torch::NoGradGuard noGrad;
 			auto nextV = torch::minimum(
-				valueA->Forward(nextObs, false).squeeze(-1),
-				valueB->Forward(nextObs, false).squeeze(-1)
+				valueA->Forward(xNext, false).squeeze(-1),
+				valueB->Forward(xNext, false).squeeze(-1)
 			).clamp(-bound, bound);                       // bounded BEFORE it is bootstrapped
 			auto raw = reward + config.gamma * (1.0f - done) * nextV;
 			stats.maxAbsTarget = raw.abs().max().item<float>();
@@ -72,8 +120,8 @@ namespace GGL {
 			target = raw.clamp(-bound, bound);            // and bounded again after
 		}
 
-		auto predA = valueA->Forward(obs, false).squeeze(-1);
-		auto predB = valueB->Forward(obs, false).squeeze(-1);
+		auto predA = valueA->Forward(xObs, false).squeeze(-1);
+		auto predB = valueB->Forward(xObs, false).squeeze(-1);
 		auto loss = ExpectileLoss(predA, target, config.valueExpectile)
 		          + ExpectileLoss(predB, target, config.valueExpectile);
 		loss.backward();
@@ -83,8 +131,8 @@ namespace GGL {
 		return stats;
 	}
 
-	torch::Tensor FrontierModule::Encode(torch::Tensor obs) {
-		return quasi->Forward(obs, false);
+	torch::Tensor FrontierModule::Encode(torch::Tensor obs, torch::Tensor ctx) {
+		return quasi->Forward(WithCtx(obs, ctx), false);
 	}
 
 	torch::Tensor FrontierModule::Distance(torch::Tensor fromLatent, torch::Tensor toLatent) {
@@ -98,13 +146,13 @@ namespace GGL {
 	}
 
 	FrontierModule::QuasiStats FrontierModule::TrainQuasi(
-		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done) {
+		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done, torch::Tensor ctx) {
 
 		QuasiStats stats = {};
 
-		auto zFrom = Encode(obs);
-		auto zNext = Encode(nextObs);
-		auto zPair = Encode(pairObs);
+		auto zFrom = Encode(obs, ctx);
+		auto zNext = Encode(nextObs, ctx);
+		auto zPair = Encode(pairObs, ctx);
 
 		// Local constraint: one real decision costs at most 1. Terminal rows are teleports
 		// (their stored successor is a kickoff) and carry no constraint.
@@ -130,17 +178,21 @@ namespace GGL {
 	}
 
 	FrontierModule::GoalPick FrontierModule::SelectGoals(torch::Tensor obs, torch::Tensor candidates,
-		float bandLo, float bandHi, int mode) {
+		float bandLo, float bandHi, int mode, torch::Tensor ctx) {
 		torch::NoGradGuard noGrad;
 		GoalPick pick = {};
 
 		const int n = obs.size(0);
 		const int m = candidates.size(0);
 
-		auto zObs = Encode(obs);                    // [n, latent]
-		auto zCand = Encode(candidates);            // [m, latent]
-		auto vObs = Value(obs);                     // [n]
-		auto vCand = Value(candidates);             // [m]
+		// EVERYTHING is evaluated under the CURRENT opponent context, including candidates that
+		// were collected against a different one. That is the point: a state that was worth
+		// reaching against an old version gets re-priced against who we are playing now.
+		auto zObs = Encode(obs, ctx);               // [n, latent]
+		auto zCand = Encode(candidates, ctx);       // [m, latent]
+		auto vObs = Value(obs, ctx);                // [n]
+		auto vCand = Value(candidates, ctx);        // [m]
+		auto lpCand = LearningProgress(candidates, ctx);   // [m]
 
 		// [n, m] distances and value gains
 		auto dist = Distance(zObs.unsqueeze(1).expand({ n, m, zObs.size(-1) }),
@@ -160,6 +212,9 @@ namespace GGL {
 				break;
 			case FrontierConfig::GOALSEL_RARITY:
 				pref = rarity.unsqueeze(0).expand_as(gain);
+				break;
+			case FrontierConfig::GOALSEL_PROGRESS:
+				pref = lpCand.unsqueeze(0).expand_as(gain);
 				break;
 			default:
 				pref = gain;                        // GOALSEL_VALUE
@@ -181,6 +236,10 @@ namespace GGL {
 		// Rarity of what was chosen, relative to the pool's mean rarity: > 1 means the goals are
 		// less-visited than a random candidate. Under GOALSEL_VALUE this reads ~1 or below, which
 		// is the diagnostic that the mechanism is exploiting rather than exploring.
+		auto chosenLp = lpCand.index_select(0, best);
+		float poolLp = lpCand.mean().item<float>();
+		pick.meanProgress = poolLp > 1e-9f
+			? ((chosenLp * validF).sum().item<float>() / denom.item<float>()) / poolLp : 0.f;
 		auto chosenRarity = rarity.index_select(0, best);
 		float poolRarity = rarity.mean().item<float>();
 		pick.meanRarity = poolRarity > 1e-6f
@@ -189,7 +248,7 @@ namespace GGL {
 	}
 
 	FrontierModule::Progress FrontierModule::PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal,
-		torch::Tensor live) {
+		torch::Tensor live, torch::Tensor ctx) {
 		torch::NoGradGuard noGrad;
 		Progress out = {};
 
@@ -197,8 +256,8 @@ namespace GGL {
 		const int n = prefixObs.size(0);
 		const int T = prefixObs.size(1);
 
-		auto zPrefix = Encode(prefixObs.reshape({ n * T, obsSize })).reshape({ n, T, -1 });
-		auto zGoal = Encode(goal).unsqueeze(1).expand({ n, T, -1 });
+		auto zPrefix = Encode(prefixObs.reshape({ n * T, obsSize }), ctx).reshape({ n, T, -1 });
+		auto zGoal = Encode(goal, ctx).unsqueeze(1).expand({ n, T, -1 });
 		auto dist = Distance(zPrefix, zGoal);                   // [n, T]
 		if (live.defined())
 			dist = torch::where(live, dist, torch::full_like(dist, 1e18f));

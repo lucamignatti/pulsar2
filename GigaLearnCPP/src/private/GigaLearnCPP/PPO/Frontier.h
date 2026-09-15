@@ -22,19 +22,33 @@ namespace GGL {
 		Model* valueA;   // twin value heads; the target uses min(valueA, valueB) as the anti-ratchet
 		Model* valueB;
 		Model* quasi;    // encoder -> [latentAsym + latentSym]
+		// Lagged copy of valueA, refreshed every progressLagIters. NOT in the ModelSet: it is a
+		// measurement device, and a resume that starts it equal to valueA simply reads zero
+		// learning progress for one lag period rather than carrying stale state across runs.
+		Model* valueSlow = nullptr;
+		int sinceLagRefresh = 0;
+
+		// Width of the opponent context appended to every input (0 = unconditioned).
+		int ctxDim = 0;
+		// Concatenate ctx onto obs. ctx is [ctxDim] (one opponent per iteration, broadcast) or
+		// [n, ctxDim]; undefined ctx with ctxDim > 0 is a programming error, not a silent zero.
+		torch::Tensor WithCtx(torch::Tensor obs, torch::Tensor ctx);
+		void RefreshLag();
 
 		FrontierModule(int obsSize, const FrontierConfig& config, torch::Device device, ModelSet& outModels);
 
 		// --- value map -------------------------------------------------------------------------
 		// min(Va, Vb) over raw obs. Detached by construction: callers never backprop through it.
-		torch::Tensor Value(torch::Tensor obs);
+		torch::Tensor Value(torch::Tensor obs, torch::Tensor ctx);
+		// |V - V_lagged|: how much the map has moved here since the last refresh.
+		torch::Tensor LearningProgress(torch::Tensor obs, torch::Tensor ctx);
 		// One bounded expectile backup. obs/nextObs are [n, obsSize]; reward/done are [n].
 		// Returns the scalar loss (already stepped by the caller's optimizer group).
 		struct ValueStats { float loss = 0, meanValue = 0, maxAbsTarget = 0; int clamped = 0; };
-		ValueStats TrainValue(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done);
+		ValueStats TrainValue(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done, torch::Tensor ctx);
 
 		// --- quasimetric -----------------------------------------------------------------------
-		torch::Tensor Encode(torch::Tensor obs);
+		torch::Tensor Encode(torch::Tensor obs, torch::Tensor ctx);
 		// d(from -> to) for matched rows of already-encoded latents.
 		torch::Tensor Distance(torch::Tensor fromLatent, torch::Tensor toLatent);
 		// QRL objective: push distances apart subject to every OBSERVED one-step transition
@@ -43,17 +57,17 @@ namespace GGL {
 		// done marks rows whose nextObs is the next episode's kickoff, not a successor: those
 		// pairs are excluded from the one-step constraint (a goal is not one decision from kickoff).
 		struct QuasiStats { float loss = 0, meanLocal = 0, violation = 0, meanSpread = 0; };
-		QuasiStats TrainQuasi(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done);
+		QuasiStats TrainQuasi(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done, torch::Tensor ctx);
 
 		// --- goals -----------------------------------------------------------------------------
 		// For each row of obs, pick the candidate with the largest value gain whose distance falls
 		// inside [bandLow, bandHigh]. Returns the chosen candidate rows and a validity mask.
 		// Candidates outside the band are rejected because the toy measured that distances to
 		// states outside forward reach carry no usable gradient at all.
-		struct GoalPick { torch::Tensor goals; torch::Tensor valid; float meanGain = 0, meanDist = 0, meanRarity = 0; };
+		struct GoalPick { torch::Tensor goals; torch::Tensor valid; float meanGain = 0, meanDist = 0, meanRarity = 0, meanProgress = 0; };
 		// bandLo/bandHi are in METRIC UNITS; the caller converts from decisions via LocalD().
 		// mode is FrontierConfig::GoalSelect.
-		GoalPick SelectGoals(torch::Tensor obs, torch::Tensor candidates, float bandLo, float bandHi, int mode);
+		GoalPick SelectGoals(torch::Tensor obs, torch::Tensor candidates, float bandLo, float bandHi, int mode, torch::Tensor ctx);
 
 		// Live one-step distance, EMA'd over TrainQuasi calls. This is the metric's SCALE: one
 		// executed decision costs this much, so a band in decisions becomes a band in units by
@@ -66,6 +80,6 @@ namespace GGL {
 		// live is [n, T] bool: false for padded steps past the window's episode boundary, which
 		// must not be allowed to win the closest-approach argmin.
 		struct Progress { torch::Tensor weight; torch::Tensor bestIndex; };
-		Progress PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal, torch::Tensor live);
+		Progress PrefixProgress(torch::Tensor prefixObs, torch::Tensor goal, torch::Tensor live, torch::Tensor ctx);
 	};
 }

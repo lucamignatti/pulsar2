@@ -5860,6 +5860,9 @@ void GGL::Learner::Start() {
 						// i.e. the mechanism is exploring. Under goalSelect=value this reads ~1
 						// or below, which is the signature of exploiting the map instead.
 						report["Frontier/Goal Rarity"] = fr.goalRarity;
+						// Learning progress of the chosen goals relative to the pool. >1 means the
+						// goals are where the map is still moving, i.e. where it is incomplete.
+						report["Frontier/Goal Progress"] = fr.goalProgress;
 						report["Frontier/Goal Valid Frac"] = fr.goalValidFrac;
 						// The actuator. Rows > 0 with a nonzero loss is the pull; if silActive is
 						// false while GGL_FRONTIER_SIL is set, the band is empty or no prefix closed
@@ -5875,6 +5878,7 @@ void GGL::Learner::Start() {
 							<< ", clamped " << fr.targetsClamped << ")  localD " << fr.meanLocal
 							<< "  goalGain " << fr.goalGain << " @ d" << fr.goalDist
 							<< " (" << fr.goalDistDecisions << " dec)  rarity " << fr.goalRarity
+							<< "  lp " << fr.goalProgress
 							<< "  valid " << fr.goalValidFrac
 							<< "  | SIL " << (config.ppo.frontier.silEnabled ? "on" : "off")
 							<< " win " << fr.silWindows << " rows " << fr.silRows << " meanW " << fr.silMeanWeight

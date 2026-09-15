@@ -309,6 +309,7 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			RG_ERR_CLOSE("FrontierConfig::enabled requires vdagEnabled: the frontier ingests its "
 				"transitions from the headroom block's reward reconstruction, and would silently "
 				"train on nothing without it.");
+		config.frontier.oppCtxDim = config.oppCondEnabled ? config.oppCtxDim : 0;
 		frontier = new FrontierModule(obsSize, config.frontier, device, models);
 	}
 
@@ -2438,6 +2439,11 @@ void GGL::PPOLearner::FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, t
 	frontierNextObs = nextObs.detach().to(f32);
 	frontierReward = reward.detach().flatten().to(f32);
 	frontierDone = done.detach().flatten().to(f32);
+	// One opponent per iteration for the whole fleet, so a single context vector covers every
+	// ingested row. Held on device for the trainers; FrontierCtx() is what everything else reads.
+	frontierCtx = (oppCtxForLearn.defined() && config.oppCondEnabled)
+		? oppCtxForLearn.detach().to(device, torch::kFloat32)
+		: torch::Tensor();
 
 	// Goal candidates: a rolling pool of recent observations. Deliberately NOT the policy's
 	// current batch alone -- the toy measured that goals near one arena's state are useless to
@@ -2528,8 +2534,9 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 		auto chunk = states.index_select(0, rows.flatten()).to(device, torch::kFloat32)
 			.reshape({ w1 - w0, T, obsDim });
 		auto liveD = live.to(device);
-		auto pick2 = frontier->SelectGoals(chunk.select(1, 0), cand, bandLo, bandHi, cfg.goalSelect);
-		auto prog = frontier->PrefixProgress(chunk, pick2.goals, liveD);
+		auto pick2 = frontier->SelectGoals(chunk.select(1, 0), cand, bandLo, bandHi, cfg.goalSelect,
+			FrontierCtx());
+		auto prog = frontier->PrefixProgress(chunk, pick2.goals, liveD, FrontierCtx());
 		weightParts.push_back(prog.weight);
 		bestParts.push_back(prog.bestIndex);
 		validParts.push_back(pick2.valid);
@@ -2602,7 +2609,7 @@ void GGL::PPOLearner::TrainFrontier() {
 		frontier->valueB->optim->zero_grad();
 		auto st = frontier->TrainValue(
 			frontierObs.index_select(0, idx), frontierNextObs.index_select(0, idx),
-			frontierReward.index_select(0, idx), frontierDone.index_select(0, idx));
+			frontierReward.index_select(0, idx), frontierDone.index_select(0, idx), FrontierCtx());
 		frontier->valueA->optim->step();
 		frontier->valueB->optim->step();
 		rep.valueLoss += st.loss / cfg.valueSteps;
@@ -2617,7 +2624,7 @@ void GGL::PPOLearner::TrainFrontier() {
 		frontier->quasi->optim->zero_grad();
 		auto st = frontier->TrainQuasi(
 			frontierObs.index_select(0, idx), frontierNextObs.index_select(0, idx),
-			frontierObs.index_select(0, pairIdx), frontierDone.index_select(0, idx));
+			frontierObs.index_select(0, pairIdx), frontierDone.index_select(0, idx), FrontierCtx());
 		frontier->quasi->optim->step();
 		rep.quasiLoss += st.loss / cfg.quasiSteps;
 		rep.meanLocal += st.meanLocal / cfg.quasiSteps;
@@ -2636,14 +2643,19 @@ void GGL::PPOLearner::TrainFrontier() {
 			cand = cand.index_select(0, torch::randperm(cand.size(0), longOpts).slice(0, 0, 1024));
 		const float lD = frontier->LocalD();
 		auto pick = frontier->SelectGoals(probe, cand, cfg.bandLowDecisions * lD,
-			cfg.bandHighDecisions * lD, cfg.goalSelect);
+			cfg.bandHighDecisions * lD, cfg.goalSelect, FrontierCtx());
 		rep.goalGain = pick.meanGain;
 		rep.goalDist = pick.meanDist;
 		rep.goalDistDecisions = pick.meanDist / RS_MAX(lD, 1e-3f);
 		rep.goalValidFrac = pick.valid.to(torch::kFloat32).mean().item<float>();
 		rep.goalRarity = pick.meanRarity;
+		rep.goalProgress = pick.meanProgress;
 	}
 
+	// Lagged snapshot for the learning-progress signal. Refreshed on a schedule, AFTER this
+	// iteration's backups, so |V - V_slow| always measures a full lag period.
+	if (++frontier->sinceLagRefresh >= RS_MAX(1, cfg.progressLagIters))
+		frontier->RefreshLag();
 	rep.trained = true;
 	// The SIL fields were filled at learn-prep (FrontierBuildSilRows) for THIS iteration; keep them.
 	rep.silActive = lastFrontier.silActive;
@@ -2726,11 +2738,14 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	// this module can never repeat it. The value twins carry their own LR because their target
 	// is a BOUNDED optimality backup, not the critic's on-policy return, and the quasimetric is
 	// a metric fit rather than a value fit.
-	for (const char* n : { "frontier_value_a", "frontier_value_b" })
+	const bool foc = config.oppCondEnabled && config.frontier.oppCond;
+	for (const char* n : foc ? std::initializer_list<const char*>{ "frontier_value_a_oc", "frontier_value_b_oc" }
+	                        : std::initializer_list<const char*>{ "frontier_value_a", "frontier_value_b" })
 		if (models[n])
 			models[n]->SetOptimLR(config.frontier.valueLr);
-	if (models["frontier_quasi"])
-		models["frontier_quasi"]->SetOptimLR(config.frontier.quasiLr);
+	const char* qn = foc ? "frontier_quasi_oc" : "frontier_quasi";
+	if (models[qn])
+		models[qn]->SetOptimLR(config.frontier.quasiLr);
 
 	// INTENT CLASS discriminator: same ctor lr=0 trap; own LR (Adam). Its update magnitude is
 	// logged every iteration (Intent/Disc Loss falling from log(dim) is the liveness check).

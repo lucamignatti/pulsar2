@@ -2247,7 +2247,8 @@ int main(int argc, char* argv[]) {
 			if (v == "random") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_RANDOM;
 			else if (v == "rarity") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_RARITY;
 			else if (v == "value") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_VALUE;
-			else RG_ERR_CLOSE("GGL_FRONTIER_GOALSEL must be value|random|rarity, got \"" << v << "\"");
+			else if (v == "progress") cfg.ppo.frontier.goalSelect = FrontierConfig::GOALSEL_PROGRESS;
+			else RG_ERR_CLOSE("GGL_FRONTIER_GOALSEL must be value|random|rarity|progress, got \"" << v << "\"");
 		}
 		if (const char* b = std::getenv("GGL_FRONTIER_BAND_LO"); b && *b)
 			cfg.ppo.frontier.bandLowDecisions = (float)std::atof(b);
@@ -2257,13 +2258,26 @@ int main(int argc, char* argv[]) {
 			cfg.ppo.frontier.goalTtl = std::atoi(v);
 		if (const char* v = std::getenv("GGL_FRONTIER_POOL"); v && *v && std::atoi(v) > 0)
 			cfg.ppo.frontier.candidatePool = std::atoi(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_LAG"); v && *v && std::atoi(v) > 0)
+			cfg.ppo.frontier.progressLagIters = std::atoi(v);
+		// Opponent conditioning REQUIRES the privileged context the composite critic already
+		// builds; without it the map averages over the whole version ring and nothing can go
+		// stale when the opponent changes.
+		if (const char* v = std::getenv("GGL_FRONTIER_OPPCOND"); v && *v)
+			cfg.ppo.frontier.oppCond = std::string(v) != "0";
+		if (cfg.ppo.frontier.oppCond && !cfg.ppo.oppCondEnabled)
+			RG_ERR_CLOSE("frontier.oppCond needs cfg.ppo.oppCondEnabled: there is no opponent "
+				"context to condition on. Set GGL_FRONTIER_OPPCOND=0 to run unconditioned.");
 		RG_LOG("GGL_FRONTIER: value map + quasimetric ON, SIL " << (cfg.ppo.frontier.silEnabled ? "ON" : "off")
 			<< " (coeff " << cfg.ppo.frontier.silCoeff << ", rows " << cfg.ppo.frontier.silRows
 			<< ", ttl " << cfg.ppo.frontier.goalTtl << " decisions, sharpness " << cfg.ppo.frontier.silSharpness << ")"
 			<< ", goalSel " << (cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_RARITY ? "RARITY"
-				: cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_RANDOM ? "RANDOM" : "value")
+				: cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_RANDOM ? "RANDOM"
+				: cfg.ppo.frontier.goalSelect == FrontierConfig::GOALSEL_PROGRESS ? "PROGRESS" : "value")
 			<< ", band [" << cfg.ppo.frontier.bandLowDecisions << ", " << cfg.ppo.frontier.bandHighDecisions
 			<< "] decisions, pool " << cfg.ppo.frontier.candidatePool
+			<< ", oppCond " << (cfg.ppo.frontier.oppCond ? "ON" : "off")
+			<< ", lag " << cfg.ppo.frontier.progressLagIters
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
