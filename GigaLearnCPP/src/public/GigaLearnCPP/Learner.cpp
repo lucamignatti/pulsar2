@@ -27,6 +27,8 @@
 
 #include "Util/KeyPressDetector.h"
 #include "Util/DipSearch.h"
+#include "Util/OpponentMap.h"
+#include <private/GigaLearnCPP/Util/RehearsalBank.h>
 #include <private/GigaLearnCPP/Util/WelfordStat.h>
 
 #include <algorithm>
@@ -137,6 +139,60 @@ struct GGL::GapState {
 		optim = std::make_shared<torch::optim::Adam>(exp->parameters(), lr);
 	}
 };
+// WORLD MAP state (LearnerConfig::WorldMapConfig). Members are plain MLPs on the detached
+// obs (never the trunk: the probes-never-reshape-the-trunk law), each with its own Adam.
+// Target statistics (running mean/std of the descriptor) are checkpointed with the members
+// so the error scale survives a resume.
+struct GGL::WorldMapState {
+	std::vector<torch::nn::Sequential> members;
+	std::vector<std::shared_ptr<torch::optim::Adam>> optims;
+	torch::Tensor tgtMean, tgtStd;     // [descDim] on device
+	std::filesystem::path loadFrom;
+	int64_t updates = 0;
+	// cumulative prequential error by opponent class (rank-local EMA, for the stdout line)
+	double emaSelf = -1, emaNexto = -1, emaAge[4] = { -1, -1, -1, -1 }, emaDis = -1;
+	int64_t nSelf = 0, nNexto = 0, nAge[4] = { 0, 0, 0, 0 };
+
+	void Build(int64_t inDim, int64_t descDim, torch::Device device, const WorldMapConfig& c) {
+		members.clear(); optims.clear();
+		for (int e = 0; e < RS_MAX(1, c.ensemble); e++) {
+			auto m = torch::nn::Sequential(
+				torch::nn::Linear(inDim, c.hidden), torch::nn::LayerNorm(torch::nn::LayerNormOptions({ c.hidden })), torch::nn::LeakyReLU(),
+				torch::nn::Linear(c.hidden, c.hidden), torch::nn::LayerNorm(torch::nn::LayerNormOptions({ c.hidden })), torch::nn::LeakyReLU(),
+				torch::nn::Linear(c.hidden, descDim));
+			members.push_back(m);
+		}
+		tgtMean = torch::zeros({ descDim }); tgtStd = torch::ones({ descDim });
+		if (!loadFrom.empty() && std::filesystem::exists(loadFrom / "WORLDMAP_0.lt")) {
+			try {
+				for (size_t e = 0; e < members.size(); e++)
+					torch::load(members[e], (loadFrom / RS_STR("WORLDMAP_" << e << ".lt")).string());
+				std::vector<torch::Tensor> st;
+				torch::load(st, (loadFrom / "WORLDMAP_STATS.lt").string());
+				if (st.size() >= 2) { tgtMean = st[0]; tgtStd = st[1]; }
+				updates = 1000;
+				RG_LOG("World map loaded from " << loadFrom << " (" << members.size() << " members)");
+			} catch (const std::exception& ex) {
+				RG_LOG("World map load failed (" << ex.what() << ") - starting fresh");
+				updates = 0;
+			}
+		}
+		loadFrom.clear();
+		tgtMean = tgtMean.to(device); tgtStd = tgtStd.to(device);
+		for (auto& m : members) {
+			m->to(device);
+			optims.push_back(std::make_shared<torch::optim::Adam>(m->parameters(), c.lr));
+		}
+	}
+	void Save(const std::filesystem::path& folder) const {
+		for (size_t e = 0; e < members.size(); e++)
+			torch::save(members[e], (folder / RS_STR("WORLDMAP_" << e << ".lt")).string());
+		std::vector<torch::Tensor> st = { tgtMean.cpu(), tgtStd.cpu() };
+		torch::save(st, (folder / "WORLDMAP_STATS.lt").string());
+	}
+	static void Ema(double& acc, int64_t& n, double v) { n++; acc = acc < 0 ? v : acc * 0.95 + v * 0.05; }
+};
+
 GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbackFn stepCallback, Dist::Session* dist) :
 	envCreateFn(envCreateFn), config(config), stepCallback(stepCallback), dist(dist)
 {
@@ -156,6 +212,8 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 	// comes from the real trunk output, not a config guess)
 	if (config.gapSensor.enabled)
 		gapSensor = std::make_shared<GapState>();
+	if (config.worldMap.enabled)
+		worldMap = std::make_shared<WorldMapState>();
 
 	RG_LOG("Learner::Learner():");
 
@@ -396,6 +454,41 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		RG_ERR_CLOSE("Failed to create PPO learner: " << e.what());
 	}
 
+	// ===================== REHEARSAL BANK (GGL_BANK) =====================
+	// Witnessed-success memory (private/GigaLearnCPP/Util/RehearsalBank.h): success-gated,
+	// rarity-ranked episode tails rehearsed by the main through a weighted imitation loss
+	// every update (PPOLearner::bankRows). research/reports/NATIVE_INTENT_PROTOCOL.md v2.
+	if (const char* e = std::getenv("GGL_BANK"); e && *e && std::string(e) != "0") {
+		auto envF = [](const char* n, float d) { const char* v = std::getenv(n); return (v && *v) ? (float)std::atof(v) : d; };
+		auto envI = [](const char* n, int d) { const char* v = std::getenv(n); return (v && *v) ? std::atoi(v) : d; };
+		RehearsalBankConfig bc = {};
+		bc.enabled = true;
+		bc.capacity = envI("GGL_BANK_CAP", bc.capacity);
+		bc.maxRowsPerEntry = envI("GGL_BANK_MAXROWS", bc.maxRowsPerEntry);
+		bc.pAdmit = envF("GGL_BANK_P_ADMIT", bc.pAdmit);
+		bc.life = envI("GGL_BANK_LIFE", (int)bc.life);
+		bc.minTarget = envF("GGL_BANK_MIN_TARGET", bc.minTarget);
+		bc.targetQ = envF("GGL_BANK_TARGET_Q", bc.targetQ);
+		bc.requireConv = envI("GGL_BANK_REQUIRE_CONV", bc.requireConv ? 1 : 0) != 0;
+		bc.coeff = envF("GGL_BANK_COEFF", bc.coeff);
+		bc.wFloor = envF("GGL_BANK_W_FLOOR", bc.wFloor);
+		bc.roadOnly = envI("GGL_BANK_ROAD", bc.roadOnly ? 1 : 0) != 0;
+		bc.carryTails = envI("GGL_BANK_CARRY", bc.carryTails ? 1 : 0) != 0;
+		bc.requireResetEdge = envI("GGL_BANK_REQUIRE_RESET", bc.requireResetEdge ? 1 : 0) != 0;
+		if (const char* r = std::getenv("GGL_BANK_RANK"); r && *r) {
+			std::string rm(r);
+			bc.rankMode = rm == "max" ? 0 : rm == "sum" ? 1 : rm == "state" ? 2 : rm == "headroom" ? 3 : -1;
+			if (bc.rankMode < 0) RG_ERR_CLOSE("GGL_BANK_RANK must be state|max|sum|headroom, got " << rm);
+		} else if (envI("GGL_BANK_RANK_SUM", 0) != 0) bc.rankMode = 1;
+		bank = new RehearsalBank(bc);
+		RG_LOG("RehearsalBank: ON - capacity " << bc.capacity << " episodes, <= " << bc.maxRowsPerEntry
+			<< " rows each, pAdmit q" << bc.pAdmit << ", targetQ " << bc.targetQ << ", minTarget " << bc.minTarget
+			<< ", life " << bc.life << " iters, requireConv " << (bc.requireConv ? "on" : "off")
+			<< ", coeff " << (bc.coeff > 0.f ? bc.coeff : config.ppo.silCoeff) << ", w-floor " << bc.wFloor << " cap, road-only " << (bc.roadOnly ? "on" : "off")
+			<< ", rank by " << (bc.rankMode == 3 ? "HEADROOM (max H over the chain)" : bc.rankMode == 2 ? "STATE NOVELTY (max leverage)" : bc.rankMode == 1 ? "summed surprisal" : "max single-step surprisal")
+			<< ", carry tails " << (bc.carryTails ? "ON" : "off") << ", require reset edge " << (bc.requireResetEdge ? "ON" : "off"));
+	}
+
 	// ===================== LEAGUE (GGL_LEAGUE) =====================
 	// LoRA-variant league: diverse bots + exploiters riding the LIVE main weights.
 	// Test-arm feature, default off; see League/League.h for the design contract.
@@ -429,6 +522,16 @@ GGL::Learner::Learner(EnvCreateFn envCreateFn, LearnerConfig config, StepCallbac
 		lc.binitStd = envF("GGL_LEAGUE_BINIT", lc.binitStd);
 		lc.postLN = envI("GGL_LEAGUE_POSTLN", lc.postLN ? 1 : 0) != 0;
 		lc.klCoeff = envF("GGL_LEAGUE_KL", lc.klCoeff);
+		// Pre-built adapter factors from research/tools/make_league_init.py. Measured 2x the
+		// aerial engagement of the matched-norm random init on the live 487.9B checkpoint.
+		if (const char* p = std::getenv("GGL_LEAGUE_INIT"); p && *p)
+			lc.initPath = p;
+		lc.keepBest = envI("GGL_LEAGUE_KEEPBEST", lc.keepBest);
+		lc.keepBestMargin = envF("GGL_LEAGUE_KEEPBEST_MARGIN", lc.keepBestMargin);
+		lc.keepBestRevert = envF("GGL_LEAGUE_KEEPBEST_REVERT", lc.keepBestRevert);
+		// Exposed so the retention path can be VERIFIED in a smoke: the default 20 goals
+		// per variant is unreachable in a short CPU run, which would leave keepBest dark.
+		lc.keepBestMinGoals = envI("GGL_LEAGUE_KEEPBEST_MINGOALS", lc.keepBestMinGoals);
 		lc.klTarget = envF("GGL_LEAGUE_KLTARGET", lc.klTarget);
 		lc.repelCoeff = envF("GGL_LEAGUE_REPEL", lc.repelCoeff);
 		lc.repelTarget = envF("GGL_LEAGUE_REPELTARGET", lc.repelTarget);
@@ -651,7 +754,8 @@ bool GGL::Learner::BootSanityProbe() {
 	int stepsPerEp = (int)(8 * 120 / RS_MAX(1, config.tickSkip));
 	int numPlayers = (int)arena->_cars.size();
 
-	for (int ep = 0; ep < 3; ep++) {
+	const int probeEpisodes = 6;   // was 3 (2026-09-12: 1/3-touch false negatives on a healthy fork)
+	for (int ep = 0; ep < probeEpisodes; ep++) {
 		arena->ResetToRandomKickoff(ep);
 		GameState gs = GameState(arena);
 		res.obsBuilder->Reset(gs);
@@ -676,6 +780,14 @@ bool GGL::Learner::BootSanityProbe() {
 			torch::Tensor tObs = torch::tensor(obsAll).reshape({ numPlayers, obsSizeLocal }).to(ppo->device);
 			torch::Tensor tMasks = torch::tensor(masksAll).reshape({ numPlayers, -1 }).to(ppo->device);
 			torch::Tensor tActs;
+			if (config.ppo.intentDim > 0) {
+				// INTENT CLASS: fresh uniform intents per row (no per-player state in the probe)
+				int64_t n = tObs.size(0), d = config.ppo.intentDim;
+				auto ids = torch::randint(d, { n }, torch::TensorOptions().dtype(torch::kLong));
+				auto feat = torch::zeros({ n, d + 1 }, torch::TensorOptions().dtype(torch::kFloat32));
+				feat.scatter_(1, ids.unsqueeze(1), 1.f); feat.select(1, d).fill_(1.f);
+				ppo->InferActions(tObs, tMasks, &tActs, NULL, NULL, false, feat.to(ppo->device), ids.to(ppo->device));
+			} else
 			ppo->InferActions(tObs, tMasks, &tActs, NULL); // no steer mask: raw policy
 			auto acts = TENSOR_TO_VEC<int>(tActs.cpu());
 
@@ -716,7 +828,7 @@ bool GGL::Learner::BootSanityProbe() {
 		delete wr.reward;
 	delete arena;
 
-	RG_LOG(" > Boot sanity probe: kickoff touches in " << touchedEpisodes << "/3 episodes");
+	RG_LOG(" > Boot sanity probe: kickoff touches in " << touchedEpisodes << "/" << probeEpisodes << " episodes");
 	return touchedEpisodes >= 2;
 }
 
@@ -759,10 +871,16 @@ void GGL::Learner::Save() {
 	RG_LOG("Saving to folder " << finalFolder << "...");
 	SaveStats(saveFolder / STATS_FILE_NAME);
 	ppo->SaveTo(saveFolder);
+	if (bank)
+		bank->Save(saveFolder);
 	if (league)
 		league->Save(saveFolder);
 	if (gapSensor && gapSensor->exp)
 		torch::save(gapSensor->exp, (saveFolder / "GAP_EXP.lt").string());
+	if (worldMap && !worldMap->members.empty())
+		worldMap->Save(saveFolder);
+	if (oppMap)
+		oppMap->Save(saveFolder);
 
 	// VERIFY BEFORE PUBLISHING (2026-08-07). On this date the run wrote 15 checkpoints
 	// across two incidents that were atomic, deserializable, finite, sane-magnitude and
@@ -893,17 +1011,33 @@ void GGL::Learner::Load() {
 				// not GGL_LEAGUE_BINIT was set, which made a symmetry-broken run
 				// indistinguishable from a symmetric one in the log -- exactly the kind of
 				// stale banner that costs an experiment its interpretation.
-				RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - adapters born at binitStd="
-					<< league->cfg.binitStd
-					<< (league->cfg.binitStd > 0
-						? " (diverse variants SYMMETRY-BROKEN; exploiters at B=0)"
-						: " (B=0: variants ARE the main)"));
+				// The banner must also say when the birth adapters came from GGL_LEAGUE_INIT,
+				// or a construction-seeded run reads identically to a noise-seeded one --
+				// the same stale-banner failure this comment already warns about.
+				if (!league->cfg.initPath.empty()) {
+					RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - diverse adapters born from "
+						<< "GGL_LEAGUE_INIT (" << league->cfg.initPath
+						<< "); uncovered slots at binitStd=" << league->cfg.binitStd
+						<< "; exploiters at B=0");
+				} else {
+					RG_LOG("GGL_LEAGUE_FRESH: ignoring any LEAGUE.lt - adapters born at binitStd="
+						<< league->cfg.binitStd
+						<< (league->cfg.binitStd > 0
+							? " (diverse variants SYMMETRY-BROKEN; exploiters at B=0)"
+							: " (B=0: variants ARE the main)"));
+				}
 			} else {
 				league->Load(loadFolder); // missing LEAGUE.lt = fresh adapters (warm starts)
 			}
 		}
 		if (config.gapSensor.enabled && gapSensor)
 			gapSensor->loadFrom = loadFolder;
+		if (config.worldMap.enabled && worldMap)
+			worldMap->loadFrom = loadFolder;
+		if (config.oppMap.enabled)
+			oppMapLoadFrom = loadFolder;
+		if (bank)
+			bank->Load(loadFolder); // missing REHEARSAL_BANK.lt = empty bank
 
 		if (config.bootSanityCheckEnabled) {
 			float claimedRating = 0;
@@ -913,7 +1047,21 @@ void GGL::Learner::Load() {
 				if (j.contains("skill_ratings") && j["skill_ratings"].contains("1v1"))
 					claimedRating = j["skill_ratings"]["1v1"].get<float>();
 			} catch (...) {}
-			if (claimedRating >= config.bootSanityMinRating && !BootSanityProbe())
+			// 2026-09-12 (pulsar-plain hop 4742731): the 3-episode probe is STOCHASTIC - 8 of 72
+			// ranks scored 1/3 on a healthy 473-rated fork, each renamed the SHARED folder to
+			// corrupt_ and started a fresh model (the root broadcast then overwrote them, so the
+			// run survived - by luck of rank 0 passing). Verdict now comes from rank 0 ONLY and is
+			// broadcast, so the fleet acts as one and no non-root rank can quarantine a folder the
+			// others are loading; the probe itself runs 6 episodes (pass >= 2).
+			int probeOk = 1;
+			if (claimedRating >= config.bootSanityMinRating) {
+				const bool distOn = dist && dist->distributed();
+				if (!distOn || dist->rank() == 0)
+					probeOk = BootSanityProbe() ? 1 : 0;
+				if (distOn)
+					dist->bcast_host(&probeOk, sizeof(probeOk), 0);
+			}
+			if (!probeOk)
 				throw std::runtime_error("boot sanity probe failed: a policy rated "
 					+ std::to_string((int)claimedRating) + " cannot touch the ball on a "
 					"CONTESTED kickoff (scripted opponent commits) - weights are likely "
@@ -1219,6 +1367,15 @@ void GGL::Learner::Start() {
 			// learn-prep can restore the exact physics state a dipping row was observed in.
 			std::vector<int64_t> dipSnapId;
 
+			// INTENT CLASS (config.ppo.intentDim > 0): per-row intent id, clock (remaining/period)
+			// and boundary flag (1 on the first row of an interval). The policy acted on exactly
+			// these, so the learn pass must feed the same values (see InferPolicyProbsFromModels).
+			std::vector<int32_t> intentIds;
+			std::vector<int32_t> bankPlayer; // REHEARSAL BANK v2.3: per-row player index (tail carrying)
+			std::vector<int32_t> oppId;      // OPPONENT MAP: served-opponent identity per row (0 self, 1 nexto, 2+ ring version bucket)
+			FList intentClock;
+			std::vector<uint8_t> intentBoundary;
+
 
 			// GGL-2 Clear(): drop contents, keep allocations. `*this = Trajectory()` was
 			// reallocating every episode (512 players × ~1800-step episodes).
@@ -1262,6 +1419,11 @@ void GGL::Learner::Start() {
 				steerPractice.clear();
 				steerMode.clear();
 				dipSnapId.clear();
+				intentIds.clear();
+				bankPlayer.clear();
+				oppId.clear();
+				intentClock.clear();
+				intentBoundary.clear();
 			}
 
 			void Reserve(size_t rows, int obsSize, int numActions, bool reach, bool proposer, bool practice) {
@@ -1347,6 +1509,11 @@ void GGL::Learner::Start() {
 				srcPlayer += other.srcPlayer;
 				srcStep += other.srcStep;
 				dipSnapId += other.dipSnapId;
+				intentIds += other.intentIds;
+				bankPlayer += other.bankPlayer;
+				oppId += other.oppId;
+				intentClock += other.intentClock;
+				intentBoundary += other.intentBoundary;
 			}
 
 			// Every per-row column must have exactly one entry per action row; a missed append
@@ -1375,6 +1542,12 @@ void GGL::Learner::Start() {
 					RG_ASSERT(steerPractice.size() == n && steerMode.size() == n);
 				if (!dipSnapId.empty())
 					RG_ASSERT(dipSnapId.size() == n);
+				if (!intentIds.empty())
+					RG_ASSERT(intentIds.size() == n && intentClock.size() == n && intentBoundary.size() == n);
+				if (!bankPlayer.empty())
+					RG_ASSERT(bankPlayer.size() == n);
+				if (!oppId.empty())
+					RG_ASSERT(oppId.size() == n);
 			}
 
 			size_t Length() const {
@@ -1402,10 +1575,19 @@ void GGL::Learner::Start() {
 			size_t cap = nSel * (2 * stepsPerItr + (size_t)maxEpisodeLength);
 			dipBank = new DipSnapshotBank(cap);
 			dipSearch = new DipSearch(config.dipSearch, envCreateFn, config.tickSkip, config.actionDelay,
-				obsSize, numActions, config.ppo.gaeGamma);
+				obsSize, numActions, config.ppo.gaeGamma, nullptr, config.ppo.intentDim, config.ppo.intentPeriod);
 			RG_LOG("DipSearch: ON - " << nSel << "/" << envSet->arenas.size() << " arenas banked/step, bank cap "
 				<< cap << " snapshots, k=" << config.dipSearch.k << " q=" << config.dipSearch.dipQuantile
 				<< " maxStates=" << config.dipSearch.maxStates << " budget " << config.dipSearch.budgetSecs << "s");
+		}
+		// ===== OPPONENT MAP (Util/OpponentMap.h; WORLD_MODEL.md) =====
+		if (config.oppMap.enabled && !render) {
+			oppMap = std::make_shared<OpponentMap>(config.oppMap, obsSize, config.ppo.intentDim, numActions, ppo->device);
+			oppMap->SetDist(dist);
+			if (!oppMapLoadFrom.empty())
+				oppMap->Load(oppMapLoadFrom);
+			oppMap->BroadcastParameters();
+			oppMap->SyncCollectSnapshot();
 		}
 		const size_t expectedStepsPerEpisode = (size_t)RS_MAX(1, (int)(maxEpisodeLength * 1.2f));
 
@@ -1550,6 +1732,55 @@ void GGL::Learner::Start() {
 		std::vector<int> ksArenaCar(envSet->arenas.size(), -1);  // global player idx, -1 = no window
 		std::vector<int> ksArenaSteps(envSet->arenas.size(), 0);
 		std::vector<uint8_t> ksSuppress(numPlayers, 0);
+
+		// ===== INTENT CLASS per-player state (research/reports/NATIVE_INTENT_PROTOCOL.md) =====
+		// Exogenous uniform intents: z ~ U{0..intentDim-1} every intentPeriod decisions, reset on
+		// every terminal and at the iteration truncation (an interval never spans a boundary).
+		// Persistent engine, NOT RocketSim's clock-reseeded thread_local one (see the serve roll).
+		const int intentDim = config.ppo.intentDim, intentPeriod = RS_MAX(1, config.ppo.intentPeriod);
+		const bool intentOn = intentDim > 0;
+		std::vector<int32_t> intentZ(numPlayers, 0), intentLeft(numPlayers, 0);
+		std::mt19937_64 intentRng((uint64_t)config.randomSeed * 7919ULL + (uint64_t)DistRank() + 17ULL);
+
+		// ===== MECHANIC TELEMETRY (2026-09-11): in-trainer flip-reset counter =====
+		// The FlipReset reward's event rule (CommonRewards.h): airborne, flip restored THIS
+		// step, attributed to a ball touch this step (else a surface reset). Conversion = a
+		// flip within 15 decisions (1 s) of the reset while still airborne. Per-player cells
+		// (race-free in the per-player parallel-for); rank-local, reported per iteration and
+		// cumulatively. Exists because the cluster has no Python torch for the offline evaluator.
+		std::vector<int64_t> mechResets(numPlayers, 0), mechSurface(numPlayers, 0), mechConv(numPlayers, 0), mechRows(numPlayers, 0);
+		std::vector<int> mechPending(numPlayers, 0);
+		int64_t mechCumResets = 0, mechCumSurface = 0, mechCumConv = 0, mechCumRows = 0;
+		int64_t dipCumSearched = 0, dipCumAccepted = 0, dipCumRows = 0; double dipCumGain = 0; // DipSearch stdout summary (cluster logs have no wandb reader)
+		// WORLD MAP: the opponent the just-collected iteration faced (one per fleet iteration),
+		// handed to the learn pass at the barrier like oppCtxCollected
+		// OPPONENT MAP draw counters (collect thread), handed to the learn side at the barrier
+		int64_t oppTotalDraws = 0, oppPlanDraws = 0, oppTotalDrawsLearn = 0, oppPlanDrawsLearn = 0;
+		int oppIdLive = 0;   // identity of the opponent the fleet faces this iteration (collect thread)
+		std::vector<int64_t> oppPlanHist(RS_MAX(1, config.ppo.intentDim), 0), oppPlanHistLearn(RS_MAX(1, config.ppo.intentDim), 0);
+		int wmOppModeCollected = 0, wmOppModeLearn = 0;          // 0 self, 1 old version, 2 nexto
+		float wmOppAgeFracCollected = 0, wmOppAgeFracLearn = 0;   // 1 = oldest ring member, 0 = newest
+		int64_t wmOppAgeStepsCollected = 0, wmOppAgeStepsLearn = 0;
+
+		// REHEARSAL BANK state-novelty ranking (RehearsalBank.h rankMode 2): running mean/cov of a
+		// 26-dim physical descriptor over PAST iterations (EMA, ~50-iteration memory), per-row
+		// Mahalanobis leverage scored BEFORE the batch updates the stats. Not checkpointed: it
+		// re-warms in ~50 iterations after a resume (the first iteration scores 0 = no admissions).
+		const std::vector<int64_t> bankDescIdxV = { 0,1,2, 3,4,5, 51,52,53, 54,55,56, 57,58,59, 60,61,62, 69,70,71, 72,73,74, 76, 77 };
+		torch::Tensor bankDescIdx = torch::tensor(bankDescIdxV, torch::TensorOptions().dtype(torch::kLong));
+		torch::Tensor bankDescMean, bankDescCov;
+		const float bankDescEma = 0.02f;
+		torch::Tensor tIntentIdsHost, tIntentFeatHost;   // [n] long, [n, dim+1] float (CPU)
+		torch::Tensor tdIntentIds, tdIntentFeat;         // same, on the inference device
+		// Fresh per-row intents with a full clock for paths without per-player state (boot
+		// probe); the toy's execution ablation kept ~2/3 of the skill under per-step resampling.
+		auto fnFreshIntentFeats = [&](int64_t n, torch::Tensor* outIds, torch::Tensor* outFeat) {
+			auto ids = torch::randint(intentDim, { n }, torch::TensorOptions().dtype(torch::kLong));
+			auto feat = torch::zeros({ n, (int64_t)intentDim + 1 }, torch::TensorOptions().dtype(torch::kFloat32));
+			feat.scatter_(1, ids.unsqueeze(1), 1.f);
+			feat.select(1, intentDim).fill_(1.f);
+			*outIds = ids.to(ppo->device); *outFeat = feat.to(ppo->device);
+		};
 		// Hard cap on a window that never sees a touch (script whiffed/bumped): ~5s
 		const int ksWindowMaxSteps = (int)(5 * 120 / RS_MAX(1, config.tickSkip));
 		std::vector<uint8_t> ksPrevTerminals; // loop-top snapshot scratch, hoisted
@@ -2302,6 +2533,12 @@ void GGL::Learner::Start() {
 						? 1.f - (float)pickIdx / (float)(versionMgr->versions.size() - 1) : 0.f;
 				}
 				oppTeam = Team(oppPack[2]);
+				wmOppModeCollected = oppPack[0];
+				oppIdLive = oppPack[0] == 2 ? 1 : (oppPack[0] == 1 && oppModels)
+					? 2 + (int)((versionMgr->versions[(size_t)oppPack[1]].timesteps / (uint64_t)std::max<int64_t>(1, config.tsPerVersion)) % (uint64_t)std::max(1, config.oppMap.identitySlots - 2)) : 0;
+				wmOppAgeFracCollected = oppAgeFrac;
+				wmOppAgeStepsCollected = (oppPack[0] == 1 && oppModels)
+					? (int64_t)totalTimesteps - (int64_t)versionMgr->versions[(size_t)oppPack[1]].timesteps : 0;
 				// PRIVILEGED OPPONENT CONTEXT (composite value critic): the baseline may see
 				// who it is playing; the policy never does. oppCtxLive conditions THIS
 				// iteration's collection-time value inference; oppCtxCollected is handed to
@@ -2730,6 +2967,49 @@ void GGL::Learner::Start() {
 						}
 						inferH2dTime += h2dTimer.Elapsed();
 
+						// ===== INTENT CLASS: draw/hold this step's intents BEFORE the rows are
+						// recorded and BEFORE inference, so the stored row, the acting policy and
+						// the learn pass all see identical (z, clock). Boundary = intentLeft == 0.
+						if (intentOn) {
+							if (!tIntentIdsHost.defined() || tIntentIdsHost.size(0) != (int64_t)numPlayers) {
+								tIntentIdsHost = torch::zeros({ (int64_t)numPlayers }, torch::TensorOptions().dtype(torch::kLong));
+								tIntentFeatHost = torch::zeros({ (int64_t)numPlayers, (int64_t)intentDim + 1 }, torch::TensorOptions().dtype(torch::kFloat32));
+							}
+							auto* idsP = tIntentIdsHost.data_ptr<int64_t>();
+							auto* featP = tIntentFeatHost.data_ptr<float>();
+							std::uniform_int_distribution<int> zRoll(0, intentDim - 1);
+							// OPPONENT MAP planning: boundary players draw the map's intent with prob planFrac
+							// (from THEIR current obs and THEIR z), uniform otherwise
+							std::vector<int> plannedIntent;
+							if (oppMap && oppMap->PlanReady()) {
+								plannedIntent.assign(numPlayers, -1);
+								std::vector<int> ask;
+								std::uniform_real_distribution<float> pr(0.f, 1.f);
+								for (int i = 0; i < numPlayers; i++)
+									if (intentLeft[i] == 0) { oppTotalDraws++; if (pr(intentRng) < config.oppMap.planFrac) ask.push_back(i); }
+								if (!ask.empty()) {
+									std::vector<float> rows(ask.size() * (size_t)obsSize);
+									for (size_t k = 0; k < ask.size(); k++)
+										std::memcpy(&rows[k * (size_t)obsSize], &envSet->state.obs.At(ask[k], 0), sizeof(float) * (size_t)obsSize);
+									auto res = oppMap->Plan(rows.data(), ask, (int)ask.size(), oppIdLive);
+									for (size_t k = 0; k < res.size(); k++) { plannedIntent[(size_t)ask[k]] = res[k]; oppPlanDraws++; oppPlanHist[(size_t)res[k]]++; }
+								}
+							}
+							for (int i = 0; i < numPlayers; i++) {
+								if (intentLeft[i] == 0) {
+									intentZ[i] = (!plannedIntent.empty() && plannedIntent[(size_t)i] >= 0) ? plannedIntent[(size_t)i] : zRoll(intentRng);
+									intentLeft[i] = intentPeriod;
+								}
+								idsP[i] = intentZ[i];
+								float* row = featP + (size_t)i * (intentDim + 1);
+								for (int j = 0; j <= intentDim; j++) row[j] = 0.f;
+								row[intentZ[i]] = 1.f;
+								row[intentDim] = (float)intentLeft[i] / (float)intentPeriod;
+							}
+							tdIntentIds = tIntentIdsHost.to(ppo->device, /*non_blocking=*/false);
+							tdIntentFeat = tIntentFeatHost.to(ppo->device, /*non_blocking=*/false);
+						}
+
 						// Snapshot the obs the policy is about to act on. StepSecondHalf rewrites
 						// the shared buffer in place, so by the time the frame is streamed the
 						// original is gone — and this exists to answer "did the policy see the
@@ -2757,6 +3037,14 @@ void GGL::Learner::Start() {
 									return;
 								fnAppendObsRow(trajectories[newPlayerIdx].states, newPlayerIdx);
 								fnAppendMaskRow(trajectories[newPlayerIdx].actionMasks, newPlayerIdx);
+								if (bank || oppMap) trajectories[newPlayerIdx].bankPlayer.push_back(newPlayerIdx);
+								if (oppMap) trajectories[newPlayerIdx].oppId.push_back(oppIdLive);
+								if (intentOn) {
+									auto& tj = trajectories[newPlayerIdx];
+									tj.intentIds.push_back(intentZ[newPlayerIdx]);
+									tj.intentClock.push_back((float)intentLeft[newPlayerIdx] / (float)intentPeriod);
+									tj.intentBoundary.push_back(intentLeft[newPlayerIdx] == intentPeriod ? 1 : 0);
+								}
 								if (dipOn) {
 									int64_t id = dipArenaSnapId[(size_t)playerArenaIdx[newPlayerIdx]];
 									trajectories[newPlayerIdx].dipSnapId.push_back(
@@ -2847,7 +3135,9 @@ void GGL::Learner::Start() {
 								ModelSet* oldModelsPtr = oppModels;
 						if (render)
 							oldModelsPtr = renderOrangeModels.map.empty() ? NULL : &renderOrangeModels;
-						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr);
+						ppo->InferActions(tdOldStates, tdOldActionMasks, &tOldActions, NULL, oldModelsPtr, false,
+							intentOn ? tdIntentFeat.index_select(0, idxOld) : torch::Tensor{},
+							intentOn ? tdIntentIds.index_select(0, idxOld) : torch::Tensor{});
 							}
 					};
 					auto fnInferMain = [&]() {
@@ -2857,7 +3147,9 @@ void GGL::Learner::Start() {
 							ppo->InferActionsLowRankES(*newModelsPtr, tdNewStates,
 								tdNewActionMasks, esCtx, &tNewActions, &tLogProbs);
 						else
-							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr);
+							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs, newModelsPtr, false,
+								intentOn ? tdIntentFeat.index_select(0, idxNew) : torch::Tensor{},
+								intentOn ? tdIntentIds.index_select(0, idxNew) : torch::Tensor{});
 					};
 					if (oppParallel) {
 						std::thread oppThread(fnInferOpp);
@@ -2884,7 +3176,9 @@ void GGL::Learner::Start() {
 
 							torch::Tensor tNewActions, tLgActions, tLgLogProbs;
 							ppo->InferActions(tdNewStates, tdNewActionMasks, &tNewActions, &tLogProbs,
-								collectModelsPtr, /*allowCudaGraph=*/collectionCudaGraphsOn);
+								collectModelsPtr, /*allowCudaGraph=*/collectionCudaGraphsOn,
+								intentOn ? tdIntentFeat.index_select(0, idxNew) : torch::Tensor{},
+								intentOn ? tdIntentIds.index_select(0, idxNew) : torch::Tensor{});
 							league->InferActions(collectModelsPtr ? *collectModelsPtr : ppo->models,
 								tdLgStates, tdLgActionMasks, tLeagueRowVariantDev,
 								&tLgActions, &tLgLogProbs);
@@ -2904,7 +3198,8 @@ void GGL::Learner::Start() {
 							else
 								ppo->InferActions(
 									tdStates, tdActionMasks, &tActions, &tLogProbs, collectModelsPtr,
-									/*allowCudaGraph=*/collectionCudaGraphsOn);
+									/*allowCudaGraph=*/collectionCudaGraphsOn,
+									intentOn ? tdIntentFeat : torch::Tensor{}, intentOn ? tdIntentIds : torch::Tensor{});
 						}
 						inferKernTime += inferTimer.Elapsed();
 
@@ -3183,9 +3478,29 @@ void GGL::Learner::Start() {
 								traj.teamTouched.push_back(arenaTeamTouched[player.team == Team::BLUE ? 0 : 1][arenaIdx]);
 							}
 
+							{ // MECHANIC TELEMETRY (per-player cell)
+								auto& mp = envSet->state.gameStates[playerArenaIdx[newPlayerIdx]].players[playerSlotIdx[newPlayerIdx]];
+								mechRows[newPlayerIdx]++;
+								const bool rising = mp.prev && !mp.isOnGround && mp.HasFlipReset() && !mp.prev->HasFlipReset();
+								if (rising) {
+									if (mp.ballTouchedStep) { mechResets[newPlayerIdx]++; mechPending[newPlayerIdx] = 15; }
+									else mechSurface[newPlayerIdx]++;
+								} else if (mechPending[newPlayerIdx] > 0) {
+									if (mp.isFlipping) { mechConv[newPlayerIdx]++; mechPending[newPlayerIdx] = 0; }
+									else if (mp.isOnGround) mechPending[newPlayerIdx] = 0;
+									else mechPending[newPlayerIdx]--;
+								}
+								if (curTerminals[newPlayerIdx]) mechPending[newPlayerIdx] = 0;
+							}
+
 							int8_t terminalType = curTerminals[newPlayerIdx];
 							if (!terminalType && traj.Length() >= maxEpisodeLength)
 								terminalType = RLGC::TerminalType::TRUNCATED;
+
+							// INTENT CLASS: the interval advances one decision; a terminal ends it
+							// (per-player cell, race-free in this parallel-for)
+							if (intentOn)
+								intentLeft[newPlayerIdx] = terminalType ? 0 : RS_MAX(0, intentLeft[newPlayerIdx] - 1);
 
 							traj.terminals.push_back(terminalType);
 							if (terminalType == RLGC::TerminalType::TRUNCATED) {
@@ -3200,6 +3515,11 @@ void GGL::Learner::Start() {
 
 							finalTerminals[newPlayerIdx] = terminalType;
 						});
+
+						if (intentOn) // scripted (suppressed) players record no rows: hold the clock at 0 so the
+							for (int newPlayerIdx : newPlayerIndices) // first row after the window (mid-episode) OPENS an interval
+								if (ksSuppress[newPlayerIdx])          // (2026-09-11 crash: an advanced clock made it mid-interval)
+									intentLeft[newPlayerIdx] = 0;
 
 						// Serial finalize, in the original player order (deterministic episode
 						// order in combinedTrajNext, same as the old fully-serial loop)
@@ -3325,6 +3645,7 @@ void GGL::Learner::Start() {
 							fnRelabelReachGoals(traj, newPlayerIdx);
 							combinedTrajNext.Append(traj);
 							traj.Clear();
+							if (intentOn) intentLeft[newPlayerIdx] = 0; // an interval never spans the boundary
 						}
 					}
 
@@ -3552,6 +3873,12 @@ void GGL::Learner::Start() {
 					ppo->oppCtxForLearn = ppo->oppCtxCollected.defined()
 						? ppo->oppCtxCollected.clone()
 						: torch::zeros({ config.ppo.oppCtxDim }, torch::kFloat32);
+				wmOppModeLearn = wmOppModeCollected; wmOppAgeFracLearn = wmOppAgeFracCollected; wmOppAgeStepsLearn = wmOppAgeStepsCollected;
+				if (oppMap) {
+					oppMap->SyncCollectSnapshot();   // barrier zone: publish z table + frozen outcome head
+					oppTotalDrawsLearn = oppTotalDraws; oppPlanDrawsLearn = oppPlanDraws; oppPlanHistLearn = oppPlanHist;
+					oppTotalDraws = oppPlanDraws = 0; std::fill(oppPlanHist.begin(), oppPlanHist.end(), 0);
+				}
 				collectReport.Finish();
 				for (auto& kv : collectReport.data)
 					report.data[kv.first] = kv.second;
@@ -3703,6 +4030,17 @@ void GGL::Learner::Start() {
 					}
 					torch::Tensor tActions = MakePinnedActionIndices(combinedTraj.actions);
 					torch::Tensor tLogProbs = MakePinned1D<float>(combinedTraj.logProbs);
+					// INTENT CLASS: the (z, clock) the policy acted on, as the learn-pass inputs
+					torch::Tensor tIntentIds, tIntentFeat, tIntentBoundary;
+					if (intentOn) {
+						RG_ASSERT(combinedTraj.intentIds.size() == combinedTraj.Length());
+						tIntentIds = MakePinnedActionIndices(combinedTraj.intentIds);
+						int64_t nR = (int64_t)combinedTraj.Length();
+						tIntentFeat = torch::zeros({ nR, (int64_t)intentDim + 1 }, torch::TensorOptions().dtype(torch::kFloat32));
+						tIntentFeat.scatter_(1, tIntentIds.view({ nR, 1 }), 1.f);
+						tIntentFeat.select(1, intentDim).copy_(MakePinned1D<float>(combinedTraj.intentClock));
+						tIntentBoundary = MakePinned1D<uint8_t>(combinedTraj.intentBoundary);
+					}
 					torch::Tensor tRewards = MakePinned1D<float>(combinedTraj.rewards);
 					torch::Tensor tTerminals = MakePinned1D<int8_t>(combinedTraj.terminals);
 					// The value read and PPO learn pass consume the same state rows. Upload the
@@ -4172,6 +4510,8 @@ void GGL::Learner::Start() {
 					Timer gaeTimer = {};
 					// Run GAE
 					torch::Tensor tAdvantages, tTargetVals, tReturns, tVdagTargets, tRhatTargets, tAdvFilterMask, tEntWeights, tSilWeights;
+					float silCapCur = 0.f;      // this iteration's SIL weight cap (bank weights reuse it)
+					torch::Tensor tHForBank;    // per-row headroom of the buffer, CPU (bank telemetry)
 					float rewClipPortion;
 					GAE::Compute(
 						tRewards, tTerminals, tValPreds, tTruncValPreds,
@@ -4435,6 +4775,21 @@ void GGL::Learner::Start() {
 								tTargetVals.to(torch::kFloat32).flatten()
 									.slice(0, 0, nR - 1));
 						}
+						// FRONTIER: executed transitions for the bounded value backup and the
+						// quasimetric fit. Same arrival-reward reconstruction as the theory head,
+						// so the value map lands in the critic's units. Pairs whose departure row
+						// ended an episode are goal->kickoff teleports, not executed dynamics,
+						// and are excluded by the continuation mask.
+						if (config.ppo.frontier.enabled) {
+							auto z0f = torch::zeros({ 1 }, scaledR.options());
+							auto arrivalF = torch::cat({ z0f, scaledR.slice(0, 0, nR - 1) });
+							auto contPrevF = torch::cat({ z0f, cont.slice(0, 0, nR - 1) });
+							ppo->FrontierIngest(
+								tStates.slice(0, 0, nR - 1),
+								tStates.slice(0, 1, nR),
+								(arrivalF * contPrevF).slice(0, 1, nR),
+								1.0f - cont.slice(0, 0, nR - 1));
+						}
 						if (config.ppo.vdagTheoryEnabled) {
 							auto z0 = torch::zeros({ 1 }, scaledR.options());
 							auto arrival = torch::cat({ z0, scaledR.slice(0, 0, nR - 1) });
@@ -4487,10 +4842,12 @@ void GGL::Learner::Start() {
 								? (0.5f * unit(tHGeo) + 0.5f * unit(tH)) : unit(tH);
 							auto hQ = hMix.quantile((double)config.ppo.silGateQ);
 							auto conv = (tgtF > vexp) & (hMix >= hQ);
+							tHForBank = tH;
 							auto resid = tgtF - vpF;
 							float cap = config.ppo.silWCapSigma
 								* (resid.std().item<float>() + 1e-8f);
 							tSilWeights = resid.clamp(0.f, cap) * conv.to(torch::kFloat32);
+							silCapCur = cap;
 							float nConv = conv.to(torch::kFloat32).sum().item<float>();
 							report["SIL/Frac"] = nConv / (float)nR;
 							report["SIL/Mean W"] = nConv > 0
@@ -4504,6 +4861,202 @@ void GGL::Learner::Start() {
 						report["Headroom/H P90"] = tH.quantile(0.9).item<float>();
 						report["Headroom/Inj Abs Mean"] = inj.abs().mean().item<float>();
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] G1_headroom_done sh=%p\n", (void*)ppo->models["shared_head"]);
+					}
+
+					// ===== INTENT CLASS: discriminability credit (NATIVE_INTENT_PROTOCOL.md) =====
+					// l_b = log q(z_b | s_b, y_b) - log(1/dim) per interval, q scored on THIS batch
+					// before it is fitted on it (fresh data), broadcast to the interval's rows, then
+					// centred / sigma-floored / sigma-matched / clamped exactly like the seek term
+					// above, and added to the advantages. y_b is the observation of the interval's
+					// LAST decision (7 decisions after s_b; 1-row intervals score ~0). prevAction
+					// block [9,17) zeroed in both, so the intent cannot be read off its own actions.
+					if (intentOn && config.ppo.intentDiscBeta > 0 && ppo->models["intent_disc"] && tIntentBoundary.defined()) {
+						Timer intentTimer = {};
+						Model* disc = ppo->models["intent_disc"];
+						const int64_t nR = (int64_t)combinedTraj.Length();
+						auto bnd = tIntentBoundary.to(torch::kLong);
+						RG_ASSERT(nR > 0);
+						// Every episode start is an interval start by construction; enforce it here too
+						// (rows are episode-contiguous, so a start = row 0 or the row after a terminal)
+						// and count the rows where the collect-side clock disagreed - must read 0.
+						auto epStart = torch::cat({ torch::ones({ 1 }, torch::TensorOptions().dtype(torch::kLong)),
+							(tTerminals.to(torch::kLong).slice(0, 0, nR - 1) != 0).to(torch::kLong) });
+						const float forcedBnd = ((epStart == 1) & (bnd == 0)).to(torch::kFloat32).sum().item<float>();
+						bnd = torch::max(bnd, epStart);
+						report["Intent/Forced Bnd"] = forcedBnd;
+						auto iid = torch::cumsum(bnd, 0) - 1;               // interval id per row (rows are episode-contiguous)
+						auto startRows = bnd.nonzero().flatten();
+						const int64_t nI = startRows.size(0);
+						auto endRows = torch::cat({ startRows.slice(0, 1, nI) - 1,
+							torch::tensor({ nR - 1 }, torch::TensorOptions().dtype(torch::kLong)) });
+						auto sF = tStates.to(torch::kFloat32);
+						auto sb = sF.index_select(0, startRows).clone();
+						auto yb = sF.index_select(0, endRows).clone();
+						sb.slice(1, 9, 17).zero_(); yb.slice(1, 9, 17).zero_();
+						auto x = torch::cat({ sb, yb }, 1).to(ppo->device);
+						auto z = tIntentIds.index_select(0, startRows).to(ppo->device, torch::kLong);
+						torch::Tensor ell; float acc = 0.f;
+						{
+							RG_NO_GRAD;
+							auto logq = torch::log_softmax(disc->Forward(x, false), -1);
+							ell = logq.gather(1, z.unsqueeze(1)).squeeze(1) + std::log((float)intentDim);
+							acc = (logq.argmax(1) == z).to(torch::kFloat32).mean().item<float>();
+						}
+						// fit AFTER scoring: 4 epochs of 4096-row minibatches, CE. Learn-prep runs
+						// under no-grad; the fit needs autograd back on for its own scope.
+						float lastLoss = 0.f; int discSteps = 0;
+						torch::AutoGradMode enableGrad(true);
+						for (int ep = 0; ep < 4; ep++) {
+							auto perm = torch::randperm(nI, torch::TensorOptions().dtype(torch::kLong).device(ppo->device));
+							for (int64_t i0 = 0; i0 < nI; i0 += 4096) {
+								auto idx = perm.slice(0, i0, RS_MIN(nI, i0 + 4096));
+								auto loss = torch::nn::functional::cross_entropy(disc->Forward(x.index_select(0, idx), false), z.index_select(0, idx));
+								disc->optim->zero_grad();
+								loss.backward();
+								disc->optim->step();
+								lastLoss = loss.item<float>(); discSteps++;
+							}
+						}
+						disc->optim->zero_grad();
+						disc->_seqHalfOutdated = true;
+						auto ellRow = ell.to(torch::kCPU).index_select(0, iid);
+						auto aD = ellRow - ellRow.mean();
+						auto advF = tAdvantages.to(torch::kFloat32);
+						float sExt = advF.std().item<float>();
+						float sD = RS_MAX(0.05f * sExt, aD.std().item<float>());
+						auto injD = ((config.ppo.intentDiscBeta * sExt / sD) * aD).clamp(-3.f * sExt, 3.f * sExt).to(tAdvantages.device(), tAdvantages.dtype());
+						tAdvantages = tAdvantages + injD.view_as(tAdvantages);
+						report["Intent/Ell Mean"] = ell.mean().item<float>();
+						report["Intent/Ell Std"] = ell.std().item<float>();
+						report["Intent/Disc Acc"] = acc;
+						report["Intent/Disc Loss"] = lastLoss;
+						report["Intent/Intervals"] = (float)nI;
+						report["Intent/Inj Std Ratio"] = injD.std().item<float>() / RS_MAX(sExt, 1e-8f);
+						report["Intent/Time"] = intentTimer.Elapsed();
+						if (DistRank() == 0) RG_LOG("Intent: intervals " << nI << " q-acc " << acc << " ell " << ell.mean().item<float>()
+							<< " loss " << lastLoss << " inj/sExt " << report["Intent/Inj Std Ratio"] << " forced-bnd " << forcedBnd << " (" << discSteps << " disc steps)");
+					}
+
+					// ===================== MECHANIC TELEMETRY report =====================
+					{
+						int64_t r = 0, sf = 0, cv = 0, rows = 0;
+						for (int i = 0; i < numPlayers; i++) { r += mechResets[i]; sf += mechSurface[i]; cv += mechConv[i]; rows += mechRows[i]; mechResets[i] = mechSurface[i] = mechConv[i] = mechRows[i] = 0; }
+						mechCumResets += r; mechCumSurface += sf; mechCumConv += cv; mechCumRows += rows;
+						const double per = rows > 0 ? 1e5 / (double)rows : 0.0, cper = mechCumRows > 0 ? 1e5 / (double)mechCumRows : 0.0;
+						report["Mechanic/Flip Resets per 100k"] = (float)(r * per);
+						report["Mechanic/Surface Resets per 100k"] = (float)(sf * per);
+						report["Mechanic/Flip Resets Cum per 100k"] = (float)(mechCumResets * cper);
+						report["Mechanic/Reset Conversion Cum"] = mechCumResets > 0 ? (float)mechCumConv / (float)mechCumResets : 0.f;
+						report["Mechanic/Flip Resets Cum"] = (float)mechCumResets;
+						if (DistRank() == 0 && (totalIterations % 20 == 0))
+							RG_LOG("Mechanic: resets/100k iter " << r * per << " cum " << mechCumResets * cper << " (n " << mechCumResets
+								<< ", surface " << mechCumSurface * cper << ", conv " << report["Mechanic/Reset Conversion Cum"] << ", rows " << mechCumRows << ")");
+					}
+
+					// ===================== REHEARSAL BANK: admit, expire, hand rows to the main =====================
+					// Admission from THIS iteration's buffer (success by outcome + rarity under the
+					// acting policy), then the bank's rows go to the main's imitation term with
+					// weights clamp(target - V, 0, cap) from the live critic.
+					ppo->bankRows = {};
+					if (bank && tTargetVals.defined()) {
+						RG_NO_GRAD;
+						Timer bankTimer = {};
+						const int64_t nR = (int64_t)combinedTraj.Length();
+						auto tgtC = tTargetVals.to(torch::kCPU, torch::kFloat32).flatten();
+						auto logpC = tLogProbs.to(torch::kCPU, torch::kFloat32).flatten();
+						const float pThresh = std::exp(logpC.quantile((double)bank->cfg.pAdmit).item<float>());
+						const float tgtThresh = tgtC.quantile((double)bank->cfg.targetQ).item<float>();
+						report["Rehearsal/P Thresh"] = pThresh;
+						report["Rehearsal/Target Thresh"] = tgtThresh;
+						auto masksC = torch::from_blob((void*)combinedTraj.actionMasks.data(), { nR, (int64_t)numActions }, torch::kUInt8);
+						auto convC = tSilWeights.defined() ? (tSilWeights.to(torch::kCPU).flatten() > 0.f)
+							: torch::zeros({ nR }, torch::kBool);
+						auto hC = tHForBank.defined() ? tHForBank.to(torch::kCPU, torch::kFloat32).flatten() : torch::zeros({ nR }, torch::kFloat32);
+						// State novelty: leverage of each row's descriptor against the running stats of past
+						// iterations, then fold this batch into the stats.
+						torch::Tensor novC;
+						{
+							auto X = tStates.to(torch::kCPU, torch::kFloat32).index_select(1, bankDescIdx); // [nR, 26]
+							const int64_t D = X.size(1);
+							auto eyeD = torch::eye(D, torch::kFloat32) * 1e-4f;
+							if (bankDescMean.defined()) {
+								auto Xc = X - bankDescMean;
+								// No LAPACK on the cluster libtorch (the EffRank SVD lesson): invert the
+								// 26x26 SPD matrix by hand (Gauss-Jordan, partial pivoting, double).
+								auto A = (bankDescCov + eyeD).to(torch::kFloat64).contiguous();
+								std::vector<double> M(A.data_ptr<double>(), A.data_ptr<double>() + D * D), I((size_t)D * D, 0.0);
+								for (int64_t i = 0; i < D; i++) I[(size_t)i * D + i] = 1.0;
+								bool singular = false;
+								for (int64_t c = 0; c < D && !singular; c++) {
+									int64_t piv = c;
+									for (int64_t r = c + 1; r < D; r++) if (std::fabs(M[(size_t)r * D + c]) > std::fabs(M[(size_t)piv * D + c])) piv = r;
+									if (std::fabs(M[(size_t)piv * D + c]) < 1e-12) { singular = true; break; }
+									if (piv != c) for (int64_t k = 0; k < D; k++) { std::swap(M[(size_t)c * D + k], M[(size_t)piv * D + k]); std::swap(I[(size_t)c * D + k], I[(size_t)piv * D + k]); }
+									const double d = M[(size_t)c * D + c];
+									for (int64_t k = 0; k < D; k++) { M[(size_t)c * D + k] /= d; I[(size_t)c * D + k] /= d; }
+									for (int64_t r = 0; r < D; r++) {
+										if (r == c) continue;
+										const double f = M[(size_t)r * D + c];
+										if (f == 0.0) continue;
+										for (int64_t k = 0; k < D; k++) { M[(size_t)r * D + k] -= f * M[(size_t)c * D + k]; I[(size_t)r * D + k] -= f * I[(size_t)c * D + k]; }
+									}
+								}
+								auto inv = singular ? torch::zeros({ D, D }, torch::kFloat32)
+									: torch::from_blob(I.data(), { D, D }, torch::kFloat64).to(torch::kFloat32).clone();
+								novC = (Xc.matmul(inv) * Xc).sum(1).clamp_min(0.f);
+							} else {
+								novC = torch::zeros({ nR }, torch::kFloat32);
+							}
+							auto mB = X.mean(0);
+							auto XcB = X - mB;
+							auto covB = XcB.t().matmul(XcB) / (float)RS_MAX((int64_t)1, nR - 1);
+							if (!bankDescMean.defined()) { bankDescMean = mB; bankDescCov = covB; }
+							else { bankDescMean = (1.f - bankDescEma) * bankDescMean + bankDescEma * mB; bankDescCov = (1.f - bankDescEma) * bankDescCov + bankDescEma * covB; }
+							report["Rehearsal/Novelty Mean"] = novC.mean().item<float>();
+							report["Rehearsal/Novelty P99"] = nR > 100 ? novC.quantile(0.99).item<float>() : 0.f;
+						}
+						torch::Tensor playerC;
+						if (bank->cfg.carryTails && (int64_t)combinedTraj.bankPlayer.size() == nR)
+							playerC = torch::from_blob((void*)combinedTraj.bankPlayer.data(), { nR }, torch::kInt32);
+						bank->Admit(tStates, tActions, masksC, tgtC, tTerminals, convC, logpC.exp(), hC,
+							intentOn ? tIntentIds : torch::Tensor(), intentOn ? tIntentFeat : torch::Tensor(),
+							novC, playerC, (int64_t)totalIterations, pThresh, tgtThresh);
+						bank->Expire((int64_t)totalIterations);
+						bank->ReportTo(report, "Rehearsal/");
+						auto rows = bank->GetRows(bank->cfg.roadOnly);
+						float wMean = 0.f;
+						if (rows.n > 0) {
+							if (intentOn) RG_ASSERT(rows.intentFeat.defined()); // an intent run rehearses intent-conditioned rows only
+							auto st = rows.states.to(ppo->device, true);
+							auto v = ppo->InferCritic(st).flatten().to(torch::kFloat32);
+							auto resid = rows.targets.to(ppo->device, true) - v;
+							const float cap = silCapCur > 0.f ? silCapCur : (resid.std().item<float>() * config.ppo.silWCapSigma + 1e-8f);
+							auto w = resid.clamp(bank->cfg.wFloor * cap, cap);
+							if ((w > 0.f).any().item<bool>()) {
+								ppo->bankRows.states = st;
+								ppo->bankRows.actions = rows.actions.to(ppo->device, true);
+								ppo->bankRows.masks = rows.masks.to(ppo->device, true);
+								ppo->bankRows.weights = w;
+								ppo->bankRows.coeff = bank->cfg.coeff;
+								if (rows.intentFeat.defined()) {
+									ppo->bankRows.intentFeat = rows.intentFeat.to(ppo->device, true);
+									ppo->bankRows.intentIds = rows.intentIds.to(ppo->device, true);
+								}
+								wMean = w.mean().item<float>();
+							}
+							report["Rehearsal/Main Rows"] = (float)rows.n;
+							report["Rehearsal/Main W Mean"] = wMean;
+						}
+						report["Rehearsal/Time"] = bankTimer.Elapsed();
+						if (DistRank() == 0)
+							RG_LOG("Rehearsal: entries=" << bank->entries.size() << " rows=" << bank->RowCount()
+								<< " admitted=" << bank->admitted << " candidates=" << bank->candidates
+								<< " refusedNeg=" << bank->refusedNegative << " refusedCommon=" << bank->refusedCommon
+								<< " refusedWeak=" << bank->refusedWeak << " refusedNoEvent=" << bank->refusedNoEvent << " evicted=" << bank->evicted << " expired=" << bank->expired
+								<< " wMean=" << wMean << " pThresh=" << pThresh << " tgtThresh=" << tgtThresh
+								<< " minScore=" << report["Rehearsal/Min Score"] << " novP99=" << report["Rehearsal/Novelty P99"]
+								<< " carried=" << bank->carriedRows << "/" << bank->carriedSegments << " prefixes=" << bank->prefixes.size()
+								<< " entryCarried=" << report["Rehearsal/Mean Carried Rows"] << " resetEntries=" << report["Rehearsal/Entries With Reset"] << " entryH=" << report["Rehearsal/Mean Max Headroom"]);
 					}
 
 					if (returnStat) {
@@ -4864,19 +5417,26 @@ void GGL::Learner::Start() {
 						std::vector<DipSearchResult> res;
 						if (!states.empty())
 							dipSearch->Run(states, ppo, pMean, pStd, rScale, rClip, res, dcfg.budgetSecs);
-						int nSearched = 0, nAccepted = 0, nGoodHalf = 0; double gSum = 0, bG = 0, sG = 0, bC = 0, sC = 0;
+						int nSearched = 0, nAccepted = 0, nGoodHalf = 0, nIntentWin = 0, nIntentAcc = 0; double gSum = 0, bG = 0, sG = 0, bC = 0, sC = 0;
 						std::vector<float> rObs; std::vector<int64_t> rAct; std::vector<uint8_t> rMask; std::vector<float> rW;
+						std::vector<int64_t> rIntentId; std::vector<float> rIntentFeat;
 						for (auto& r : res) {
 							if (!r.searched) continue;
 							nSearched++; gSum += r.gain; nGoodHalf += r.gain >= 0.5f;
 							bG += r.baseGoal; sG += r.bestGoal; bC += r.baseConcede; sC += r.bestConcede;
+							nIntentWin += r.intentPrefix && r.bestL > 0;
 							if (!r.accepted || r.nRows == 0) continue;
-							nAccepted++;
+							nAccepted++; nIntentAcc += r.intentPrefix;
 							float w = RS_MIN(r.gain, dcfg.weightCap);
 							rObs.insert(rObs.end(), r.obs.begin(), r.obs.end());
 							for (int32_t a : r.actions) rAct.push_back((int64_t)a);
 							rMask.insert(rMask.end(), r.masks.begin(), r.masks.end());
 							rW.insert(rW.end(), (size_t)r.nRows, w);
+							if (intentOn) {
+								RG_ASSERT((int)r.intentIds.size() == r.nRows && r.intentFeat.size() == (size_t)r.nRows * (size_t)(intentDim + 1));
+								for (int32_t z : r.intentIds) rIntentId.push_back((int64_t)z);
+								rIntentFeat.insert(rIntentFeat.end(), r.intentFeat.begin(), r.intentFeat.end());
+							}
 						}
 						if (!rAct.empty()) {
 							int64_t n = (int64_t)rAct.size();
@@ -4888,7 +5448,14 @@ void GGL::Learner::Start() {
 								.to(ppo->device, false, true);
 							ppo->dipRows.weights = torch::from_blob(rW.data(), { n }, torch::kFloat32)
 								.to(ppo->device, false, true);
+							if (intentOn) {
+								ppo->dipRows.intentIds = torch::from_blob(rIntentId.data(), { n }, torch::kInt64).to(ppo->device, false, true);
+								ppo->dipRows.intentFeat = torch::from_blob(rIntentFeat.data(), { n, (int64_t)intentDim + 1 }, torch::kFloat32)
+									.to(ppo->device, false, true);
+							}
 						}
+						report["DipSearch/Intent Winners"] = (float)nIntentWin;
+						report["DipSearch/Intent Accepted"] = (float)nIntentAcc;
 						report["DipSearch/Candidates"] = (float)dips.size();
 						report["DipSearch/Picked"] = (float)picked.size();
 						report["DipSearch/Evicted"] = (float)evicted;
@@ -4904,7 +5471,205 @@ void GGL::Learner::Start() {
 						report["DipSearch/A_k Thr"] = thr;
 						report["DipSearch/Bank Size"] = (float)dipBank->Size();
 						report["DipSearch/Waves"] = (float)dipSearch->lastWaves;
+						report["DipSearch/Skipped Jobs"] = (float)dipSearch->lastSkippedJobs;
 						report["DipSearch/Time"] = dipTimer.Elapsed();
+						dipCumSearched += nSearched; dipCumAccepted += nAccepted; dipCumRows += (int64_t)rAct.size(); dipCumGain += gSum;
+						if (DistRank() == 0 && (totalIterations % 5 == 0))
+							RG_LOG("DipSearch: cand " << dips.size() << " picked " << picked.size() << " searched " << nSearched << " accepted " << nAccepted
+								<< " rows " << rAct.size() << " gain " << (nSearched ? gSum / nSearched : 0.0) << " thr " << thr << " bank " << dipBank->Size()
+								<< " waves " << dipSearch->lastWaves << " skipped " << dipSearch->lastSkippedJobs << " t " << dipTimer.Elapsed()
+								<< "s | cum searched " << dipCumSearched << " accepted " << dipCumAccepted << " rows " << dipCumRows
+								<< " gain " << (dipCumSearched ? dipCumGain / dipCumSearched : 0.0)
+								<< (intentOn ? RS_STR(" | intent winners " << nIntentWin << " accepted " << nIntentAcc) : ""));
+					}
+
+					// ===== WORLD MAP (measurement only; LearnerConfig::WorldMapConfig) =====
+					// Prequential error FIRST (the members have only seen earlier iterations), keyed by
+					// this iteration's opponent; then one subsample training pass per member.
+					{
+						int doWm = (worldMap && (int64_t)combinedTraj.Length() > config.worldMap.k + 1) ? 1 : 0;
+						if (DistActive())
+							dist->min_host(&doWm, 1);
+						if (doWm) {
+							const auto& wc = config.worldMap;
+							Timer wmTimer = {};
+							const int64_t nR = (int64_t)combinedTraj.Length();
+							const int K = RS_MAX(1, wc.k);
+							const int64_t inDim = obsSize + numActions + (intentOn ? intentDim + 1 : 0);
+							const int64_t descDim = (int64_t)bankDescIdxV.size();
+							if (worldMap->members.empty())
+								worldMap->Build(inDim, descDim, ppo->device, wc);
+							// rows i in [0, nR-K) with no terminal inside [i, i+K)
+							auto term = (tTerminals.to(torch::kLong) != 0).to(torch::kLong);
+							auto cs = term.cumsum(0);
+							// terminals inside [i, i+K) = cs[i+K-1] - cs[i-1]  (cs[-1] := 0), for i in [0, nR-K)
+							auto csHi = cs.slice(0, K - 1, nR - 1);
+							auto csLo = torch::cat({ torch::zeros({ 1 }, cs.options()), cs.slice(0, 0, nR - K - 1) });
+							auto inWin = csHi - csLo;
+							auto validIdx = torch::nonzero(inWin == 0).flatten();
+							const int64_t nValid = validIdx.size(0);
+							int haveValid = nValid > 256 ? 1 : 0;
+							if (DistActive())
+								dist->min_host(&haveValid, 1);
+							if (haveValid) {
+								auto fnInputs = [&](torch::Tensor idx) {
+									auto s = tStates.index_select(0, idx).to(ppo->device, true);
+									auto a = torch::nn::functional::one_hot(tActions.index_select(0, idx).to(ppo->device, true).to(torch::kLong), numActions).to(torch::kFloat32);
+									if (intentOn)
+										return torch::cat({ s, a, tIntentFeat.index_select(0, idx).to(ppo->device, true) }, 1);
+									return torch::cat({ s, a }, 1);
+								};
+								auto fnTargets = [&](torch::Tensor idx) {
+									auto d = tStates.index_select(0, idx + K).index_select(1, bankDescIdx).to(ppo->device, true);
+									return (d - worldMap->tgtMean) / worldMap->tgtStd;
+								};
+								// ---- prequential error + disagreement on a subsample
+								if (worldMap->updates >= 5) {
+									RG_NO_GRAD;
+									int64_t sample = RS_MIN((int64_t)32768, nValid);
+									auto pick = validIdx.index_select(0, torch::randperm(nValid, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, sample));
+									auto x = fnInputs(pick); auto y = fnTargets(pick);
+									std::vector<torch::Tensor> preds;
+									for (auto& m : worldMap->members) preds.push_back(m->forward(x));
+									auto P = torch::stack(preds, 0);                       // [E, n, D]
+									auto err = (P.mean(0) - y).pow(2).mean(1);             // per row, ensemble-mean prediction
+									auto dis = P.size(0) > 1 ? P.var(0, false).mean(1) : torch::zeros_like(err);
+									float errM = err.mean().item<float>(), disM = dis.mean().item<float>();
+									float errP90 = err.quantile(0.9).item<float>();
+									report["World/Err"] = errM;
+									report["World/Err P90"] = errP90;
+									report["World/Disagree"] = disM;
+									report["World/Opp Mode"] = (float)wmOppModeLearn;
+									report["World/Opp Age Frac"] = wmOppAgeFracLearn;
+									report["World/Opp Age Steps"] = (float)wmOppAgeStepsLearn;
+									if (wmOppModeLearn == 0) { report["World/Err Self"] = errM; WorldMapState::Ema(worldMap->emaSelf, worldMap->nSelf, errM); }
+									else if (wmOppModeLearn == 2) { report["World/Err Nexto"] = errM; WorldMapState::Ema(worldMap->emaNexto, worldMap->nNexto, errM); }
+									else {
+										int b = RS_CLAMP((int)(wmOppAgeFracLearn * 4.f), 0, 3);
+										report[RS_STR("World/Err Age Q" << b)] = errM;
+										report["World/Err Old"] = errM;
+										WorldMapState::Ema(worldMap->emaAge[b], worldMap->nAge[b], errM);
+									}
+									{ int64_t dummy = 0; WorldMapState::Ema(worldMap->emaDis, dummy, disM); }
+									// per-iteration record (rank 0): the ring cadence is 1B steps on the cluster, so age
+									// quartiles fill over days - regress err on ageSteps from these lines instead
+									if (DistRank() == 0)
+										RG_LOG("WorldIter: mode " << wmOppModeLearn << " ageSteps " << wmOppAgeStepsLearn << " ageFrac " << wmOppAgeFracLearn
+											<< " err " << errM << " p90 " << errP90 << " dis " << disM << " n " << sample);
+								}
+								// ---- update the target statistics (EMA, before training on this batch)
+								{
+									RG_NO_GRAD;
+									int64_t sample = RS_MIN((int64_t)65536, nValid);
+									auto pick = validIdx.slice(0, 0, sample) + K;
+									auto d = tStates.index_select(0, pick).index_select(1, bankDescIdx).to(ppo->device, true);
+									auto m = d.mean(0), s = d.std(0).clamp_min(1e-3f);
+									const float a = worldMap->updates == 0 ? 1.f : 0.02f;
+									worldMap->tgtMean = worldMap->tgtMean * (1.f - a) + m * a;
+									worldMap->tgtStd = worldMap->tgtStd * (1.f - a) + s * a;
+								}
+								// ---- train: one subsample pass per member (own permutation each)
+								{
+									torch::AutoGradMode _wmGradOn(true);
+									int64_t chunk = RS_MAX((int64_t)8192, (int64_t)ppo->config.miniBatchSize);
+									int64_t rows = RS_MIN((int64_t)wc.trainRows, nValid);
+									int nChunks = (int)((rows + chunk - 1) / chunk);
+									if (DistActive())
+										dist->min_host(&nChunks, 1);
+									float lossSum = 0; int lossN = 0;
+									for (size_t e = 0; e < worldMap->members.size(); e++) {
+										auto perm = validIdx.index_select(0, torch::randperm(nValid, torch::TensorOptions().dtype(torch::kLong)).slice(0, 0, rows));
+										for (int c = 0; c < nChunks; c++) {
+											auto idx = perm.slice(0, (int64_t)c * chunk, RS_MIN((int64_t)(c + 1) * chunk, rows));
+											worldMap->optims[e]->zero_grad();
+											auto loss = (worldMap->members[e]->forward(fnInputs(idx)) - fnTargets(idx)).pow(2).mean();
+											loss.backward();
+											lossSum += loss.item<float>(); lossN++;
+											if (DistActive()) {
+												std::vector<Dist::Session::GradRef> refs;
+												for (auto& p : worldMap->members[e]->parameters()) {
+													if (!p.requires_grad()) continue;
+													if (!p.grad().defined()) p.mutable_grad() = torch::zeros_like(p);
+													auto g = p.grad();
+													if (g.is_cuda() && g.scalar_type() == torch::kFloat)
+														refs.push_back({ g.data_ptr<float>(), (size_t)g.numel() });
+												}
+												dist->allreduce_avg_grads(refs);
+											}
+											worldMap->optims[e]->step();
+										}
+									}
+									worldMap->updates++;
+									if (lossN > 0) report["World/Loss"] = lossSum / lossN;
+								}
+								report["World/Valid Rows"] = (float)nValid;
+								report["World/Time"] = wmTimer.Elapsed();
+								if (DistRank() == 0 && (totalIterations % 20 == 0))
+									RG_LOG("World: err self " << worldMap->emaSelf << " (n " << worldMap->nSelf << ") old q0..q3 "
+										<< worldMap->emaAge[0] << "/" << worldMap->emaAge[1] << "/" << worldMap->emaAge[2] << "/" << worldMap->emaAge[3]
+										<< " (n " << worldMap->nAge[0] << "/" << worldMap->nAge[1] << "/" << worldMap->nAge[2] << "/" << worldMap->nAge[3]
+										<< ") nexto " << worldMap->emaNexto << " (n " << worldMap->nNexto << ") disagree " << worldMap->emaDis
+										<< " | this iter mode " << wmOppModeLearn << " ageFrac " << wmOppAgeFracLearn << " ageSteps " << wmOppAgeStepsLearn
+										<< " loss " << report["World/Loss"] << " valid " << nValid << " t " << wmTimer.Elapsed() << "s");
+							}
+						}
+					}
+
+					// ===== OPPONENT MAP learn (identifier + staleness + outcome map) =====
+					if (oppMap && (int64_t)combinedTraj.Length() > 1 && tTargetVals.defined()
+						&& combinedTraj.bankPlayer.size() == combinedTraj.Length() && combinedTraj.oppId.size() == combinedTraj.Length()) {
+						Timer omTimer = {};
+						auto res = oppMap->Learn(tStates, tTargetVals.to(torch::kCPU, torch::kFloat32).flatten(),
+							intentOn ? tIntentIds : torch::Tensor(), tActions.to(torch::kLong), combinedTraj.bankPlayer, combinedTraj.terminals,
+							combinedTraj.oppId, combinedTraj.intentBoundary);
+						report["OppMap/NLL"] = res.nll;
+						report["OppMap/Entropy"] = res.entropy;
+						report["OppMap/Excess"] = res.excess;
+						report["OppMap/Excess P90"] = res.excessP90;
+						report["OppMap/Disagree"] = res.disagree;
+						report["OppMap/Outcome Loss"] = res.outcomeLoss;
+						report["OppMap/Z Norm"] = res.zNorm;
+						report["OppMap/Segments"] = (float)res.segments;
+						report["OppMap/Opp Mode"] = (float)wmOppModeLearn;
+						report["OppMap/Opp Age Steps"] = (float)wmOppAgeStepsLearn;
+						report["OppMap/Plan Frac"] = oppTotalDrawsLearn ? (float)oppPlanDrawsLearn / (float)oppTotalDrawsLearn : 0.f;
+						for (size_t k = 0; k < oppPlanHistLearn.size(); k++)
+							report[RS_STR("OppMap/Plan Intent " << k)] = oppPlanDrawsLearn ? (float)oppPlanHistLearn[k] / (float)oppPlanDrawsLearn : 0.f;
+						if (wmOppModeLearn == 0) report["OppMap/Excess Self"] = res.excess;
+						else if (wmOppModeLearn == 2) report["OppMap/Excess Nexto"] = res.excess;
+						else { report["OppMap/Excess Old"] = res.excess; report[RS_STR("OppMap/Excess Age Q" << RS_CLAMP((int)(wmOppAgeFracLearn * 4.f), 0, 3))] = res.excess; }
+						// ===== STALENESS POTENTIAL (user: the pressure is the point) =====
+						// Phi = prequential across-member disagreement (variance head cannot absorb it:
+						// it is measured BEFORE the update, across independent encoders), injected as
+						// gamma(1-d)Phi(s') - Phi(s), centred, sigma-matched and clamped exactly like the
+						// seek term. Potential-based, so optimal policies are preserved.
+						if (config.oppMap.staleBeta > 0.f && res.stale.defined() && res.stale.numel() == (int64_t)combinedTraj.Length()) {
+							const int64_t nR = (int64_t)combinedTraj.Length();
+							auto phi = res.stale.to(torch::kFloat32);
+							auto contS = (tTerminals.to(torch::kFloat32) == 0).to(torch::kFloat32);
+							auto phiN = torch::cat({ phi.slice(0, 1, nR), torch::zeros({ 1 }) });
+							auto aStale = config.ppo.gaeGamma * contS * phiN - phi;
+							aStale = aStale - aStale.mean();
+							auto advC = tAdvantages.to(torch::kCPU, torch::kFloat32).flatten();
+							float sExt = advC.std().item<float>();
+							float sInt = RS_MAX(0.05f * sExt, aStale.std().item<float>());
+							auto injS = ((config.oppMap.staleBeta * sExt / sInt) * aStale).clamp(-3.f * sExt, 3.f * sExt);
+							tAdvantages = tAdvantages + injS.to(tAdvantages.device(), tAdvantages.scalar_type()).view_as(tAdvantages);
+							report["OppMap/Stale Mean"] = phi.mean().item<float>();
+							report["OppMap/Stale P90"] = phi.quantile(0.9).item<float>();
+							report["OppMap/Stale Inj Std Ratio"] = injS.std().item<float>() / RS_MAX(sExt, 1e-8f);
+						}
+						report["OppMap/Time"] = omTimer.Elapsed();
+						if (DistRank() == 0) {
+							std::string hist;
+							for (size_t k = 0; k < oppPlanHistLearn.size(); k++) hist += RS_STR((k ? "/" : "") << oppPlanHistLearn[k]);
+							RG_LOG("OppMapIter: mode " << wmOppModeLearn << " ageSteps " << wmOppAgeStepsLearn << " ageFrac " << wmOppAgeFracLearn
+								<< " nll " << res.nll << " ent " << res.entropy << " excess " << res.excess << " p90 " << res.excessP90
+								<< " dis " << res.disagree << " outcome " << res.outcomeLoss << " znorm " << res.zNorm
+								<< " segs " << res.segments << " rows " << res.rows << " plan " << oppPlanDrawsLearn << "/" << oppTotalDrawsLearn
+								<< " hist " << hist << " ready " << (oppMap->PlanReady() ? 1 : 0)
+								<< (config.oppMap.staleBeta > 0.f ? RS_STR(" staleInj " << report["OppMap/Stale Inj Std Ratio"]) : "") << " t " << omTimer.Elapsed() << "s");
+						}
 					}
 
 					// Set experience buffer
@@ -4916,6 +5681,10 @@ void GGL::Learner::Start() {
 					experience.data.states = tDeviceStates;
 					experience.data.advantages = tAdvantages;
 					experience.data.targetValues = tTargetVals;
+					if (intentOn) {
+						experience.data.intentIds = ppo->device.is_cuda() ? tIntentIds.to(ppo->device, true) : tIntentIds;
+						experience.data.intentFeat = ppo->device.is_cuda() ? tIntentFeat.to(ppo->device, true) : tIntentFeat;
+					}
 					report["Headroom/Tgt Set"] = tVdagTargets.defined()
 						? (float)tVdagTargets.numel() : -1.f;
 					report["Headroom/Rows N"] = (float)tStates.size(0);
@@ -5054,6 +5823,41 @@ void GGL::Learner::Start() {
 				Timer learnTimer = {};
 				if (std::getenv("GGL_MOE_DEBUG")) fprintf(stderr, "[MOEDBG] H_learn_start\n");
 				ppo->Learn(experience, report, isFirstIteration);
+
+				// FRONTIER: bounded value backups + quasimetric fit, after the PPO pass so the
+				// fits see this iteration's transitions. Pure instrument - it touches no
+				// advantage, no return and no critic, and its trunk read is detached.
+				if (config.ppo.frontier.enabled) {
+					ppo->TrainFrontier();
+					const auto& fr = ppo->lastFrontier;
+					if (fr.trained) {
+						report["Frontier/Value Loss"] = fr.valueLoss;
+						report["Frontier/Value Mean"] = fr.meanValue;
+						// If this ever sits pinned at the configured bound the backup is
+						// saturating and the map is no longer informative - the toy diverged
+						// 0.25 -> 38,187 without it.
+						report["Frontier/Target Max Abs"] = fr.maxAbsTarget;
+						report["Frontier/Targets Clamped"] = (float)fr.targetsClamped;
+						report["Frontier/Quasi Loss"] = fr.quasiLoss;
+						// Should sit near 1: one executed decision costs one. Far below means the
+						// metric has collapsed and carries no gradient.
+						report["Frontier/Quasi Local D"] = fr.meanLocal;
+						report["Frontier/Quasi Violation"] = fr.violation;
+						report["Frontier/Quasi Spread"] = fr.meanSpread;
+						// Goal diagnostics. A gain at or below zero means the search is aiming at
+						// states no better than where the policy already is, which is the failure
+						// mode that produced exactly zero acquisition in four separate rankings.
+						report["Frontier/Goal Gain"] = fr.goalGain;
+						report["Frontier/Goal Dist"] = fr.goalDist;
+						report["Frontier/Goal Valid Frac"] = fr.goalValidFrac;
+						// Also to stdout: this module is new, its whole failure mode is looking
+						// healthy while doing nothing, and wandb is not always attached.
+						RG_LOG("Frontier: V " << fr.meanValue << " (|tgt|max " << fr.maxAbsTarget
+							<< ", clamped " << fr.targetsClamped << ")  localD " << fr.meanLocal
+							<< "  goalGain " << fr.goalGain << " @ d" << fr.goalDist
+							<< "  valid " << fr.goalValidFrac);
+					}
+				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();
 
 				// LEAGUE learn pass: AFTER the main optimizer step so the base weights the

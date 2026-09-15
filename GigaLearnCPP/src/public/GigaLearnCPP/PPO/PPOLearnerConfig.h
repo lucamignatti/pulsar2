@@ -15,6 +15,69 @@ namespace GGL {
 	// Two heads share one phi(trunk(obs), action) encoder:
 	//  CAR  head: "can this car reach the ball" (HER on the car-local ball)
 	//  BALL head: "can the ball reach the opponent net" (HER on the canonical ball state)
+	// ---------------------------------------------------------------------------------------
+	// FRONTIER (research/reports/WORLD_MODEL_W163_VALUE_MAP.md, WORLD_MODEL_W161_STEPWISE_SIL.md)
+	//
+	// Toy result this is a port of: a policy that never performs a multi-step conduct acquires and
+	// RETAINS it from purely on-policy collection, with nothing injected, when self-imitation is
+	// aimed at goals chosen by a VALUE MAP built by backward value iteration. The value map is the
+	// load-bearing piece; four other goal-ranking signals (novelty, learned headroom, simulated
+	// return, policy advantage) all produced exactly zero acquisition across every seed.
+	//
+	// Two properties the toy proved are essential and are preserved here:
+	//   * The backup takes a MAX over actions, not an average over what the policy did. V^pi at a
+	//     state the policy never enters reports what the CURRENT policy would get there, which is
+	//     low, and is therefore the wrong question. The max never needs a good policy as input.
+	//   * The bootstrap target must be BOUNDED. Without it the toy's value map diverged from 0.25
+	//     to 38,187 in 32 sweeps; twin nets trained on identical targets are too correlated for
+	//     their minimum to act as pessimism on its own. Same failure shape as the composition
+	//     critic's headroom running 0.3 -> 11.8. valueAbsMax is that bound and it is REQUIRED.
+	//
+	// Everything here is an instrument: it never enters advantages, returns or the critic, and the
+	// trunk read is DETACHED (Law 2/4 - probes never reshape the trunk; the carStateHead incident
+	// cost ~125 Rating when this was violated).
+	struct FrontierConfig {
+		bool enabled = false;      // Train the value map + quasimetric, publish diagnostics
+		bool silEnabled = false;   // Actually add the progress-weighted imitation term (requires enabled)
+
+		// Value map
+		float gamma = 0.997f;      // Re-derive with tickSkip, like TRAIN_GAMMA
+		float valueExpectile = 0.9f; // Soft max over the action distribution when actions cannot be
+		                             // expanded; 0.5 would be a mean and is never what we want
+		float valueAbsMax = 0;     // REQUIRED bound on |target|. 0 disables the module at boot with
+		                           // a loud error rather than silently allowing divergence.
+		float valueLr = 3e-4f;
+		int valueSteps = 8;        // Backups per learn iteration
+		int valueBatch = 4096;
+
+		// Quasimetric reachability, d(x->y) = max_i relu(h_i(y)-h_i(x)) + ||g(y)-g(x)||
+		int latentAsym = 32;
+		int latentSym = 8;
+		float quasiLr = 3e-4f;
+		float quasiConstraintWeight = 50.0f; // Penalty on d(s,s') > 1 for OBSERVED one-step transitions
+		float quasiSpreadCap = 64.0f;        // Soft cap so the max-distance term cannot diverge
+		int quasiSteps = 8;
+		int quasiBatch = 2048;
+
+		// Goal selection: among candidate states inside the reachability band, take the largest
+		// value gain over where the agent already is. The band matters - the toy measured that
+		// distances to states outside forward reach carry NO usable gradient (every action scored
+		// negative), so a goal must be near enough that the metric still means something.
+		float bandLow = 1.5f;
+		float bandHigh = 6.0f;
+		int candidatePool = 4096;  // Recent observations retained as goal candidates
+		int goalTtl = 12;          // Decisions a goal is held before reselection
+
+		// Progress-weighted self-imitation. W161 measured the ORIGINAL endpoint-prefix rule
+		// beating per-transition credit 2 seeds to 1, so the prefix rule is what is ported.
+		float silSharpness = 6.0f; // weight = exp(sharpness * progress), progress in [0,1]
+		float silCoeff = 0.005f;
+		int silRows = 1024;        // Rows sampled into each minibatch
+		int withdrawAtIteration = 0; // 0 = never withdraw; otherwise SIL is off from this iteration
+
+		PartialModelConfig value, quasi;
+	};
+
 	struct ReachabilityConfig {
 		bool enabled = false;     // Train the heads (aux loss) + compute gate diagnostics
 		bool gateEnabled = false; // Actually scale the gated rewards (requires enabled)
@@ -359,7 +422,27 @@ namespace GGL {
 		bool useGuidingPolicy = false;
 		std::filesystem::path guidingPolicyPath = "guiding_policy/"; // Path of the guiding policy model(s)
 		float guidingStrength = 0.03f;
+		// Extra policy-head inputs the GUIDING checkpoint was trained with, if different from this
+		// run's. Distillation needs matching ACTIONS and OBS, not matching weights -- which is the
+		// whole reason a fresh net can inherit from a checkpoint it is not weight-compatible with.
+		// But the loader must still build the guiding policy at ITS width, not this run's: the
+		// 422B and multi-mode GCO policies are 768x1280 (no intent features) and would fail to
+		// load into a 1287-wide slot. -1 means "same as this run".
+		int guidingPolicyIntentExtra = -1;
 
+		// SECOND teacher, for team-mode rows. Pulsar 2.5 distils from two checkpoints at once:
+		// the best 1v1 policy on 1v1 arenas and the best multi-mode policy on 2v2/3v3 arenas.
+		// A row's mode is read from the observation's teammate PRESENCE FLAGS, so no per-row
+		// plumbing is needed and the split cannot desync from the arena layout.
+		bool useGuidingPolicyTeam = false;
+		// Slots per team in the padded observation. Needed to locate the presence flags, which
+		// are the last (2*n - 1) entries. MAX_PLAYERS_PER_TEAM is a file-local constant in
+		// ExampleMain and is not exported, so it is passed rather than guessed from obsSize.
+		int obsMaxPlayersPerTeam = 3;
+		std::filesystem::path guidingPolicyTeamPath = "guiding_policy_team/";
+		int guidingPolicyTeamIntentExtra = -1;
+
+		FrontierConfig frontier;
 		ReachabilityConfig reachability;
 		GoalCriticConfig goalCritic;
 
@@ -378,6 +461,24 @@ namespace GGL {
 		// deploys). Revert = set false here and rebuild.
 		bool vdagEnabled = true;
 		float vdagTau = 0.75f;
+		// INTENT CLASS (research/reports/NATIVE_INTENT_PROTOCOL.md, 2026-09-11). Exogenous
+		// uniform intents: every intentPeriod decisions each player draws z ~ U{0..intentDim-1};
+		// the policy head reads trunk ++ onehot(z) ++ remaining/intentPeriod, and a trainable
+		// [intentDim x numActions] table of action-logit biases (init N(0, intentBiasStd)) gives
+		// coherent, on-policy exploration (the toy's supply lever: bias std 3 = 4x std 1). The
+		// intent is NOT learned by a manager (toy: uniform intents scored as well as the learned
+		// manager at execution; its entropy stayed near-maximal in training), so the likelihood
+		// is plain pi(a|s,z) and the PPO ratio is exact. intentDim 0 = class off (no shape change).
+		int intentDim = 0;
+		int intentPeriod = 8;
+		float intentBiasStd = 3.f;
+		// Discriminability credit l = log q(z|s_b, y_b) - log(1/intentDim), q a small MLP on the
+		// boundary obs and the interval's last obs with the prevAction block zeroed, fit each
+		// iteration on that iteration's boundary rows AFTER scoring (fresh data). Broadcast to
+		// the interval's rows, centred, sigma-matched at intentDiscBeta, clamped +-3 sigma,
+		// added to advantages through the seek-term pathway. 0 = off.
+		float intentDiscBeta = 1.f;
+		float intentDiscLR = 1e-3f;   // q's Adam LR (toy: 1e-3); ADAM, not Muon (a classifier, not a trunk)
 		// Dose curve measured (rltest, n=2/point, 25M): inverted-U, optimum 0.30-0.45.
 		// 0.15 -> 0.30 gave touch +45% / air +93%. beta >= 1.0 is WORSE THAN BASE (the
 		// +-3sigma clamp binds, clipped potential diffs stop telescoping, PBRS

@@ -744,6 +744,10 @@ int main(int argc, char* argv[]) {
 	// Revert = 0 (resume-compatible), but note reverting also reverts the probe's
 	// training-side pressure, not the probe itself.
 	cfg.kickoffScriptChance = 0.5f;
+	if (const char* ks = std::getenv("GGL_KICKOFF_SCRIPT")) { // 2026-09-11: intent runs set 0 (user-directed)
+		cfg.kickoffScriptChance = (float)atof(ks);
+		RG_LOG("GGL_KICKOFF_SCRIPT: kickoffScriptChance = " << cfg.kickoffScriptChance);
+	}
 
 	// 6.0 ts1: 1024 -> 128. This is NOT a throughput cut — it is the tickSkip change applied to
 	// the fleet. Each arena now yields 8x more decisions per game-second, so 1024 arenas at ts1
@@ -1146,6 +1150,77 @@ int main(int argc, char* argv[]) {
 	// symmetry - positive side muted, mirror charged in full - and PBRS telescoping), so the gate
 	// would be a mathematical no-op anyway; this makes that explicit. Keep enabled=true: the heads
 	// still feed the InfoNCE trunk aux + Reach/* plasticity canaries.
+	// ===== FRONTIER (research/reports/WORLD_MODEL_W163_VALUE_MAP.md) =====
+	// OFF. Ported 2026-09-14, never run on this lineage. When disabled nothing is constructed,
+	// no tensor is ingested and no loss is added, so the run is bit-identical to before the port.
+	//
+	// What the toy established, and what it did NOT:
+	//   PASS  A policy that never performs a multi-step conduct ACQUIRES and RETAINS it from
+	//         purely on-policy collection, nothing injected, when self-imitation is aimed at goals
+	//         chosen by this value map. Retention held at 0.91-0.94 after withdrawal.
+	//   FAIL  Only 1-2 of 4 seeds ignited; the registered gate wanted 3. Do not expect
+	//         reliability, expect a chance of ignition per seed.
+	//   FAIL  Per-transition distance credit LOST to the original endpoint-prefix rule, 2 seeds
+	//         to 1, which is why silSharpness/prefix weighting is what got ported.
+	//   OPEN  The value map's advantage over four other goal rankings was measured on an 8-dim
+	//         toy. Nothing here shows a quasimetric works at 230 dims; the existing reachability
+	//         signal on this lineage sits near 0.7 AUC and is called a coarse compass.
+	//
+	// valueAbsMax is REQUIRED and has no safe default: the toy's map diverged 0.25 -> 38,187 in
+	// 32 sweeps without a bounded bootstrap target, the same shape as the V-dagger headroom
+	// running 0.3 -> 11.8. Set it from THIS reward stack's plausible return magnitude, not from
+	// the toy's +-1, and watch Frontier/Targets Clamped: pinned at the batch size means the bound
+	// is doing the work and the map has stopped being informative.
+	cfg.ppo.frontier.enabled = false;
+	cfg.ppo.frontier.silEnabled = false;
+	cfg.ppo.frontier.gamma = TRAIN_GAMMA;        // same horizon as GAE; re-derive with tickSkip
+	cfg.ppo.frontier.valueAbsMax = 0;            // MUST be set before enabling; 0 aborts at boot
+	cfg.ppo.frontier.value = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
+	cfg.ppo.frontier.quasi = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
+
+	// ============================ PULSAR 2.5 ============================
+	// GGL_PULSAR25=1. Fresh weights, distilled from TWO frozen teachers at once, multi-mode from
+	// step zero, GCO reward, frontier instrument on.
+	//
+	// Why FRESH rather than a branch: distillation needs matching ACTIONS (90) and OBSERVATIONS
+	// (230), not matching weights. Both teachers are 768x1280 policies with no intent features and
+	// are NOT weight-compatible with this run's 1287-wide head. Grafting them is the hybrid restore
+	// the recovery doctrine forbids; distilling them is free and drops the 22b-compat debt for good.
+	//
+	// Two teachers because one policy is best at 1v1 and another at team modes. Each row is routed
+	// by its own observation's teammate presence flags, so the split cannot desync from the fleet.
+	if (const char* p25 = std::getenv("GGL_PULSAR25"); p25 && std::atoi(p25) != 0) {
+		RG_LOG("GGL_PULSAR25: fresh weights, dual-teacher distillation, multi-mode, GCO.");
+
+		cfg.ppo.useGuidingPolicy = true;
+		cfg.ppo.guidingPolicyPath = std::getenv("GGL_TEACHER_1V1")
+			? std::getenv("GGL_TEACHER_1V1") : "teacher_1v1/";
+		cfg.ppo.useGuidingPolicyTeam = true;
+		cfg.ppo.guidingPolicyTeamPath = std::getenv("GGL_TEACHER_MM")
+			? std::getenv("GGL_TEACHER_MM") : "teacher_mm/";
+		// Both teachers predate the intent head: their policy first layer is 768x1280, so they
+		// must be built at ZERO extra head inputs regardless of what this run uses.
+		cfg.ppo.guidingPolicyIntentExtra = 0;
+		cfg.ppo.guidingPolicyTeamIntentExtra = 0;
+
+		// FRONTIER. GCO is the best possible setting for it: the reward is a single terminal
+		// GoalReward and the episode ends on that goal, so a normalized return cannot exceed the
+		// reward clip. That makes the bound EXACT rather than a guess - and the bound is the
+		// component whose absence let the toy's value map run 0.25 -> 38,187 in 32 sweeps.
+		cfg.ppo.frontier.enabled = true;
+		cfg.ppo.frontier.valueAbsMax = cfg.ppo.rewardClipRange;
+		cfg.ppo.frontier.gamma = TRAIN_GAMMA;
+		// SIL stays OFF for the first run. The mechanism ignited in only 1-2 of 4 toy seeds and has
+		// never run natively; let the value map and quasimetric publish their panels against a
+		// distillation run that is otherwise understood before anything acts on them.
+		cfg.ppo.frontier.silEnabled = false;
+
+	}
+
+	// Padded-obs geometry, passed so the learn pass can locate the presence flags that tell it
+	// which game mode a row came from (used to pick the matching guiding teacher).
+	cfg.ppo.obsMaxPlayersPerTeam = MAX_PLAYERS_PER_TEAM;
+
 	cfg.ppo.reachability.enabled = true;
 	cfg.ppo.reachability.gateEnabled = false;
 
@@ -1494,6 +1569,15 @@ int main(int argc, char* argv[]) {
 	cfg.ppo.vdagSeekBeta = 0.0f;  // the pre-geo vdag-only injection too (it is overwritten
 	                              // while geoEnabled, but a later geo toggle must not
 	                              // silently resurrect it)
+	// GGL_VDAG_SEEK_BETA (2026-09-11, intent v2.3, user-directed): re-arm the composition
+	// critic's seek term Phi = +H (COMPOSITION_CRITIC.md; paper value 0.15) so the policy is
+	// shaped toward states whose OPTIMISTIC value exceeds the mean value - "potentially better
+	// in the best case" - which a return-gated bank cannot see for a conduct that pays no
+	// better than average today (reset->goal 0.094 vs 0.118 baseline).
+	if (const char* sb = std::getenv("GGL_VDAG_SEEK_BETA"); sb && *sb) {
+		cfg.ppo.vdagSeekBeta = (float)atof(sb);
+		RG_LOG("GGL_VDAG_SEEK_BETA: vdagSeekBeta = " << cfg.ppo.vdagSeekBeta);
+	}
 	cfg.ppo.silEnabled = true;
 	cfg.ppo.silCoeff = 0.05f;     // toy-validated 0.1, halved for the opposed live game
 	                              // (imitated overcommits are the un-derisked hazard --
@@ -1508,6 +1592,38 @@ int main(int argc, char* argv[]) {
 	// search-found prefix steps, weighted by held-out gain (silCoeff-scaled, so SIL's
 	// coefficient governs both). Default OFF. Records the C2 conflict with
 	// COMPOSITION_CRITIC.md deliberately (Util/DipSearch.h header).
+	if (const char* d = std::getenv("GGL_OPPMAP"); d && *d && std::string(d) != "0") {
+		auto envF = [](const char* n, float dflt) { const char* e = std::getenv(n); return (e && *e) ? (float)std::atof(e) : dflt; };
+		auto envI = [](const char* n, int dflt) { const char* e = std::getenv(n); return (e && *e) ? std::atoi(e) : dflt; };
+		auto& om = cfg.oppMap;
+		om.enabled = true;
+		om.zdim = envI("GGL_OPPMAP_ZDIM", om.zdim);
+		om.hidden = envI("GGL_OPPMAP_HIDDEN", om.hidden);
+		om.ensemble = envI("GGL_OPPMAP_ENS", om.ensemble);
+		om.lr = envF("GGL_OPPMAP_LR", om.lr);
+		om.trainEpisodes = envI("GGL_OPPMAP_EPISODES", om.trainEpisodes);
+		om.maxLen = envI("GGL_OPPMAP_MAXLEN", om.maxLen);
+		om.planFrac = envF("GGL_OPPMAP_PLAN_FRAC", om.planFrac);
+		om.planWarmup = envI("GGL_OPPMAP_WARMUP", om.planWarmup);
+		om.useContext = envI("GGL_OPPMAP_CONTEXT", 1) != 0;
+		om.staleBeta = envF("GGL_OPPMAP_STALE_BETA", om.staleBeta);
+		RG_LOG("GGL_OPPMAP: ON - opponent-conditioned world model: zdim=" << om.zdim << " ens=" << om.ensemble
+			<< " lr=" << om.lr << " episodes=" << om.trainEpisodes << " maxLen=" << om.maxLen
+			<< " planFrac=" << om.planFrac << " warmup=" << om.planWarmup << " context=" << (om.useContext ? "on" : "OFF (ablation)") << " staleBeta=" << om.staleBeta);
+	}
+	if (const char* d = std::getenv("GGL_WORLDMAP"); d && *d && std::string(d) != "0") {
+		auto envF = [](const char* n, float dflt) { const char* e = std::getenv(n); return (e && *e) ? (float)std::atof(e) : dflt; };
+		auto envI = [](const char* n, int dflt) { const char* e = std::getenv(n); return (e && *e) ? std::atoi(e) : dflt; };
+		auto& wm = cfg.worldMap;
+		wm.enabled = true;
+		wm.k = envI("GGL_WORLDMAP_K", wm.k);
+		wm.lr = envF("GGL_WORLDMAP_LR", wm.lr);
+		wm.trainRows = envI("GGL_WORLDMAP_ROWS", wm.trainRows);
+		wm.ensemble = envI("GGL_WORLDMAP_ENS", wm.ensemble);
+		wm.hidden = envI("GGL_WORLDMAP_HIDDEN", wm.hidden);
+		RG_LOG("GGL_WORLDMAP: ON (measurement only) - k=" << wm.k << " lr=" << wm.lr << " rows=" << wm.trainRows
+			<< " ensemble=" << wm.ensemble << " hidden=" << wm.hidden);
+	}
 	if (const char* d = std::getenv("GGL_DIPSEARCH"); d && *d && std::string(d) != "0") {
 		auto envF = [](const char* n, float dflt) {
 			const char* e = std::getenv(n); return (e && *e) ? (float)std::atof(e) : dflt;
@@ -1751,7 +1867,54 @@ int main(int argc, char* argv[]) {
 	// the never-delete rule. Also the clean cut from 7.0-vc's epi-poisoned baselines
 	// (see epiBlendEnabled): fresh start, not resume, per the recovery doctrine.
 	cfg.checkpointFolder = "checkpoints_7.0b";
+
+	// Pulsar 2.5 gets its OWN lineage folder, applied here because the default above would
+	// otherwise overwrite anything set earlier. A fresh run must never share a directory with an
+	// existing lineage: the loader resumes the newest checkpoint it finds, so an inherited folder
+	// silently turns "fresh weights" into a resume of someone else's run. Caught in the 2.5 smoke,
+	// which loaded a gap sensor out of checkpoints_7.0b. Explicit overrides still win, below.
+	if (const char* p25f = std::getenv("GGL_PULSAR25"); p25f && std::atoi(p25f) != 0) {
+		cfg.checkpointFolder = "checkpoints_2.5";
+		RG_LOG("GGL_PULSAR25: checkpoint folder " << cfg.checkpointFolder);
+	}
 	cfg.metricsRunName = "7.0b-ts8";
+
+	// ===== INTENT CLASS (research/reports/NATIVE_INTENT_PROTOCOL.md, 2026-09-11) =====
+	// GGL_INTENT_DIM=6 turns on exogenous uniform intents (see PPOLearnerConfig::intentDim).
+	// SHAPE-BREAKING for the policy head (+dim+1 inputs) -> it REQUIRES its own checkpoint
+	// folder (GGL_CKPT_FOLDER) and, to resume a plain-head checkpoint or keep an existing
+	// version ring, GGL_WIDEN_ON_LOAD=1 (zero-padded, function-preserving) and GGL_FRESH_OPTIM=1
+	// (the policy optimizer's saved moments have the old shape). Boot refuses the default
+	// folder with intents on so a lineage cannot be quarantined by accident.
+	if (const char* e = std::getenv("GGL_INTENT_DIM"); e && *e && std::atoi(e) > 0) {
+		cfg.ppo.intentDim = std::atoi(e);
+		// BOOT PROBE OFF on intent runs (2026-09-12 03:05, cost 4 h x 36 nodes): the boot sanity
+		// probe plays the loaded policy with FRESH uniform intents through a FRESH random logit
+		// bias table (std 3), scored 0/3 kickoff touches on the competent 531.7B Pulsar fork,
+		// quarantined it as corrupt and fell through to "starting new model" - the three
+		// "TL from Pulsar" intent arms were cold starts. The probe measures the raw policy; on
+		// an intent run it measures the bias noise. GGL_BOOT_PROBE=1 forces it back on.
+		if (const char* b = std::getenv("GGL_BOOT_PROBE"); b && *b && std::string(b) != "0") {
+			RG_LOG("Boot sanity probe: FORCED ON for an intent run (GGL_BOOT_PROBE)");
+		} else {
+			cfg.bootSanityCheckEnabled = false;
+			RG_LOG("Boot sanity probe: OFF (intent run - the probe would score the fresh intent bias, not the policy)");
+		}
+		if (const char* v = std::getenv("GGL_INTENT_PERIOD"); v && *v && std::atoi(v) > 0) cfg.ppo.intentPeriod = std::atoi(v);
+		if (const char* v = std::getenv("GGL_INTENT_BIAS_STD"); v && *v) cfg.ppo.intentBiasStd = (float)std::atof(v);
+		if (const char* v = std::getenv("GGL_INTENT_DISC_BETA"); v && *v) cfg.ppo.intentDiscBeta = (float)std::atof(v);
+		cfg.ppo.useCudaGraphs = false; // graphs do not capture the intent inputs (fatal otherwise)
+		const char* folder = std::getenv("GGL_CKPT_FOLDER");
+		if (!folder || !*folder)
+			RG_ERR_CLOSE("GGL_INTENT_DIM set without GGL_CKPT_FOLDER: the intent class changes the policy head shape; refusing to boot into the default lineage folder");
+		cfg.metricsRunName = cfg.metricsRunName + "-intent" + std::to_string(cfg.ppo.intentDim);
+		RG_LOG("INTENT CLASS: dim " << cfg.ppo.intentDim << ", period " << cfg.ppo.intentPeriod << ", bias std "
+			<< cfg.ppo.intentBiasStd << ", disc beta " << cfg.ppo.intentDiscBeta << ", cuda graphs off");
+	}
+	if (const char* f = std::getenv("GGL_CKPT_FOLDER"); f && *f) {
+		cfg.checkpointFolder = f;
+		RG_LOG("GGL_CKPT_FOLDER: checkpoint folder " << cfg.checkpointFolder);
+	}
 	if (const char* n = std::getenv("GGL_METRICS_RUN_NAME"); n && *n)
 		cfg.metricsRunName = n;
 	if (const char* g = std::getenv("GGL_METRICS_GROUP_NAME"); g && *g)
@@ -1774,6 +1937,12 @@ int main(int argc, char* argv[]) {
 	cfg.iterPerSave = 40;
 	// Cadence seats iterate several times per second; a save every 40 iters then fires
 	// every ~15s and each save joins the collect worker (~1.5s) — a 7-10% wall tax.
+	// GGL_TS_PER_VERSION: version-ring cadence in steps (cluster launchers set 1B so the 32-deep
+	// ring spans ~30B fleet steps instead of 32 iterations; the desktop keeps the 25M default).
+	if (const char* s = std::getenv("GGL_TS_PER_VERSION"); s && *s && std::atoll(s) > 0) {
+		cfg.tsPerVersion = (int64_t)std::atoll(s);
+		RG_LOG("GGL_TS_PER_VERSION: tsPerVersion = " << cfg.tsPerVersion);
+	}
 	if (const char* s = std::getenv("GGL_ITER_PER_SAVE"); s && *s && std::atoi(s) > 0)
 		cfg.iterPerSave = std::atoi(s);
 	// GGL_SMOKE: force a real checkpoint round-trip within a few CPU iterations, so the smoke
@@ -2088,7 +2257,15 @@ int main(int argc, char* argv[]) {
 	// If the marker read ever disappears again the symptom is that exact restart loop.
 	// PHASE_B_ENABLED guards the READ as well as the trigger, so an inherited or hand-copied
 	// marker cannot engage team modes behind your back.
-	g_PhaseB = PHASE_B_ENABLED && std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER);
+	// Pulsar 2.5 plays multi-mode from step ZERO rather than flipping partway. The rating-gated
+	// flip is deliberately bypassed: its trigger reads Rating/1v1, which this project measures as
+	// ~6x inflated, and 6.1b flipped mid-run on that number without anyone deciding to. Here the
+	// mode mix is a property of the run, decided once, and both teachers are present from the
+	// start so neither mode is ever learned from scratch.
+	const bool pulsar25 = [] { const char* v = std::getenv("GGL_PULSAR25"); return v && std::atoi(v) != 0; }();
+	g_PhaseB = pulsar25 || (PHASE_B_ENABLED && std::filesystem::exists(cfg.checkpointFolder / PHASE_B_MARKER));
+	if (pulsar25)
+		RG_LOG("GGL_PULSAR25: multi-mode fleet from step zero (no rating-gated flip).");
 	TEAM_SPIRIT = g_PhaseB ? 0.6f : 0.3f; // 5.0 spirit schedule (see the declaration)
 	if (const char* n = std::getenv("GGL_NUM_GAMES"); n && *n)
 		cfg.numGames = std::atoi(n);

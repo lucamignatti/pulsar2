@@ -124,8 +124,36 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			RG_LOG("PPOLearner: learn autocast fp16 loss_scale=" << ampLossScale);
 		}
 	}
+	// INTENT CLASS: the policy head gets onehot(z) ++ clock and carries the bias table.
+	if (config.intentDim > 0) {
+		RG_ASSERT(config.intentPeriod > 0);
+		config.policy.intentBiasRows = config.intentDim;
+		config.policy.intentBiasStd = config.intentBiasStd;
+		RG_LOG("PPOLearner: INTENT CLASS on - " << config.intentDim << " intents x " << config.intentPeriod
+			<< " decisions, bias std " << config.intentBiasStd << ", disc beta " << config.intentDiscBeta);
+	}
 	MakeModels(true, obsSize, numActions, config.sharedHead, config.policy, config.critic,
-		config.criticTrunk, device, models);
+		config.criticTrunk, device, models, config.intentDim > 0 ? config.intentDim + 1 : 0);
+
+	// INTENT CLASS discriminator q(z | s_b, y_b): a training-only classifier over the boundary
+	// observation and the interval's last observation (prevAction block zeroed by the caller).
+	// Step-exempt: it is scored on the fresh batch and then fitted by its own loop in
+	// Learner's learn-prep; the shared StepOptims sweep must never touch it (an Adam step on a
+	// zero gradient still moves the weights through momentum).
+	if (config.intentDim > 0 && config.intentDiscBeta > 0) {
+		PartialModelConfig dc = {};
+		dc.layerSizes = { 256, 256 };
+		dc.activationType = ModelActivationType::LEAKY_RELU;
+		dc.addLayerNorm = true;
+		dc.addOutputLayer = true;
+		dc.optimType = ModelOptimType::ADAM;
+		ModelConfig full = dc;
+		full.numInputs = 2 * obsSize;
+		full.numOutputs = config.intentDim;
+		Model* disc = new Model("intent_disc", full, device);
+		disc->groupStepExempt = true;
+		models.Add(disc);
+	}
 
 	// Secondary goal-only critic: a fully independent net (raw obs in, no shared trunk) so its
 	// gradients can't touch the proven policy/critic path. Lives in `models` so it checkpoints and
@@ -270,6 +298,20 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 			/*makeCarStateHead=*/config.reachability.carStateHead);
 	}
 
+	if (config.frontier.enabled) {
+		// The frontier's transitions are ingested from inside the HEADROOM block, which is where
+		// the scaled per-step reward and the continuation mask are reconstructed. With vdagEnabled
+		// off that block never runs, so the module would construct, register its optimizers, save
+		// its weights and train on NOTHING -- inert while looking perfectly healthy. This project
+		// has paid for that twice: V-dagger frozen at lr=0 for 3.4B steps, and the composition
+		// critic injecting a random projection. Fail at boot instead.
+		if (!config.vdagEnabled)
+			RG_ERR_CLOSE("FrontierConfig::enabled requires vdagEnabled: the frontier ingests its "
+				"transitions from the headroom block's reward reconstruction, and would silently "
+				"train on nothing without it.");
+		frontier = new FrontierModule(obsSize, config.frontier, device, models);
+	}
+
 	SetLearningRates(config.policyLR, config.criticLR);
 
 	// Print param counts
@@ -285,17 +327,35 @@ GGL::PPOLearner::PPOLearner(int obsSize, int numActions, PPOLearnerConfig _confi
 	if (config.useGuidingPolicy) {
 		RG_LOG("Guiding policy enabled, loading from " << config.guidingPolicyPath << "...");
 		// makeCritic=false, so no critic trunk either (it is value-side only)
+		int guidingExtra = config.guidingPolicyIntentExtra >= 0
+			? config.guidingPolicyIntentExtra
+			: (config.intentDim > 0 ? config.intentDim + 1 : 0);
+		RG_LOG("\tGuiding policy head extra inputs: " << guidingExtra
+			<< (config.guidingPolicyIntentExtra >= 0 ? " (explicit)" : " (same as this run)"));
 		MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic,
-			/*criticTrunkConfig=*/{}, device, guidingPolicyModels);
+			/*criticTrunkConfig=*/{}, device, guidingPolicyModels, guidingExtra);
 		guidingPolicyModels.Load(config.guidingPolicyPath, false, false);
+
+		if (config.useGuidingPolicyTeam) {
+			int teamExtra = config.guidingPolicyTeamIntentExtra >= 0
+				? config.guidingPolicyTeamIntentExtra : guidingExtra;
+			RG_LOG("Team-mode guiding policy enabled, loading from " << config.guidingPolicyTeamPath
+				<< " (head extra inputs: " << teamExtra << ")...");
+			MakeModels(false, obsSize, numActions, config.sharedHead, config.policy, config.critic,
+				/*criticTrunkConfig=*/{}, device, guidingPolicyTeamModels, teamExtra);
+			guidingPolicyTeamModels.Load(config.guidingPolicyTeamPath, false, false);
+		}
 	}
 }
 
 GGL::PPOLearner::~PPOLearner() {
 	delete reach;
 	reach = nullptr;
+	delete frontier;
+	frontier = nullptr;
 	models.Free();
 	guidingPolicyModels.Free();
+	guidingPolicyTeamModels.Free();
 }
 
 void GGL::PPOLearner::MakeModels(
@@ -304,10 +364,11 @@ void GGL::PPOLearner::MakeModels(
 	PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
 	PartialModelConfig criticTrunkConfig,
 	torch::Device device,
-	ModelSet& outModels) {
+	ModelSet& outModels,
+	int policyExtraInputs) {
 
 	ModelConfig fullPolicyConfig = policyConfig;
-	fullPolicyConfig.numInputs = obsSize;
+	fullPolicyConfig.numInputs = obsSize + policyExtraInputs;
 	fullPolicyConfig.numOutputs = numActions;
 
 	ModelConfig fullCriticConfig = criticConfig;
@@ -330,7 +391,9 @@ void GGL::PPOLearner::MakeModels(
 
 		RG_ASSERT(!sharedHeadConfig.addOutputLayer);
 
-		fullPolicyConfig.numInputs = fullSharedHeadConfig.layerSizes.back();
+		// INTENT CLASS: the policy head reads trunk ++ onehot(z) ++ clock; the critic does not
+		// (an intent baseline must not condition on the just-sampled intent).
+		fullPolicyConfig.numInputs = fullSharedHeadConfig.layerSizes.back() + policyExtraInputs;
 		fullCriticConfig.numInputs = fullSharedHeadConfig.layerSizes.back();
 
 		outModels.Add(new Model("shared_head", fullSharedHeadConfig, device));
@@ -362,12 +425,17 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	float temperature, bool halfPrec,
 	torch::Tensor steerDelta, torch::Tensor* outRowOk,
 	torch::Tensor precomputedTrunk,
-	bool useCudaGraph) {
+	bool useCudaGraph,
+	torch::Tensor intentFeat,
+	torch::Tensor intentIds) {
 
-	if (useCudaGraph)
+	if (useCudaGraph) {
+		if (intentFeat.defined() || intentIds.defined())
+			RG_ERR_CLOSE("InferPolicyProbsFromModels: CUDA graphs do not capture intent features; run the intent class with GGL_CUDA_GRAPHS off");
 		return PolicyCudaGraph::InferPolicyProbs(
 			models, obs, actionMasks, temperature, halfPrec,
 			steerDelta, outRowOk, precomputedTrunk, true);
+	}
 
 	actionMasks = actionMasks.to(torch::kBool);
 
@@ -391,6 +459,22 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 		obs = obs + steerDelta.to(obs.dtype());
 	}
 
+	// INTENT CLASS: the policy head expects trunk ++ intent features. Missing features are
+	// fatal, never a zero fallback (a silently-zeroed input biases the PPO ratio on exactly
+	// the rows that matter - the retired Ladder wire's one hard bug class).
+	{
+		const int64_t expected = models["policy"]->config.numInputs, have = obs.size(1);
+		if (expected != have) {
+			if (!intentFeat.defined() || intentFeat.size(0) != obs.size(0) || have + intentFeat.size(1) != expected)
+				RG_ERR_CLOSE("InferPolicyProbsFromModels: policy head expects " << expected << " inputs, trunk emits "
+					<< have << ", intent features " << (intentFeat.defined() ? intentFeat.sizes() : torch::IntArrayRef{})
+					<< " - every acting path must supply the intent features");
+			obs = torch::cat({ obs, intentFeat.to(obs.device(), obs.dtype()) }, -1);
+		} else if (intentFeat.defined()) {
+			RG_ERR_CLOSE("InferPolicyProbsFromModels: intent features supplied but the policy head has no extra inputs");
+		}
+	}
+
 	// temperature == 1 is the live setting and `/ 1.0f` is a full [rows x 90] elementwise kernel
 	// launched every collection step for nothing. Inference here is DISPATCH-bound, not
 	// arithmetic-bound (the 21-op network was issuing ~55 GPU ops), so an op that computes an
@@ -398,6 +482,15 @@ torch::Tensor GGL::PPOLearner::InferPolicyProbsFromModels(
 	auto logits = models["policy"]->Forward(obs, halfPrec, /*keepHalf=*/halfPrec);
 	if (logits.scalar_type() != torch::kFloat)
 		logits = logits.to(torch::kFloat);
+	// INTENT CLASS: per-intent action-preference table, added BEFORE the mask so disabled
+	// actions stay at -1e10. Fatal if the table exists and no ids were given (same rule).
+	if (models["policy"]->intentBias.defined()) {
+		if (!intentIds.defined() || intentIds.size(0) != logits.size(0))
+			RG_ERR_CLOSE("InferPolicyProbsFromModels: policy has an intent bias table but no intent ids were supplied");
+		logits = logits + models["policy"]->intentBias.squeeze(-1).index_select(0, intentIds.to(logits.device())).to(logits.dtype());
+	} else if (intentIds.defined()) {
+		RG_ERR_CLOSE("InferPolicyProbsFromModels: intent ids supplied but the policy has no intent bias table");
+	}
 	if (temperature != 1.f)
 		logits = logits / temperature;
 
@@ -455,12 +548,14 @@ void GGL::PPOLearner::InferActionsFromModels(
 	bool deterministic, float temperature, bool halfPrec,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
 	torch::Tensor steerDelta,
-	bool useCudaGraph) {
+	bool useCudaGraph,
+	torch::Tensor intentFeat,
+	torch::Tensor intentIds) {
 
 	torch::Tensor rowOk;
 	auto probs = InferPolicyProbsFromModels(
 		models, obs, actionMasks, temperature, halfPrec,
-		steerDelta, &rowOk, {}, useCudaGraph);
+		steerDelta, &rowOk, {}, useCudaGraph, intentFeat, intentIds);
 
 	if (deterministic) {
 		auto action = probs.argmax(1);
@@ -559,7 +654,9 @@ void GGL::PPOLearner::InferActions(
 	torch::Tensor obs, torch::Tensor actionMasks,
 	torch::Tensor* outActions, torch::Tensor* outLogProbs,
 	ModelSet* models,
-	bool allowCudaGraph) {
+	bool allowCudaGraph,
+	torch::Tensor intentFeat,
+	torch::Tensor intentIds) {
 	ModelSet& m = models ? *models : this->models;
 
 	// Activation steering was removed 2026-07-25 (it had been inert at alpha = 0 since the
@@ -570,7 +667,7 @@ void GGL::PPOLearner::InferActions(
 	InferActionsFromModels(
 		m, obs, actionMasks, config.deterministic, config.policyTemperature,
 		config.useHalfPrecision, outActions, outLogProbs, steerDelta,
-		config.useCudaGraphs && allowCudaGraph);
+		config.useCudaGraphs && allowCudaGraph, intentFeat, intentIds);
 }
 
 GGL::PolicyCudaGraphStats GGL::PPOLearner::GetCudaGraphStats() {
@@ -1157,7 +1254,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	torch::Tensor sumGuidingLoss = zmet(), sumClip = zmet(), sumDivergence = zmet();
 	torch::Tensor sumVdagLoss = zmet(), sumVdagTwinSpread = zmet(), sumRhatLoss = zmet();
 	torch::Tensor sumReachLoss = zmet(), sumReachCarStateLoss = zmet();
-	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
+	torch::Tensor lastEntGate, lastSilLoss, lastDipLoss, lastBankLoss, lastAuxNLL, lastYvAbs, lastVdagRaw;
 	torch::Tensor nRelEntropy = zmet();
 	int metricPolicySteps = 0, metricCriticSteps = 0, metricGoalSteps = 0;
 	int metricKlSteps = 0, metricClipSteps = 0, metricGuidingSteps = 0;
@@ -1312,6 +1409,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 				auto advantages = take(batchAdvantages);
 				auto oldProbs = take(batchOldProbs);
 				auto targetValues = take(batchTargetValues);
+				auto intentFeat = take(batch.intentFeat);   // INTENT CLASS (undefined when off)
+				auto intentIds = take(batch.intentIds);
 
 				// Advantage filtering (policy only; see the note above the minibatch lambda)
 				torch::Tensor advKeep, keepSum;
@@ -1343,7 +1442,7 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					torch::Tensor curEntropyT;
 					{
 						probs = InferPolicyProbsFromModels(models, obs, actionMasks, config.policyTemperature, false,
-							{}, nullptr, fnTrunkVR());
+							{}, nullptr, fnTrunkVR(), /*useCudaGraph=*/false, intentFeat, intentIds);
 						logProbs = probs.log().gather(-1, acts.unsqueeze(-1));
 						auto entRows = ComputeEntropyRows(probs, actionMasks, config.maskEntropy);
 						// Report the UNWEIGHTED mean so the panel stays comparable to runs
@@ -1423,22 +1522,56 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 					// minibatch, batchSizeRatio-scaled so accumulation matches a full-batch pass.
 					if (dipRows.states.defined() && dipRows.states.size(0) > 0) {
 						auto dProbs = InferPolicyProbsFromModels(models, dipRows.states, dipRows.masks,
-							config.policyTemperature, false);
+							config.policyTemperature, false, {}, nullptr, {}, false, dipRows.intentFeat, dipRows.intentIds);
 						auto dLogp = dProbs.log().gather(-1, dipRows.actions.unsqueeze(-1)).flatten();
 						auto dipLoss = (-(dLogp) * dipRows.weights).sum()
 							/ (float)dipRows.weights.size(0) * config.silCoeff * batchSizeRatio;
 						lastDipLoss = dipLoss.detach();
 						ppoLoss = ppoLoss + dipLoss;
 					}
+					// REHEARSAL BANK rows (Util/RehearsalBank.h): identical form; whole witnessed
+					// success tails kept across iterations, forwarded with their own intent features.
+					if (bankRows.states.defined() && bankRows.states.size(0) > 0) {
+						auto bProbs = InferPolicyProbsFromModels(models, bankRows.states, bankRows.masks,
+							config.policyTemperature, false, {}, nullptr, {}, false, bankRows.intentFeat, bankRows.intentIds);
+						auto bLogp = bProbs.log().gather(-1, bankRows.actions.unsqueeze(-1)).flatten();
+						const float bCoeff = bankRows.coeff > 0.f ? bankRows.coeff : config.silCoeff;
+						auto bankLoss = (-(bLogp) * bankRows.weights).sum()
+							/ (float)bankRows.weights.size(0) * bCoeff * batchSizeRatio;
+						lastBankLoss = bankLoss.detach();
+						ppoLoss = ppoLoss + bankLoss;
+					}
 
 					if (config.useGuidingPolicy) {
 						torch::Tensor guidingProbs;
+						torch::Tensor teamRowFrac;   // diagnostic: share of rows on the team teacher
 						{
 							RG_NO_GRAD;
 							guidingProbs = InferPolicyProbsFromModels(guidingPolicyModels, obs, actionMasks, config.policyTemperature, config.useHalfPrecision);
+
+							if (config.useGuidingPolicyTeam && guidingPolicyTeamModels["policy"]) {
+								// A row's game mode is read from the padded observation's TEAMMATE
+								// presence flags, which are the last (2*MAX_PLAYERS_PER_TEAM - 1)
+								// entries: two teammate slots first, then the opponent slots. Any
+								// teammate present means this row came from a 2v2/3v3 arena. Taking
+								// it from the obs rather than from an arena index means the split
+								// can never desync from the fleet layout.
+								const int64_t maxPT = config.obsMaxPlayersPerTeam;
+								const int64_t nFlags = 2 * maxPT - 1;
+								const int64_t flagStart = obs.size(-1) - nFlags;
+								RG_ASSERT(flagStart > 0);
+								auto mateFlags = obs.slice(-1, flagStart, flagStart + (maxPT - 1));
+								auto isTeam = (mateFlags.sum(-1) > 0.5f).to(probs.dtype()).unsqueeze(-1);
+								teamRowFrac = isTeam.mean().detach();
+
+								auto teamProbs = InferPolicyProbsFromModels(guidingPolicyTeamModels, obs, actionMasks, config.policyTemperature, config.useHalfPrecision);
+								guidingProbs = torch::where(isTeam > 0.5f, teamProbs, guidingProbs);
+							}
 						}
 
 						auto guidingLoss = (guidingProbs - probs).abs().mean();
+						if (teamRowFrac.defined())
+							lastGuidingTeamFrac = teamRowFrac.item<float>();
 						sumGuidingLoss += guidingLoss.detach();
 						metricGuidingSteps++;
 						// batchSizeRatio keeps gradient accumulation identical to a full-batch
@@ -2056,6 +2189,9 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 	float dbgDipLoss = -1.f;
 	if (lastDipLoss.defined())
 		dbgDipLoss = lastDipLoss.item<float>();
+	float dbgBankLoss = -1.f;
+	if (lastBankLoss.defined())
+		dbgBankLoss = lastBankLoss.item<float>();
 	if (lastAuxNLL.defined())
 		dbgAuxNLL = lastAuxNLL.item<float>();
 	if (lastYvAbs.defined())
@@ -2135,6 +2271,8 @@ void GGL::PPOLearner::Learn(ExperienceBuffer& experience, Report& report, bool i
 			report["SIL/Loss"] = dbgSilLoss;
 		if (dbgDipLoss >= 0.f)
 			report["DipSearch/Loss"] = dbgDipLoss;
+		if (dbgBankLoss >= 0.f)
+			report["Rehearsal/Main Loss"] = dbgBankLoss;
 		if (dbgHullNLL > -900.f)
 			report["Hull/Chart NLL"] = dbgHullNLL;
 		if (dbgHullL1 >= 0.f)
@@ -2274,6 +2412,92 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 	SetLearningRates(config.policyLR, config.criticLR);
 }
 
+void GGL::PPOLearner::FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done) {
+	if (!frontier)
+		return;
+	frontierObs = obs.detach();
+	frontierNextObs = nextObs.detach();
+	frontierReward = reward.detach().flatten();
+	frontierDone = done.detach().flatten();
+
+	// Goal candidates: a rolling pool of recent observations. Deliberately NOT the policy's
+	// current batch alone -- the toy measured that goals near one arena's state are useless to
+	// another, and that a pool has to be wide enough to contain something worth reaching.
+	auto pool = obs.detach();
+	frontierCandidates = frontierCandidates.defined()
+		? torch::cat({ frontierCandidates, pool }, 0)
+		: pool;
+	int64_t cap = config.frontier.candidatePool;
+	if (frontierCandidates.size(0) > cap)
+		frontierCandidates = frontierCandidates.slice(0, frontierCandidates.size(0) - cap);
+}
+
+void GGL::PPOLearner::TrainFrontier() {
+	if (!frontier)
+		return;
+	if (!frontierObs.defined() || frontierObs.size(0) < 64) {
+		// Loud, not silent: a frontier that never receives transitions is the failure mode this
+		// module's boot check exists to prevent, and a mid-run regression would look identical.
+		lastFrontier = FrontierReport{};
+		RG_LOG("Frontier: NO transitions ingested this iteration - the module is inert.");
+		return;
+	}
+
+	auto& cfg = config.frontier;
+	const int64_t n = frontierObs.size(0);
+	auto longOpts = torch::TensorOptions().dtype(torch::kLong).device(device);
+
+	FrontierReport rep = {};
+
+	for (int step = 0; step < cfg.valueSteps; step++) {
+		auto idx = torch::randint(n, { RS_MIN((int64_t)cfg.valueBatch, n) }, longOpts);
+		frontier->valueA->optim->zero_grad();
+		frontier->valueB->optim->zero_grad();
+		auto st = frontier->TrainValue(
+			frontierObs.index_select(0, idx), frontierNextObs.index_select(0, idx),
+			frontierReward.index_select(0, idx), frontierDone.index_select(0, idx));
+		frontier->valueA->optim->step();
+		frontier->valueB->optim->step();
+		rep.valueLoss += st.loss / cfg.valueSteps;
+		rep.meanValue += st.meanValue / cfg.valueSteps;
+		rep.maxAbsTarget = RS_MAX(rep.maxAbsTarget, st.maxAbsTarget);
+		rep.targetsClamped += st.clamped;
+	}
+
+	for (int step = 0; step < cfg.quasiSteps; step++) {
+		auto idx = torch::randint(n, { RS_MIN((int64_t)cfg.quasiBatch, n) }, longOpts);
+		auto pairIdx = torch::randint(n, { RS_MIN((int64_t)cfg.quasiBatch, n) }, longOpts);
+		frontier->quasi->optim->zero_grad();
+		auto st = frontier->TrainQuasi(
+			frontierObs.index_select(0, idx), frontierNextObs.index_select(0, idx),
+			frontierObs.index_select(0, pairIdx));
+		frontier->quasi->optim->step();
+		rep.quasiLoss += st.loss / cfg.quasiSteps;
+		rep.meanLocal += st.meanLocal / cfg.quasiSteps;
+		rep.violation += st.violation / cfg.quasiSteps;
+		rep.meanSpread += st.meanSpread / cfg.quasiSteps;
+	}
+
+	// Goal diagnostics: what the mechanism WOULD aim at. Published before anything acts on it,
+	// which is the order every previous version of this got wrong.
+	if (frontierCandidates.defined() && frontierCandidates.size(0) >= 64) {
+		auto probe = frontierObs.slice(0, 0, RS_MIN((int64_t)512, n));
+		auto cand = frontierCandidates.slice(0, 0, RS_MIN((int64_t)1024, frontierCandidates.size(0)));
+		auto pick = frontier->SelectGoals(probe, cand);
+		rep.goalGain = pick.meanGain;
+		rep.goalDist = pick.meanDist;
+		rep.goalValidFrac = pick.valid.to(torch::kFloat32).mean().item<float>();
+	}
+
+	rep.trained = true;
+	lastFrontier = rep;
+
+	frontierObs = torch::Tensor();
+	frontierNextObs = torch::Tensor();
+	frontierReward = torch::Tensor();
+	frontierDone = torch::Tensor();
+}
+
 void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 	config.policyLR = policyLR;
 	config.criticLR = criticLR;
@@ -2335,6 +2559,22 @@ void GGL::PPOLearner::SetLearningRates(float policyLR, float criticLR) {
 		if (models[n])
 			models[n]->SetOptimLR(criticLR);
 
+	// FRONTIER value map and quasimetric: same ctor lr=0 trap that left V-dagger frozen at
+	// random init for 3.4B steps while its loss still reshaped the trunk. Named explicitly so
+	// this module can never repeat it. The value twins carry their own LR because their target
+	// is a BOUNDED optimality backup, not the critic's on-policy return, and the quasimetric is
+	// a metric fit rather than a value fit.
+	for (const char* n : { "frontier_value_a", "frontier_value_b" })
+		if (models[n])
+			models[n]->SetOptimLR(config.frontier.valueLr);
+	if (models["frontier_quasi"])
+		models["frontier_quasi"]->SetOptimLR(config.frontier.quasiLr);
+
+	// INTENT CLASS discriminator: same ctor lr=0 trap; own LR (Adam). Its update magnitude is
+	// logged every iteration (Intent/Disc Loss falling from log(dim) is the liveness check).
+	if (models["intent_disc"])
+		models["intent_disc"]->SetOptimLR(config.intentDiscLR);
+
 	RG_LOG("PPOLearner: " << RS_STR(std::scientific << "Set learning rate to [" << policyLR << ", " << criticLR << "]"));
 }
 
@@ -2370,6 +2610,11 @@ GGL::ModelSet GGL::PPOLearner::GetPolicyModels() {
 		// checkpoint. Same backward-compatibility argument as vdag: dirs that carry the files
 		// keep them unread.
 		if (name.rfind("hull_", 0) == 0)
+			continue;
+
+		// INTENT CLASS discriminator is training-only (acting reads shared_head + policy, whose
+		// intent_bias table travels with POLICY.lt); old version dirs never carry it.
+		if (name == "intent_disc")
 			continue;
 
 		result.Add(model);

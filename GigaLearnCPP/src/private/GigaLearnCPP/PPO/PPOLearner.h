@@ -8,6 +8,7 @@
 #include "../Util/Models.h"
 #include "../Util/ObsMirror.h"
 #include "Reachability.h"
+#include "Frontier.h"
 
 #include <torch/optim/adam.h>
 #include <torch/nn/modules/loss.h>
@@ -24,10 +25,40 @@ namespace GGL {
 	public:
 		ModelSet models = {};
 		ModelSet guidingPolicyModels = {};
+		// Team-mode teacher (empty unless config.useGuidingPolicyTeam)
+		ModelSet guidingPolicyTeamModels = {};
+		// Share of the last minibatch's rows routed to the team teacher (diagnostic).
+		float lastGuidingTeamFrac = 0;
 
 		// Reachability aux heads (null unless config.reachability.enabled);
 		// its models live inside `models` and save/load/step with everything else
 		ReachabilityModule* reach = NULL;
+
+		// Frontier value map + reachability quasimetric (null unless config.frontier.enabled).
+		// Its models live inside `models` and save/load/step with everything else. Pure
+		// instrument: never enters advantages, returns or the critic.
+		FrontierModule* frontier = NULL;
+		// Last iteration's frontier telemetry, read by the Learner for its report panels.
+		struct FrontierReport {
+			float valueLoss = 0, meanValue = 0, maxAbsTarget = 0;
+			float quasiLoss = 0, meanLocal = 0, violation = 0, meanSpread = 0;
+			float goalGain = 0, goalDist = 0, goalValidFrac = 0;
+			float silMeanWeight = 0, silRows = 0;
+			int targetsClamped = 0;
+			bool trained = false, silActive = false;
+		};
+		FrontierReport lastFrontier = {};
+		// One iteration's executed transitions for the frontier fits: s, s', the scaled reward
+		// that landed on s', and done. Same reconstruction the theory head uses, so the value
+		// map is in the critic's units. Cleared after TrainFrontier().
+		torch::Tensor frontierObs, frontierNextObs, frontierReward, frontierDone;
+		// Rolling pool of recent observations used as goal candidates.
+		torch::Tensor frontierCandidates;
+
+		// Called from the Learner where scaledR and the continuation mask exist.
+		void FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done);
+		// Runs the bounded value backups and the quasimetric fit. No-op unless enabled.
+		void TrainFrontier();
 		// InfoNCE categorical accuracy of the last Learn() call (min of the two heads),
 		// read by the Learner to drive the gate's accuracy EMA. lastReachTrained guards the
 		// EMA update: false until the heads have actually trained this process (so a fresh
@@ -48,13 +79,18 @@ namespace GGL {
 			Dist::Session* dist = nullptr
 		);
 
+		// policyExtraInputs: INTENT CLASS - extra policy-head inputs (onehot(z) ++ clock) appended
+		// after the trunk output. Every builder that must load the same checkpoint (trainer,
+		// InferUnit/RLBot, NextoEval, CrossPlay) has to pass the same value; a mismatch aborts
+		// loudly at load (layer-0 size), it never plays a different policy silently.
 		static void MakeModels(
 			bool makeCritic,
 			int obsSize, int numActions,
 			PartialModelConfig sharedHeadConfig, PartialModelConfig policyConfig, PartialModelConfig criticConfig,
 			PartialModelConfig criticTrunkConfig,
 			torch::Device device,
-			ModelSet& outModels);
+			ModelSet& outModels,
+			int policyExtraInputs = 0);
 
 		// Ladder wire generations (owned by the Learner's gap state, assigned each
 		// iteration): `ladderCollect` is what the collection forward uses (snapshot
@@ -94,7 +130,9 @@ namespace GGL {
 			torch::Tensor obs, torch::Tensor actionMasks,
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
 			ModelSet* models = NULL,
-			bool allowCudaGraph = false);
+			bool allowCudaGraph = false,
+			torch::Tensor intentFeat = {},
+			torch::Tensor intentIds = {});
 
 		// EGGROLL-ES batched low-rank population forward (research/reports/ES_EGGROLL.md).
 		// Each ROW belongs to a population member (rowMember, int64 [rows]); every Linear
@@ -169,7 +207,15 @@ namespace GGL {
 		// minibatch as a SIL-shaped term (-log pi(a|s) * w, silCoeff-scaled). Undefined = none
 		// this iteration. Device tensors: states [n, obs], actions [n] int64, masks [n, A]
 		// uint8, weights [n] float (critic units, already capped).
-		struct DipImitationRows { torch::Tensor states, actions, masks, weights; } dipRows;
+		struct DipImitationRows {
+			torch::Tensor states, actions, masks, weights;
+			torch::Tensor intentFeat, intentIds; // INTENT CLASS conditioning of the rows (undefined = none)
+			float coeff = 0.f;                   // 0 = silCoeff
+		} dipRows;
+		// REHEARSAL BANK rows (Util/RehearsalBank.h): the witnessed-success memory, same
+		// shape and loss as dipRows (weighted -log pi on rows outside the buffer). Weights =
+		// clamp(target - V, 0, cap), recomputed at learn-prep with the current critic.
+		DipImitationRows bankRows;
 
 		torch::Tensor oppCtxForLearn;      // CPU; barrier-copied so learn sees ITS iteration
 		float valueEvEma = 0.f;            // explained-variance EMA (drives the epi blend)
@@ -204,6 +250,12 @@ namespace GGL {
 		// otherwise this function runs shared_head itself and the main trunk is built AND
 		// backpropped twice per minibatch. Leave undefined on collection/eval paths, which have
 		// no other consumer to share with.
+		// intentFeat ([n, k], optional): INTENT CLASS features (onehot(z) ++ clock) concatenated
+		// onto the trunk output before the policy head. REQUIRED whenever the policy head expects
+		// more inputs than the trunk emits (a silently-missing feature would be the same bug
+		// class as the zeroed Ladder wire: a biased ratio) - so its absence is fatal, not a
+		// fallback. intentIds ([n] long, optional): rows of the policy's intent_bias table added
+		// to the logits before masking; required when the table exists.
 		static torch::Tensor InferPolicyProbsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
@@ -212,14 +264,18 @@ namespace GGL {
 			torch::Tensor steerDelta = {},
 			torch::Tensor* outRowOk = nullptr,
 			torch::Tensor precomputedTrunk = {},
-			bool useCudaGraph = false);
+			bool useCudaGraph = false,
+			torch::Tensor intentFeat = {},
+			torch::Tensor intentIds = {});
 		static void InferActionsFromModels(
 			ModelSet& models,
 			torch::Tensor obs, torch::Tensor actionMasks,
 			bool deterministic, float temperature, bool halfPrec,
 			torch::Tensor* outActions, torch::Tensor* outLogProbs,
 			torch::Tensor steerDelta = {},
-			bool useCudaGraph = false
+			bool useCudaGraph = false,
+			torch::Tensor intentFeat = {},
+			torch::Tensor intentIds = {}
 		);
 
 		/** Process-local CUDA graph telemetry; each MPI rank owns an independent cache. **/
