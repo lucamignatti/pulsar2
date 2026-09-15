@@ -2462,7 +2462,7 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto& R = lastFrontier;
 	R.silActive = false; R.silRows = 0; R.silMeanWeight = 0; R.silValidFrac = 0; R.silWindows = 0;
 	R.bankMeanBest = 0;
-	R.goalMassFrac = 0; R.fieldContrast = 0; R.fieldSigma = 0;
+	R.goalMassFrac = 0; R.fieldContrast = 0; R.fieldSigma = 0; R.provenFrac = 0; R.disFloor = 0;
 	if (!frontier || !config.frontier.silEnabled)
 		return;
 	if (!frontierCandidates.defined() || frontierCandidates.size(0) < 256)
@@ -2528,9 +2528,22 @@ void GGL::PPOLearner::FrontierBuildSilRows(torch::Tensor states, torch::Tensor a
 	auto vc = frontier->Value(cand, FrontierCtx());
 	auto dis = frontier->Disagreement(cand, FrontierCtx());
 	auto vis = frontier->VisitOf(zc);
-	auto unknown = dis >= torch::quantile(dis, cfg.unknownQuantile);
-	auto unproven = (vc >= torch::quantile(vc, 0.5f)) & (vis <= torch::quantile(vis, 0.5f));
-	auto isGoal = unknown | unproven;
+	// ABSOLUTE thresholds anchored on the PROVEN set, so goal mass can actually reach zero.
+	auto proven = vis >= cfg.visitProvenFrac * vis.mean();
+	torch::Tensor isGoal;
+	if (proven.sum().item<int64_t>() >= 8) {
+		auto pIdx = proven.nonzero().flatten();
+		auto floorDis = torch::quantile(dis.index_select(0, pIdx), 0.5f);
+		auto vTyp = vc.index_select(0, pIdx).mean();
+		auto unknown = dis > cfg.unknownMargin * floorDis;
+		auto unproven = (~proven) & (vc > vTyp);
+		isGoal = unknown | unproven;
+		R.provenFrac = proven.to(torch::kFloat32).mean().item<float>();
+		R.disFloor = floorDis.item<float>();
+	} else {
+		isGoal = torch::ones_like(proven);      // nothing proven yet: everything needs visiting
+		R.provenFrac = 0.f; R.disFloor = 0.f;
+	}
 	R.goalMassFrac = isGoal.to(torch::kFloat32).mean().item<float>();
 	auto gi = isGoal.nonzero().flatten();
 	if (gi.size(0) < 8) {
@@ -2690,6 +2703,8 @@ void GGL::PPOLearner::TrainFrontier() {
 	rep.goalMassFrac = lastFrontier.goalMassFrac;
 	rep.fieldContrast = lastFrontier.fieldContrast;
 	rep.fieldSigma = lastFrontier.fieldSigma;
+	rep.provenFrac = lastFrontier.provenFrac;
+	rep.disFloor = lastFrontier.disFloor;
 	rep.silLoss = dbgFrontierSilLoss;
 	lastFrontier = rep;
 

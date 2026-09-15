@@ -5883,6 +5883,11 @@ void GGL::Learner::Start() {
 						// sigma must TRACK Quasi Spread as the metric trains; if it flatlines
 						// while spread grows, contrast dies and the pull goes undirected.
 						report["Frontier/Field Sigma"] = fr.fieldSigma;
+						// Proven Frac should RISE and Goal Mass Frac should FALL as the map
+						// completes. Both are now absolute, so unlike the old quantile rule they
+						// can actually reach their limits.
+						report["Frontier/Proven Frac"] = fr.provenFrac;
+						report["Frontier/Disagreement Floor"] = fr.disFloor;
 						// Mean field value of the rows actually imitated. Against Field Contrast
 						// this says whether the pull is landing on the field's peaks or its bulk.
 						report["Frontier/Imitated Phi"] = fr.bankMeanBest;
@@ -5899,7 +5904,7 @@ void GGL::Learner::Start() {
 							<< " win " << fr.silWindows << " rows " << fr.silRows
 							<< " loss " << fr.silLoss
 							<< " | phi " << fr.bankMeanBest << " mass " << fr.goalMassFrac
-							<< " contrast " << fr.fieldContrast << " sigma " << fr.fieldSigma);
+							<< " contrast " << fr.fieldContrast << " sigma " << fr.fieldSigma << " proven " << fr.provenFrac);
 					}
 				}
 				report["PPO Learn Time"] = learnTimer.Elapsed();

@@ -47,7 +47,19 @@ MAP_STEPS=24;TWIN_STEPS=24;REPLAY=200_000
 # it in decisions does not transfer between metrics with different spreads: the same 50 decisions in
 # this toy gives sigma >> the whole distance distribution, and the field goes flat (contrast 1.09).
 GRAVITY_FRAC=0.67
-UNKNOWN_Q=0.90             # twin disagreement above this = the map does not know it
+# ABSOLUTE thresholds, not quantiles. Defining "unknown" as a top-decile RANK pins goal mass at
+# >=10% of the pool forever - 10% of states are always in the top decile however well the map knows
+# everything - so the pull can never exhaust and the map can never be complete. Measured in the
+# first W164 run: mass sat flat at 0.31-0.55 for 1800 iterations in every seed, including the one
+# that ignited. Both criteria are now absolute and BOTH reach zero as coverage and confidence grow:
+#   proven set P = states visited at least VISIT_PROVEN_FRAC x the MEAN visit count
+#   unknown(c)   = disagreement(c) > UNKNOWN_MARGIN x median disagreement over P (P is where the
+#                  map has the most data, so its disagreement is the irreducible noise floor)
+#   unproven(c)  = c not in P, and V(c) > mean V over P ("better than what we have proven")
+# If coverage becomes uniform every state joins P, every disagreement falls to the floor, and mass
+# reaches 0 - which makes "the map is complete" an attainable state rather than a rank.
+UNKNOWN_MARGIN=2.0
+VISIT_PROVEN_FRAC=0.5
 OCC=8192                   # occupancy pool ~ the C++ 65k/16.7k = several updates of retention
 GOAL_CAP=512               # goals sampled per update (compute cap)
 VISIT_BITS=12              # 4096 buckets vs 1024 pool rows/update, ~the C++ ratio
@@ -107,9 +119,15 @@ class Gravity:
         dis=(self.v1(x)-self.v2(x)).squeeze(-1).abs()
         z=self.maps.encode(o,c)
         vis=self.visit[self._key(z)]
-        unknown=dis>=torch.quantile(dis,UNKNOWN_Q)
-        unproven=(v>=torch.quantile(v,0.5))&(vis<=torch.quantile(vis,0.5))
+        proven=vis>=VISIT_PROVEN_FRAC*vis.mean()
+        if int(proven.sum())>=8:
+            floor=torch.quantile(dis[proven],0.5);vtyp=v[proven].mean()
+        else:
+            floor=torch.zeros(());vtyp=torch.full((),-1e18)   # nothing proven yet: all is a goal
+        unknown=dis>UNKNOWN_MARGIN*floor
+        unproven=(~proven)&(v>vtyp)
         m=(unknown|unproven)
+        self.floor=float(floor);self.proven_frac=float(proven.float().mean())
         gi=torch.nonzero(m).flatten()
         if len(gi)<8:self.goalz=None;return False
         if len(gi)>GOAL_CAP:gi=gi[torch.randperm(len(gi))[:GOAL_CAP]]
@@ -171,7 +189,7 @@ def run(seed,arm,root=None,iterations=None,guidance_end=None):
     fr=Gravity(rows.n,maps,seed,value=valuefn,v1=_v1,v2=_v2,arm=arm)
     C.dump(out/'resume.json',dict(fork=str(BASE/f'seed{seed}_snapshot_{FORK}.pt'),seed=seed,arm=arm,
         mechanism='gravity field, binary goal mass, no bank/goals/band',
-        gravity_frac=GRAVITY_FRAC,unknown_q=UNKNOWN_Q,occ=OCC,top_frac=TOP_FRAC,
+        gravity_frac=GRAVITY_FRAC,unknown_margin=UNKNOWN_MARGIN,visit_proven_frac=VISIT_PROVEN_FRAC,occ=OCC,top_frac=TOP_FRAC,
         commitment=False,reward_shaping=False,withdrawn_at=guidance_end))
     hist=[];replay=None;t0=time.time()
     for it in range(iterations):
@@ -201,7 +219,7 @@ def run(seed,arm,root=None,iterations=None,guidance_end=None):
             loss=loss+expectile_loss(twins.dag2(z).squeeze(-1),tgt,twins.tau)
             tw.zero_grad();loss.backward();torch.nn.utils.clip_grad_norm_(twins.parameters(),10.);tw.step()
         region,sil=build_region(fr.rows if fr.enabled else [],
-                                dict(mass_frac=getattr(fr,'mass_frac',0.),localD=fr.localD,sigma=getattr(fr,'sigma',0.)))
+                                dict(mass_frac=getattr(fr,'mass_frac',0.),localD=fr.localD,sigma=getattr(fr,'sigma',0.),proven_frac=getattr(fr,'proven_frac',0.),dis_floor=getattr(fr,'floor',0.)))
         grad=C.ppo(agent,opt,D,bank,region)
         rec=dict(iteration=it,real_steps=rows.real_rows,
             train_return=float(D['ep_ret'].mean()) if len(D['ep_ret']) else 0.,
@@ -212,7 +230,7 @@ def run(seed,arm,root=None,iterations=None,guidance_end=None):
             rec['profile']=C.action_profile(agent,710000+seed*31+it)
             print(seed,arm,it,{k:round(v,4) for k,v in rec['evaluation']['mid'].items()},
                   'sil',sil.get('entries',0),'contrast',round(sil.get('field_contrast',0),3),
-                  'mass',round(sil.get('mass_frac',0),3),
+                  'mass',round(sil.get('mass_frac',0),3),'proven',round(sil.get('proven_frac',0),3),
                   'pop',round(rec['profile']['p_pop_when_grounded_near'],5),flush=True)
         hist.append(rec);C.dump(out/'history.json',hist)
         if it in (guidance_end-1,iterations-1):

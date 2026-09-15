@@ -119,10 +119,22 @@ namespace GGL {
 		// stop the policy forgetting what it already stumbled into.
 
 		// ===== THE GRAVITY FIELD =====
-		// Goal mass is BINARY and decided by what the map believes, not by a quantile of
-		// convenience: a state is a goal if the map does not KNOW it (twin disagreement high), or
-		// if the map thinks it is GOOD but we have not proven it (value above median, visits
-		// below median). A state the map knows and rates poorly is not a goal.
+		// Goal mass is BINARY and decided by what the map believes: a state is a goal if the map
+		// does not KNOW it, or thinks it is GOOD but we have not PROVEN it. A state the map knows
+		// and rates poorly is not a goal.
+		//
+		// The thresholds are ABSOLUTE, not quantiles. Defining "unknown" as a top-decile RANK pins
+		// goal mass at >=10% of the pool forever - 10% of states are always in the top decile
+		// however well the map knows everything - so the pull can never exhaust and the map can
+		// never be complete, which destroys the convergence argument the whole design rests on.
+		// AirLine measured it directly: mass sat flat at 0.31-0.55 for 1800 iterations in every
+		// seed, including the one that ignited. With absolute thresholds it fell to 0.27 with 80%
+		// of the pool proven, and can reach 0.
+		//
+		//   proven set P = visits >= visitProvenFrac x the MEAN visit count
+		//   unknown(c)   = disagreement(c) > unknownMargin x median disagreement over P
+		//                  (P is where the map has most data, so its disagreement is the floor)
+		//   unproven(c)  = c not in P, and V(c) > mean V over P ("better than what we proved")
 		//
 		//   phi(s) = sum over goals of exp( -d(s->g) / (gravityRangeDecisions * localD) )
 		//
@@ -140,7 +152,8 @@ namespace GGL {
 		// 0.67 is the ratio that measured contrast 1.76 on the 591.7B rollout (sigma 23.5 units
 		// against a 35-unit median pair distance), which is where aerial enrichment peaked.
 		float gravityFrac = 0.67f;
-		float unknownQuantile = 0.90f;  // twin disagreement above this = the map does not know it
+		float unknownMargin = 2.0f;     // x the noise floor of disagreement on well-known states
+		float visitProvenFrac = 0.5f;   // visits >= this x mean = the state counts as proven
 		int goalCandidates = 512;       // goals sampled from the pool per iteration (compute cap)
 
 		// Visitation, for "good but unproven". A fixed random projection of the quasimetric latent

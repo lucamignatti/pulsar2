@@ -2262,8 +2262,10 @@ int main(int argc, char* argv[]) {
 			cfg.ppo.frontier.progressLagIters = std::atoi(v);
 		if (const char* v = std::getenv("GGL_FRONTIER_GRAVITY"); v && *v)
 			cfg.ppo.frontier.gravityFrac = (float)std::atof(v);
-		if (const char* v = std::getenv("GGL_FRONTIER_UNKNOWN_Q"); v && *v)
-			cfg.ppo.frontier.unknownQuantile = (float)std::atof(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_UNKNOWN_MARGIN"); v && *v)
+			cfg.ppo.frontier.unknownMargin = (float)std::atof(v);
+		if (const char* v = std::getenv("GGL_FRONTIER_PROVEN_FRAC"); v && *v)
+			cfg.ppo.frontier.visitProvenFrac = (float)std::atof(v);
 		// Opponent conditioning REQUIRES the privileged context the composite critic already
 		// builds; without it the map averages over the whole version ring and nothing can go
 		// stale when the opponent changes.
@@ -2283,8 +2285,9 @@ int main(int argc, char* argv[]) {
 			<< ", oppCond " << (cfg.ppo.frontier.oppCond ? "ON" : "off")
 			<< ", lag " << cfg.ppo.frontier.progressLagIters
 			<< ", gravity frac "
-			<< cfg.ppo.frontier.gravityFrac << " of median pair dist, unknown q "
-			<< cfg.ppo.frontier.unknownQuantile
+			<< cfg.ppo.frontier.gravityFrac << " of median pair dist, unknown margin "
+			<< cfg.ppo.frontier.unknownMargin << "x floor, provenFrac "
+			<< cfg.ppo.frontier.visitProvenFrac
 			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
