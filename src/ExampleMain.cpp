@@ -2228,8 +2228,15 @@ int main(int argc, char* argv[]) {
 		cfg.ppo.frontier.value = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
 		cfg.ppo.frontier.quasi = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
 		cfg.ppo.obsMaxPlayersPerTeam = MAX_PLAYERS_PER_TEAM;
-		RG_LOG("GGL_FRONTIER: value map + quasimetric ON (instrument only, SIL off), |V| bound "
-			<< cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
+		// GGL_FRONTIER_SIL=1: the actuator. Self-imitation of the policy's own executed prefixes,
+		// credited by quasimetric distance closed toward a value-map goal. Toy gate: value map
+		// alone ignited 2/4, with SIL credit 1-2/4 - the map is load-bearing, the pull is not yet
+		// proven. Default OFF; turn on only after the instrument reads sane at 230 dims
+		// (localD ~1, valid > 0, goalGain > 0), never in the same hop that first boots the map.
+		if (const char* fs = std::getenv("GGL_FRONTIER_SIL"); fs && *fs && std::string(fs) != "0")
+			cfg.ppo.frontier.silEnabled = true;
+		RG_LOG("GGL_FRONTIER: value map + quasimetric ON, SIL " << (cfg.ppo.frontier.silEnabled ? "ON" : "off")
+			<< ", |V| bound " << cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
 	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
 		cfg.ppo.vdagEnabled = false;
