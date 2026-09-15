@@ -96,7 +96,19 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 		tActionMasks = tActionMasks.to(device);
 		torch::Tensor tActions, tLogProbs;
 
-		PPOLearner::InferActionsFromModels(*models, tObs, tActionMasks, deterministic, temperature, false, &tActions, &tLogProbs);
+		// Probs first, then sample here: the theta-commit executor needs the full
+		// distribution and a second forward to get it would double inference cost.
+		// Sampling semantics mirror InferActionsFromModels exactly (the clamp and the
+		// non-finite sanitize already happened inside InferPolicyProbsFromModels).
+		auto tProbs = PPOLearner::InferPolicyProbsFromModels(
+			*models, tObs, tActionMasks, temperature, false);
+		if (deterministic) {
+			tActions = tProbs.argmax(1).flatten();
+		} else {
+			auto sampled = torch::multinomial(tProbs, 1, true);
+			tLogProbs = torch::log(tProbs).gather(-1, sampled).flatten();
+			tActions = sampled.flatten();
+		}
 
 		auto actionIndices = TENSOR_TO_VEC<int>(tActions);
 
@@ -106,8 +118,12 @@ std::vector<RLGC::Action> GGL::InferUnit::BatchInferActions(const std::vector<RL
 		if (debugOut) {
 			debugOut->resize(batchSize);
 			const int maskWidth = actionParser->GetActionAmount();
+			auto probsCpu = tProbs.to(torch::kCPU, torch::kFloat32).contiguous();
+			const float* probsPtr = probsCpu.data_ptr<float>();
 			for (int i = 0; i < batchSize; i++) {
 				auto& dbg = (*debugOut)[i];
+				dbg.probs.assign(probsPtr + (size_t)i * maskWidth,
+					probsPtr + (size_t)(i + 1) * maskWidth);
 				dbg.obs.assign(allObs.begin() + (size_t)i * obsSize,
 					allObs.begin() + (size_t)(i + 1) * obsSize);
 				dbg.actionMask.assign(allActionMasks.begin() + (size_t)i * maskWidth,

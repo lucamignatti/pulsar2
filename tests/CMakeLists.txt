@@ -15,6 +15,10 @@ find_package(Torch REQUIRED)
 target_include_directories(GigaLearnTests PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(GigaLearnTests GigaLearnCPP "${TORCH_LIBRARIES}")
 
+# Packet timing needs neither libtorch nor a running game.
+add_executable(RLBotActionTimingTests TestMain.cpp test_rlbot_action_timing.cpp)
+set_target_properties(RLBotActionTimingTests PROPERTIES CXX_STANDARD 20)
+
 # Keep reward semantics independently runnable on Windows, where unrelated internal
 # GigaLearnCPP symbols are intentionally not exported from the trainer DLL.
 add_executable(GigaLearnRewardTests TestMain.cpp test_team_rewards.cpp test_reward_schedule.cpp)

@@ -138,3 +138,103 @@ torch::Tensor GGL::Muon::step(LossClosure closure) {
 
 	return loss;
 }
+
+void GGL::Muon::save(torch::serialize::OutputArchive& archive) const {
+    torch::optim::SGD::save(archive);
+    torch::serialize::OutputArchive adam;
+    adam.write("version", torch::tensor(int64_t(2)));
+    // Torch 2.1's SGD loader does not restore group options. Persist explicitly.
+    std::vector<double> options;
+    for (const auto& group : param_groups()) {
+        const auto& o = static_cast<const MuonOptions&>(group.options());
+        options.insert(options.end(), {o.lr(), o.momentum(), o.dampening(), o.weight_decay(), double(o.nesterov())});
+    }
+    adam.write("options", torch::tensor(options, torch::kFloat64).reshape({(int64_t)param_groups().size(), 5}));
+    std::vector<int64_t> present;
+    int64_t index = 0;
+    for (const auto& group : param_groups()) for (const auto& p : group.params()) {
+        auto it = adamStates.find(p.unsafeGetTensorImpl());
+        present.push_back(it != adamStates.end());
+        if (it != adamStates.end()) {
+            torch::serialize::OutputArchive entry;
+            entry.write("mean", it->second.expAvg);
+            entry.write("square", it->second.expAvgSq);
+            entry.write("step", torch::tensor(it->second.stepCount));
+            adam.write(std::to_string(index), entry);
+        }
+        ++index;
+    }
+    adam.write("present", torch::tensor(present, torch::kInt64));
+    archive.write("muon_adam", adam);
+}
+
+void GGL::Muon::load(torch::serialize::InputArchive& archive) {
+    torch::optim::SGD::load(archive);
+    torch::serialize::InputArchive adam;
+    if (!archive.try_read("muon_adam", adam)) {
+        adamStates.clear();
+        loadedLegacyAdamState = true;
+        RG_LOG("MUON_LEGACY_RESUME: archive has no fallback Adam moments; unavailable historical state starts fresh");
+        return;
+    }
+    torch::Tensor version, present, options;
+    adam.read("version", version);
+    adam.read("present", present);
+    TORCH_CHECK(version.scalar_type() == torch::kInt64 && version.numel() == 1
+        && version.item<int64_t>() == 2, "Unsupported Muon Adam checkpoint version");
+    adam.read("options", options);
+    TORCH_CHECK(options.scalar_type() == torch::kFloat64 && options.dim() == 2
+        && options.size(0) == param_groups().size() && options.size(1) == 5
+        && torch::isfinite(options).all().item<bool>(), "Invalid Muon optimizer options");
+    options = options.cpu();
+    for (int64_t g = 0; g < options.size(0); ++g) {
+        auto o = options[g];
+        const double lr=o[0].item<double>(), momentum=o[1].item<double>(), damp=o[2].item<double>(), decay=o[3].item<double>(), nest=o[4].item<double>();
+        TORCH_CHECK(lr >= 0 && momentum >= 0 && damp >= 0 && decay >= 0
+            && (nest == 0 || nest == 1) && (!nest || (momentum > 0 && damp == 0)), "Invalid Muon optimizer options");
+    }
+    int64_t count = 0;
+    for (const auto& group : param_groups()) count += group.params().size();
+    TORCH_CHECK(present.scalar_type() == torch::kInt64 && present.dim() == 1
+        && present.numel() == count, "Muon Adam checkpoint parameter count mismatch");
+    present = present.cpu();
+    std::unordered_map<void*, AdamState> restored;
+    int64_t index = 0;
+    for (const auto& group : param_groups()) for (const auto& p : group.params()) {
+        int64_t flag = present[index].item<int64_t>();
+        TORCH_CHECK(flag == 0 || flag == 1, "Invalid Muon Adam checkpoint presence flag");
+        if (flag) {
+            const bool matrix = (p.dim() == 2 && p.size(0) > 1 && p.size(1) > 1)
+                || (p.dim() == 3 && p.size(1) > 1 && p.size(2) > 1);
+            TORCH_CHECK(!matrix, "Fallback Adam state attached to a Muon matrix");
+            torch::serialize::InputArchive entry;
+            adam.read(std::to_string(index), entry);
+            AdamState state;
+            torch::Tensor step;
+            entry.read("mean", state.expAvg);
+            entry.read("square", state.expAvgSq);
+            entry.read("step", step);
+            TORCH_CHECK(step.scalar_type() == torch::kInt64 && step.numel() == 1
+                && step.item<int64_t>() > 0, "Invalid Muon Adam step count");
+            TORCH_CHECK(state.expAvg.sizes() == p.sizes() && state.expAvgSq.sizes() == p.sizes()
+                && state.expAvg.scalar_type() == p.scalar_type() && state.expAvgSq.scalar_type() == p.scalar_type(),
+                "Muon Adam checkpoint tensor shape/type mismatch");
+            TORCH_CHECK(torch::isfinite(state.expAvg).all().item<bool>()
+                && torch::isfinite(state.expAvgSq).all().item<bool>()
+                && (state.expAvgSq >= 0).all().item<bool>(), "Invalid Muon Adam moments");
+            state.expAvg = state.expAvg.to(p.device());
+            state.expAvgSq = state.expAvgSq.to(p.device());
+            state.stepCount = step.item<int64_t>();
+            restored.emplace(p.unsafeGetTensorImpl(), std::move(state));
+        }
+        ++index;
+    }
+    adamStates = std::move(restored);
+    for (size_t g = 0; g < param_groups().size(); ++g) {
+        auto v = options[(int64_t)g];
+        auto& o = static_cast<MuonOptions&>(param_groups()[g].options());
+        o.lr(v[0].item<double>()); o.momentum(v[1].item<double>());
+        o.dampening(v[2].item<double>()); o.weight_decay(v[3].item<double>()); o.nesterov(v[4].item<double>() != 0);
+    }
+    loadedLegacyAdamState = false;
+}

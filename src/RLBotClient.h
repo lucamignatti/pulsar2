@@ -6,6 +6,7 @@
 // current model config) is transport-agnostic; this file only handles the v5 protocol.
 
 #include <rlbot/Bot.h>
+#include "RLBotActionTiming.h"
 
 #include <RLGymCPP/Framework.h>
 #include <RLGymCPP/ObsBuilders/ObsBuilder.h>
@@ -90,8 +91,7 @@ private:
 	struct CarCtx {
 		RLGC::Action action = {};   // Most recently inferred action
 		RLGC::Action controls = {}; // Action currently being applied
-		bool updateAction = true;
-		int ticks = -1;
+		RLBotActionTiming timing;
 		// Scripted kickoff state (Nexto's state machine, ported): -1 = kickoff not yet
 		// evaluated, -2 = evaluated and we are not the taker, >= 0 = tape position in
 		// ticks. Reset to -1 whenever the match phase leaves Kickoff.
@@ -105,6 +105,14 @@ private:
 		RLGC::Action echoSent = {};
 		uint32_t echoSentFrame = 0;
 		bool echoWaiting = false;
+		// THETA-COMMIT executor state (GGL_THETA), mirroring the trainer's collector.
+		// The theta lineage was trained holding each action while the policy still rated
+		// it within thetaCommit of its own current favourite, so driving it at a fixed
+		// rate hands it a controller it never trained under: at its nominal ts2 that is
+		// 4x the trained decision count, which multiplies the firing rate of committal
+		// actions like jump (rate = decisions/sec * p). -1 = nothing held.
+		int heldActionIdx = -1;
+		int heldSteps = 0;
 	};
 	std::unordered_map<unsigned, CarCtx> ctxByIndex;
 

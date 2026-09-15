@@ -66,6 +66,12 @@ fi
 if [ -z "$GGL_TICK_SKIP" ] && [ -f "$HERE/checkpoint/TICKSKIP" ]; then
 	export GGL_TICK_SKIP="$(cat "$HERE/checkpoint/TICKSKIP")"
 fi
+# Theta-commit strength travels with the checkpoint too (play.sh sync_checkpoint). The
+# theta lineages HOLD each action between decisions; without this the bot decides at the
+# full rate with no holds, which is a silent mismatch exactly like a wrong tickSkip.
+if [ -z "$GGL_THETA" ] && [ -f "$HERE/checkpoint/THETA" ]; then
+	export GGL_THETA="$(cat "$HERE/checkpoint/THETA")"
+fi
 
 LOG="$HERE/bot.$$.log"
 "$REPO/build/GigaLearnRLBot" "$HERE/checkpoint" > "$LOG" 2>&1

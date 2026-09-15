@@ -231,12 +231,53 @@ tick_skip_for_root() {
 		# 7.9gco_ts1 = same gco lineage after the 2026-08-23 mid-run switch to tickSkip 1
 		# (120 Hz, gamma 0.99971123 / 20s). Recovered to ~98% at ts1 within ~8h.
 		*checkpoints_7.9gco_ts1*) echo 1 ;;
+		# gco_ts2_mm = the 2026-08-29 multi-mode cold start: tickSkip 2 (60 Hz), and
+		# 1/3 each of 1v1/2v2/3v3 from birth, so it is the first gco seat worth
+		# watching at team sizes 2 and 3. Without this entry it falls through to the
+		# ts8 default at the bottom, and a 60 Hz policy driven at 15 Hz reads as
+		# "the bot is bad" rather than "the rate is wrong".
+		*checkpoints_gco_ts2_mm*) echo 2 ;;
+		# gco_220b_ts2 / gco_220b_ts2mm = the 2026-09-02 experiments branched off the 220b
+		# lineage (ts8 GCO resume) and re-derived to tickSkip 2 (60 Hz) via GGL_TRAIN_TICK_SKIP;
+		# ts2mm additionally runs all three team modes. One pattern covers both names.
+		*checkpoints_gco_220b_ts2*) echo 2 ;;
+		# theta lineage: TRUE rate is ts2, but only correct with the theta-commit executor
+		# (GGL_THETA), which holds each action while the policy still rates it within 0.5
+		# of its favourite. The client implements it as of 2026-08-31, and theta_for_root
+		# below stamps THETA next to TICKSKIP. Driving this lineage at a bare ts2 with no
+		# holds re-decides 4x more often than it trained and spams committal actions like
+		# jump (firing rate = decisions/sec * p); driving it at ts8 only matches the MEAN
+		# hold and loses every fast reaction.
+		*checkpoints_gco_theta*) echo 2 ;;
 		# 7.9gco = the goal/concede-only sparse cold start (2026-08-21), ts8 recipe.
 		*checkpoints_7.9gco*) echo 8 ;;
 		*checkpoints_7.0b*) echo 8 ;;   # composite critic, ts8 validation seat
 		*checkpoints_7.*)   echo 1 ;;   # 7.0 / 7.1 / 7.2 were all ts1
 		*checkpoints_6.*)   echo 1 ;;   # 6.0 / 6.1 / 6.1b / 6.2 all ts1
 		*)                  echo 8 ;;   # 5.x and earlier
+	esac
+}
+
+# Theta-commit strength per lineage: 0 = fixed-rate decisions (every lineage before the
+# theta run), >0 = hold each action while the policy still rates it within this fraction
+# of its current favourite. Stamped next to TICKSKIP at sync time for the same reason:
+# the rate AND the executor both have to travel with the checkpoint, or a staged copy
+# outlives the knowledge of how it is supposed to be driven.
+theta_for_root() {
+	case "$1" in
+		*checkpoints_gco_theta*) echo 0.5 ;;
+		*)                       echo 0 ;;
+	esac
+}
+
+# Which lineage each sync-tracking bot dir follows. A dir absent from this table is
+# STATIC by design (e.g. pulsar-gco-ts1-577b-bot, pulsar-gco220-bot: frozen A/B
+# reference points) and must never be restaged automatically.
+ckpt_root_for_botdir() {
+	case "$1" in
+		pulsar-bot)         echo "${GGL_CKPT_ROOT:-../build/checkpoints_7.8dense}" ;;
+		pulsar-gco-latest-bot) echo "${GGL_GCO_ROOT:-../build/checkpoints_7.9gco_ts1_aimos}" ;;  # ts1 reset lineage
+		*) return 1 ;;
 	esac
 }
 
@@ -249,8 +290,12 @@ sync_checkpoint() {
 	# recipe the 1B MoE reached 3.6% while this reached 91.6%, because the MoE forward
 	# costs 22ms + 0.2ms*experts with no token term (25k SPS vs dense's 515k), i.e. 20x
 	# fewer experiences per hour. Override with GGL_CKPT_ROOT=<dir> as always.
-	local root="${GGL_CKPT_ROOT:-../build/checkpoints_7.8dense}"
-	local dest="pulsar-bot/checkpoint"
+	# $1 = bot dir (default pulsar-bot), $2 = lineage root. Both are parameters because
+	# more than one bot dir is now sync-tracking; hardcoding pulsar-bot here is what let
+	# match_gcots1_vs_human.toml sit on a months-old staged checkpoint in silence.
+	local botdir="${1:-pulsar-bot}"
+	local root="${2:-${GGL_CKPT_ROOT:-../build/checkpoints_7.8dense}}"
+	local dest="$botdir/checkpoint"
 
 	if [ ! -d "$root" ]; then
 		log "SYNC FAILED: checkpoint root '$root' does not exist."
@@ -267,16 +312,28 @@ sync_checkpoint() {
 	mkdir -p "$dest" 2>/dev/null
 	echo "$ts_for_root" > "$dest/TICKSKIP"
 	log "SYNC: lineage '$root' -> tickSkip $ts_for_root ($(awk -v t="$ts_for_root" 'BEGIN{printf "%.0f", 120/t}') Hz)"
+	# Theta-commit strength travels with the checkpoint, same as the rate.
+	local th_for_root
+	th_for_root="${GGL_THETA:-$(theta_for_root "$root")}"
+	echo "$th_for_root" > "$dest/THETA"
+	if [ "$th_for_root" != "0" ]; then
+		log "SYNC: theta-commit executor ON (theta=$th_for_root) - actions are held while"
+		log "SYNC: the policy still rates them within $th_for_root of its favourite."
+	fi
 
 	# In-game display name, per lineage (bot.toml is shared by every root, so stamp it
 	# at sync time like TICKSKIP - a stale name can never outlive its checkpoint).
 	local bot_name
 	case "$root" in
+		*checkpoints_7.9gco_ts1*) bot_name="pulsar2-GCO-ts1" ;;  # MUST precede the ts8 rule
 		*checkpoints_7.9gco*) bot_name="pulsar2-GCO" ;;   # sparse goal-only cold start
 		*)                    bot_name="Pulsar2" ;;
 	esac
+	# Two gco dirs can share a lineage root (a static A/B point and the sync-tracking
+	# one), and identical in-game names make a match log unreadable. Suffix the tracker.
+	case "$botdir" in *-latest-bot) bot_name="${bot_name}-latest" ;; esac
 	bot_name="${BOT_NAME:-$bot_name}"
-	sed -i "s/^name = \".*\"/name = \"$bot_name\"/" pulsar-bot/bot.toml
+	sed -i "s/^name = \".*\"/name = \"$bot_name\"/" "$botdir/bot.toml"
 	log "SYNC: bot name -> $bot_name"
 
 	local have=""
@@ -323,7 +380,7 @@ sync_checkpoint() {
 			return 0
 		fi
 		local src="$root/$ts"
-		local stage="pulsar-bot/.ckpt_stage.$$"
+		local stage="$botdir/.ckpt_stage.$$"
 		rm -rf "$stage"; mkdir -p "$stage" || return 1
 
 		# Only what InferUnit actually loads. RUNNING_STATS is optional (this lineage
@@ -492,14 +549,19 @@ fi
 # described the match is actively misleading - it once read "already current at 67.75B"
 # for a match whose cars were the 404.5B ts1 policy and BonkDaddy. Only sync when this
 # config actually uses pulsar-bot, and always print the REAL participants afterwards.
-if grep -q 'config_file = "pulsar-bot/bot.toml"' "$CONFIG" 2>/dev/null; then
+_synced=0
+for _bt in $(grep -oE 'config_file = "[^"]+"' "$CONFIG" 2>/dev/null | sed 's/.*"\(.*\)"/\1/'); do
+	_bdir="$(dirname "$_bt")"
+	_root="$(ckpt_root_for_botdir "$_bdir")" || continue
+	_synced=1
 	if [ "$SYNC" = 1 ]; then
-		sync_checkpoint || log "SYNC: continuing on the previously staged checkpoint"
+		sync_checkpoint "$_bdir" "$_root" || log "SYNC: continuing on the previously staged checkpoint"
 	else
-		log "SYNC: skipped (nosync); bot stays on $(cat pulsar-bot/checkpoint/STEPS.txt 2>/dev/null || echo '<unknown>') steps"
+		log "SYNC: skipped (nosync); $_bdir stays on $(cat "$_bdir/checkpoint/STEPS.txt" 2>/dev/null || echo '<unknown>') steps"
 	fi
-else
-	log "SYNC: skipped - '$CONFIG' does not use pulsar-bot (static bot dirs only)."
+done
+if [ "$_synced" = 0 ]; then
+	log "SYNC: skipped - '$CONFIG' fields no sync-tracking bot dir (all static)."
 fi
 # Say what is ACTUALLY on the field: each car's dir, staged steps and decision rate.
 log "PLAYERS:"

@@ -3,6 +3,7 @@
 #include <public/GigaLearnCPP/Util/Report.h>
 
 #include <torch/csrc/api/include/torch/serialize.h>
+#include <torch/script.h>
 #include <torch/nn/modules/loss.h>
 #include <torch/nn/modules/normalization.h>   // LayerNormImpl, for post-norm delta injection
 #include <cstring>
@@ -72,10 +73,73 @@ static std::vector<GGL::Model*> PolicyChain(GGL::ModelSet& models) {
 	return chain;
 }
 
-void GGL::LeagueModule::MakeAdapters(const std::vector<Model*>& chain, AdapterStack& live, AdapterStack& snap) {
+// Snapshot a variant's adapters when its measured win share sets a new personal best, and
+// restore them when it falls back. The toy measured the optimizer BUILDING a solution and
+// then discarding it (EV +0.984 -> -1.000, rebuilt three times); one parameter copy
+// recovered it. This is that copy, per variant. Barrier-zone only.
+void GGL::LeagueModule::KeepBestHarvest() {
+	RG_NO_GRAD;
+	const int V = cfg.Total();
+	if ((int)bestShare.size() != V) {
+		bestShare.assign(V, -1.f);
+		bestPolA.assign(pol.A.size() * V, torch::Tensor());
+		bestPolB.assign(pol.B.size() * V, torch::Tensor());
+		bestCriA.assign(cri.A.size() * V, torch::Tensor());
+		bestCriB.assign(cri.B.size() * V, torch::Tensor());
+	}
+	auto slice = [&](std::vector<torch::Tensor>& dst, const std::vector<torch::Tensor>& src,
+					 int v, bool save) {
+		for (size_t l = 0; l < src.size(); l++) {
+			auto& cell = dst[l * V + v];
+			if (save)
+				cell = src[l].narrow(0, v, 1).detach().clone();
+			else if (cell.defined())
+				src[l].narrow(0, v, 1).copy_(cell);
+		}
+	};
+	for (int v = 0; v < V; v++) {
+		const int64_t gf = winGoalsFor[v], ga = winGoalsAgainst[v];
+		if (gf + ga < (int64_t)cfg.keepBestMinGoals)
+			continue; // too few goals for the window to be a rate rather than noise
+		const float share = (float)gf / (float)(gf + ga);
+		if (share > bestShare[v] + cfg.keepBestMargin || bestShare[v] < 0.f) {
+			bestShare[v] = share;
+			slice(bestPolA, pol.A, v, true);  slice(bestPolB, pol.B, v, true);
+			slice(bestCriA, cri.A, v, true);  slice(bestCriB, cri.B, v, true);
+			keepBestSaves++;
+		} else if (share < bestShare[v] - cfg.keepBestRevert) {
+			slice(bestPolA, pol.A, v, false); slice(bestPolB, pol.B, v, false);
+			slice(bestCriA, cri.A, v, false); slice(bestCriB, cri.B, v, false);
+			keepBestRestores++;
+		}
+	}
+}
+
+void GGL::LeagueModule::MakeAdapters(const std::vector<Model*>& chain, AdapterStack& live, AdapterStack& snap,
+		bool applyInit) {
 	RG_NO_GRAD;
 	const int V = cfg.Total();
 	const int r = cfg.rank;
+	// Optional pre-built factors (LeagueConfig::initPath). Loaded up-front so a bad file
+	// fails before any adapter is built, rather than half-initialising the roster.
+	std::shared_ptr<torch::jit::script::Module> initMod;
+	int initVariants = 0;
+	if (applyInit && !cfg.initPath.empty()) {
+		try {
+			initMod = std::make_shared<torch::jit::script::Module>(torch::jit::load(cfg.initPath, device));
+		} catch (const std::exception& e) {
+			RG_ERR_CLOSE("GGL_LEAGUE_INIT: failed to load \"" << cfg.initPath << "\": " << e.what());
+		}
+		for (const auto& b : initMod->named_buffers()) {
+			if (b.name.rfind("A", 0) == 0) {
+				initVariants = (int)b.value.size(0);
+				break;
+			}
+		}
+		RG_LOG(" > League: loading adapter init from " << cfg.initPath
+			<< " (" << initVariants << " variants, rank from file)");
+	}
+	int layerIdx = 0;
 	for (Model* m : chain) {
 		for (int i = 0; i < (int)m->seq->size(); i++) {
 			auto lin = std::dynamic_pointer_cast<torch::nn::LinearImpl>(m->seq->ptr(i));
@@ -96,6 +160,24 @@ void GGL::LeagueModule::MakeAdapters(const std::vector<Model*>& chain, AdapterSt
 			if (cfg.binitStd > 0 && cfg.numDiverse > 0) {
 				B.narrow(0, 0, cfg.numDiverse).normal_(0.0, (double)cfg.binitStd);
 			}
+			if (initMod) {
+				// Overwrite the DIVERSE slots the file covers; exploiters and any
+				// uncovered slots keep the noise init above.
+				auto an = "A" + std::to_string(layerIdx), bn = "B" + std::to_string(layerIdx);
+				auto Ai = initMod->attr(an).toTensor().to(device);
+				auto Bi = initMod->attr(bn).toTensor().to(device);
+				const int nv = std::min({ initVariants, cfg.numDiverse, (int)Ai.size(0) });
+				if (Ai.size(1) != r || Bi.size(1) != r || Ai.size(2) != out || Bi.size(2) != in) {
+					RG_ERR_CLOSE("GGL_LEAGUE_INIT: layer " << layerIdx << " shape mismatch: file A "
+						<< Ai.sizes() << " B " << Bi.sizes() << ", expected A {V," << r << "," << out
+						<< "} B {V," << r << "," << in << "}");
+				}
+				if (nv > 0) {
+					A.narrow(0, 0, nv).copy_(Ai.narrow(0, 0, nv));
+					B.narrow(0, 0, nv).copy_(Bi.narrow(0, 0, nv));
+				}
+			}
+			layerIdx++;
 			A.set_requires_grad(true);
 			B.set_requires_grad(true);
 			live.A.push_back(A);
@@ -112,7 +194,7 @@ GGL::LeagueModule::LeagueModule(ModelSet& baseModels, LeagueConfig config, torch
 	RG_ASSERT(cfg.numDiverse >= 2); // the discriminator needs >= 2 classes
 	RG_ASSERT(cfg.rank >= 1 && cfg.lagShort < cfg.lagLong);
 
-	MakeAdapters(PolicyChain(baseModels), pol, polSnap);
+	MakeAdapters(PolicyChain(baseModels), pol, polSnap, /*applyInit=*/true);
 	RG_ASSERT(baseModels["critic"]);
 	MakeAdapters({ baseModels["critic"] }, cri, criSnap);
 
@@ -495,6 +577,8 @@ void GGL::LeagueModule::PrepareLearnData() {
 	// the slope the cumulative counters bury.
 	statWinFor = winGoalsFor;
 	statWinAgainst = winGoalsAgainst;
+	if (cfg.keepBest)
+		KeepBestHarvest();
 	if (++winHarvests >= RS_MAX(1, cfg.winResetEvery)) {
 		winHarvests = 0;
 		std::fill(winGoalsFor.begin(), winGoalsFor.end(), (int64_t)0);
@@ -859,6 +943,17 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		double bPol = 0, bCri = 0;
 		for (auto& t : pol.B) bPol += t.detach().pow(2).sum().item<double>();
 		for (auto& t : cri.B) bCri += t.detach().pow(2).sum().item<double>();
+		// KeepBest must be OBSERVABLE. An unreported mechanism is how the V-dagger twins sat
+		// at lr=0 for the life of a run while their seek term still injected: if these read
+		// 0 for a whole run, retention never fired and any effect is from something else.
+		if (cfg.keepBest) {
+			report["League/KeepBest Saves"] = (float)keepBestSaves;
+			report["League/KeepBest Restores"] = (float)keepBestRestores;
+			float bs = 0.f; int n = 0;
+			for (float x : bestShare) if (x >= 0.f) { bs += x; n++; }
+			report["League/KeepBest Tracked"] = (float)n;
+			if (n) report["League/KeepBest Mean Best Share"] = bs / (float)n;
+		}
 		report["League/B Norm Policy"] = (float)std::sqrt(bPol);
 		report["League/B Norm Critic"] = (float)std::sqrt(bCri);
 		// BEHAVIOURAL divergence: mean KL(variant || base) over a sample of real rows.
@@ -909,6 +1004,11 @@ void GGL::LeagueModule::Learn(PPOLearner* ppo, torch::Tensor states, torch::Tens
 		};
 		RG_LOG("League: rows=" << n << " updMag=" << report["League/Adapter Update Magnitude"]
 			<< " bPol=" << report["League/B Norm Policy"]
+			// keepBest on STDOUT, not only in the wandb report. A mechanism visible only in
+			// wandb is a mechanism nobody checks: the V-dagger twins sat at lr=0 for a whole
+			// run while their seek term still injected. kb=saves/restores; 0/0 all run means
+			// retention never fired and any effect came from something else.
+			<< (cfg.keepBest ? " kb=" + std::to_string(keepBestSaves) + "/" + std::to_string(keepBestRestores) : "")
 			// KL is the BEHAVIOURAL divergence; bPol is only parameter distance. A large
 			// bPol with ~0 KL means the delta is being normalised away and the variant is
 			// not actually playing differently.

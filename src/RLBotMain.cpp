@@ -173,6 +173,21 @@ int main(int argc, char** argv) {
 	RG_LOG("Decision rate: tickSkip=" << params.tickSkip << " ("
 		<< (120.0 / params.tickSkip) << " Hz), actionDelay=" << params.actionDelay
 		<< "  [override with GGL_TICK_SKIP]");
+	// The theta lineages HOLD actions between decisions; driving one at a fixed rate is
+	// a silent mismatch exactly like a wrong tickSkip, so state the mode at boot.
+	{
+		const char* th = std::getenv("GGL_THETA");
+		const double thv = (th && *th) ? std::atof(th) : 0.0;
+		if (thv > 0) {
+			RG_LOG("Theta-commit executor: ON (theta=" << thv << ", maxHold="
+				<< (std::getenv("GGL_THETA_MAX_HOLD") ? std::getenv("GGL_THETA_MAX_HOLD") : "8")
+				<< ") - each action is held while the policy still rates it within theta"
+				" of its current favourite");
+		} else {
+			RG_LOG("Theta-commit executor: OFF - fixed-rate decisions (correct for every"
+				" non-theta lineage; set GGL_THETA=0.5 for the theta lineages)");
+		}
+	}
 	params.inferUnit = inferUnit;
 
 	RLBotClient::Run(params);

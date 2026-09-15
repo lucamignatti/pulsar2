@@ -3,6 +3,7 @@
 #include <RLGymCPP/Gamestates/GameState.h>
 
 #include <random>
+#include <string>
 
 namespace GGL {
 
@@ -101,6 +102,24 @@ namespace GGL {
 		// updates: measured wDiv .398 and falling at binit=0 versus .46 stable at 1e-3,
 		// same targets and LR.
 		float binitStd = 1e-3f;
+		// GGL_LEAGUE_INIT: path to a jit archive of PRE-BUILT adapter factors, written by
+		// research/tools/make_league_init.py. Empty = the historical noise init above.
+		//
+		// Why this exists. Variants are born as the main (B = 0) plus binitStd noise, and
+		// diversity is then MANUFACTURED by pairwise repulsion. Measured on the live 487.9B
+		// checkpoint: a tiny random perturbation does not move a confident policy's mode, so
+		// matched-norm random rank-4 init produces 2.43 airborne-high touches per 100k while
+		// the rank-4 projection of a STATE-CONDITIONAL ALTERNATIVE SELF produces 4.91 -- a
+		// coherent situational deviation from birth instead of one repulsion has to invent.
+		// (Global "deviate everywhere" degrades a real policy monotonically; the deviation
+		// must be scoped to a region of the policy's own state distribution. See
+		// research/testbeds/frontier_restart_20260908/PULSAR_PORT_PLAN.md.)
+		//
+		// Archive layout: buffers A{i}/B{i} per Linear layer i, in PolicyChain order
+		// (shared_head then policy, Linear modules only), A = {V,r,out}, B = {V,r,in},
+		// delta = A^T @ B. Fewer variants in the file than slots is fine: the remainder keep
+		// the noise init, and exploiters are deliberately left at B = 0.
+		std::string initPath = "";
 		// Apply the LoRA delta AFTER the block's LayerNorm instead of at the Linear.
 		// See ForwardLora: post-norm blocks normalise the delta away, and LayerNorm is
 		// scale-invariant, so magnitude levers cannot work at all without this.
@@ -153,6 +172,26 @@ namespace GGL {
 		// version of this panel read 0/-1 forever and was unreadable. The window must
 		// be long enough to hold goals but short enough to still show a slope.
 		int winResetEvery = 200;
+		// BEST-EVER VARIANT RETENTION (GGL_LEAGUE_KEEPBEST). 0 = off (historical behaviour).
+		//
+		// Measured on the toy (SNAPSHOT_RETENTION_RESULT.md): with a commitment held, PPO
+		// reached EV +0.984 / completion 1.000 and then DESTROYED it, oscillating back to
+		// -1.000 and rebuilding it three separate times in 3000 iterations. One parameter
+		// copy recovered completion 0.106 -> 1.000. The optimizer constructs the solution
+		// repeatedly and discards it, so consolidation is a RETENTION problem, not a credit
+		// problem -- which is why three credit-assignment mechanisms (success-SIL, a
+		// witnessed-success memory, rate-separated retention) were all unnecessary.
+		//
+		// Here: at each win-share harvest, a variant whose share beats its own best-ever by
+		// `keepBestMargin` has its A/B snapshotted; a variant that falls `keepBestRevert`
+		// BELOW its best is restored from that snapshot. Pulsar already runs this pattern for
+		// checkpoints (the golden archive holds the top-3 rated outside rotation); this
+		// applies it per variant. Cost is one extra adapter-sized copy per variant (rank r,
+		// so tiny). Retention preserves what was VISITED; it cannot manufacture what was not.
+		int keepBest = 0;
+		float keepBestMargin = 0.01f;  // share improvement required to re-snapshot
+		float keepBestRevert = 0.10f;  // share drop below best that triggers a restore
+		int keepBestMinGoals = 20;     // ignore windows with too few goals to be a rate
 		// The league's OWN minibatch, independent of the main's GGL_MINIBATCH. It must be
 		// tunable because the per-row LoRA gather materialises [rows, r, in] per Linear,
 		// which scales with BOTH rows and rank: at rank 32 with ~12k accumulated rows that
@@ -237,6 +276,11 @@ namespace GGL {
 		// publish the slope directly).
 		std::vector<int64_t> goalsFor, goalsAgainst;
 		std::vector<int64_t> winGoalsFor, winGoalsAgainst;
+		// Best-ever retention (cfg.keepBest): per-variant best win share and the adapter
+		// slices that achieved it. Barrier-zone only, like every other adapter mutation.
+		std::vector<float> bestShare;
+		std::vector<torch::Tensor> bestPolA, bestPolB, bestCriA, bestCriB;
+		int64_t keepBestSaves = 0, keepBestRestores = 0;
 		// Iteration-window r_div telemetry (collect thread).
 		double rdivSum = 0, rdivSqSum = 0; int64_t rdivCnt = 0;
 
@@ -329,6 +373,12 @@ namespace GGL {
 		torch::Tensor PolicyLogitsLora(ModelSet& base, torch::Tensor obs,
 			const AdapterStack& stack, torch::Tensor rowVariant);
 		// Disc forward on CPU snapshots: returns [n] log q(z=variant | inputs).
-		void MakeAdapters(const std::vector<Model*>& chain, AdapterStack& live, AdapterStack& snap);
+		// applyInit: only the POLICY chain takes cfg.initPath. The critic chain has its own
+		// shapes and its own job (pricing the variant's return); seeding it with policy
+		// factors is meaningless and was a real bug caught by the CPU smoke test.
+		void MakeAdapters(const std::vector<Model*>& chain, AdapterStack& live, AdapterStack& snap,
+			bool applyInit = false);
+		// Snapshot/restore variant adapters by measured win share (cfg.keepBest).
+		void KeepBestHarvest();
 	};
 }

@@ -1,4 +1,5 @@
 #include "PolicyVersionManager.h"
+#include <random>
 #include <nlohmann/json.hpp>
 
 #include <GigaLearnCPP/Util/Utils.h>
@@ -232,6 +233,28 @@ static int PlayEvalSegment(
 
 	int goals = 0;
 	float stepTime = env->config.tickSkip * RLGC::CommonValues::TICK_TIME;
+
+	// INTENT CLASS (PPOLearnerConfig::intentDim): the same 8-decision uniform-intent schedule
+	// as training, per player, reset on this env's terminals. Old versions carry zero-padded
+	// heads and ignore the features; the trainee acts as in training. Both sides get it so
+	// the served tensors always match the head widths.
+	const int iDim = ppo->config.intentDim, iPeriod = RS_MAX(1, ppo->config.intentPeriod);
+	const int nAll = env->state.numPlayers;
+	std::vector<int> iZ(nAll, 0), iLeft(nAll, 0);
+	std::mt19937_64 iRng(0x5EEDULL + (uint64_t)env->config.tickSkip);
+	auto fnIntent = [&](torch::Tensor players, torch::Tensor* outFeat, torch::Tensor* outIds) {
+		if (iDim <= 0) { *outFeat = torch::Tensor(); *outIds = torch::Tensor(); return; }
+		auto idx = TENSOR_TO_VEC<int>(players);
+		auto ids = torch::zeros({ (int64_t)idx.size() }, torch::TensorOptions().dtype(torch::kLong));
+		auto feat = torch::zeros({ (int64_t)idx.size(), (int64_t)iDim + 1 }, torch::TensorOptions().dtype(torch::kFloat32));
+		auto* ip = ids.data_ptr<int64_t>(); auto* fp = feat.data_ptr<float>();
+		for (size_t k = 0; k < idx.size(); k++) {
+			int i = idx[k];
+			ip[k] = iZ[i]; fp[k * (iDim + 1) + iZ[i]] = 1.f; fp[k * (iDim + 1) + iDim] = (float)iLeft[i] / (float)iPeriod;
+		}
+		*outFeat = feat.to(ppo->device, true); *outIds = ids.to(ppo->device, true);
+	};
+
 	for (float t = 0;
 		t < simSecs && *totalSimTime < maxSimTime && (goalsSoFar + goals) < goalCap;
 		t += stepTime, *totalSimTime += stepTime) {
@@ -246,17 +269,31 @@ static int PlayEvalSegment(
 		torch::Tensor tMainMasks = tActionMasks.index_select(0, tMainPlayers);
 		torch::Tensor tOppMasks = tActionMasks.index_select(0, tOppPlayers);
 
+		// draw/hold intents for this decision (boundary when the clock is 0 or after a terminal)
+		if (iDim > 0) {
+			std::uniform_int_distribution<int> zRoll(0, iDim - 1);
+			for (int i = 0; i < nAll; i++) {
+				if (env->state.terminals[i]) iLeft[i] = 0;
+				if (iLeft[i] == 0) { iZ[i] = zRoll(iRng); iLeft[i] = iPeriod; }
+			}
+		}
+		torch::Tensor tMainFeat, tMainIds, tOppFeat, tOppIds;
+		fnIntent(tMainPlayers, &tMainFeat, &tMainIds);
+		fnIntent(tOppPlayers, &tOppFeat, &tOppIds);
+
 		env->StepFirstHalf(true);
 
 		torch::Tensor tMainActions, tOppActions, _tLogProbs;
 		PPOLearner::InferActionsFromModels(
 			ppo->models, tMainStates.to(ppo->device, true), tMainMasks.to(ppo->device, true),
 			deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
-			&tMainActions, &_tLogProbs);
+			&tMainActions, &_tLogProbs, {}, false, tMainFeat, tMainIds);
 		PPOLearner::InferActionsFromModels(
 			oppModels, tOppStates.to(ppo->device, true), tOppMasks.to(ppo->device, true),
 			deterministic, ppo->config.policyTemperature, ppo->config.useHalfPrecision,
-			&tOppActions, &_tLogProbs);
+			&tOppActions, &_tLogProbs, {}, false, tOppFeat, tOppIds);
+		if (iDim > 0)
+			for (int i = 0; i < nAll; i++) iLeft[i] = RS_MAX(0, iLeft[i] - 1);
 
 		auto mainActions = TENSOR_TO_VEC<int>(tMainActions);
 		auto oppActions = TENSOR_TO_VEC<int>(tOppActions);

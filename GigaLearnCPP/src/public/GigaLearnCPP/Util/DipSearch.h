@@ -21,6 +21,9 @@
 //               policy-at-temperature) with the policy closing the loop and playing every
 //               other car; finalists are re-evaluated fresh; the winner is re-evaluated
 //               HELD-OUT. gain = held-out mean - baseline mean, in critic (GAE) units.
+//   intents   : on an INTENT CLASS run (Learner intentDim > 0) the pool cars carry intents
+//               and the candidate set is intent SEQUENCES (kind 3, L in {1,2,3} periods)
+//               closed by the intent-conditioned policy, plus the temperature prefixes.
 //   learn     : states with gain >= minGain contribute their prefix steps (obs, action,
 //               mask) as extra imitation rows, weight = min(gain, weightCap), consumed by
 //               PPOLearner as a SIL-shaped term (-log pi(a|s) * w, silCoeff-scaled). They
@@ -37,6 +40,14 @@
 #include "../Framework.h"
 #include "VizControl.h"          // ArenaSnapshot
 #include "DipSearchConfig.h"
+// True variable tickskip exists only on the titan lineage; one source serves both.
+#if __has_include("VarTickSkip.h")
+#include "VarTickSkip.h"
+#define GGL_DIP_HAS_VTS 1
+#else
+#define GGL_DIP_HAS_VTS 0
+namespace GGL { struct VarTickSkipConfig { bool enabled = false; int innerActions = 0; }; }
+#endif
 #include <RLGymCPP/EnvSet/EnvSet.h>
 
 #include <deque>
@@ -64,6 +75,12 @@ namespace GGL {
 		int64_t firstId = 0;
 	};
 
+	// Byte image of an ArenaSnapshot, for shipping inside a TrajectoryFragment (async
+	// collector -> learner). Fixed size for a given arena configuration (car count, pad
+	// count, engine extra-state size). Trivially-copyable engine structs are memcpy'd.
+	std::vector<uint8_t> SerializeSnapshot(const ArenaSnapshot& snap);
+	bool DeserializeSnapshot(const uint8_t* data, size_t nbytes, ArenaSnapshot& out);
+
 	struct DipSearchState {
 		ArenaSnapshot snap;
 		int slot = 0;            // the player (car index in the arena) whose row dipped
@@ -84,14 +101,24 @@ namespace GGL {
 		std::vector<float> obs;
 		std::vector<int32_t> actions;
 		std::vector<uint8_t> masks;
+		// INTENT CLASS runs: the rows' intent conditioning (id + onehot(z) ++ clock), and
+		// whether the winning prefix was an INTENT sequence (kind 3) rather than actions
+		bool intentPrefix = false;
+		std::vector<int32_t> intentIds;
+		std::vector<float> intentFeat;
 	};
 
 	class PPOLearner;
 
 	class DipSearch {
 	public:
+		// vts: non-null = TRUE VARIABLE TICKSKIP semantics (the async executor): an action
+		// index encodes its hold bucket, a car is only re-decided when its hold expires,
+		// gamma is PER TICK, the horizon is horizon*tickSkip physics ticks, and a prefix is
+		// a list of successive self-player DECISIONS (macro is ignored).
 		DipSearch(const DipSearchConfig& cfg, RLGC::EnvCreateFn envCreateFn,
-			int tickSkip, int actionDelay, int obsSize, int numActions, float gamma);
+			int tickSkip, int actionDelay, int obsSize, int numActions, float gamma,
+			const VarTickSkipConfig* vts = nullptr, int intentDim = 0, int intentPeriod = 8);
 		~DipSearch();
 		RG_NO_COPY(DipSearch);
 
@@ -107,6 +134,7 @@ namespace GGL {
 		// telemetry from the last Run
 		float lastWaveSecs = 0;
 		int lastWaves = 0;
+		int lastSkippedJobs = 0;   // jobs that found no pool slot with a matching car count
 
 	private:
 		struct Slot;
@@ -114,6 +142,16 @@ namespace GGL {
 		DipSearchConfig cfg;
 		int tickSkip, actionDelay, obsSize, numActions, numPlayers = 0;
 		float gamma;
+		VarTickSkipConfig vts = {};
+		bool vtsOn = false;
+		// INTENT CLASS (intentDim > 0): every pool car carries an exogenous intent z with the
+		// collection semantics (uniform draw every intentPeriod decisions, feature =
+		// onehot(z) ++ clock). Baselines and action prefixes draw intents fresh; kind-3
+		// candidates PLAN IN INTENT SPACE - the self car commits to a sequence of intents
+		// (one per period) and the intent-conditioned policy closes the loop on actions.
+		// 6^L coherent candidates instead of 90^(3L) incoherent ones.
+		int intentDim = 0, intentPeriod = 8;
+		bool intentOn = false;
 		std::vector<Slot*> pool;
 
 		void Restore(Slot& s, const ArenaSnapshot& snap);

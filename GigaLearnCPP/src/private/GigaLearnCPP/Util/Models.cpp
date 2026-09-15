@@ -1,5 +1,8 @@
 #include "Models.h"
 #include "MoE.h"
+#include <torch/version.h>
+#include <torch/optim/adam.h>
+#include <torch/optim/sgd.h>
 #include "../PPO/CudaGraphPolicy.h"
 
 #include <torch/csrc/api/include/torch/serialize.h>
@@ -90,6 +93,12 @@ GGL::Model::Model(
 
 	register_module("seq", seq);
 	seq->to(device);
+	if (config.intentBiasRows > 0) {
+		RG_ASSERT(config.addOutputLayer && config.numOutputs > 0);
+		intentBias = register_parameter("intent_bias",
+			(torch::randn({ (int64_t)config.intentBiasRows, (int64_t)config.numOutputs, 1 })
+				* config.intentBiasStd).to(device));
+	}
 	optim = MakeOptimizer(config.optimType, this->parameters(), 0);
 }
 
@@ -336,6 +345,13 @@ void GGL::Model::Save(std::filesystem::path folder, bool saveOptim) {
 	streamOut.flush();
 	streamOut.close();
 
+	if (intentBias.defined()) {
+		auto biasStream = std::ofstream(GetSuffixedSavePath(folder, "_intent_bias"), std::ios::binary);
+		torch::save(intentBias.detach().cpu(), biasStream);
+		biasStream.flush();
+		biasStream.close();
+	}
+
 	if (saveOptim) {
 		torch::serialize::OutputArchive optimArchive;
 		optim->save(optimArchive);
@@ -372,6 +388,33 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 		);
 	}
 
+	// WIDEN-ON-LOAD (intent class, 2026-09-11). A saved first Linear with FEWER input columns
+	// than this model expects is zero-padded on the right: the extra inputs then contribute
+	// exactly nothing, so the loaded network computes the same function as before on the
+	// original inputs (the 90->450 head widening used the same identity). This is what lets
+	// the version ring, the reference set and old checkpoints survive a policy-head input
+	// change instead of being renamed corrupt_<ts> on the first boot. Opt-in by env so it can
+	// never mask a real corruption on a run that did not ask for it. Only the first Linear may
+	// differ, and only in its input width; anything else still fails below.
+	static const bool widenOnLoad = [] {
+		const char* e = std::getenv("GGL_WIDEN_ON_LOAD");
+		return e && *e && std::string(e) != "0";
+	}();
+	if (widenOnLoad && seq->size() > 0) {
+		if (auto lin = std::dynamic_pointer_cast<torch::nn::LinearImpl>(seq->ptr(0))) {
+			RG_NO_GRAD;
+			auto w = lin->weight;
+			const int64_t inSaved = w.size(1), inExpected = (int64_t)config.numInputs;
+			if (inSaved < inExpected && w.size(0) == (int64_t)lin->options.out_features()) {
+				auto nw = torch::zeros({ w.size(0), inExpected }, w.options());
+				nw.slice(1, 0, inSaved).copy_(w);
+				lin->weight.set_data(nw);
+				RG_LOG("Model \"" << modelName << "\": widened first Linear inputs "
+					<< inSaved << " -> " << inExpected << " with zero columns (GGL_WIDEN_ON_LOAD)");
+			}
+		}
+	}
+
 	// Torch will happily load in a model of a totally different size, then we will crash when we try to use it
 	// So we need to manually check if it is the same size
 	auto sizesAfter = GetSeqSizes(seq);
@@ -395,14 +438,28 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 		}
 	}
 
+	if (intentBias.defined()) {
+		std::filesystem::path biasPath = GetSuffixedSavePath(folder, "_intent_bias");
+		if (std::filesystem::exists(biasPath)) {
+			RG_NO_GRAD;
+			torch::Tensor loaded;
+			auto biasStream = std::ifstream(biasPath, std::ios::binary);
+			torch::load(loaded, biasStream);
+			if (loaded.sizes() != intentBias.sizes())
+				RG_ERR_CLOSE("Model \"" << modelName << "\": intent bias shape " << loaded.sizes()
+					<< " does not match " << intentBias.sizes());
+			intentBias.copy_(loaded.to(device));
+		} else {
+			RG_LOG("Model \"" << modelName << "\": no intent bias in " << folder << ", keeping init (std "
+				<< config.intentBiasStd << ")");
+		}
+	}
+
 	/////////////////////////////
 
-	// GGL_FRESH_OPTIM: skip optimizer-state load on resume. Muon keys its momentum by
-	// process-local TensorImpl pointers, so deserialized state can never match the new
-	// process's params — the loaded buffers sit ORPHANED next to freshly-allocated ones
-	// (~= a full extra weights-worth of GPU memory at MoE scale, the resumed-hop OOM).
-	// Momentum resets on resume under this flag: a mild warmup hiccup, not a semantics
-	// change (grads/weights are exact).
+	// Explicit experiment override: skip optimizer-state load. Normally libtorch
+	// remaps saved keys by parameter order; incompatible generations must fail the
+	// full checkpoint load rather than silently reset one model's optimizer.
 	static const bool freshOptim = [] {
 		const char* e = std::getenv("GGL_FRESH_OPTIM");
 		return e && *e && std::string(e) != "0";
@@ -413,14 +470,77 @@ void GGL::Model::Load(std::filesystem::path folder, bool allowNotExist, bool loa
 		if (std::filesystem::exists(optimPath)) {
 			std::ifstream testStream = std::ifstream(optimPath, std::istream::ate | std::ios::binary);
 			if (testStream.tellg() > 0) {
-				torch::serialize::InputArchive optimArchive;
-				optimArchive.load_from(optimPath.string(), device);
-				optim->load(optimArchive);
+				// OPTIMIZER-STATE SHAPE GUARD (22b-compat, 2026-09-01). libtorch remaps saved
+				// per-param state onto the new process's params by the param-group ORDER, keyed
+				// by stringified TensorImpl pointers. Archives written by one libtorch generation
+				// and read by another can mis-key (2.1 writes "0x..." hex keys that 2.9's stoull
+				// parses as 0 — every state collapses onto one param), and the failure surfaces
+				// only inside the first optimizer step as a tensor-size error, which on an
+				// unattended chain is a crash-loop. Validate every mapped state against its
+				// param; on mismatch reject this full resume. The caller can select an
+				// older complete checkpoint without retaining partially restored state.
+				std::string why;
+				bool ok = true;
+				try {
+					torch::serialize::InputArchive optimArchive;
+					optimArchive.load_from(optimPath.string(), device);
+					optim->load(optimArchive);
+				} catch (const std::exception& e) {
+					ok = false;
+					why = std::string("load exception: ") + e.what();
+				}
+				if (ok) {
+					int checked = 0;
+					for (auto& group : optim->param_groups()) {
+						for (auto& p : group.params()) {
+#if TORCH_VERSION_MAJOR < 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 2)
+							const auto key = c10::guts::to_string(p.unsafeGetTensorImpl());
+#else
+							const auto key = p.unsafeGetTensorImpl();
+#endif
+							auto it = optim->state().find(key);
+							if (it == optim->state().end())
+								continue;
+							if (!it->second) {
+								ok = false;
+								why = "null state entry after load (key collision)";
+								break;
+							}
+							torch::Tensor ref;
+							if (config.optimType == ModelOptimType::ADAM)
+								ref = static_cast<torch::optim::AdamParamState&>(*it->second).exp_avg();
+							else
+								ref = static_cast<torch::optim::SGDParamState&>(*it->second).momentum_buffer();
+							if (ref.defined() && ref.sizes() != p.sizes()) {
+								std::stringstream ss;
+								ss << "state " << ref.sizes() << " vs param " << p.sizes();
+								why = ss.str();
+								ok = false;
+								break;
+							}
+							if (ref.defined() && !torch::isfinite(ref).all().item<bool>()) {
+								ok = false; why = "nonfinite optimizer moment"; break;
+							}
+							checked++;
+						}
+						if (!ok)
+							break;
+					}
+					if (ok && checked != optim->state().size()) {
+						ok = false; why = "unmapped optimizer state entries after load";
+					}
+					if (ok)
+						RG_LOG("Optimizer state for \"" << modelName << "\" loaded (" << checked << " param states verified)");
+				}
+				if (!ok) {
+					RG_ERR_CLOSE("Invalid optimizer state for \"" << modelName << "\" at " << optimPath
+						<< " (" << why << "); refusing partial checkpoint restore");
+				}
 			} else {
-				RG_LOG("WARNING: Saved optimizer at " << optimPath << " is empty, optimizer will be reset");
+				RG_ERR_CLOSE("Empty optimizer at " << optimPath << "; refusing partial checkpoint restore");
 			}
 		} else {
-			RG_LOG("WARNING: No optimizer found at " << optimPath << ", optimizer will be reset");
+			RG_ERR_CLOSE("Missing optimizer at " << optimPath << "; refusing partial checkpoint restore");
 		}
 	}
 

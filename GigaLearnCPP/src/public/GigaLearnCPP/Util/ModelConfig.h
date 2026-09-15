@@ -51,6 +51,16 @@ namespace GGL {
 		int moeTopK = 0;
 		int moeHidden = 0;
 
+		// INTENT CLASS (research/reports/NATIVE_INTENT_PROTOCOL.md). When intentBiasRows > 0
+		// the model carries an extra registered parameter `intent_bias` of shape
+		// [rows, numOutputs, 1] (3-D on purpose: Muon orthogonalizes 2-D params and a 6x90
+		// action-preference table is not a matrix to orthogonalize; 3-D falls to Muon's Adam
+		// path). Init N(0, intentBiasStd). Saved/loaded as <NAME>_INTENT_BIAS.lt; absent on
+		// old checkpoints -> kept at init (a zero std makes it exactly inert). The caller
+		// (InferPolicyProbsFromModels) adds row z to the logits before masking.
+		int intentBiasRows = 0;
+		float intentBiasStd = 0.f;
+
 		bool IsValid() const {
 			return !layerSizes.empty()
 				&& (moeBlocks == 0 || (moeExperts > 0 && moeTopK > 0 && moeHidden > 0

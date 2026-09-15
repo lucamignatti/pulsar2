@@ -32,6 +32,11 @@ namespace GGL {
 			RLGC::FList obs;
 			std::vector<uint8_t> actionMask;
 			int actionIndex = -1;
+			// Masked action probabilities for this row (same width as actionMask).
+			// Needed by the theta-commit executor, which holds an action while the
+			// policy still rates it within thetaCommit of its current favourite -
+			// that test needs the whole distribution, not just the sampled index.
+			std::vector<float> probs;
 		};
 
 		// NOTE: Reset() will never be called on your obs

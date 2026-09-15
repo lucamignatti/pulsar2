@@ -42,6 +42,10 @@ namespace GGL {
 			auxDispTargets, auxDispMask,
 			// privileged opponent context, row-expanded (undefined unless oppCondEnabled)
 			oppCtx,
+			// INTENT CLASS: per-row intent id (long) and policy-head features onehot(z)++clock
+			// (undefined unless intentDim > 0). The policy acted on these; the learn pass MUST
+			// feed the same ones or the ratio is biased (InferPolicyProbsFromModels enforces it).
+			intentIds, intentFeat,
 			advantages;
 
 		auto begin() { return &states; }

@@ -87,6 +87,11 @@ namespace GGL {
 
 		torch::optim::Optimizer* optim = nullptr;
 
+		// Intent-class action-preference table (ModelConfig::intentBiasRows). Undefined unless
+		// configured. Registered AFTER seq so parameters() order is [seq..., intent_bias] on
+		// both a model and its clones (MakeClone copies parameters() positionally).
+		torch::Tensor intentBias;
+
 		// When true, ModelSet::StepOptims() skips this model — it is stepped
 		// independently by its owning module (e.g. ProposerModule::Train()).
 		bool groupStepExempt = false;

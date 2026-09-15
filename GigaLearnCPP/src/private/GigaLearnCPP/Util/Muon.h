@@ -19,7 +19,7 @@ namespace GGL {
 	// orthogonalizing a vector is meaningless, and Adam is the canonical fallback.
 	//
 	// The 2D momentum buffers live in SGD's param state so they serialize with checkpoints;
-	// the (tiny) Adam moments for the non-matrix params are process-local and reset on resume.
+	// fallback Adam moments and step counts serialize separately by parameter order.
 	class Muon : public torch::optim::SGD {
 	public:
 		explicit Muon(std::vector<torch::Tensor> params, MuonOptions defaults)
@@ -27,6 +27,10 @@ namespace GGL {
 		}
 
 		torch::Tensor step(LossClosure closure = nullptr) override;
+		void save(torch::serialize::OutputArchive& archive) const override;
+		void load(torch::serialize::InputArchive& archive) override;
+		bool loadedLegacyAdamState = false; // old archives never stored fallback moments
+		size_t AdamStateCount() const { return adamStates.size(); }
 
 		// NS-shard spec, set by ModelSet::StepOptimsSharded before each step and reset after.
 		// When shardWorld > 1, the momentum update still runs for EVERY 2D param (identical

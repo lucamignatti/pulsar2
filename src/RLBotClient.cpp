@@ -783,7 +783,7 @@ void RLBotBot::update(
 	for (unsigned index : this->indices) {
 		if (!script.empty()) { RunScripted(packet, index, ticksElapsed); continue; }
 
-		// Default-constructs the ctx (updateAction = true, ticks = -1) on first sight.
+		// Each car starts its decision clock on its first usable packet.
 		CarCtx& ctx = ctxByIndex[index];
 
 		if (index >= gs.players.size()) {
@@ -792,7 +792,7 @@ void RLBotBot::update(
 			continue;
 		}
 
-		ctx.ticks += ticksElapsed;
+		const bool updateAction = ctx.timing.Advance(ticksElapsed, params.tickSkip);
 
 		auto& localPlayer = gs.players[index];
 		localPlayer.prevAction = ctx.controls;
@@ -828,8 +828,7 @@ void RLBotBot::update(
 			}
 		}
 
-		if (ctx.updateAction) {
-			ctx.updateAction = false;
+		if (updateAction) {
 			// GGL_SAMPLE_ACTIONS=1 -> sample from the policy instead of argmax. The viz
 			// viewer samples by default (matching how the bot trains and self-plays), so
 			// sim-parity experiments should set this; deployment default stays argmax.
@@ -837,9 +836,56 @@ void RLBotBot::update(
 				const char* v = std::getenv("GGL_SAMPLE_ACTIONS");
 				return v && *v && std::string(v) != "0";
 			}();
+			// THETA-COMMIT executor (GGL_THETA), the client half of the trainer's
+			// dynamic tickskip. Run at the lineage's TRUE rate (ts2) and hold each
+			// action while the policy still rates it within GGL_THETA of its current
+			// favourite. Without this a theta checkpoint plays a controller it never
+			// trained under - see CarCtx::heldActionIdx. Needs the whole distribution
+			// every decision, so dbg is requested unconditionally when it is on.
+			static const float thetaCommit = [] {
+				const char* v = std::getenv("GGL_THETA");
+				return (v && *v) ? (float)std::atof(v) : 0.f;
+			}();
+			static const int thetaMaxHold = [] {
+				const char* v = std::getenv("GGL_THETA_MAX_HOLD");
+				return (v && *v) ? std::max(1, std::atoi(v)) : 8;
+			}();
+			const bool thetaOn = thetaCommit > 0.f;
+
 			GGL::InferUnit::InferDebug dbg;
 			ctx.action = params.inferUnit->InferAction(localPlayer, gs, !sampleActions, 1,
-				dbgOn ? &dbg : nullptr);
+				(dbgOn || thetaOn) ? &dbg : nullptr);
+
+			if (thetaOn && !dbg.probs.empty()) {
+				// A hold can never span a kickoff: the tape drives the car and the next
+				// state is a fresh spawn (the trainer clears holds on every terminal).
+				if (ctx.kickoffIndex >= 0) {
+					ctx.heldActionIdx = -1;
+					ctx.heldSteps = 0;
+				}
+				float pMax = 0.f;
+				for (float p : dbg.probs)
+					pMax = std::max(pMax, p);
+				const int held = ctx.heldActionIdx;
+				// Break on ANY of: illegal now (masks move - a held flip after the flip
+				// is spent would replay an illegal action), hold cap, or the policy
+				// changing its mind. Same predicate as LearnerAsync's executor.
+				const bool legal = held >= 0 && held < (int)dbg.probs.size()
+					&& held < (int)dbg.actionMask.size() && dbg.actionMask[held];
+				const float ratio = legal ? dbg.probs[(size_t)held] / std::max(pMax, 1e-9f) : -1.f;
+				if (legal && ctx.heldSteps < thetaMaxHold && ratio >= thetaCommit) {
+					// Re-parse the held INDEX against the current state, exactly like the
+					// trainer (which replays the index, not the parsed control tuple).
+					ctx.action = params.inferUnit->actionParser->ParseAction(held, localPlayer, gs);
+					ctx.heldSteps++;
+					// Keep the decision log truthful: report the action actually
+					// EXECUTED, not the sample that was discarded by the hold.
+					dbg.actionIndex = held;
+				} else {
+					ctx.heldActionIdx = dbg.actionIndex;
+					ctx.heldSteps = 1;
+				}
+			}
 
 			// Decision line: the exact obs/mask/action inference consumed, the raw
 			// packet fields it was reconstructed from, and where the car/ball were.
@@ -858,7 +904,11 @@ void RLBotBot::update(
 					<< ",\"atsj\":" << localPlayer.airTimeSinceJump
 					<< ",\"flip\":" << (int)localPlayer.HasFlipOrJump()
 					<< ",\"turtle\":" << (int)localPlayer.worldContact.hasContact
-					<< ",\"act\":" << dbg.actionIndex;
+					<< ",\"act\":" << dbg.actionIndex
+					// Theta-commit hold depth: 0 = executor off, 1 = fresh decision,
+					// N>1 = this action has now been held for N consecutive decisions.
+					// Its histogram here should look like the trainer's Skip/Hold/*.
+					<< ",\"hold\":" << ctx.heldSteps;
 				float tuple[8];
 				for (int d = 0; d < 8; d++)
 					tuple[d] = ctx.action[d];
@@ -956,15 +1006,9 @@ void RLBotBot::update(
 			}
 		}
 
-		if (ctx.ticks >= (params.actionDelay - 1) || ctx.ticks == -1) {
-			// Apply new action
+		if (ctx.timing.ShouldApply(params.actionDelay)) {
+			// Inference above must precede application, including at delay zero.
 			ctx.controls = ctx.action;
-		}
-
-		if (ctx.ticks >= params.tickSkip || ctx.ticks == -1) {
-			// Trigger action update next tick
-			ctx.ticks = 0;
-			ctx.updateAction = true;
 		}
 
 		// Scripted kickoff override (see KickoffTape above). Runs AFTER the policy

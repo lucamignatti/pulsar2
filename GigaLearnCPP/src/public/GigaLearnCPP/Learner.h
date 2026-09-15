@@ -48,6 +48,10 @@ namespace GGL {
 		class DipSnapshotBank* dipBank = nullptr;
 		class DipSearch* dipSearch = nullptr;
 
+		// REHEARSAL BANK (private/GigaLearnCPP/Util/RehearsalBank.h; GGL_BANK): witnessed-
+		// success memory rehearsed by the main through imitation. Null unless enabled.
+		class RehearsalBank* bank = nullptr;
+
 		struct WelfordStat* returnStat;
 		struct BatchedWelfordStat* obsStat;
 
@@ -115,6 +119,11 @@ namespace GGL {
 		// V_exp, the return-level expectile twin (opaque; GAP_EXP.lt). Measurement only -
 		// see the struct in Learner.cpp. Actuation lives with the composition critic.
 		std::shared_ptr<struct GapState> gapSensor;
+		// World map (LearnerConfig::worldMap): detached descriptor-ahead ensemble, measurement only
+		std::shared_ptr<struct WorldMapState> worldMap;
+		// Opponent map (LearnerConfig::oppMap; Util/OpponentMap.h): built in Start() once obsSize is known
+		std::shared_ptr<class OpponentMap> oppMap;
+		std::filesystem::path oppMapLoadFrom;
 
 		// External fixed opponent (config.externalOpponent; opaque - torch types
 		// stay out of this header). Frozen weights: collection-side only, nothing

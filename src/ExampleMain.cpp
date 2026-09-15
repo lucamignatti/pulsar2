@@ -2213,6 +2213,24 @@ int main(int argc, char* argv[]) {
 	// override, put it HERE unless you have checked there is no later assignment.
 	// GGL_NO_HEADROOM: composition-critic family + gap sensor + SIL off — the MoE
 	// leak bisect hammer (consume-extras vs core).
+	// GGL_FRONTIER=1: value map + reachability quasimetric, INSTRUMENT ONLY (no self-imitation).
+	// Placed in this override section deliberately - four features have already been silently
+	// inert here by being set before a later production assignment overwrote them.
+	// valueAbsMax: GCO's only reward is a single terminal goal and the episode ends on it, so a
+	// normalized return cannot exceed the reward clip. That makes the bound EXACT. Under the
+	// shaped stack it would be a guess, and the bound is the component whose absence let the toy's
+	// value map run 0.25 -> 38,187 in 32 sweeps.
+	if (const char* fr = std::getenv("GGL_FRONTIER"); fr && *fr && std::string(fr) != "0") {
+		cfg.ppo.frontier.enabled = true;
+		cfg.ppo.frontier.silEnabled = false;
+		cfg.ppo.frontier.gamma = cfg.ppo.gaeGamma;
+		cfg.ppo.frontier.valueAbsMax = cfg.ppo.rewardClipRange > 0 ? cfg.ppo.rewardClipRange : 10.f;
+		cfg.ppo.frontier.value = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
+		cfg.ppo.frontier.quasi = { { 256, 256 }, ModelActivationType::RELU, ModelOptimType::ADAM };
+		cfg.ppo.obsMaxPlayersPerTeam = MAX_PLAYERS_PER_TEAM;
+		RG_LOG("GGL_FRONTIER: value map + quasimetric ON (instrument only, SIL off), |V| bound "
+			<< cfg.ppo.frontier.valueAbsMax << ", gamma " << cfg.ppo.frontier.gamma);
+	}
 	if (const char* nh = std::getenv("GGL_NO_HEADROOM"); nh && *nh && std::string(nh) != "0") {
 		cfg.ppo.vdagEnabled = false;
 		cfg.ppo.silEnabled = false;

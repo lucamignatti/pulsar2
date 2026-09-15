@@ -35,6 +35,10 @@ ARCH_70 = {
     "REACH_PSI_BALL":     ([384, 384, 384],    True,  True,  True),
     "REACH_PSI_CAR":      ([384, 384, 384],    True,  True,  True),
     "REACH_PSI_CARSTATE": ([384, 384, 384],    True,  True,  True),
+    # mode-heads test (2026-09-11): per-mode policy heads on the policy penultimate 768
+    "POLICY_MODE1":       ([512],              True,  False, True),
+    "POLICY_MODE2":       ([512],              True,  False, True),
+    "POLICY_MODE3":       ([512],              True,  False, True),
 }
 
 

@@ -41,6 +41,43 @@ namespace GGL {
 	//
 	// Arena layout: [0, numSteered) steered practice | [numSteered, numPractice) control
 	// practice | rest match. Pair ALL practice arenas (steered + control) with
+	// WORLD MAP (measurement only; NATIVE_INTENT_PROTOCOL.md "Staleness world model"): a
+	// detached ensemble that predicts the 26-dim physical descriptor k decisions ahead from
+	// (obs, action, intent) on-policy. Because the fleet faces ONE opponent per iteration, its
+	// prequential (before-update) error per iteration is keyed by that opponent's age, so the
+	// panels answer the pre-registered question: does a model trained under recent opponents
+	// err more against older ones? (= it captured the opponent-conditioned world, not physics).
+	// Nothing injects from it.
+	// OPPONENT MAP (Util/OpponentMap.h; research/reports/WORLD_MODEL.md) - the opponent-
+	// conditioned world model: identifier z from the episode context, opponent-displacement
+	// model with predicted entropy (staleness = excess NLL), outcome map R(s, intent, z) that
+	// plans the intent at each boundary with prob planFrac. Validated on the LobLine toy.
+	struct OppMapConfig {
+		bool enabled = false;
+		int zdim = 8;
+		int hidden = 64;
+		int ensemble = 3;
+		float lr = 3e-4f;
+		int trainEpisodes = 1024;
+		int maxLen = 256;
+		float planFrac = 0.75f;
+		int planWarmup = 50;
+		int oppSlotBase = 138, playerStride = 29, oppSlots = 3, presenceBase = 227, posOff = 0, velOff = 9;
+		bool useContext = true;   // false = ABLATION: outcome head sees neither z nor the identity embedding
+		float staleBeta = 0.f;    // > 0: inject the STALENESS potential (prequential across-member disagreement,
+		                          // normalised by predicted variance) sigma-matched like the seek term
+		int identitySlots = 64;   // identity embedding table (0 self, 1 nexto, 2+ ring versions by timestep bucket)
+	};
+
+	struct WorldMapConfig {
+		bool enabled = false;
+		int k = 15;              // decisions ahead (1 s at 15 Hz)
+		float lr = 1e-4f;
+		int trainRows = 98304;   // rows per member per iteration
+		int ensemble = 3;        // members; disagreement = across-member prediction variance
+		int hidden = 512;
+	};
+
 	struct GapSensorConfig {
 		bool enabled = false;
 		float tau = 0.8f;        // expectile: "returns when it goes well"
@@ -201,6 +238,8 @@ namespace GGL {
 		// DIP SEARCH: search-and-imitate from value dips (Util/DipSearch.h; the study is
 		// research/reports/HEADROOM_SEARCH.md). Default OFF; GGL_DIPSEARCH=1 in ExampleMain.
 		DipSearchConfig dipSearch;
+		WorldMapConfig worldMap;
+		OppMapConfig oppMap;
 
 		// Standardize the obs values (doesn't seem to help much from my testing)
 		bool standardizeObs = false;
