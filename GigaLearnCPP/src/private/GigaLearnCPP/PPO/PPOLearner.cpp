@@ -2415,15 +2415,19 @@ void GGL::PPOLearner::LoadFrom(std::filesystem::path folderPath)  {
 void GGL::PPOLearner::FrontierIngest(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor reward, torch::Tensor done) {
 	if (!frontier)
 		return;
-	frontierObs = obs.detach();
-	frontierNextObs = nextObs.detach();
-	frontierReward = reward.detach().flatten();
-	frontierDone = done.detach().flatten();
+	// The trajectory tensors live on the host; the module's nets and its sampling indices live on
+	// `device`. Move once here (the desktop smoke ran GGL_DEVICE=cpu, which is why this was invisible
+	// until the first CUDA hop died in TrainFrontier on index_select).
+	auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+	frontierObs = obs.detach().to(f32);
+	frontierNextObs = nextObs.detach().to(f32);
+	frontierReward = reward.detach().flatten().to(f32);
+	frontierDone = done.detach().flatten().to(f32);
 
 	// Goal candidates: a rolling pool of recent observations. Deliberately NOT the policy's
 	// current batch alone -- the toy measured that goals near one arena's state are useless to
 	// another, and that a pool has to be wide enough to contain something worth reaching.
-	auto pool = obs.detach();
+	auto pool = frontierObs;
 	frontierCandidates = frontierCandidates.defined()
 		? torch::cat({ frontierCandidates, pool }, 0)
 		: pool;
