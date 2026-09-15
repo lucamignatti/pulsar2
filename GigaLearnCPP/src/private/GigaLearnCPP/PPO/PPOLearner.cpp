@@ -2578,7 +2578,7 @@ void GGL::PPOLearner::TrainFrontier() {
 		frontier->quasi->optim->zero_grad();
 		auto st = frontier->TrainQuasi(
 			frontierObs.index_select(0, idx), frontierNextObs.index_select(0, idx),
-			frontierObs.index_select(0, pairIdx));
+			frontierObs.index_select(0, pairIdx), frontierDone.index_select(0, idx));
 		frontier->quasi->optim->step();
 		rep.quasiLoss += st.loss / cfg.quasiSteps;
 		rep.meanLocal += st.meanLocal / cfg.quasiSteps;

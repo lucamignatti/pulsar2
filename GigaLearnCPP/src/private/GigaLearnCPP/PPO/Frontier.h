@@ -40,8 +40,10 @@ namespace GGL {
 		// QRL objective: push distances apart subject to every OBSERVED one-step transition
 		// costing at most 1. Triangle inequality is structural, so this converges toward
 		// shortest-path decision counts rather than fitting whatever the behaviour produced.
+		// done marks rows whose nextObs is the next episode's kickoff, not a successor: those
+		// pairs are excluded from the one-step constraint (a goal is not one decision from kickoff).
 		struct QuasiStats { float loss = 0, meanLocal = 0, violation = 0, meanSpread = 0; };
-		QuasiStats TrainQuasi(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs);
+		QuasiStats TrainQuasi(torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done);
 
 		// --- goals -----------------------------------------------------------------------------
 		// For each row of obs, pick the candidate with the largest value gain whose distance falls

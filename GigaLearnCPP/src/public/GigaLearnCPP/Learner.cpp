@@ -4776,18 +4776,20 @@ void GGL::Learner::Start() {
 									.slice(0, 0, nR - 1));
 						}
 						// FRONTIER: executed transitions for the bounded value backup and the
-						// quasimetric fit. Same arrival-reward reconstruction as the theory head,
-						// so the value map lands in the critic's units. Pairs whose departure row
-						// ended an episode are goal->kickoff teleports, not executed dynamics,
-						// and are excluded by the continuation mask.
+						// quasimetric fit, in the critic's units (scaledR is what GAE consumes).
+						// Row i is (s_i, a_i) -> s_{i+1} with reward scaledR[i] and done = 1 - cont[i].
+						// On a terminal row the stored s_{i+1} is the next episode's kickoff, not a
+						// successor: (1 - done) zeroes its bootstrap, and the quasimetric's one-step
+						// constraint is masked by done inside TrainQuasi. The reward itself
+						// is NOT masked: under GCO the terminal goal is the only reward that exists,
+						// and the first version of this block (arrival * contPrev, copied from the
+						// theory head where it is correct) zeroed exactly those rows - the map
+						// trained on all-zero targets and collapsed to 0 within 200 iterations.
 						if (config.ppo.frontier.enabled) {
-							auto z0f = torch::zeros({ 1 }, scaledR.options());
-							auto arrivalF = torch::cat({ z0f, scaledR.slice(0, 0, nR - 1) });
-							auto contPrevF = torch::cat({ z0f, cont.slice(0, 0, nR - 1) });
 							ppo->FrontierIngest(
 								tStates.slice(0, 0, nR - 1),
 								tStates.slice(0, 1, nR),
-								(arrivalF * contPrevF).slice(0, 1, nR),
+								scaledR.slice(0, 0, nR - 1),
 								1.0f - cont.slice(0, 0, nR - 1));
 							// FRONTIER SIL rows for THIS iteration's learn pass, scored by the map and
 							// metric as fitted through the previous iteration.

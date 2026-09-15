@@ -95,7 +95,7 @@ namespace GGL {
 	}
 
 	FrontierModule::QuasiStats FrontierModule::TrainQuasi(
-		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs) {
+		torch::Tensor obs, torch::Tensor nextObs, torch::Tensor pairObs, torch::Tensor done) {
 
 		QuasiStats stats = {};
 
@@ -103,9 +103,12 @@ namespace GGL {
 		auto zNext = Encode(nextObs);
 		auto zPair = Encode(pairObs);
 
-		// Local constraint: one real decision costs at most 1.
+		// Local constraint: one real decision costs at most 1. Terminal rows are teleports
+		// (their stored successor is a kickoff) and carry no constraint.
+		auto keep = (1.0f - done.to(torch::kFloat32).flatten());
+		auto nKeep = keep.sum().clamp_min(1.0f);
 		auto local = Distance(zFrom, zNext);
-		auto violation = torch::relu(local - 1.0f).pow(2).mean();
+		auto violation = (torch::relu(local - 1.0f).pow(2) * keep).sum() / nKeep;
 
 		// Spread: push everything else apart, softly capped so it cannot run away.
 		const float cap = config.quasiSpreadCap;
@@ -116,7 +119,7 @@ namespace GGL {
 		loss.backward();
 
 		stats.loss = loss.item<float>();
-		stats.meanLocal = local.mean().item<float>();
+		stats.meanLocal = ((local * keep).sum() / nKeep).item<float>();
 		stats.violation = violation.item<float>();
 		stats.meanSpread = spread.mean().item<float>();
 		return stats;
